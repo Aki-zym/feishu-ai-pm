@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 2,
+  "kind": "issue111_publication_review_fixture",
+  "scope": "synthetic_local_L4_only",
+  "purpose": "Reviewer can reconstruct immutable publication safety without relying on ignored ci-artifacts directories.",
+  "requiredReaderRules": [
+    "current pointer, root slot and referenced evidence are fully validated before acceptance",
+    "missing or damaged pointer with existing history fails closed unless explicit recovery is requested",
+    "failed generations remain history and never become current",
+    "current/history generation links are monotonic and previousGeneration-bound",
+    "lease identities, heartbeat pulses, states and reclaim guards are immutable no-replace paths",
+    "release/reclaim/publish use identity and generation CAS without deleting shared replacement paths"
+  ],
+  "injectionCases": {
+    "A": { "hook": "beforeCandidatePublish", "expected": "temporary candidate is cleaned; no destination is partially visible" },
+    "B": { "hook": "beforeReclaimStatePublish", "expected": "replacement identity remains; stale reclaimer can only publish the old identity tombstone" },
+    "C": { "hook": "beforeReleaseFinalCompare", "expected": "replacement identity remains; old owner cannot release or remove it" },
+    "D": { "hook": "beforePointerPublish", "expected": "lease state replacement fences the old writer; no current pointer is published" }
+  },
+  "generations": [
+    {
+      "generation": "20260817110000000-fa110001",
+      "runId": "local-20260817T110000Z-fa110001",
+      "status": "failed",
+      "previousGeneration": null,
+      "counts": { "total": 5, "passed": 3, "failed": 2, "skipped": 0 },
+      "payloadDigest": "3320bb53603512af19e652ee8b1e45dd0ab15479c7d5d3e12730cc1ffc5b8011",
+      "evidenceSha256": "2c8496c09c0a81d2a3baac589d116e249ce42fc5313252b11a4fdbbd610346a0"
+    },
+    {
+      "generation": "20260817111000000-fa110002",
+      "runId": "local-20260817T111000Z-fa110002",
+      "status": "failed",
+      "previousGeneration": "20260817110000000-fa110001",
+      "counts": { "total": 6, "passed": 5, "failed": 1, "skipped": 0 },
+      "payloadDigest": "37748d4979bc64f02e8da500808c79ab4a37b16b47fe5eb0daf4589957417099",
+      "evidenceSha256": "f6330adcb9c05ca5b65a399e9d22b62cbe45b0befd4f6f502a502e992c407b5b"
+    },
+    {
+      "generation": "20260817112000000-a1100001",
+      "runId": "local-20260817T112000Z-a1100001",
+      "status": "success",
+      "previousGeneration": "20260817111000000-fa110002",
+      "counts": { "total": 7, "passed": 7, "failed": 0, "skipped": 0 },
+      "payloadDigest": "3c02dd3a664d76b35b9dad1c229b99b184d417a5a8db54f33ac7c42ddc1cadc9",
+      "evidenceSha256": "e055fc15e8cf38c4acea35560df7c5c41b14d276dc966fc8720e6fb93a263d41"
+    }
+  ],
+  "expectedCurrent": "20260817112000000-a1100001",
+  "reviewArtifacts": {
+    "history": "ci-artifacts/local-verification/generations/<generation>/<runId>/evidence.json",
+    "root": "ci-artifacts/local-verification/root-slots/<generation>.json",
+    "current": "ci-artifacts/local-verification/pointers/<generation>.json",
+    "leaseIdentity": "ci-artifacts/local-verification/leases/<generation>-<token>/lease.json",
+    "leaseReference": "ci-artifacts/local-verification/lease-refs/<generation>.json",
+    "validator": "node scripts/local-verification-fixture.mjs"
+  },
+  "boundaries": [
+    "does not authorize real Feishu/LLM/provider or production data",
+    "does not authorize signed Windows Release, L5 or L6",
+    "does not replace independent Reviewer, mechanical Merger, or post-merge integration verification"
+  ]
+}

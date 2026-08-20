@@ -1,0 +1,27 @@
+# CODEOWNERS is review routing, not proof of independent review.
+# This repository currently has one confirmed GitHub owner; do not claim two-person independence.
+
+# Core server and data/runtime behavior
+/apps/server/ @guanchen-dotcom
+
+# Desktop shell, IPC and release configuration
+/apps/desktop/ @guanchen-dotcom
+/release/ @guanchen-dotcom
+
+# Web UI
+/apps/web/ @guanchen-dotcom
+
+# Security, privacy and Feishu integration contracts
+/docs/security_and_privacy.md @guanchen-dotcom
+/docs/feishu-integration.md @guanchen-dotcom
+/apps/server/src/integrations/ @guanchen-dotcom
+
+# Documentation and verification
+/README.md @guanchen-dotcom
+/AGENTS.md @guanchen-dotcom
+/CONTRIBUTING.md @guanchen-dotcom
+/docs/ @guanchen-dotcom
+
+# Workflow and governance
+/.github/ @guanchen-dotcom
+/scripts/ @guanchen-dotcom

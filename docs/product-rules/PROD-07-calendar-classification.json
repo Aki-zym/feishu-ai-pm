@@ -1,0 +1,419 @@
+{
+  "schema_version": 1,
+  "id": "PROD-07",
+  "title": "日历事实与任务候选分类规则",
+  "status": "contract_only",
+  "owner": "product_owner",
+  "last_reviewed": "2026-08-16",
+  "target": "M1 / 首个受控单用户试点 / calendar source classification",
+  "scope": "本文件只定义产品规则、合成验收夹具和后续实现输入输出；本 Issue 不修改生产分类行为。",
+  "evidence_ceiling": ["L0"],
+  "source_policy": {
+    "calendar_fact_is_authoritative": true,
+    "filtered_event_is_retained": true,
+    "raw_content_not_uploaded": true,
+    "meeting_placeholder_is_not_action": true,
+    "minutes_or_explicit_message_preferred_for_action_item": true
+  },
+  "routes": {
+    "calendar_fact": {
+      "meaning": "时间事实或提醒，保留在 Calendar 来源和日历展示中",
+      "candidate_created": false,
+      "owner_confirmation_required": false,
+      "source_retained": true,
+      "explanation_required": false
+    },
+    "candidate_review": {
+      "meaning": "明确责任、动作和交付物/截止点，生成一个待主人确认的候选",
+      "candidate_created": true,
+      "owner_confirmation_required": true,
+      "source_retained": true,
+      "explanation_required": true
+    },
+    "owner_confirmation": {
+      "meaning": "有行动迹象但责任或交付边界不完整，只提示主人确认，不批量制造候选",
+      "candidate_created": false,
+      "owner_confirmation_required": true,
+      "source_retained": true,
+      "explanation_required": true
+    }
+  },
+  "role_matrix": [
+    {
+      "role": "organizer",
+      "default_route": "calendar_fact",
+      "candidate_condition": "仅当正文明确主人负责动作且同时有交付物或截止点",
+      "does_not_imply_task": true
+    },
+    {
+      "role": "required_attendee",
+      "default_route": "calendar_fact",
+      "candidate_condition": "仅出席不构成候选；需要主人责任、动作和交付信号",
+      "does_not_imply_task": true
+    },
+    {
+      "role": "optional_attendee",
+      "default_route": "calendar_fact",
+      "candidate_condition": "仅在正文明确主人交付责任时进入后续规则",
+      "does_not_imply_task": true
+    },
+    {
+      "role": "no_response",
+      "default_route": "calendar_fact",
+      "candidate_condition": "不得因未响应推断主人需要执行；责任不明时只走确认提示",
+      "does_not_imply_task": true
+    }
+  ],
+  "event_matrix": [
+    { "event_type": "ordinary_reminder", "default_route": "calendar_fact", "reason": "普通提醒只是时间事实" },
+    { "event_type": "attendance_only", "default_route": "calendar_fact", "reason": "仅出席不等于主人有交付责任" },
+    { "event_type": "meeting_placeholder", "default_route": "calendar_fact", "reason": "会议占位不能单独推断 action item" },
+    { "event_type": "all_day", "default_route": "calendar_fact", "reason": "全天属性不增加任务责任" },
+    { "event_type": "recurring", "default_route": "calendar_fact", "reason": "重复属性不增加任务责任，后续实现需按系列去重" },
+    { "event_type": "holiday", "default_route": "calendar_fact", "reason": "节假日是订阅或时间事实" },
+    { "event_type": "birthday", "default_route": "calendar_fact", "reason": "生日提醒默认不是交付任务" },
+    { "event_type": "subscribed_calendar", "default_route": "calendar_fact", "reason": "订阅日历默认只提供事实" },
+    { "event_type": "explicit_owner_delivery", "default_route": "candidate_review", "reason": "明确主人责任、动作和交付物或截止点" },
+    { "event_type": "minutes_action_item", "default_route": "candidate_review", "reason": "纪要或明确消息提供了可追溯 action item" },
+    { "event_type": "ambiguous_action", "default_route": "owner_confirmation", "reason": "有行动词但责任或交付边界不完整" }
+  ],
+  "decision_rules": {
+    "candidate_requires_all": ["explicit_owner_responsibility", "action", "deliverable_or_deadline"],
+    "explicit_action_verbs": ["准备", "提交", "评审", "确认", "交付", "整理", "回复", "更新", "跟进"],
+    "owner_responsibility_signals": ["我负责", "由我", "请我", "主人需要", "我来提交", "我来确认"],
+    "deliverable_or_deadline_signals": ["报告", "名单", "文档", "结果", "方案", "截止", "到期", "之前完成", "周一前", "明天前"],
+    "non_signals": ["仅供参考", "提醒一下", "欢迎参加", "可选参加", "生日快乐", "节假日", "订阅日历", "例会"],
+    "uncertain_rule": {
+      "route": "owner_confirmation",
+      "candidate_created": false,
+      "source_retained": true,
+      "bulk_candidate_creation": false,
+      "missing_signal_policy": "owner_confirmation",
+      "scope": "single_event",
+      "required_fields": ["missing_signal_code", "source_reference"],
+      "forbidden_fields": ["raw_source_content", "global_calendar_filter", "source_deletion"]
+    },
+    "meeting_rule": {
+      "placeholder_route": "calendar_fact",
+      "placeholder_is_action": false,
+      "action_item_sources": ["minutes", "explicit_message"],
+      "requires_all_candidate_signals": true,
+      "source_retained": true,
+      "scope": "event_then_explicit_related_source"
+    },
+    "explanation_rule": {
+      "calendar_fact": {
+        "route": "calendar_fact",
+        "required_fields": [],
+        "forbidden_fields": ["raw_source_content", "provider_payload", "attendee_directory"],
+        "source_reference_required": false,
+        "raw_content_allowed": false,
+        "free_text_allowed": false,
+        "scope": "none"
+      },
+      "candidate_review": {
+        "route": "candidate_review",
+        "required_fields": ["owner_responsibility", "action", "deliverable_or_deadline", "source_reference"],
+        "forbidden_fields": ["raw_source_content", "provider_payload", "attendee_directory"],
+        "source_reference_required": true,
+        "raw_content_allowed": false,
+        "free_text_allowed": false,
+        "scope": "redacted_explanation"
+      },
+      "owner_confirmation": {
+        "route": "owner_confirmation",
+        "required_fields": ["missing_signal_code", "source_reference"],
+        "forbidden_fields": ["raw_source_content", "provider_payload", "attendee_directory"],
+        "source_reference_required": true,
+        "raw_content_allowed": false,
+        "free_text_allowed": false,
+        "scope": "redacted_explanation"
+      }
+    }
+  },
+  "correction_rule": {
+    "entry_label": "这只是提醒",
+    "current_event_scope": "current_event_only",
+    "series_scope": "explicit_owner_selection_only",
+    "learning_boundary": "same_event_family_only",
+    "reclassification_boundary": "derived_state_only",
+    "source_mutation": "forbidden",
+    "audit_event": "private_correction_event_required",
+    "global_filter": false,
+    "global_source_deletion": false,
+    "requires_new_revision": true,
+    "idempotency": "operation_id_required"
+  },
+  "examples": [
+    {
+      "id": "negative-reminder-01",
+      "kind": "negative",
+      "role": "organizer",
+      "event_type": "ordinary_reminder",
+      "title": "周例会提醒",
+      "description": "提醒主人周三 10:00 参加例会。",
+      "signals": [],
+      "expected_route": "calendar_fact",
+      "candidate_created": false,
+      "source_retained": true,
+      "explanation_code": "calendar_reminder",
+      "explanation": "仅提醒，不包含主人动作或交付物。"
+    },
+    {
+      "id": "negative-attendance-01",
+      "kind": "negative",
+      "role": "required_attendee",
+      "event_type": "attendance_only",
+      "title": "数据周会",
+      "description": "请参加会议，无需准备材料。",
+      "signals": [],
+      "expected_route": "calendar_fact",
+      "candidate_created": false,
+      "source_retained": true,
+      "explanation_code": "calendar_attendance_only",
+      "explanation": "仅出席，不推断任务。"
+    },
+    {
+      "id": "negative-all-day-01",
+      "kind": "negative",
+      "role": "no_response",
+      "event_type": "all_day",
+      "title": "公司节假日",
+      "description": "全天休息。",
+      "signals": [],
+      "expected_route": "calendar_fact",
+      "candidate_created": false,
+      "source_retained": true,
+      "explanation_code": "calendar_all_day",
+      "explanation": "全天和节假日属性不是交付责任。"
+    },
+    {
+      "id": "negative-recurring-01",
+      "kind": "negative",
+      "role": "optional_attendee",
+      "event_type": "recurring",
+      "title": "每周提醒：查看周报",
+      "description": "重复提醒，仅供参考。",
+      "signals": [],
+      "expected_route": "calendar_fact",
+      "candidate_created": false,
+      "source_retained": true,
+      "explanation_code": "calendar_recurring",
+      "explanation": "重复属性和查看提示不足以证明交付。"
+    },
+    {
+      "id": "negative-subscription-01",
+      "kind": "negative",
+      "role": "no_response",
+      "event_type": "subscribed_calendar",
+      "title": "订阅日历：生日提醒",
+      "description": "订阅来源的生日提示。",
+      "signals": [],
+      "expected_route": "calendar_fact",
+      "candidate_created": false,
+      "source_retained": true,
+      "explanation_code": "calendar_subscription",
+      "explanation": "订阅日历和生日默认只保留事实。"
+    },
+    {
+      "id": "negative-meeting-01",
+      "kind": "negative",
+      "role": "required_attendee",
+      "event_type": "meeting_placeholder",
+      "title": "项目同步会议",
+      "description": "会议占位，没有纪要或后续消息。",
+      "signals": [],
+      "expected_route": "calendar_fact",
+      "candidate_created": false,
+      "source_retained": true,
+      "explanation_code": "calendar_meeting_placeholder",
+      "explanation": "会议占位不能单独推断 action item。"
+    },
+    {
+      "id": "positive-delivery-01",
+      "kind": "positive",
+      "role": "organizer",
+      "event_type": "explicit_owner_delivery",
+      "title": "提交活动复盘",
+      "description": "我负责在周五前提交活动复盘报告。",
+      "signals": ["explicit_owner_responsibility", "action", "deliverable_or_deadline"],
+      "expected_route": "candidate_review",
+      "candidate_created": true,
+      "source_retained": true,
+      "explanation_code": "candidate_explicit_delivery",
+      "explanation": "主人责任：我负责；动作：提交；交付物/截止点：复盘报告、周五前。"
+    },
+    {
+      "id": "positive-prepare-01",
+      "kind": "positive",
+      "role": "required_attendee",
+      "event_type": "explicit_owner_delivery",
+      "title": "准备评审材料",
+      "description": "请我在会议前准备评审材料，周三 18:00 前交付。",
+      "signals": ["explicit_owner_responsibility", "action", "deliverable_or_deadline"],
+      "expected_route": "candidate_review",
+      "candidate_created": true,
+      "source_retained": true,
+      "explanation_code": "candidate_prepare",
+      "explanation": "明确主人动作和交付截止点，进入待确认候选。"
+    },
+    {
+      "id": "positive-minutes-01",
+      "kind": "positive",
+      "role": "required_attendee",
+      "event_type": "minutes_action_item",
+      "title": "纪要 action item：确认埋点名单",
+      "description": "纪要明确：主人在周一前确认埋点名单。",
+      "signals": ["explicit_owner_responsibility", "action", "deliverable_or_deadline"],
+      "expected_route": "candidate_review",
+      "candidate_created": true,
+      "source_retained": true,
+      "explanation_code": "candidate_minutes_action_item",
+      "explanation": "action item 来自纪要并带有主人责任和截止点。"
+    },
+    {
+      "id": "positive-message-01",
+      "kind": "positive",
+      "role": "optional_attendee",
+      "event_type": "explicit_owner_delivery",
+      "title": "更新方案并回复",
+      "description": "由我更新方案，明天下午前回复最终版本。",
+      "signals": ["explicit_owner_responsibility", "action", "deliverable_or_deadline"],
+      "expected_route": "candidate_review",
+      "candidate_created": true,
+      "source_retained": true,
+      "explanation_code": "candidate_explicit_message",
+      "explanation": "即使是可选参与者，正文已明确主人动作和交付截止点。"
+    },
+    {
+      "id": "boundary-ambiguous-01",
+      "kind": "boundary",
+      "role": "organizer",
+      "event_type": "ambiguous_action",
+      "title": "评审准备",
+      "description": "下周评审，准备一下。",
+      "signals": ["action"],
+      "expected_route": "owner_confirmation",
+      "candidate_created": false,
+      "source_retained": true,
+      "explanation_code": "confirmation_missing_owner_or_delivery",
+      "explanation": "有动作词但没有闭合主人责任和交付物/截止点，只提示确认。"
+    },
+    {
+      "id": "boundary-no-response-01",
+      "kind": "boundary",
+      "role": "no_response",
+      "event_type": "explicit_owner_delivery",
+      "title": "请确认谁来提交",
+      "description": "周五前提交名单，负责人未响应。",
+      "signals": ["action", "deliverable_or_deadline"],
+      "expected_route": "owner_confirmation",
+      "candidate_created": false,
+      "source_retained": true,
+      "explanation_code": "confirmation_missing_owner",
+      "explanation": "有交付但责任不明，不直接制造候选。"
+    },
+    {
+      "id": "boundary-meeting-without-minutes-01",
+      "kind": "boundary",
+      "role": "organizer",
+      "event_type": "meeting_placeholder",
+      "title": "产品评审",
+      "description": "标题出现“确认”，但没有纪要或明确消息说明主人负责什么。",
+      "signals": ["action"],
+      "expected_route": "owner_confirmation",
+      "candidate_created": false,
+      "source_retained": true,
+      "explanation_code": "confirmation_meeting_without_source",
+      "explanation": "会议占位和孤立动作词不足以形成候选。"
+    }
+  ],
+  "acceptance": {
+    "fixture_batches": [
+      {
+        "id": "ordinary-reminders-50",
+        "input_count": 50,
+        "expected_route": "calendar_fact",
+        "expected_candidate_count": 0,
+        "expected_owner_confirmation_count": 0,
+        "expected_source_retained_count": 50,
+        "max_candidate_noise_rate": 0
+      },
+      {
+        "id": "explicit-delivery-10",
+        "input_count": 10,
+        "expected_route": "candidate_review",
+        "expected_candidate_count": 10,
+        "expected_owner_confirmation_count": 0,
+        "expected_source_retained_count": 10,
+        "max_candidate_noise_rate": 0
+      },
+      {
+        "id": "uncertain-responsibility-10",
+        "input_count": 10,
+        "expected_route": "owner_confirmation",
+        "expected_candidate_count": 0,
+        "expected_owner_confirmation_count": 10,
+        "expected_source_retained_count": 10,
+        "max_candidate_noise_rate": 0
+      },
+      {
+        "id": "repeat-series-12",
+        "input_count": 12,
+        "expected_route": "calendar_fact",
+        "expected_candidate_count": 0,
+        "expected_owner_confirmation_count": 0,
+        "expected_source_retained_count": 12,
+        "max_candidate_noise_rate": 0
+      }
+    ],
+    "metrics": {
+      "fact_retention_rate_min": 1,
+      "facts_only_candidate_noise_rate_max": 0,
+      "explicit_delivery_candidate_recall_min": 1,
+      "uncertain_bulk_candidate_count_max": 0,
+      "candidate_explanation_coverage_min": 1,
+      "duplicate_series_candidate_multiplier_max": 1,
+      "desktop_mobile_rule_parity_required": true
+    },
+    "visible_acceptance": [
+      "Calendar 中仍能看到被判为事实/提醒的事件，候选页不出现同一事件。",
+      "候选卡解释主人责任、动作、交付物/截止点和来源依据；责任不明显示待确认原因。",
+      "后续实现验收目标：桌面与窄屏使用相同 route 和解释，不把 Calendar 事实写成任务；本 Issue 尚未实现或验证 UI 分类行为。",
+      "“这只是提醒”只影响主人选择的事件或系列，来源、审计和其他事件不被删除。"
+    ]
+  },
+  "implementation_contract": {
+    "minimum_calendar_dto_fields": [
+      "event_key_for_dedupe",
+      "start_at",
+      "end_at",
+      "timezone",
+      "is_all_day",
+      "recurrence_or_series_key",
+      "calendar_kind",
+      "title_or_bounded_description",
+      "owner_role",
+      "owner_response",
+      "has_minutes_or_explicit_message_reference"
+    ],
+    "normalized_output_fields": [
+      "route",
+      "source_retained",
+      "candidate_created",
+      "requires_owner_confirmation",
+      "explanation_code",
+      "evidence_fields",
+      "correction_scope"
+    ],
+    "must_not_request_or_expose": [
+      "full_attendee_directory",
+      "raw_user_ids",
+      "full_meeting_transcript",
+      "raw_calendar_payload",
+      "provider_or_model_prompt",
+      "source_deletion_as_filtering"
+    ],
+    "production_behavior_status": "not_changed_by_issue_85"
+  }
+}

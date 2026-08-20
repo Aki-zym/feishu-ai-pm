@@ -1,0 +1,60 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets.json
+credentials.json
+
+# Private data and local databases
+data/private/
+data/raw-chat/
+exports/
+downloads/
+.handoff/current.md
+.handoff/*.local.md
+*.sqlite
+*.sqlite3
+*.db
+**/var/*.sqlite*
+
+# Logs and runtime files
+logs/
+*.log
+tmp/
+.tmp/
+.cache/
+test-results/
+playwright-report/
+ci-artifacts/
+var/
+
+# JavaScript / TypeScript
+node_modules/
+.next/
+.vite/
+dist/
+build/
+release/
+secrets/
+coverage/
+
+# Local toolchain
+.local-tools/
+*.cindy
+pr*-body*
+*readback*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

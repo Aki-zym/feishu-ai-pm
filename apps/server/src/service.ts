@@ -1,0 +1,17450 @@
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, renameSync, statfsSync, writeFileSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { z } from 'zod';
+import type { AppConfig } from './config.js';
+import type {
+  CandidateState,
+  CandidateAnalysis,
+  CandidateMergeClassificationContext,
+  CandidateMergeDecision,
+  CandidateDraft,
+  CandidateNarrativeUpdates,
+  FeishuMonitoringScope,
+  FeishuMonitorTarget,
+  MemoryProjectionRecord,
+  MessageAction,
+  MessageActionDecision,
+  ModelThreadCandidate,
+  NormalizedSourceEvent,
+  OwnerIdentity,
+  OwnerIntentDecision,
+  OwnerSourceKind,
+  OwnerSourceStatus,
+  RequirementThreadRecord,
+  RiskLevel,
+  TaskUpdateProposalRecord,
+  TaskRecord,
+  TaskStatus,
+  SourceDocumentContext,
+  ThreadAssociationDecision,
+  ThreadClassificationContext,
+} from './domain.js';
+import { CURRENT_SCHEMA_VERSION, DatabaseUpgradeError, type AppDatabase } from './database.js';
+import {
+  AUDIT_REPLAY_INTENT,
+  DATA04_OWNER_SCOPE,
+  canonicalRevisionHash,
+  canonicalRevisionSetHash,
+  type ReplayCapabilityBinding,
+  type RevisionSetEntry,
+} from './data04.js';
+import type { ReturnTypeOfAdapters } from './types.js';
+import type { ClassificationResult, ClassificationUnitResult, DurableEventReceipt, FeishuScopeUpdate, IntegrationCheck } from './integration-contracts.js';
+import { calendarClassificationDraft, classifyCalendarSource, type CalendarClassification } from './calendar-classification.js';
+import { describeFeishuAuthError, FeishuAuthError, LiveFeishuAdapter, feishuScopeUpdateOf, normalizeFeishuScopeUpdate } from './integrations/feishu.js';
+import { FeishuSyncRunner } from './integrations/feishu-sync.js';
+import { FeishuOwnerSyncRunner } from './integrations/feishu-owner-sync.js';
+import { FeishuCalendarSyncRunner } from './integrations/feishu-calendar-sync.js';
+import { FeishuMinutesSyncRunner } from './integrations/feishu-minutes-sync.js';
+import { FeishuDocumentContextService, sourceContextRevision } from './integrations/feishu-document-context.js';
+import { FeishuDocumentContextSyncRunner } from './integrations/feishu-document-sync.js';
+import { enforceUntrustedClassificationBoundary, projectUntrustedSenderName, timeRangeFromSource } from './integrations/llm.js';
+import { PmRuntime, sanitizeRuntimeError, type RuntimeJobRow } from './runtime.js';
+import { RuntimeCooldownDeferredError } from './runtime.js';
+import { classifyRetryFailure, RetryCoordinator, SqliteRetryCooldownStore, type RetryFailureMetadata } from './retry-policy.js';
+import {
+  SHANGHAI_CALENDAR_OMITTED_WARNING,
+  SHANGHAI_TIMEZONE,
+  assertShanghaiCalendarPlanRange,
+  projectShanghaiCalendarPlan,
+  shanghaiDayWindow,
+} from './shanghai-time.js';
+import {
+  REDACTION_SCHEMA_VERSION,
+  redactDiagnosticRecord,
+  redactDiagnosticText,
+  redactDiagnosticValue,
+} from './redaction.js';
+import {
+  failedSourceOutcome,
+  childOperationContext,
+  createOperationContext,
+  isOperationContext,
+  operationEnvelope,
+  releaseIdentity,
+  safeSyncTotals,
+  syncSourceOutcome,
+  type ReadinessStatus,
+  type OperationContext,
+  type SafeReason,
+  type SourceOutcome,
+} from './observability.js';
+import {
+  decideOwnerIntent,
+  isOwnerDecisionSource,
+  type OwnerDecisionResult,
+  type OwnerDecisionTarget,
+  type OwnerScheduleEvidence,
+} from './owner-decision.js';
+import {
+  minimalCandidateDtoSchema,
+  minimalSourceDtoSchema,
+  ownerInformationDtoSchema,
+  sourceExcerpt,
+  sourceScope,
+  sourceVerificationDtoSchema,
+  sourceVerificationRequestSchema,
+  requirementThreadDtoSchema,
+  threadRevisionDtoSchema,
+  threadDetailDtoSchema,
+  taskDetailDtoSchema,
+  taskDtoSchema,
+  taskUpdateProposalDtoSchema,
+  type MinimalSourceDto,
+  type SourceVerificationDto,
+} from './source-privacy.js';
+
+type CandidateRow = {
+  id: string;
+  version: number;
+  source_event_id: string;
+  demand_unit_id: string | null;
+  title: string;
+  proposer_name: string;
+  background: string;
+  validation_question: string;
+  describe: string;
+  analysis_json: string;
+  confidence: number;
+  state: CandidateState;
+  snoozed_until: string | null;
+  accepted_task_id: string | null;
+  merged_into_candidate_id: string | null;
+  merged_at: string | null;
+  deleted_at: string | null;
+  processing_state: 'organizing' | 'retry_waiting' | 'ready' | 'incomplete_context' | 'recovered' | 'failed_visible';
+  processing_job_id: string | null;
+  processing_error: string | null;
+  context_state: 'complete' | 'possibly_incomplete';
+  context_reason: string | null;
+  recovered_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export const CANDIDATE_VERSION_CONFLICT_MESSAGE = '候选已被其他操作更新，请刷新后重试。';
+
+export class CandidateVersionConflictError extends Error {
+  readonly errorCode = 'CONFLICT' as const;
+
+  constructor() {
+    super(CANDIDATE_VERSION_CONFLICT_MESSAGE);
+    this.name = 'CandidateVersionConflictError';
+  }
+}
+
+export class CandidateVersionRequiredError extends Error {
+  readonly errorCode = 'INVALID_EXPECTED_VERSION' as const;
+
+  constructor() {
+    super('候选变更需要提供当前候选版本。');
+    this.name = 'CandidateVersionRequiredError';
+  }
+}
+
+export class ReplayAuthorizationError extends Error {
+  readonly statusCode = 403 as const;
+
+  constructor(message = 'AI 决策回放不属于当前系统主人范围；已拒绝访问。') {
+    super(message);
+    this.name = 'ReplayAuthorizationError';
+  }
+}
+
+type AuditReplayCapabilitySecret = {
+  token: string;
+  csrfToken: string;
+  expiresAt: number;
+  origin: 'app://local';
+};
+
+type ReplayDecisionRow = {
+  id: string;
+  source_event_id: string | null;
+  source_revision: string | null;
+  demand_unit_id: string | null;
+  candidate_id: string | null;
+  is_data_request: number;
+  input_hash: string | null;
+  revision_set_hash: string | null;
+  prompt_hash: string | null;
+  model_config_hash: string | null;
+  replay_state: 'replayable' | 'unreplayable_legacy';
+  replay_state_reason: string | null;
+  owner_scope: string;
+  created_at: string;
+};
+
+type ReplayRevisionRow = {
+  source_event_id: string;
+  revision_id: string | null;
+  source_order: number;
+  reference_hash: string | null;
+  reference_owner_scope: string;
+  source_owner_scope: string | null;
+  revision_source_event_id: string | null;
+  revision_owner_scope: string | null;
+  revision_number: number | null;
+  revision_hash: string | null;
+  revision_kind: string | null;
+  external_id: string | null;
+  source_type: string | null;
+  conversation_id: string | null;
+  sender_id: string | null;
+  sender_name: string | null;
+  content: string | null;
+  owner_mentioned: number | null;
+  source_url: string | null;
+  completeness: string | null;
+  discovery_reason: string | null;
+  metadata_json: string | null;
+  occurred_at: string | null;
+  captured_at: string | null;
+};
+
+function replayHashEquals(left: string, right: string) {
+  if (!/^[a-f0-9]{64}$/u.test(left) || !/^[a-f0-9]{64}$/u.test(right)) return false;
+  return timingSafeEqual(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
+}
+
+function assertReplayCapabilityBinding(binding: ReplayCapabilityBinding): asserts binding is ReplayCapabilityBinding {
+  if (!binding || typeof binding !== 'object'
+    || !/^[a-f0-9]{64}$/u.test(binding.tokenHash)
+    || !/^[a-f0-9]{64}$/u.test(binding.csrfTokenHash)
+    || binding.origin !== 'app://local') {
+    throw new ReplayAuthorizationError('AI 决策回放能力凭证无效；已拒绝访问。');
+  }
+}
+
+type CandidateRevisionPayloadRow = {
+  id: string;
+  candidate_id: string;
+  title: string;
+  proposer_name: string;
+  background: string;
+  validation_question: string;
+  describe: string;
+  analysis_json: string;
+  confidence: number;
+  state: 'current' | 'proposed' | 'superseded' | 'rejected';
+};
+
+type CandidateDeletedState = 'active' | 'only' | 'all';
+type CandidateRuntimeFence = { candidateId: string; version: number };
+
+const candidateRuntimeFenceSchema = z.array(z.object({
+  candidateId: z.string().min(1).max(200),
+  version: z.number().int().positive(),
+}).strict()).max(128);
+
+type SourceFailureStatus = 'open' | 'retrying' | 'resolved' | 'ignored' | 'stale';
+const SOURCE_FAILURE_CODE_VALUES = [
+  'MODEL_OUTPUT_INVALID',
+  'MODEL_TIMEOUT',
+  'MODEL_RATE_LIMITED',
+  'MODEL_REQUEST_FAILED',
+  'SOURCE_CLASSIFICATION_FAILED',
+] as const;
+type SourceFailureCode = typeof SOURCE_FAILURE_CODE_VALUES[number];
+const SOURCE_FAILURE_CODES = new Set<string>(SOURCE_FAILURE_CODE_VALUES);
+function isSourceFailureCode(value: string): value is SourceFailureCode {
+  return SOURCE_FAILURE_CODES.has(value);
+}
+
+function sourceFailureId(sourceEventId: string, sourceRevision: string) {
+  return `failure_${createHash('sha256').update(`${sourceEventId}:${sourceRevision}`).digest('hex').slice(0, 24)}`;
+}
+
+function stableSourceFailureCode(code: string | null | undefined, error?: unknown): SourceFailureCode {
+  const normalized = typeof code === 'string' ? code.trim() : '';
+  if (isSourceFailureCode(normalized)) return normalized;
+  const name = error instanceof Error ? error.name : '';
+  if (name === 'AbortError' || /timeout/i.test(name)) return 'MODEL_TIMEOUT';
+  if (/invalidmodeljson|zoderror|schema|json/i.test(`${normalized} ${name}`)) return 'MODEL_OUTPUT_INVALID';
+  if (/rate|429/i.test(`${normalized} ${name}`)) return 'MODEL_RATE_LIMITED';
+  if (/network|fetch|connect|request/i.test(`${normalized} ${name}`)) return 'MODEL_REQUEST_FAILED';
+  return 'SOURCE_CLASSIFICATION_FAILED';
+}
+
+function sourceFailureMessage(errorCode: SourceFailureCode) {
+  switch (errorCode) {
+    case 'MODEL_OUTPUT_INVALID': return '模型输出未通过结构校验，来源已保留，等待安全重试。';
+    case 'MODEL_TIMEOUT': return '模型请求超时，来源已保留，等待安全重试。';
+    case 'MODEL_RATE_LIMITED': return '模型服务暂时限流，来源已保留，等待安全重试。';
+    case 'MODEL_REQUEST_FAILED': return '模型请求失败，来源已保留，等待安全重试。';
+    default: return '来源分类未完成，来源已保留，等待安全重试。';
+  }
+}
+
+const sourceFailureTimestamp = z.string().min(1).max(80).refine((value) => Number.isFinite(Date.parse(value)), '时间格式不合法。');
+const sourceFailureRecordSchema = z.object({
+  id: z.string().regex(/^failure_[a-f0-9]{24}$/u),
+  source_revision: z.string().regex(/^[a-f0-9]{64}$/u),
+  source_event_ids: z.array(z.string().trim().min(1).max(256)).min(1).max(64),
+  job_id: z.string().trim().min(1).max(256),
+  stage: z.literal('classification'),
+  error_code: z.enum(SOURCE_FAILURE_CODE_VALUES),
+  error_message: z.string().max(300),
+  status: z.enum(['open', 'retrying', 'resolved', 'ignored']),
+  retryable: z.boolean(),
+  attempts: z.number().int().nonnegative().max(1_000_000),
+  max_attempts: z.number().int().positive().max(1_000_000),
+  first_failed_at: sourceFailureTimestamp,
+  last_failed_at: sourceFailureTimestamp,
+  next_retry_at: sourceFailureTimestamp.nullable(),
+  resolved_at: sourceFailureTimestamp.nullable(),
+  ignored_at: sourceFailureTimestamp.nullable(),
+  updated_at: sourceFailureTimestamp,
+}).strict().superRefine((value, context) => {
+  if (new Set(value.source_event_ids).size !== value.source_event_ids.length) {
+    context.addIssue({ code: 'custom', path: ['source_event_ids'], message: '来源 ID 不得重复。' });
+  }
+  if (value.max_attempts < value.attempts) {
+    context.addIssue({ code: 'custom', path: ['max_attempts'], message: '最大尝试次数不能小于当前尝试次数。' });
+  }
+  if (Date.parse(value.first_failed_at) > Date.parse(value.last_failed_at)) {
+    context.addIssue({ code: 'custom', path: ['last_failed_at'], message: '失败时间顺序不合法。' });
+  }
+  if (value.error_message !== sourceFailureMessage(value.error_code)) {
+    context.addIssue({ code: 'custom', path: ['error_message'], message: '错误消息不是固定脱敏消息。' });
+  }
+  const retryable = value.status === 'open' || value.status === 'retrying';
+  if (value.retryable !== retryable) {
+    context.addIssue({ code: 'custom', path: ['retryable'], message: 'retryable 与状态不一致。' });
+  }
+  if (value.status === 'resolved' && !value.resolved_at) {
+    context.addIssue({ code: 'custom', path: ['resolved_at'], message: 'resolved 必须有 resolved_at。' });
+  }
+  if (value.status !== 'resolved' && value.resolved_at) {
+    context.addIssue({ code: 'custom', path: ['resolved_at'], message: '非 resolved 不得携带 resolved_at。' });
+  }
+  if (value.status === 'ignored' && !value.ignored_at) {
+    context.addIssue({ code: 'custom', path: ['ignored_at'], message: 'ignored 必须有 ignored_at。' });
+  }
+  if (value.status !== 'ignored' && value.ignored_at) {
+    context.addIssue({ code: 'custom', path: ['ignored_at'], message: '非 ignored 不得携带 ignored_at。' });
+  }
+  if (value.status === 'retrying' && !value.next_retry_at) {
+    context.addIssue({ code: 'custom', path: ['next_retry_at'], message: 'retrying 必须有 next_retry_at。' });
+  }
+  if (value.status !== 'retrying' && value.next_retry_at) {
+    context.addIssue({ code: 'custom', path: ['next_retry_at'], message: '非 retrying 不得携带 next_retry_at。' });
+  }
+});
+
+type SourceFailureRecord = z.infer<typeof sourceFailureRecordSchema>;
+
+type SourceFailureRelation = {
+  job: RuntimeJobRow;
+  sourceEventIds: string[];
+  sourceRevision: string;
+};
+
+type SourceFailureMetadata = {
+  failure_inbox?: unknown;
+};
+
+type LogDecisionRow = Record<
+  'id' | 'provider' | 'model' | 'prompt_version' | 'is_data_request' |
+  'confidence' | 'used_fallback' | 'http_status' | 'attempts' |
+  'structured_mode' | 'input_hash' | 'input_char_count' | 'fallback_mode' |
+  'latency_ms' | 'created_at',
+  unknown
+>;
+
+type LogCorrectionRow = Record<
+  'id' | 'task_id' | 'candidate_id' | 'correction_type' | 'note' | 'created_at',
+  unknown
+>;
+
+function diagnosticNumber(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function diagnosticBoolean(value: unknown) {
+  return value === true || value === 1;
+}
+
+function diagnosticInternalId(value: unknown) {
+  if (typeof value === 'string' && /^[A-Za-z0-9:_-]{1,200}$/u.test(value)) return value;
+  return `redacted_${createHash('sha256').update(typeof value === 'string' ? value : '').digest('hex').slice(0, 16)}`;
+}
+
+function optionalDiagnosticInternalId(value: unknown) {
+  return value === null || value === undefined ? null : diagnosticInternalId(value);
+}
+
+function diagnosticTimestamp(value: unknown) {
+  return typeof value === 'string' && value.length <= 80 && Number.isFinite(Date.parse(value)) ? value : null;
+}
+
+const diagnosticEventLabels: Record<string, string> = {
+  'feishu.sync.completed': '信息源同步已结束',
+  'feishu.source_sync.completed': '单个信息源同步已结束',
+  'feishu.listener.started': '信息流监听已启动',
+  'feishu.listener.stopped': '信息流监听已停止',
+  'feishu.listener.start_failed': '信息流监听启动失败',
+  'feishu.bot_listener.start_failed': '补充入口启动失败',
+  'feishu.owner.refreshed': '主人身份已刷新',
+  'feishu.monitoring_scope.refreshed': '关注范围已刷新',
+  'feishu.monitoring_scope.saved': '关注范围已保存',
+  'feishu.oauth.completed': '授权已完成',
+  'feishu.oauth.exchange_failed': '授权交换失败',
+  'feishu.oauth.owner_identity_failed': '主人身份读取失败',
+  'integration.checked': '连接检查已完成',
+  'logs.cleanup': '诊断日志已清理',
+  'reference.inspected': '参考路径已检查',
+  'reference.unbound': '参考路径已解除绑定',
+  'memory.rebuilt': '任务记忆已重建',
+  'memory.projected': '任务记忆已投影',
+  'memory.projection_failed': '任务记忆投影失败',
+};
+const diagnosticEventFallback = '已记录一条受控运行事件。';
+
+function diagnosticLogDetails(value: unknown) {
+  let parsed: unknown = value;
+  if (typeof value === 'string') {
+    try { parsed = JSON.parse(value) as unknown; } catch { return {}; }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  const input = parsed as Record<string, unknown>;
+  const aliases: Record<string, string> = {
+    operationId: 'operation_id', requestId: 'request_id', traceId: 'trace_id', parentSpanId: 'parent_span_id', spanId: 'span_id',
+    errorCode: 'error_code', nextRetryAt: 'next_retry_at', durationMs: 'duration_ms',
+  };
+  const safeEventCodes = new Set([
+    'OBS_ALREADY_RUNNING', 'OBS_SYNC_DISABLED', 'FEISHU_OAUTH_REQUIRED', 'FEISHU_SCOPE_REQUIRED',
+    'OBS_ADAPTER_UNAVAILABLE', 'OBS_NOTHING_TO_SYNC', 'FEISHU_SYNC_PARTIAL', 'FEISHU_SYNC_FAILED',
+    'OBS_INVALID_SOURCE_RESULT', 'FEISHU_TOKEN_REFRESH_FAILED', 'FEISHU_RATE_LIMITED',
+    'FEISHU_TRANSIENT_FAILURE', 'FEISHU_AUTHORIZATION_FAILED', 'FEISHU_PERMISSION_DENIED',
+    'FEISHU_API_ERROR', 'OBS_INTERNAL_FAILURE', 'PRIVACY_COLLECTION_STOPPED',
+  ]);
+  const safeStatuses = new Set(['success', 'partial_success', 'skipped', 'failure']);
+  const safeStages = new Set(['token_refresh', 'sync', 'source_sync', 'runtime', 'listener']);
+  const safeOutcomes = new Set(['success', 'partial_success', 'skipped', 'failure']);
+  const allowed = new Set(['operation_id', 'request_id', 'trace_id', 'parent_span_id', 'span_id', 'outcome', 'source', 'status', 'error_code', 'reason', 'duration_ms', 'stale', 'next_retry_at', 'stage', 'job_id', 'task_id']);
+  const result: Record<string, string | number | boolean | null> = {};
+  for (const [rawKey, rawValue] of Object.entries(input)) {
+    const key = aliases[rawKey] ?? rawKey;
+    if (!allowed.has(key)) continue;
+    if (typeof rawValue === 'string') {
+      if (key.endsWith('_id')) {
+        result[key] = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(rawValue) ? rawValue.toLowerCase() : null;
+      } else if (key === 'next_retry_at') {
+        result[key] = diagnosticTimestamp(rawValue);
+      } else if (key === 'error_code' || key === 'reason') {
+        result[key] = safeEventCodes.has(rawValue) ? rawValue : null;
+      } else if (key === 'status') {
+        result[key] = safeStatuses.has(rawValue) ? rawValue : null;
+      } else if (key === 'outcome') {
+        result[key] = safeOutcomes.has(rawValue) ? rawValue : null;
+      } else if (key === 'stage') {
+        result[key] = safeStages.has(rawValue) ? rawValue : null;
+      } else {
+        result[key] = redactDiagnosticText(rawValue, 120) || null;
+      }
+    } else if (typeof rawValue === 'number' && Number.isFinite(rawValue)) result[key] = rawValue;
+    else if (typeof rawValue === 'boolean') result[key] = rawValue;
+    else if (rawValue === null) result[key] = null;
+  }
+  return result;
+}
+
+function diagnosticRecentError(row: Record<string, unknown>) {
+  const category = row.category === 'runtime' || row.category === 'integration' || row.category === 'ai' || row.category === 'workspace'
+    ? row.category
+    : 'unknown';
+  return {
+    category,
+    level: 'error',
+    event_type: 'OBS_ERROR_EVENT',
+    summary: '已记录一条受控运行错误。',
+    created_at: diagnosticTimestamp(row.created_at),
+  };
+}
+
+function diagnosticDecision(row: LogDecisionRow) {
+  return {
+    id: diagnosticInternalId(row.id),
+    provider: redactDiagnosticText(row.provider, 80),
+    model: redactDiagnosticText(row.model, 120),
+    prompt_version: redactDiagnosticText(row.prompt_version, 120),
+    is_data_request: diagnosticBoolean(row.is_data_request),
+    confidence: diagnosticNumber(row.confidence),
+    used_fallback: diagnosticBoolean(row.used_fallback),
+    http_status: diagnosticNumber(row.http_status),
+    attempts: diagnosticNumber(row.attempts),
+    structured_mode: redactDiagnosticText(row.structured_mode, 80) || null,
+    input_hash: typeof row.input_hash === 'string' && /^[a-f0-9]{64}$/iu.test(row.input_hash) ? row.input_hash : null,
+    input_char_count: diagnosticNumber(row.input_char_count),
+    fallback_mode: redactDiagnosticText(row.fallback_mode, 80) || null,
+    latency_ms: diagnosticNumber(row.latency_ms),
+    created_at: redactDiagnosticText(row.created_at, 80),
+  };
+}
+
+function diagnosticCorrection(row: LogCorrectionRow) {
+  return {
+    id: diagnosticInternalId(row.id),
+    task_id: optionalDiagnosticInternalId(row.task_id),
+    candidate_id: optionalDiagnosticInternalId(row.candidate_id),
+    correction_type: redactDiagnosticText(row.correction_type, 80),
+    // A free-form correction note may contain copied source text. The logs UI
+    // only needs to know that a note exists, never its contents.
+    note: typeof row.note === 'string' && row.note.trim() ? '<redacted>' : '',
+    created_at: redactDiagnosticText(row.created_at, 80),
+  };
+}
+
+type ClassificationPersistResult = {
+  deduplicated: boolean;
+  sourceEventId: string;
+  sourceEventIds?: string[];
+  sourceRevision?: string;
+  errorCode?: string;
+  candidate: CandidateRow | null;
+  candidates?: CandidateRow[];
+  candidateIds?: string[];
+  demandUnitIds?: string[];
+  threadIds?: string[];
+  classificationDeferred?: boolean;
+  /** Optional association deferral can be explicitly terminal even if a legacy adapter omitted metadata. */
+  deferredRetryable?: boolean;
+  recoveryReason?: string;
+  metadata?: ClassificationResult['metadata'];
+};
+
+type ClassificationResultIds = Pick<ClassificationPersistResult, 'candidateIds' | 'demandUnitIds' | 'threadIds'>;
+
+type OwnerDecisionRow = {
+  id: string;
+  source_event_id: string;
+  source_revision: string;
+  candidate_id: string | null;
+  thread_id: string | null;
+  task_id: string | null;
+  action: OwnerIntentDecision['action'];
+  disposition: string;
+  confidence: number;
+  summary: string;
+  delegate_to: string | null;
+  schedule_text: string | null;
+  patch_json: string;
+  evidence_json: string;
+  reason: string;
+  provider: string;
+  model: string;
+  prompt_version: string;
+  runtime_job_id: string | null;
+  state: 'queued' | 'running' | 'applied' | 'review' | 'failed' | 'stale' | 'noop';
+  target_snapshot_json: string;
+  applied_task_version: number | null;
+  applied_thread_version: number | null;
+  error: string | null;
+  created_at: string;
+  applied_at: string | null;
+};
+
+type OwnerDecisionCandidateRow = CandidateRow & { source_occurred_at: string };
+type OwnerDecisionTargetSnapshots = {
+  schemaVersion: 1;
+  contextCount: number;
+  targets: Record<OwnerIntentDecision['action'], OwnerDecisionTarget[]>;
+};
+
+class OwnerTargetSnapshotPersistenceError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'OwnerTargetSnapshotPersistenceError';
+  }
+}
+
+const ownerDecisionTargetSchema = z.object({
+  candidateId: z.string().nullable(),
+  // DATA-03 adds candidate CAS identity to the owner target snapshot.  Keep
+  // these nullable/optional for snapshots written before the CAS fields
+  // existed; ownerTargetMatchesCurrent still fails closed when a live
+  // candidate lacks either value.
+  candidateVersion: z.number().int().nonnegative().nullable().optional(),
+  candidateGroupVersionHash: z.string().nullable().optional(),
+  candidateState: z.enum(['pending', 'snoozed', 'ignored', 'accepted']).nullable(),
+  acceptedTaskId: z.string().nullable(),
+  threadId: z.string().nullable(),
+  taskId: z.string().nullable(),
+  taskStatus: z.enum(['unplanned', 'planned', 'in_progress', 'waiting', 'review', 'completed', 'archived']).nullable(),
+  taskVersion: z.number().int().nonnegative().nullable(),
+  threadVersion: z.number().int().nonnegative().nullable(),
+  sourceMatched: z.boolean(),
+  candidateDeleted: z.boolean(),
+  taskDeleted: z.boolean(),
+  taskInvalidated: z.boolean(),
+}).strict();
+
+const ownerDecisionTargetSnapshotsSchema = z.object({
+  schemaVersion: z.literal(1),
+  contextCount: z.number().int().nonnegative(),
+  targets: z.object({
+    continue: z.array(ownerDecisionTargetSchema),
+    confirm_schedule: z.array(ownerDecisionTargetSchema),
+    request_context: z.array(ownerDecisionTargetSchema),
+    decline: z.array(ownerDecisionTargetSchema),
+    delegate: z.array(ownerDecisionTargetSchema),
+    uncertain: z.array(ownerDecisionTargetSchema),
+  }).strict(),
+}).strict();
+
+class ClassificationRevisionChangedError extends Error {
+  constructor(readonly rows: SourceEventRow[]) {
+    super('来源在多需求判断期间发生更新，需要基于新版本重新整理。');
+  }
+}
+
+/** A persisted owner decision was based on an old task/thread snapshot. */
+class OwnerDecisionStaleError extends Error {
+  constructor(message = '主人判断对应的需求已经发生变化，未自动覆盖最新状态。') {
+    super(message);
+    this.name = 'OwnerDecisionStaleError';
+  }
+}
+
+/** A late OAuth response must not mutate owner or source state. */
+class FeishuAuthStateStaleError extends Error {
+  constructor() {
+    super('飞书授权状态已更新，已丢弃迟到的主人身份响应。');
+    this.name = 'FeishuAuthStateStaleError';
+  }
+}
+
+function classificationResultIds(result: ClassificationPersistResult): ClassificationResultIds {
+  const candidates = result.candidates ?? (result.candidate ? [result.candidate] : []);
+  return {
+    candidateIds: [...new Set(result.candidateIds ?? candidates.map((candidate) => candidate.id))],
+    demandUnitIds: [...new Set(result.demandUnitIds ?? candidates.map((candidate) => candidate.demand_unit_id).filter((value): value is string => Boolean(value)))],
+    threadIds: [...new Set(result.threadIds ?? [])],
+  };
+}
+
+type PersistableClassificationUnit = {
+  unitKey: string;
+  sourceKeys: string[];
+  sourceKeyById: Map<string, string>;
+  sourceRows: SourceEventRow[];
+  anchor: SourceEventRow;
+  isDataRequest: boolean;
+  draft: CandidateDraft | null;
+  reason: string;
+};
+
+type RequirementThreadRow = RequirementThreadRecord;
+
+type RequirementThreadSourceRow = {
+  thread_id: string;
+  source_event_id: string;
+  demand_unit_id: string | null;
+  relation_type: string;
+  confidence: number | null;
+  evidence_json: string;
+  root_id: string | null;
+  parent_id: string | null;
+  created_at: string;
+};
+
+type TaskUpdateProposalRow = TaskUpdateProposalRecord;
+
+type TaskPatch = Partial<{
+  title: string;
+  describe: string;
+  status: TaskStatus;
+  scheduleAt: string | null;
+  plannedStartAt: string | null;
+  plannedDueAt: string | null;
+  nextStep: string;
+  risk: RiskLevel;
+  waitingReason: string | null;
+  threadTitle: string;
+  threadBackground: string;
+  threadValidationQuestion: string;
+  threadDescribe: string;
+  note: string;
+  expectedVersion: number;
+}>;
+
+type AutomationMode = 'auto' | 'suggest';
+type ProposalApplyActor = 'owner' | 'ai';
+const AUTO_UPDATE_POLICY_VERSION = 'private_task_auto_v1';
+const AUTO_ASSOCIATION_CONFIDENCE = 0.9;
+const AUTO_SEMANTIC_ASSOCIATION_CONFIDENCE = 0.96;
+const AUTO_SEMANTIC_ASSOCIATION_MARGIN = 0.15;
+const AUTO_CANDIDATE_MERGE_CONFIDENCE = 0.94;
+const AUTO_CANDIDATE_MERGE_MARGIN = 0.15;
+const AUTO_CANDIDATE_PRIMARY_CONFIDENCE = 0.9;
+const AUTO_CANDIDATE_DRAFT_CONFIDENCE = 0.85;
+const MIN_EXPLICIT_MESSAGE_ACTION_CONFIDENCE = 0.85;
+const AUTO_UPDATE_CONFIDENCE = 0.92;
+const AUTO_TERMINAL_STATUS_CONFIDENCE = 0.97;
+const CONTINUOUS_MESSAGE_WINDOW_MS = 5 * 60 * 1000;
+const CONTINUOUS_DIALOGUE_WINDOW_MS = 30 * 60 * 1000;
+const EXPLICIT_MESSAGE_CONTEXT_WINDOW_MS = 72 * 60 * 60 * 1000;
+const terminalQuestionPattern = /[？?]|(?:是否|能否|可否|是不是|有没有)/iu;
+const explicitCompletionPatterns = [
+  /^(?:(?:这项|这个|该项|本项)(?:需求|任务|分析|工作|事项))?(?:已经|已|现已|确认(?:已经|已)?)(?:明确)?(?:完成|做完|交付|结项)(?:了|啦|完毕)?$/iu,
+  /^(?:这项|这个|该项|本项)(?:需求|任务|分析|工作|事项)(?:完成|做完|交付|结项)(?:了|啦|完毕)?$/iu,
+  /^(?:(?:这项|这个|该项|本项)(?:需求|任务|分析|工作|事项))?验收(?:已经|已)?通过(?:了)?$/iu,
+  /^(?:可以|可)(?:直接)?(?:结项|关闭(?:(?:这项|这个|该项|本项)(?:需求|任务|分析|工作|事项))?)(?:了)?$/iu,
+  /^(?:(?:the\s+)?(?:task|request|work|analysis)\s+)?(?:(?:is|has\s+been|was)\s+)?(?:completed|delivered|done)$/iu,
+];
+const explicitArchivePatterns = [
+  /^(?:这项|这个|该项|本项)(?:需求|任务|分析|工作|事项)?(?:已经|已|正式)?(?:取消|撤销|终止|停止|归档|关闭)(?:了)?$/iu,
+  /^(?:已经|已|正式)(?:取消|撤销|终止|停止|归档|关闭)(?:(?:这项|这个|该项|本项)(?:需求|任务|分析|工作|事项)?)?(?:了)?$/iu,
+  /^(?:取消|撤销|终止|停止|归档|关闭)(?:这项|这个|该项|本项)(?:需求|任务|分析|工作|事项)?(?:了)?$/iu,
+  /^(?:无需|不用|不必|不再)(?:再|继续)?(?:处理|推进|跟进|开展)(?:(?:这项|这个|该项|本项)(?:需求|任务|分析|工作|事项)?)?(?:了)?$/iu,
+  /^(?:(?:the\s+)?(?:task|request|work|analysis)\s+)?(?:(?:is|has\s+been|was)\s+)?(?:cancelled|canceled|archived|closed)$/iu,
+  /^no\s+longer\s+(?:need|needed)(?:\s+(?:this|the))?(?:\s+(?:task|request|work|analysis))?$/iu,
+];
+
+function terminalEvidenceClauses(content: string) {
+  return content
+    .replace(/([，。！？；;,.!?：:])/gu, '$1\n')
+    .split(/\n+/u)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function hasExplicitTerminalEvidence(content: string, status: 'completed' | 'archived') {
+  const patterns = status === 'completed' ? explicitCompletionPatterns : explicitArchivePatterns;
+  return terminalEvidenceClauses(content).some((rawClause) => {
+    if (terminalQuestionPattern.test(rawClause)) return false;
+    const clause = rawClause.replace(/[，。！；;,.!:：]+$/gu, '').trim();
+    return patterns.some((pattern) => pattern.test(clause));
+  });
+}
+
+function appendNarrativeValue(current: string, addition: string) {
+  const existing = current.trim();
+  const next = addition.trim();
+  if (!next || existing === next || existing.includes(next)) return existing;
+  if (!existing) return next;
+  return `${existing}\n${next}`;
+}
+
+type NarrativeReplacementField = 'title' | 'describe' | 'background' | 'validationQuestion';
+
+const narrativeReplacementFieldPatterns: Record<NarrativeReplacementField, RegExp> = {
+  title: /(?:标题|题目|任务名|需求名|task\s*title)/iu,
+  describe: /(?:describe|描述|需求摘要|任务摘要|需求描述|任务描述)/iu,
+  background: /(?:背景|需求背景|task\s*background)/iu,
+  validationQuestion: /(?:希望验证|验证问题|验证目标|核心问题|待验证问题|validation\s*question)/iu,
+};
+
+function hasExplicitNarrativeReplacement(content: string, field: NarrativeReplacementField) {
+  return terminalEvidenceClauses(content).some((clause) => (
+    narrativeReplacementFieldPatterns[field].test(clause)
+    && /(?:改成|修改为|调整为|更正为|纠正为|应为|应该是|不是.+(?:而是|是)|(?:说|写|记|理解)?错了)/iu.test(clause)
+  ));
+}
+
+const AUDIT_SOURCE_TYPES = ['owner_dm', 'group', 'calendar', 'meeting', 'manual', 'document'] as const;
+const AUDIT_COMPLETENESS = ['complete', 'partial', 'limited'] as const;
+const AUDIT_UNIT_KINDS = ['demand', 'context_only'] as const;
+const AUDIT_DEMAND_STATES = ['provisional', 'ready', 'needs_confirmation', 'incomplete_context', 'superseded', 'failed_visible'] as const;
+const AUDIT_CANDIDATE_STATES = ['pending', 'snoozed', 'ignored', 'accepted'] as const;
+const AUDIT_THREAD_STATES = ['open', 'needs_confirmation', 'closed'] as const;
+const AUDIT_TASK_STATUSES = ['unplanned', 'planned', 'in_progress', 'waiting', 'review', 'completed', 'archived'] as const;
+const AUDIT_RISK_LEVELS = ['low', 'medium', 'high'] as const;
+const AUDIT_RECORD_STATES = ['active', 'invalidated'] as const;
+const AUDIT_SOURCE_ROLES = ['anchor', 'evidence', 'context', 'owner_delivery'] as const;
+const AUDIT_RELATION_TYPES = [
+  'origin', 'primary', 'supporting', 'owner_corrected', 'owner_confirmed', 'owner_corrected_new',
+  'owner_confirmed_new', 'owner_delivery', 'session', 'batch_context', 'batch_continuation',
+  'semantic_unique', 'merged_origin', 'candidate_auto_merge', 'owner_candidate_merge', 'candidate_owner_merge',
+] as const;
+const AUDIT_EVENT_TYPES = [
+  'task_created', 'task_updated', 'task_auto_updated', 'task_deleted', 'task_restored',
+  'task_auto_update_reverted', 'correction_recorded',
+] as const;
+const AUDIT_ACTOR_TYPES = ['ai', 'owner', 'system'] as const;
+const AUDIT_VISIBILITIES = ['private', 'awaiting_approval', 'external'] as const;
+const AUDIT_CORRECTION_TYPES = [
+  'integrity_gap_closed', 'candidate_auto_merge', 'candidate_owner_merge', 'wrong_association',
+  'false_positive', 'describe_incomplete', 'reprocess',
+] as const;
+const AUDIT_OPERATIONS = ['apply', 'revert', 'dismiss'] as const;
+const AUDIT_GAP_STATUSES = ['open', 'corrected', 'dismissed'] as const;
+const AUDIT_GAP_CODES = ['missing_or_ambiguous_demand_unit', 'wrong_association'] as const;
+const AUDIT_RECORD_KINDS = [
+  'source_event', 'source_demand_unit', 'source_demand_unit_source', 'candidate_request',
+  'requirement_thread_source', 'requirement_thread_unit', 'task_source_link', 'task_event',
+  'correction_event', 'owner_decision', 'ai_decision_log',
+] as const;
+const AUDIT_INTERNAL_ID_PATTERN = /^[A-Za-z0-9:_-]{1,200}$/u;
+
+type PrivacyScope = 'all' | 'sources' | 'tasks' | 'audit';
+type PrivacyControlRow = {
+  collection_status: 'running' | 'stopped';
+  oauth_status: 'unknown' | 'authorized' | 'expired' | 'revoked' | 'not_configured';
+  retention_status: 'active' | 'paused';
+  version: number;
+  updated_at: string;
+  created_at: string;
+};
+
+type PrivacyCollectionSnapshot = {
+  control: PrivacyControlRow;
+  sourceStates: Array<Record<string, unknown>>;
+};
+
+type PrivacyAuthorizationSnapshot = PrivacyCollectionSnapshot & {
+  owner: Record<string, unknown> | undefined;
+  cursors: Array<Record<string, unknown>>;
+  monitorTargets: Array<Record<string, unknown>>;
+  adapterState: unknown;
+};
+
+type PrivacyLifecycleOperationType = 'collection_start' | 'collection_stop' | 'authorization_revoke' | 'hard_delete';
+type PrivacyLifecycleClaimRow = {
+  operation_id: string;
+  operation_token: string;
+  operation_type: PrivacyLifecycleOperationType;
+  owner_open_id: string;
+  capability_token_hash: string;
+  capability_csrf_hash: string;
+  capability_origin: 'app://local';
+  intent: string;
+  expected_version: number;
+  claimed_version: number;
+  final_version: number | null;
+  status: 'claimed' | 'committed' | 'compensating' | 'compensated' | 'recovery_required' | 'failed' | 'expired';
+  expires_at: string;
+  heartbeat_at: string;
+  snapshot_json: string;
+  recovery_code: string | null;
+  last_error: string | null;
+  reclaimed_from_operation_id: string | null;
+  reclaimed_from_operation_token: string | null;
+  reclaimed_from_expected_version: number | null;
+  reclaimed_from_claimed_version: number | null;
+  reclaim_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
+const PRIVACY_LIFECYCLE_LEASE_MS = 15 * 60 * 1_000;
+const PRIVACY_LIFECYCLE_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
+
+function parsePrivacyLifecycleTimestamp(value: string, label: string) {
+  if (!PRIVACY_LIFECYCLE_TIMESTAMP.test(value)) {
+    throw new Error(`隐私生命周期 ${label} 时间戳格式无效；已 fail-closed。`);
+  }
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== value) {
+    throw new Error(`隐私生命周期 ${label} 时间戳无效；已 fail-closed。`);
+  }
+  return parsed;
+}
+
+function privacyLifecycleTimeState(claim: PrivacyLifecycleClaimRow, nowMs: number) {
+  const createdMs = parsePrivacyLifecycleTimestamp(claim.created_at, 'created_at');
+  const heartbeatMs = parsePrivacyLifecycleTimestamp(claim.heartbeat_at, 'heartbeat_at');
+  const expiresMs = parsePrivacyLifecycleTimestamp(claim.expires_at, 'expires_at');
+  if (heartbeatMs < createdMs || expiresMs < heartbeatMs) {
+    throw new Error('隐私生命周期 claim 时间顺序无效；已 fail-closed。');
+  }
+  if (nowMs < createdMs || nowMs < heartbeatMs) {
+    throw new Error('检测到系统时钟回拨，隐私生命周期 claim 已 fail-closed。');
+  }
+  return { createdMs, heartbeatMs, expiresMs, expired: nowMs >= expiresMs };
+}
+
+type PrivacyCapabilityBinding = {
+  tokenHash: string;
+  csrfTokenHash: string;
+  origin: 'app://local';
+};
+
+type PrivacyTaskMemoryPurgeStage = {
+  count: number;
+  proofHash: string;
+  finalize(): void;
+  rollback(): void;
+};
+
+const PRIVACY_PURGE_TABLES = [
+  'data_integrity_gap', 'reference_snapshot', 'memory_projection', 'runtime_tool_call',
+  'runtime_checkpoint', 'provider_retry_cooldown', 'job_source_link', 'task_update_proposal', 'requirement_thread_revision',
+  'requirement_thread_unit', 'requirement_thread_source', 'notification', 'reminder',
+  'reference_binding', 'outbox', 'approval', 'task_event', 'task_source_link', 'correction_event',
+  'candidate_revision', 'candidate_merge_exclusion', 'owner_decision', 'ai_decision_log',
+  'audit_replay_capability',
+  'ai_decision_source_revision', 'source_event_revision',
+  'source_context', 'source_demand_unit_source', 'candidate_request', 'requirement_thread',
+  'source_demand_unit', 'privacy_export',
+  'job', 'task', 'source_event', 'app_log', 'integration_health', 'sync_cursor',
+  'feishu_monitor_target', 'information_source_state', 'owner_profile', 'app_setting',
+] as const;
+const PRIVACY_PRESERVED_TABLES = new Set([
+  'database_metadata', 'schema_migration', 'privacy_control', 'privacy_retention_policy',
+  'privacy_deletion', 'privacy_backup', 'privacy_audit_event', 'privacy_lifecycle_claim',
+  'privacy_backup_cleanup_intent',
+]);
+
+const PRIVACY_RETENTION_OPERATIONS = Object.freeze([
+  Object.freeze({ kind: 'source', table: 'source_demand_unit_source', timestamp: 'created_at' }),
+  Object.freeze({ kind: 'source', table: 'source_context', timestamp: 'created_at' }),
+  Object.freeze({ kind: 'source', table: 'source_demand_unit', timestamp: 'created_at' }),
+  Object.freeze({ kind: 'source', table: 'source_event', timestamp: 'captured_at' }),
+  Object.freeze({ kind: 'source', table: 'source_event_revision', timestamp: 'created_at' }),
+  Object.freeze({ kind: 'derived', table: 'reference_snapshot', timestamp: 'inspected_at' }),
+  Object.freeze({ kind: 'derived', table: 'task_event', timestamp: 'recorded_at' }),
+  Object.freeze({ kind: 'derived', table: 'ai_decision_log', timestamp: 'created_at' }),
+  Object.freeze({ kind: 'derived', table: 'owner_decision', timestamp: 'created_at' }),
+  Object.freeze({ kind: 'derived', table: 'correction_event', timestamp: 'created_at' }),
+  Object.freeze({ kind: 'derived', table: 'candidate_revision', timestamp: 'created_at' }),
+  Object.freeze({ kind: 'derived', table: 'requirement_thread_revision', timestamp: 'created_at' }),
+  Object.freeze({ kind: 'derived', table: 'privacy_export', timestamp: 'created_at' }),
+  Object.freeze({ kind: 'derived', table: 'candidate_request', timestamp: 'updated_at' }),
+  Object.freeze({ kind: 'derived', table: 'requirement_thread', timestamp: 'updated_at' }),
+  Object.freeze({ kind: 'derived', table: 'task', timestamp: 'updated_at' }),
+  Object.freeze({ kind: 'diagnostics', table: 'app_log', timestamp: 'created_at' }),
+  Object.freeze({ kind: 'diagnostics', table: 'integration_health', timestamp: 'checked_at' }),
+] as const);
+
+function privacyHash(value: unknown) {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+export const PRIVACY_DELETION_INTENT = 'privacy.deletion.hard-delete.v1';
+const PRIVACY_OWNER_ACTION_INTENT = 'privacy.owner-action.v1';
+
+function privacyCapabilityBindingHash(binding: PrivacyCapabilityBinding) {
+  if (!/^[a-f0-9]{64}$/u.test(binding.tokenHash) || !/^[a-f0-9]{64}$/u.test(binding.csrfTokenHash) || binding.origin !== 'app://local') {
+    throw new PrivacyAuthorizationError(403, '桌面主人操作能力凭证绑定无效。');
+  }
+  return privacyHash(binding);
+}
+
+function privacyConfirmationHash(token: string, ownerOpenId: string, deletionId: string, capabilityBinding: PrivacyCapabilityBinding) {
+  return privacyHash({
+    intent: PRIVACY_DELETION_INTENT,
+    ownerOpenId,
+    deletionId,
+    capabilityBinding: privacyCapabilityBindingHash(capabilityBinding),
+    token,
+  });
+}
+
+function assertPrivacyKey(value: string, label: string) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9:_-]{0,199}$/u.test(value)) throw new Error(`${label}格式不正确。`);
+}
+
+export class PrivacyAuthorizationError extends Error {
+  readonly statusCode: 401 | 403;
+
+  constructor(statusCode: 401 | 403, message: string) {
+    super(message);
+    this.name = 'PrivacyAuthorizationError';
+    this.statusCode = statusCode;
+  }
+}
+
+function auditEnum(value: string | null | undefined, allowed: readonly string[]) {
+  return typeof value === 'string' && allowed.includes(value) ? value : 'unknown';
+}
+
+function auditHash(value: string | null | undefined) {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/u.test(value) ? value : null;
+}
+
+function auditRequiredId(value: string | null | undefined) {
+  return typeof value === 'string' && AUDIT_INTERNAL_ID_PATTERN.test(value) ? value : 'unknown';
+}
+
+function auditOptionalId(value: string | null | undefined) {
+  return typeof value === 'string' && AUDIT_INTERNAL_ID_PATTERN.test(value) ? value : null;
+}
+
+function privacyFailure(message: string, failures: unknown[]) {
+  const errors = failures.filter((failure): failure is Error => failure instanceof Error);
+  if (errors.length === 1) return errors[0]!;
+  return new AggregateError(errors.length ? errors : failures, message);
+}
+
+export type AuditChainDto = {
+  filters: {
+    source_event_id: string | null;
+    demand_unit_id: string | null;
+    candidate_id: string | null;
+    thread_id: string | null;
+    task_id: string | null;
+  };
+  sources: Array<{
+    id: string;
+    source_type: string;
+    owner_mentioned: boolean;
+    completeness: string;
+    occurred_at: string;
+    captured_at: string;
+  }>;
+  demand_units: Array<{
+    id: string;
+    anchor_source_event_id: string;
+    unit_kind: string;
+    state: string;
+    classification_revision: string | null;
+    ai_decision_id: string | null;
+    created_at: string;
+    updated_at: string;
+  }>;
+  candidates: Array<{
+    id: string;
+    source_event_id: string;
+    demand_unit_id: string | null;
+    confidence: number;
+    state: string;
+    accepted_task_id: string | null;
+    merged_into_candidate_id: string | null;
+    merged_at: string | null;
+    deleted_at: string | null;
+    created_at: string;
+    updated_at: string;
+  }>;
+  threads: Array<{
+    id: string;
+    status: string;
+    active_task_id: string | null;
+    primary_source_event_id: string | null;
+    version: number;
+    last_activity_at: string | null;
+    created_at: string;
+    updated_at: string;
+  }>;
+  tasks: Array<{
+    id: string;
+    status: string;
+    schedule_at: string | null;
+    planned_start_at: string | null;
+    planned_due_at: string | null;
+    risk: string;
+    version: number;
+    thread_id: string | null;
+    record_state: string;
+    created_at: string;
+    updated_at: string;
+  }>;
+  source_demand_units: Array<{
+    demand_unit_id: string;
+    source_event_id: string;
+    source_role: string;
+    sequence: number;
+    created_at: string;
+  }>;
+  thread_units: Array<{
+    thread_id: string;
+    demand_unit_id: string;
+    relation_type: string;
+    confidence: number | null;
+    created_at: string;
+  }>;
+  thread_sources: Array<{
+    thread_id: string;
+    source_event_id: string;
+    demand_unit_id: string | null;
+    relation_type: string;
+    confidence: number | null;
+    source_revision: string | null;
+    source_role: string;
+    created_at: string;
+  }>;
+  task_source_links: Array<{
+    task_id: string;
+    source_event_id: string;
+    demand_unit_id: string | null;
+    relation_type: string;
+    created_at: string;
+  }>;
+  ai_decisions: Array<{
+    id: string;
+    source_event_id: string;
+    source_revision: string | null;
+    demand_unit_id: string | null;
+    candidate_id: string | null;
+    confidence: number;
+    used_fallback: boolean;
+    http_status: number | null;
+    attempts: number;
+    structured_mode: string;
+    input_hash: string | null;
+    input_char_count: number;
+    fallback_mode: string;
+    latency_ms: number | null;
+    created_at: string;
+  }>;
+  owner_decisions: Array<{
+    id: string;
+    source_event_id: string;
+    source_revision: string | null;
+    demand_unit_id: string | null;
+    candidate_id: string | null;
+    thread_id: string | null;
+    task_id: string | null;
+    action: string;
+    disposition: string;
+    confidence: number;
+    state: string;
+    applied_task_version: number | null;
+    applied_thread_version: number | null;
+    created_at: string;
+    applied_at: string | null;
+  }>;
+  task_events: Array<{
+    id: string;
+    task_id: string;
+    event_type: string;
+    actor_type: string;
+    visibility: string;
+    source_event_id: string | null;
+    demand_unit_id: string | null;
+    occurred_at: string;
+    recorded_at: string;
+    version: number;
+  }>;
+  corrections: Array<{
+    id: string;
+    task_id: string | null;
+    candidate_id: string | null;
+    source_event_id: string | null;
+    demand_unit_id: string | null;
+    correction_type: string;
+    visibility: string;
+    operation: string;
+    created_at: string;
+  }>;
+  integrity_gaps: Array<{
+    id: string;
+    source_event_id: string | null;
+    demand_unit_id: string | null;
+    candidate_id: string | null;
+    thread_id: string | null;
+    task_id: string | null;
+    record_kind: string;
+    gap_code: string;
+    status: string;
+    correction_event_id: string | null;
+    created_at: string;
+    updated_at: string;
+  }>;
+};
+
+function threadRevisionPatchFromDraft(draft: CandidateDraft, includeNarrative: boolean) {
+  if (!includeNarrative) return {};
+  return {
+    title: draft.title,
+    background: draft.background,
+    validationQuestion: draft.validationQuestion,
+    describe: draft.describe,
+    analysis: draft.analysis ?? {},
+  };
+}
+
+const taskStatusValues = [
+  'unplanned', 'planned', 'in_progress', 'waiting', 'review', 'completed', 'archived',
+] as const satisfies readonly TaskStatus[];
+const riskLevelValues = ['low', 'medium', 'high'] as const satisfies readonly RiskLevel[];
+const threadStatusValues = ['open', 'needs_confirmation', 'closed'] as const satisfies readonly RequirementThreadRow['status'][];
+const candidateStateValues = ['pending', 'snoozed', 'ignored', 'accepted'] as const satisfies readonly CandidateState[];
+const nullableStringSchema = z.string().nullable();
+const nullableIsoDateTimeSchema = z.string().datetime().nullable();
+const taskUpdateTaskSnapshotSchema = z.object({
+  id: z.string().min(1),
+  title: z.string(),
+  proposer_name: z.string(),
+  describe: z.string(),
+  status: z.enum(taskStatusValues),
+  schedule_at: nullableIsoDateTimeSchema,
+  planned_start_at: nullableIsoDateTimeSchema,
+  planned_due_at: nullableIsoDateTimeSchema,
+  next_step: z.string(),
+  risk: z.enum(riskLevelValues),
+  waiting_reason: nullableStringSchema,
+  completed_at: nullableIsoDateTimeSchema,
+  archived_at: nullableIsoDateTimeSchema,
+  auto_update_paused: z.boolean(),
+});
+const taskUpdateThreadSnapshotSchema = z.object({
+  id: z.string().min(1),
+  title: z.string(),
+  background: z.string(),
+  validation_question: z.string(),
+  describe: z.string(),
+  analysis_json: z.string(),
+  status: z.enum(threadStatusValues),
+  version: z.number().int().nonnegative(),
+  last_activity_at: nullableIsoDateTimeSchema,
+});
+const taskUpdateCandidateSnapshotSchema = z.object({
+  id: z.string().min(1),
+  title: z.string(),
+  proposer_name: z.string(),
+  background: z.string(),
+  validation_question: z.string(),
+  describe: z.string(),
+  analysis_json: z.string(),
+  confidence: z.number(),
+  state: z.enum(candidateStateValues),
+});
+const taskUpdateProposalSnapshotSchema = z.object({
+  task: taskUpdateTaskSnapshotSchema,
+  thread: taskUpdateThreadSnapshotSchema.nullable(),
+  candidate: taskUpdateCandidateSnapshotSchema.nullable(),
+  previousCandidateRevisionId: nullableStringSchema.optional().default(null),
+});
+type TaskUpdateProposalSnapshot = z.infer<typeof taskUpdateProposalSnapshotSchema>;
+const INVALID_TASK_UPDATE_SNAPSHOT_ERROR = '自动更新的前置快照损坏，不能安全撤销。';
+
+type OwnerProfileRow = {
+  id: string;
+  open_id: string;
+  union_id: string | null;
+  user_id: string | null;
+  name: string;
+  tenant_key: string | null;
+  oauth_status: 'mock' | 'authorized' | 'expired' | 'revoked' | 'unknown';
+  granted_scopes_json: string;
+  last_synced_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type InformationSourceStateRow = {
+  source_kind: OwnerSourceKind;
+  enabled: number;
+  status: OwnerSourceStatus;
+  scope_summary: string;
+  requires_admin: number;
+  requires_bot_in_chat: number;
+  sync_mode: 'realtime' | 'periodic' | 'manual' | 'mixed';
+  last_success_at: string | null;
+  last_error: string | null;
+  details_json: string;
+  updated_at: string;
+};
+
+type FeishuMonitorTargetRow = {
+  id: string;
+  owner_open_id: string;
+  target_kind: 'person' | 'group';
+  target_key: string;
+  resolved_chat_id: string | null;
+  display_name: string;
+  secondary_label: string | null;
+  enabled: number;
+  manual_excluded: number;
+  discovery_rank: number | null;
+  selection_version: number;
+  read_policy: 'incoming_only' | 'owner_mentions';
+  selection_source: 'chat_list' | 'contact_search';
+  access_status: 'unknown' | 'readable' | 'restricted' | 'not_found' | 'error';
+  last_discovered_at: string | null;
+  last_resolved_at: string | null;
+  last_success_at: string | null;
+  last_error: string | null;
+  metadata_json: string;
+  created_at: string;
+  updated_at: string;
+};
+
+type SourceEventRow = {
+  id: string;
+  external_id: string;
+  source_type: NormalizedSourceEvent['sourceType'];
+  conversation_id: string;
+  sender_id: string;
+  sender_name: string;
+  content: string;
+  owner_mentioned: number;
+  source_url: string | null;
+  completeness: NonNullable<NormalizedSourceEvent['completeness']>;
+  discovery_reason: string;
+  metadata_json: string;
+  occurred_at: string;
+  captured_at: string;
+  owner_scope: string;
+  revision_generation: number;
+  current_revision_id: string | null;
+};
+
+const nowIso = () => new Date().toISOString();
+const id = (prefix: string) => prefix + '_' + randomUUID();
+
+type DraftOnlyState = 'draft' | 'rejected' | 'obsolete';
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(',')}]`;
+  const object = value as Record<string, unknown>;
+  return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${stableJson(object[key])}`).join(',')}}`;
+}
+
+function draftOnlyApprovalState(status: unknown): DraftOnlyState {
+  if (status === 'awaiting_approval') return 'draft';
+  if (status === 'rejected') return 'rejected';
+  return 'obsolete';
+}
+
+function draftOnlyOutboxState(status: unknown): DraftOnlyState {
+  return status === 'awaiting_approval' ? 'draft' : 'obsolete';
+}
+
+function safeDraftActionType(value: unknown) {
+  return typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,100}$/u.test(value) ? value : 'redacted_action';
+}
+
+function approvalDraftDto(row: Record<string, unknown>) {
+  const status = row.status === 'awaiting_approval'
+    ? 'awaiting_approval'
+    : row.status === 'rejected'
+      ? 'rejected'
+      : 'obsolete';
+  return {
+    id: typeof row.id === 'string' ? row.id : 'redacted_approval',
+    action_type: safeDraftActionType(row.action_type),
+    status,
+    state: draftOnlyApprovalState(row.status),
+    created_at: typeof row.created_at === 'string' ? row.created_at : null,
+    decided_at: typeof row.decided_at === 'string' ? row.decided_at : null,
+    externally_sent: false,
+  };
+}
+
+function outboxDraftDto(row: Record<string, unknown>) {
+  return {
+    id: typeof row.id === 'string' ? row.id : 'redacted_outbox',
+    approval_id: typeof row.approval_id === 'string' ? row.approval_id : 'redacted_approval',
+    action_type: safeDraftActionType(row.action_type),
+    state: draftOnlyOutboxState(row.status),
+    created_at: typeof row.created_at === 'string' ? row.created_at : null,
+    externally_sent: false,
+  };
+}
+const maxFeishuMonitorPeople = 5000;
+const maxFeishuPeoplePerRun = 50;
+const maxFeishuMonitorGroups = 50;
+
+function objectValue(value: unknown) {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : {};
+}
+
+function firstText(value: unknown, ...keys: string[]) {
+  const record = objectValue(value);
+  for (const key of keys) {
+    const item = record[key];
+    if ((typeof item === 'string' || typeof item === 'number') && String(item).trim()) return String(item).trim();
+  }
+  return '';
+}
+
+function monitorTargetView(row: FeishuMonitorTargetRow): FeishuMonitorTarget {
+  return {
+    id: row.id,
+    kind: row.target_kind,
+    name: row.display_name,
+    secondaryLabel: row.secondary_label,
+    selected: Boolean(row.enabled),
+    readPolicy: row.read_policy,
+    accessStatus: row.access_status,
+    lastDiscoveredAt: row.last_discovered_at,
+    lastSuccessAt: row.last_success_at,
+    lastError: row.last_error,
+  };
+}
+
+function parseMetadata(value: string | null | undefined) {
+  return parseJsonValue<Record<string, unknown>>(value, {});
+}
+
+const DERIVED_SOURCE_METADATA_KEYS = new Set([
+  'classificationRevision',
+  'classificationBatchSourceIds',
+  'messageAction',
+  'failure_inbox',
+  'calendarClassification',
+  'internalRequirementThreadId',
+]);
+
+function sourceRevisionMetadataJson(value: string | null | undefined) {
+  const metadata = parseMetadata(value);
+  return stableJson(Object.fromEntries(
+    Object.entries(metadata).filter(([key]) => !DERIVED_SOURCE_METADATA_KEYS.has(key)),
+  ));
+}
+
+function stripExternalFailureInbox(metadata: Record<string, unknown>) {
+  const { failure_inbox: _externalFailureInbox, ...safeMetadata } = metadata;
+  return safeMetadata;
+}
+
+type SourceDedupeIdentity = {
+  ownerScope: string;
+  sourceScope: string | null;
+  sourceType: NormalizedSourceEvent['sourceType'];
+  conversationId: string;
+};
+
+function sourceDedupeIdentityOfEvent(event: NormalizedSourceEvent): SourceDedupeIdentity {
+  const metadata = event.metadata ?? {};
+  const ownerScope = typeof metadata.ownerScope === 'string' && metadata.ownerScope.trim()
+    ? metadata.ownerScope.trim()
+    : DATA04_OWNER_SCOPE;
+  const sourceScope = typeof metadata.sourceScope === 'string' && metadata.sourceScope.trim()
+    ? metadata.sourceScope.trim()
+    : null;
+  return {
+    ownerScope,
+    sourceScope,
+    sourceType: event.sourceType,
+    conversationId: event.conversationId,
+  };
+}
+
+function sourceDedupeIdentityOfRow(row: SourceEventRow): SourceDedupeIdentity {
+  const metadata = parseMetadata(row.metadata_json);
+  const sourceScope = typeof metadata.sourceScope === 'string' && metadata.sourceScope.trim()
+    ? metadata.sourceScope.trim()
+    : null;
+  return {
+    ownerScope: row.owner_scope,
+    sourceScope,
+    sourceType: row.source_type,
+    conversationId: row.conversation_id,
+  };
+}
+
+function sourceDedupeIdentityMatches(left: SourceDedupeIdentity, right: SourceDedupeIdentity) {
+  return left.ownerScope === right.ownerScope
+    && left.sourceScope === right.sourceScope
+    && left.sourceType === right.sourceType
+    && left.conversationId === right.conversationId;
+}
+
+const checkpointEvidenceBasisSchema = z.enum(['fact', 'document', 'inferred', 'unknown']);
+const checkpointTaskStatusSchema = z.enum(['unplanned', 'planned', 'in_progress', 'waiting', 'review', 'completed', 'archived']);
+const checkpointRiskSchema = z.enum(['low', 'medium', 'high']);
+const checkpointCalendarClassificationSchema = z.object({
+  route: z.enum(['calendar_fact', 'candidate_review', 'owner_confirmation']),
+  sourceRetained: z.literal(true),
+  candidateCreated: z.boolean(),
+  requiresOwnerConfirmation: z.boolean(),
+  explanationCode: z.string().regex(/^[a-z0-9_:-]{1,160}$/u),
+  evidenceFields: z.object({
+    ownerResponsibility: z.string().max(240).optional(),
+    action: z.string().max(240).optional(),
+    deliverableOrDeadline: z.string().max(240).optional(),
+    sourceReference: z.string().regex(/^sha256:[0-9a-f]{16}$/u),
+    missingSignalCode: z.string().regex(/^[a-z0-9_:-]{1,160}$/u).optional(),
+  }).strict(),
+  correctionScope: z.literal('current_event_only'),
+}).strict();
+const checkpointOwnerIntentSchema = z.object({
+  action: z.enum(['continue', 'confirm_schedule', 'request_context', 'decline', 'delegate', 'uncertain']),
+  confidence: z.number().finite().min(0).max(1),
+  summary: z.string().max(500),
+  delegateTo: z.string().max(160).nullable(),
+  scheduleText: z.string().max(200).nullable(),
+  evidence: z.array(z.string().max(300)).max(10),
+  reason: z.string().max(1_000),
+}).strict();
+const checkpointMessageActionSchema = z.object({
+  action: z.enum(['new_demand', 'update_existing', 'context_only', 'owner_action', 'decline_or_delegate', 'uncertain']),
+  confidence: z.number().finite().min(0).max(1),
+  evidence: z.array(z.string().max(300)).max(10),
+  reason: z.string().max(1_000),
+}).strict();
+const checkpointThreadAssociationSchema = z.object({
+  targetThreadId: z.string().max(200).nullable(),
+  targetTaskId: z.string().max(200).nullable(),
+  confidence: z.number().finite().min(0).max(1).nullable(),
+  scores: z.array(z.object({ threadId: z.string().max(200), taskId: z.string().max(200), confidence: z.number().finite().min(0).max(1) }).strict()).max(16),
+  reason: z.string().max(1_000),
+  evidence: z.array(z.string().max(300)).max(10),
+  candidateSetHash: z.string().regex(/^[a-f0-9]{64}$/u),
+  candidateSetComplete: z.boolean(),
+}).strict();
+const checkpointCandidateMergeSchema = z.object({
+  targetCandidateId: z.string().max(200).nullable(),
+  targetThreadId: z.string().max(200).nullable(),
+  sameRequirement: z.boolean(),
+  confidence: z.number().finite().min(0).max(1).nullable(),
+  scores: z.array(z.object({ candidateId: z.string().max(200), threadId: z.string().max(200), confidence: z.number().finite().min(0).max(1) }).strict()).max(16),
+  primary: z.enum(['current', 'target']).nullable(),
+  primaryConfidence: z.number().finite().min(0).max(1).nullable(),
+  currentRole: z.enum(['owner_delivery', 'background', 'constraint', 'process_question', 'unknown']).nullable(),
+  targetRole: z.enum(['owner_delivery', 'background', 'constraint', 'process_question', 'unknown']).nullable(),
+  reason: z.string().max(1_000),
+  evidence: z.array(z.string().max(300)).max(10),
+  candidateSetHash: z.string().regex(/^[a-f0-9]{64}$/u),
+  candidateSetComplete: z.boolean(),
+}).strict();
+const checkpointNarrativeFieldSchema = z.object({
+  value: z.string().max(2_000),
+  mode: z.enum(['append', 'replace']),
+  basis: checkpointEvidenceBasisSchema,
+  confidence: z.number().finite().min(0).max(1),
+}).strict();
+const checkpointNarrativeUpdatesSchema = z.object({
+  taskTitle: checkpointNarrativeFieldSchema.nullable().optional(),
+  taskDescribe: checkpointNarrativeFieldSchema.nullable().optional(),
+  threadTitle: checkpointNarrativeFieldSchema.nullable().optional(),
+  threadBackground: checkpointNarrativeFieldSchema.nullable().optional(),
+  threadValidationQuestion: checkpointNarrativeFieldSchema.nullable().optional(),
+  threadDescribe: checkpointNarrativeFieldSchema.nullable().optional(),
+}).strict();
+const checkpointTimeRangeSchema = z.object({
+  status: z.enum(['explicit', 'relative_resolved', 'inferred', 'unknown']),
+  sourceText: z.string().max(200).nullable(),
+  startAt: z.string().max(80).nullable(),
+  endAt: z.string().max(80).nullable(),
+  timezone: z.literal('Asia/Shanghai'),
+  needsConfirmation: z.boolean(),
+  semantic: z.enum(['deadline', 'start', 'window', 'reference', 'unknown']).optional(),
+}).strict();
+const checkpointAnalysisSchema = z.object({
+  timeRange: checkpointTimeRangeSchema,
+  fieldBasis: z.object({
+    background: checkpointEvidenceBasisSchema,
+    validationQuestion: checkpointEvidenceBasisSchema,
+    describe: checkpointEvidenceBasisSchema,
+  }).strict(),
+  recognitionEvidence: z.array(z.string().max(300)).max(10),
+  calendarClassification: checkpointCalendarClassificationSchema.nullable().optional(),
+  ownerAction: z.object({
+    required: z.boolean(),
+    summary: z.string().max(300),
+    role: z.enum(['analyze', 'coordinate', 'review', 'follow_up', 'unknown']),
+    basis: checkpointEvidenceBasisSchema,
+    confidence: z.number().finite().min(0).max(1),
+  }).strict().nullable().optional(),
+  ownerIntent: checkpointOwnerIntentSchema.nullable().optional(),
+  prioritySuggestion: checkpointRiskSchema.nullable().optional(),
+  note: z.string().max(1_000).nullable().optional(),
+  statusSuggestion: checkpointTaskStatusSchema.nullable().optional(),
+  nextStepSuggestion: z.string().max(1_000).nullable().optional(),
+  waitingReasonSuggestion: z.string().max(1_000).nullable().optional(),
+  updateConfidence: z.number().finite().min(0).max(1).nullable().optional(),
+  narrativeUpdates: checkpointNarrativeUpdatesSchema.optional(),
+  threadAssociation: checkpointThreadAssociationSchema.nullable().optional(),
+  candidateMerge: checkpointCandidateMergeSchema.nullable().optional(),
+}).strict();
+const checkpointDraftSchema = z.object({
+  title: z.string().max(160),
+  proposerName: z.string().max(160),
+  background: z.string().max(2_000),
+  validationQuestion: z.string().max(1_000),
+  describe: z.string().max(2_000),
+  confidence: z.number().finite().min(0).max(1),
+  analysis: checkpointAnalysisSchema.optional(),
+}).strict();
+const checkpointRetrySchema = z.object({
+  category: z.enum(['rate_limit', 'server_error', 'transport', 'non_retryable']),
+  providerKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$/u),
+  cooldownKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$/u),
+  retryable: z.boolean(),
+  retryAt: z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u).nullable(),
+  retryAfterMs: z.number().int().nonnegative().max(3_600_000).nullable(),
+  status: z.number().int().min(0).max(999).nullable(),
+  code: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$/u).nullable(),
+}).strict();
+const checkpointClassificationSchema = z.object({
+  outcome: z.enum(['valid', 'repaired', 'rule_final', 'rule_provisional', 'recoverable_error']).optional(),
+  deferred: z.object({
+    kind: z.literal('association'),
+    code: z.literal('association_unavailable'),
+    retryable: z.boolean(),
+  }).strict().optional(),
+  isDataRequest: z.boolean(),
+  draft: checkpointDraftSchema.nullable(),
+  reason: z.string().max(1_000),
+  relatedTaskHint: z.string().max(500).nullable(),
+  messageAction: checkpointMessageActionSchema.nullable().optional(),
+  semanticAnalysis: checkpointAnalysisSchema.nullable().optional(),
+  ownerIntent: checkpointOwnerIntentSchema.nullable().optional(),
+  ownerIntents: z.array(checkpointOwnerIntentSchema).max(4).optional(),
+  threadAssociation: checkpointThreadAssociationSchema.nullable().optional(),
+  candidateMerge: checkpointCandidateMergeSchema.nullable().optional(),
+  units: z.array(z.object({
+    unitKey: z.string().regex(/^u[1-8]$/u),
+    sourceKeys: z.array(z.string().regex(/^s[1-9]\d*$/u)).min(1).max(32),
+    isDataRequest: z.boolean(),
+    draft: checkpointDraftSchema.nullable(),
+    reason: z.string().max(1_000),
+  }).strict()).max(8).optional(),
+  importantDates: z.array(z.string().max(200)).max(20),
+  deliverables: z.array(z.string().max(300)).max(20),
+  commitments: z.array(z.string().max(300)).max(20),
+  usedFallback: z.boolean(),
+  errorCode: z.string().max(160).optional(),
+  metadata: z.object({
+    httpStatus: z.number().int().optional(),
+    requestId: z.string().max(200).optional(),
+    attempts: z.number().int().nonnegative().optional(),
+    structuredMode: z.enum(['json_schema', 'json_object', 'none']).optional(),
+    inputHash: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
+    inputCharCount: z.number().int().nonnegative().optional(),
+    fallbackMode: z.enum(['llm', 'rule_fallback', 'rule_mock']).optional(),
+    calendarClassification: checkpointCalendarClassificationSchema.optional(),
+    repairAttempts: z.number().int().nonnegative().optional(),
+    initialErrorCode: z.string().max(160).optional(),
+    validationIssues: z.array(z.object({ path: z.string().max(200), code: z.string().max(100) }).strict()).max(32).optional(),
+    retry: checkpointRetrySchema.optional(),
+  }).strict().optional(),
+}).strict();
+
+function parseClassificationCheckpoint(value: unknown): ClassificationResult | null {
+  const parsed = checkpointClassificationSchema.safeParse(value);
+  if (!parsed.success) return null;
+  if (!['valid', 'repaired', 'rule_final'].includes(parsed.data.outcome ?? '') || parsed.data.deferred) return null;
+  return parsed.data as ClassificationResult;
+}
+
+const classificationCheckpointStateSchema = z.object({
+  sourceEventIds: z.array(z.string().min(1).max(200)).min(1).max(32),
+  revision: z.string().regex(/^[a-f0-9]{64}$/u),
+  reusable: z.literal(true),
+  classification: z.unknown(),
+}).strict();
+
+function parseReusableClassificationCheckpoint(value: unknown, sourceEventIds: string[], revision: string) {
+  const parsed = classificationCheckpointStateSchema.safeParse(value);
+  if (!parsed.success) return null;
+  if (parsed.data.revision !== revision || parsed.data.sourceEventIds.length !== sourceEventIds.length
+    || !sourceEventIds.every((id) => parsed.data.sourceEventIds.includes(id))) return null;
+  const classification = parseClassificationCheckpoint(parsed.data.classification);
+  return classification;
+}
+
+const reprocessCheckpointStateSchema = z.object({
+  candidateId: z.string().min(1).max(200),
+  revision: z.string().regex(/^[a-f0-9]{64}$/u),
+  reusable: z.literal(true),
+  classification: z.unknown(),
+}).strict();
+
+function parseReusableReprocessCheckpoint(value: unknown, candidateId: string, revision: string) {
+  const parsed = reprocessCheckpointStateSchema.safeParse(value);
+  if (!parsed.success || parsed.data.candidateId !== candidateId || parsed.data.revision !== revision) return null;
+  return parseClassificationCheckpoint(parsed.data.classification);
+}
+
+const contextCheckpointIdentitySchema = z.object({
+  sourceEventIds: z.array(z.string().min(1).max(200)).min(1).max(32),
+  contextCount: z.number().int().nonnegative().max(256),
+  sourceRevision: z.string().regex(/^[a-f0-9]{64}$/u),
+  contextFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
+}).strict();
+
+type ContextCheckpointIdentity = z.infer<typeof contextCheckpointIdentitySchema>;
+
+function matchesContextCheckpointIdentity(actual: ContextCheckpointIdentity, expected: ContextCheckpointIdentity) {
+  return actual.sourceEventIds.length === expected.sourceEventIds.length
+    && expected.sourceEventIds.every((id) => actual.sourceEventIds.includes(id))
+    && actual.sourceRevision === expected.sourceRevision
+    && actual.contextFingerprint === expected.contextFingerprint
+    && actual.contextCount === expected.contextCount;
+}
+
+const documentContextCheckpointSchema = contextCheckpointIdentitySchema.extend({
+  continuationRevision: z.string().regex(/^[a-f0-9]{64}$/u),
+}).strict();
+
+function matchesDocumentContextCheckpoint(
+  value: unknown,
+  expected: { sourceEventIds: string[]; sourceRevision: string; contextFingerprint: string; continuationRevision: string; contextCount: number },
+) {
+  const parsed = documentContextCheckpointSchema.safeParse(value);
+  return parsed.success && matchesContextCheckpointIdentity(parsed.data, expected) && parsed.data.continuationRevision === expected.continuationRevision;
+}
+
+const reprocessContextCheckpointSchema = contextCheckpointIdentitySchema.extend({
+  candidateId: z.string().min(1).max(200),
+  revision: z.string().regex(/^[a-f0-9]{64}$/u),
+}).strict();
+
+function matchesReprocessContextCheckpoint(value: unknown, expected: {
+  candidateId: string;
+  sourceEventIds: string[];
+  sourceRevision: string;
+  contextFingerprint: string;
+  revision: string;
+  contextCount: number;
+}) {
+  const parsed = reprocessContextCheckpointSchema.safeParse(value);
+  return parsed.success
+    && matchesContextCheckpointIdentity(parsed.data, {
+      sourceEventIds: expected.sourceEventIds,
+      sourceRevision: expected.sourceRevision,
+      contextFingerprint: expected.contextFingerprint,
+      contextCount: expected.contextCount,
+    })
+    && parsed.data.candidateId === expected.candidateId
+    && parsed.data.revision === expected.revision;
+}
+
+function parseJsonValue<T>(value: string | null | undefined, fallback: T): T {
+  try {
+    return JSON.parse(value || '') as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function parseTaskUpdateSnapshot(value: string): TaskUpdateProposalSnapshot {
+  const result = taskUpdateProposalSnapshotSchema.safeParse(parseJsonValue<unknown>(value, null));
+  if (!result.success) throw new Error(INVALID_TASK_UPDATE_SNAPSHOT_ERROR);
+  return result.data;
+}
+
+function parseTaskUpdatePatch(value: string): TaskPatch {
+  const parsed = parseJsonValue<unknown>(value, null);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('任务更新提案格式损坏，无法应用。');
+  const record = parsed as Record<string, unknown>;
+  const allowed = new Set([
+    'title', 'describe', 'status', 'plannedStartAt', 'plannedDueAt', 'nextStep', 'risk', 'waitingReason',
+    'threadTitle', 'threadBackground', 'threadValidationQuestion', 'threadDescribe', 'note',
+  ]);
+  const unknownKeys = Object.keys(record).filter((key) => !allowed.has(key));
+  if (unknownKeys.length) throw new Error(`任务更新提案包含不支持的字段：${unknownKeys.join('、')}。`);
+  const optionalString = (key: string, maxLength: number) => {
+    const item = record[key];
+    if (item === undefined) return undefined;
+    if (typeof item !== 'string') throw new Error(`任务更新提案字段 ${key} 格式不正确。`);
+    if (item.length > maxLength) throw new Error(`任务更新提案字段 ${key} 超过 ${maxLength} 字符上限。`);
+    return item;
+  };
+  const optionalNullableString = (key: string, maxLength: number) => {
+    const item = record[key];
+    if (item === undefined) return undefined;
+    if (item !== null && typeof item !== 'string') throw new Error(`任务更新提案字段 ${key} 格式不正确。`);
+    if (typeof item === 'string' && item.length > maxLength) throw new Error(`任务更新提案字段 ${key} 超过 ${maxLength} 字符上限。`);
+    return item as string | null;
+  };
+  const risk = record.risk;
+  if (risk !== undefined && risk !== 'low' && risk !== 'medium' && risk !== 'high') throw new Error('任务更新提案的风险等级格式不正确。');
+  const status = record.status;
+  if (status !== undefined && !['unplanned', 'planned', 'in_progress', 'waiting', 'review', 'completed', 'archived'].includes(String(status))) {
+    throw new Error('任务更新提案的任务状态格式不正确。');
+  }
+  return {
+    title: optionalString('title', 160),
+    describe: optionalString('describe', 2_000),
+    status: status as TaskStatus | undefined,
+    plannedStartAt: optionalNullableString('plannedStartAt', 80),
+    plannedDueAt: optionalNullableString('plannedDueAt', 80),
+    nextStep: optionalString('nextStep', 1_000),
+    risk: risk as RiskLevel | undefined,
+    waitingReason: optionalNullableString('waitingReason', 1_000),
+    threadTitle: optionalString('threadTitle', 160),
+    threadBackground: optionalString('threadBackground', 2_000),
+    threadValidationQuestion: optionalString('threadValidationQuestion', 1_000),
+    threadDescribe: optionalString('threadDescribe', 2_000),
+    note: optionalString('note', 1_000),
+  };
+}
+
+function metadataText(metadata: Record<string, unknown>, ...keys: string[]) {
+  for (const key of keys) {
+    const value = metadata[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function minimalCandidateAnalysis(value: unknown, sourceContent: readonly string[]) {
+  const input = objectValue(value);
+  const timeRange = objectValue(input.timeRange);
+  const fieldBasis = objectValue(input.fieldBasis);
+  const safeIso = (value: unknown) => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : null;
+  const safeSummary = (value: unknown, fallback: string, maxLength: number) => safeCandidateNarrative(value, sourceContent, fallback, maxLength);
+  const safeEnum = (value: unknown, allowed: readonly string[], fallback: string) => typeof value === 'string' && allowed.includes(value) ? value : fallback;
+  const ownerAction = objectValue(input.ownerAction);
+  const linkedDocuments = Array.isArray(input.linkedDocuments)
+    ? input.linkedDocuments.map((item) => {
+        const row = objectValue(item);
+        return {
+          documentType: safeEnum(row.documentType, ['docx', 'wiki', 'sheet', 'bitable', 'doc', 'file', 'slides', 'unknown'], 'unknown'),
+          status: safeEnum(row.status, ['ready', 'partial', 'unauthorized', 'unsupported', 'not_found', 'error', 'unknown'], 'unknown'),
+          freshness: safeEnum(row.freshness, ['fresh', 'stale', 'unknown'], 'stale'),
+          completeness: safeEnum(row.completeness, ['complete', 'partial', 'limited', 'unknown'], 'limited'),
+          truncated: row.truncated === true,
+        };
+      }).slice(0, 8)
+    : [];
+  return {
+    timeRange: {
+      status: safeEnum(timeRange.status, ['unknown', 'relative_resolved', 'inferred', 'explicit'], 'unknown'),
+      // The normalized range is useful to the owner; the model's source
+      // phrase is not. It remains available only through explicit source
+      // verification.
+      sourceText: null,
+      startAt: safeIso(timeRange.startAt),
+      endAt: safeIso(timeRange.endAt),
+      timezone: 'Asia/Shanghai' as const,
+      needsConfirmation: timeRange.needsConfirmation === true,
+    },
+    fieldBasis: {
+      background: safeEnum(fieldBasis.background, ['fact', 'document', 'inferred', 'unknown'], 'unknown'),
+      validationQuestion: safeEnum(fieldBasis.validationQuestion, ['fact', 'document', 'inferred', 'unknown'], 'unknown'),
+      describe: safeEnum(fieldBasis.describe, ['fact', 'document', 'inferred', 'unknown'], 'unknown'),
+    },
+    recognitionEvidence: Array.isArray(input.recognitionEvidence)
+      ? input.recognitionEvidence
+        .filter((item): item is string => typeof item === 'string' && Boolean(item.trim()))
+        .map((item) => safeSummary(item, '来源识别依据已保留，需主人核验。', 300))
+        .slice(0, 8)
+      : [],
+    ownerAction: ownerAction.required === true ? {
+      required: true,
+      summary: safeSummary(ownerAction.summary, '主人需要推进一项受控动作。', 300),
+      role: safeEnum(ownerAction.role, ['analyze', 'confirm', 'review', 'clarify', 'unknown'], 'unknown'),
+      basis: safeEnum(ownerAction.basis, ['fact', 'document', 'inferred', 'unknown'], 'unknown'),
+      confidence: typeof ownerAction.confidence === 'number' && Number.isFinite(ownerAction.confidence) ? ownerAction.confidence : 0,
+    } : null,
+    prioritySuggestion: typeof input.prioritySuggestion === 'string' && ['low', 'medium', 'high'].includes(input.prioritySuggestion)
+      ? input.prioritySuggestion
+      : null,
+    note: input.note === null || input.note === undefined ? null : safeSummary(input.note, '来源备注已保留，需主人核验。', 500),
+    linkedDocuments,
+    statusSuggestion: typeof input.statusSuggestion === 'string' && ['unplanned', 'planned', 'in_progress', 'waiting', 'review', 'completed', 'archived'].includes(input.statusSuggestion)
+      ? input.statusSuggestion
+      : null,
+    nextStepSuggestion: input.nextStepSuggestion === null || input.nextStepSuggestion === undefined
+      ? null
+      : safeSummary(input.nextStepSuggestion, '下一步建议已保留，需主人核验。', 1_000),
+    waitingReasonSuggestion: input.waitingReasonSuggestion === null || input.waitingReasonSuggestion === undefined
+      ? null
+      : safeSummary(input.waitingReasonSuggestion, '等待原因已保留，需主人核验。', 1_000),
+    updateConfidence: typeof input.updateConfidence === 'number' && Number.isFinite(input.updateConfidence) ? input.updateConfidence : null,
+  };
+}
+
+const SAFE_NARRATIVE_SOURCE_LIMIT = 8_000;
+const SAFE_NARRATIVE_MIN_COPY_LENGTH = 8;
+const SAFE_NARRATIVE_MIN_PREFIX_COPY_LENGTH = 16;
+const SAFE_NARRATIVE_MIN_COPY_RATIO = 0.68;
+const SAFE_NARRATIVE_MIN_SIMILARITY = 0.88;
+const SAFE_NARRATIVE_MAX_SIMILARITY_LENGTH = 512;
+const SAFE_NARRATIVE_REDACTION_MARKER = '（受控来源信息已隐藏）';
+
+function safeNarrativeCanonical(input: string) {
+  return input
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\p{White_Space}\p{P}\p{S}]+/gu, '');
+}
+
+function hasSafeNarrativeCommonRun(source: string, candidate: string, minimumLength: number) {
+  if (minimumLength <= 0 || source.length < minimumLength || candidate.length < minimumLength) return false;
+  const sourceWindows = new Set<string>();
+  for (let index = 0; index <= source.length - minimumLength; index += 1) {
+    sourceWindows.add(source.slice(index, index + minimumLength));
+  }
+  for (let index = 0; index <= candidate.length - minimumLength; index += 1) {
+    if (sourceWindows.has(candidate.slice(index, index + minimumLength))) return true;
+  }
+  return false;
+}
+
+function narrativeEditSimilarity(source: string, candidate: string) {
+  if (source === candidate) return 1;
+  if (source.length < SAFE_NARRATIVE_MIN_COPY_LENGTH || candidate.length < SAFE_NARRATIVE_MIN_COPY_LENGTH) return 0;
+  const maxLength = Math.max(source.length, candidate.length);
+  if (maxLength > SAFE_NARRATIVE_MAX_SIMILARITY_LENGTH) return 0;
+  const maxDistance = Math.floor(maxLength * (1 - SAFE_NARRATIVE_MIN_SIMILARITY));
+  let previous = Array.from({ length: candidate.length + 1 }, (_, index) => index);
+  for (let sourceIndex = 1; sourceIndex <= source.length; sourceIndex += 1) {
+    const current = [sourceIndex];
+    let rowMinimum = sourceIndex;
+    for (let candidateIndex = 1; candidateIndex <= candidate.length; candidateIndex += 1) {
+      const value = Math.min(
+        (previous[candidateIndex] ?? Number.POSITIVE_INFINITY) + 1,
+        (current[candidateIndex - 1] ?? Number.POSITIVE_INFINITY) + 1,
+        (previous[candidateIndex - 1] ?? Number.POSITIVE_INFINITY) + (source[sourceIndex - 1] === candidate[candidateIndex - 1] ? 0 : 1),
+      );
+      current.push(value);
+      rowMinimum = Math.min(rowMinimum, value);
+    }
+    if (rowMinimum > maxDistance && sourceIndex > maxDistance) return 0;
+    previous = current;
+  }
+  return 1 - (previous[candidate.length] ?? maxLength) / maxLength;
+}
+
+function redactSafeNarrativeStructuredTokens(text: string) {
+  let redacted = false;
+  let output = text;
+  const patterns = [
+    /\b(?:https?|workspace|file):\/\/[^\s<>"']+/giu,
+    /\b(?:authorization|bearer|password|passwd|secret|token|credential|api[\s_-]*key|private[\s_-]*key)\b\s*[:=]\s*\S+/giu,
+    /\b(?:ou|on|oc|om|od|os|ot|ov|ow)_[A-Za-z0-9_-]{4,}\b/giu,
+    /\b(?:doxcn|boxcn|wikcn|shtcn|bascn|fldcn|sccn|douc)[A-Za-z0-9_-]{4,}\b/giu,
+    /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/giu,
+    /\b(?:src_scope|candidate|cand|task|thread|evt|event|ai|owner-decision|proposal|revision|snapshot|reference)[_-][A-Za-z0-9_-]{3,}\b/giu,
+    /(?:[A-Za-z]:[\\/]|\\\\|\/(?:Users|home|workspace|var|tmp|opt|mnt)[\\/])[^\s<>"']+/giu,
+  ];
+  for (const pattern of patterns) {
+    output = output.replace(pattern, () => {
+      redacted = true;
+      return SAFE_NARRATIVE_REDACTION_MARKER;
+    });
+  }
+  return { text: output, redacted };
+}
+
+function hasSafeNarrativeIdLikeToken(text: string) {
+  if (
+    /\b(?:canary|synthetic|raw[_-]?error|owner[_-]?error|secret|token|credential|password|api[_-]?key)[_-][A-Za-z0-9_-]{3,}\b/iu.test(text)
+  ) return true;
+
+  // Run the opaque-token check on the NFKC/compact form as well so a canary
+  // split by whitespace or punctuation (for example `ZX 7 K9`) cannot pass
+  // merely because its pieces are each short.
+  const tokens = [
+    ...(text.match(/\b[A-Za-z0-9][A-Za-z0-9_-]{4,}\b/g) ?? []),
+    ...(safeNarrativeCanonical(text).match(/[A-Za-z][A-Za-z0-9_-]{4,}/gu) ?? []),
+  ];
+  return tokens.some((token) => {
+    const compact = token.replace(/[_-]/gu, '');
+    const digits = (compact.match(/[0-9]/gu) ?? []).length;
+    const letters = (compact.match(/[A-Za-z]/gu) ?? []).length;
+    // Two or more digits in an opaque mixed token (ZX7K9, zx7k9, ...)
+    // are a bounded canary/identifier signal.  Ordinary prose such as
+    // "retention" or "version2" is not treated as sensitive.
+    return letters > 0 && digits >= 2;
+  });
+}
+
+function safeCandidateNarrative(value: unknown, sourceContent: string | readonly string[], fallback: string, maxLength: number) {
+  if (typeof value !== 'string' || !value.trim()) return value === '' ? '' : fallback;
+  const structured = redactSafeNarrativeStructuredTokens(value.trim().slice(0, maxLength).trim());
+  if (structured.redacted) return fallback;
+  const text = structured.text;
+  if (!text) return fallback;
+  const candidateCanonical = safeNarrativeCanonical(text);
+  if (!candidateCanonical) return fallback;
+  if (hasSafeNarrativeIdLikeToken(text)) return fallback;
+
+  const sources = Array.isArray(sourceContent) ? sourceContent : [sourceContent];
+  for (const source of sources) {
+    const boundedSource = String(source).slice(0, SAFE_NARRATIVE_SOURCE_LIMIT);
+    const sourceCanonical = safeNarrativeCanonical(boundedSource);
+    if (!sourceCanonical) continue;
+
+    // A summary may replace a source URL/token with a safe placeholder while
+    // retaining a long verbatim prefix. Treat that prefix as an excerpt too;
+    // comparing only the fully redacted strings would miss this boundary.
+    const redactedSource = redactSafeNarrativeStructuredTokens(boundedSource).text;
+    const sourceBeforeRedaction = redactedSource.split(SAFE_NARRATIVE_REDACTION_MARKER, 1)[0] ?? '';
+    const sourcePrefixCanonical = safeNarrativeCanonical(sourceBeforeRedaction);
+    if (sourcePrefixCanonical.length >= SAFE_NARRATIVE_MIN_PREFIX_COPY_LENGTH
+      && candidateCanonical.startsWith(sourcePrefixCanonical)) return fallback;
+
+    // Combining marks are retained only for this narrowly scoped NFKC canary
+    // check.  This catches e + combining acute being re-emitted as a source
+    // marker without rejecting ordinary unaccented English summaries.
+    if (/\p{M}/u.test(text)) {
+      const sourceMarkers = new Set(Array.from(sourceCanonical).filter((character) => !/\p{ASCII}/u.test(character) && /\p{Script=Latin}/u.test(character)));
+      if (Array.from(candidateCanonical).some((character) => sourceMarkers.has(character))) return fallback;
+    }
+
+    const shorterLength = Math.min(sourceCanonical.length, candidateCanonical.length);
+    const longerLength = Math.max(sourceCanonical.length, candidateCanonical.length);
+    if (shorterLength < SAFE_NARRATIVE_MIN_COPY_LENGTH) continue;
+    if (sourceCanonical === candidateCanonical) return fallback;
+
+    const coverage = shorterLength / longerLength;
+    // A bounded source prefix/suffix of meaningful length is a raw excerpt
+    // even when the candidate continues with a derived clause.  Keep this
+    // separate from the similarity/overlap heuristics so ordinary shared
+    // business vocabulary is not treated as leakage.
+    const boundedExcerpt = shorterLength >= SAFE_NARRATIVE_MIN_PREFIX_COPY_LENGTH
+      && (sourceCanonical.startsWith(candidateCanonical) || sourceCanonical.endsWith(candidateCanonical));
+    const highCoverageCopy = coverage >= SAFE_NARRATIVE_MIN_COPY_RATIO
+      && (sourceCanonical.includes(candidateCanonical) || candidateCanonical.includes(sourceCanonical));
+    const contiguousCopy = coverage >= SAFE_NARRATIVE_MIN_COPY_RATIO
+      && hasSafeNarrativeCommonRun(sourceCanonical, candidateCanonical, Math.max(SAFE_NARRATIVE_MIN_COPY_LENGTH, Math.ceil(shorterLength * 0.82)));
+    const editCopy = coverage >= SAFE_NARRATIVE_MIN_COPY_RATIO
+      && narrativeEditSimilarity(sourceCanonical, candidateCanonical) >= SAFE_NARRATIVE_MIN_SIMILARITY;
+    if (boundedExcerpt || highCoverageCopy || contiguousCopy || editCopy) return fallback;
+  }
+  return text;
+}
+
+function safePublicTimestamp(value: string | null | undefined) {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : null;
+}
+
+function ownerSourceIssue(status: OwnerSourceStatus) {
+  switch (status) {
+    case 'unauthorized': return { code: 'authorization_required' as const, message: '需要系统主人重新授权后才能继续读取。' };
+    case 'admin_required': return { code: 'admin_approval_required' as const, message: '需要飞书管理员批准对应权限。' };
+    case 'unsupported': return { code: 'platform_unsupported' as const, message: '当前平台或租户暂不支持这项读取能力。' };
+    case 'partial': return { code: 'partial_access' as const, message: '当前只能读取部分已授权范围。' };
+    case 'error': return { code: 'sync_failed' as const, message: '最近同步失败；详细诊断已脱敏保留。' };
+    default: return null;
+  }
+}
+
+function ownerSourceScopeSummary(kind: OwnerSourceKind, status: OwnerSourceStatus) {
+  if (status === 'mock_ready') return '安全模拟信息源。';
+  if (status === 'ready') return '已授权信息源。';
+  if (status === 'unauthorized') return '需要系统主人授权。';
+  if (status === 'admin_required') return '需要管理员批准。';
+  if (status === 'partial') return '信息源部分可用。';
+  if (status === 'unsupported') return '当前平台不支持。';
+  if (status === 'error') return '最近同步失败；详细诊断已脱敏保留。';
+  return `${kind} 信息源状态已受控显示。`;
+}
+
+function publicMemoryProjectionError(value: string | null) {
+  if (!value) return null;
+  if (/符号链接|junction|reparse/i.test(value)) return '任务记忆路径包含符号链接或 junction，已拒绝访问。';
+  if (/路径|目录|root|outside|越过|逃逸/i.test(value)) return '任务记忆路径未通过安全边界校验。';
+  return '任务记忆投影失败；详细诊断已脱敏保留。';
+}
+
+function metadataTextArray(metadata: Record<string, unknown>, ...keys: string[]) {
+  for (const key of keys) {
+    const value = metadata[key];
+    if (Array.isArray(value)) {
+      return value
+        .map((item) => typeof item === 'string' || typeof item === 'number' ? String(item).trim() : '')
+        .filter(Boolean);
+    }
+  }
+  return [];
+}
+
+function threadMarkers(source: SourceEventRow) {
+  const metadata = parseMetadata(source.metadata_json);
+  return {
+    threadId: metadataText(metadata, 'threadId', 'thread_id'),
+    rootId: metadataText(metadata, 'rootId', 'root_id', 'replyRootId', 'reply_root_id'),
+    parentId: metadataText(metadata, 'parentId', 'parent_id', 'replyToId', 'reply_to_id'),
+    sessionId: metadataText(metadata, 'sessionId', 'session_id'),
+  };
+}
+
+function threadParticipants(source: SourceEventRow) {
+  const metadata = parseMetadata(source.metadata_json);
+  return [...new Set([source.sender_id, ...metadataTextArray(metadata, 'participantIds', 'participant_ids')].filter(Boolean))];
+}
+
+function safeSlug(value: string) {
+  const normalized = value
+    .normalize('NFKC')
+    .replace(/[^\p{L}\p{N}_-]+/gu, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+  return normalized || 'untitled-task';
+}
+
+function looksLikeFollowUp(content: string) {
+  const normalized = content.trim();
+  return /^(?:(?:再|另外|还有)?(?:补充|追加|接着|改成|调整为|再加|继续(?:说|补充|这个|这项|上面|前面))|(?:另外|还有|以及|同时|再者)[\s，,:：]|(?:关于|针对)(?:刚才|上面|前面|这个需求|这件事)|follow[ -]?up\b|update\b|continue\b|previous\b)/iu.test(normalized);
+}
+
+function explicitlyStartsNewDemand(content: string) {
+  const normalized = content.trim();
+  return /(?:^|[，。；;！？!?]\s*)(?:再提|新开|新建|另开|另外(?:还有)?|还有(?:一个|一项)|另一个|另一项|第二个|新的)(?:[^，。；;！？!?]{0,12})(?:需求|任务|分析|事情|问题)|(?:与|跟)前面(?:的)?(?:需求|任务|事情)?无关|单独(?:新建|开|做|分析)/iu.test(normalized);
+}
+
+/**
+ * Natural conversation turns often omit words such as “补充”. These short
+ * confirmations, schedule questions and material hand-offs are still strong
+ * continuation signals when the same conversation has only one recent
+ * requirement. An explicit “new/another demand” phrase always wins.
+ */
+function looksLikeConversationContinuation(content: string) {
+  const normalized = content.trim();
+  if (!normalized || explicitlyStartsNewDemand(normalized)) return false;
+  if (looksLikeFollowUp(normalized)) return true;
+  if (normalized.length > 160) return false;
+  return /^(?:那|那就|然后|接下来|后面|先|等|这个|这项|这件事|该需求|该任务|可以|行|好的|好|没问题|收到|一会儿|稍后|晚点|明天|后天|本周|这周|下周|周[一二三四五六日天])/u.test(normalized)
+    || /(?:什么时候(?:要|给|交付)|哪天(?:要|给|交付)|几号(?:要|给|交付)|能(?:不能|否)?[^。！？!?]{0,24}(?:给到|交付|完成)|可以[^。！？!?]{0,24}(?:给到|交付|完成)|策划案|需求文档|说明文档|资料在哪|文档在哪|发(?:我|你)|给(?:我|你)|收到后|对一下具体需求)/u.test(normalized);
+}
+
+function metadataVersion(metadata: Record<string, unknown>): number | string | null {
+  const opaque = metadata.sourceVersion ?? metadata.version;
+  if (opaque !== undefined && opaque !== null && opaque !== '') {
+    if (typeof opaque === 'number' && Number.isFinite(opaque)) return opaque;
+    return String(opaque);
+  }
+  const raw = metadata.sourceUpdatedAt ?? metadata.updateTime ?? metadata.updatedAt;
+  if (raw === undefined || raw === null || raw === '') return null;
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+  if (typeof raw === 'string') {
+    const parsed = Date.parse(raw);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function incomingMetadataIsNewer(incoming: number | string | null, current: number | string | null) {
+  if (incoming === null) return false;
+  if (current === null) return true;
+  if (typeof incoming === 'number' && typeof current === 'number') return incoming > current;
+  // Hash/version tokens are opaque. Any change means the source has a new
+  // revision; ordering them lexicographically would be misleading.
+  return incoming !== current;
+}
+
+function sourceRevision(source: SourceEventRow) {
+  return canonicalRevisionHash({
+    ownerScope: source.owner_scope,
+    sourceEventId: source.id,
+    revisionNumber: 0,
+    revisionKind: 'current',
+    externalId: source.external_id,
+    sourceType: source.source_type,
+    conversationId: source.conversation_id,
+    senderId: source.sender_id,
+    senderName: source.sender_name,
+    content: source.content,
+    ownerMentioned: source.owner_mentioned,
+    sourceUrl: source.source_url,
+    completeness: source.completeness,
+    discoveryReason: source.discovery_reason,
+    metadataJson: sourceRevisionMetadataJson(source.metadata_json),
+    occurredAt: source.occurred_at,
+    capturedAt: source.captured_at,
+  });
+}
+
+function combinedClassificationRevision(source: SourceEventRow, contexts: SourceDocumentContext[]) {
+  const sourceHash = sourceRevision(source);
+  const contextHash = sourceContextRevision(contexts);
+  return {
+    sourceHash,
+    contextHash,
+    revision: createHash('sha256').update(`${sourceHash}:${contextHash}`).digest('hex'),
+  };
+}
+
+function candidateAnalysisJson(
+  draftAnalysis: Omit<CandidateAnalysis, 'linkedDocuments' | 'sourceRevision' | 'contextRevision'> | undefined,
+  contexts: SourceDocumentContext[],
+  sourceHash: string,
+  contextHash: string,
+) {
+  const analysis: CandidateAnalysis = {
+    timeRange: draftAnalysis?.timeRange ?? { status: 'unknown', sourceText: null, startAt: null, endAt: null, timezone: 'Asia/Shanghai', needsConfirmation: true },
+    fieldBasis: draftAnalysis?.fieldBasis ?? { background: 'unknown', validationQuestion: 'unknown', describe: 'unknown' },
+    recognitionEvidence: draftAnalysis?.recognitionEvidence ?? [],
+    ownerAction: draftAnalysis?.ownerAction ?? null,
+    calendarClassification: draftAnalysis?.calendarClassification ?? null,
+    ownerIntent: draftAnalysis?.ownerIntent ?? null,
+    prioritySuggestion: draftAnalysis?.prioritySuggestion ?? null,
+    note: draftAnalysis?.note?.trim() || null,
+    statusSuggestion: draftAnalysis?.statusSuggestion ?? null,
+    nextStepSuggestion: draftAnalysis?.nextStepSuggestion?.trim() || null,
+    waitingReasonSuggestion: draftAnalysis?.waitingReasonSuggestion === undefined ? null : draftAnalysis.waitingReasonSuggestion,
+    updateConfidence: draftAnalysis?.updateConfidence ?? null,
+    narrativeUpdates: draftAnalysis?.narrativeUpdates ?? {},
+    threadAssociation: draftAnalysis?.threadAssociation ?? null,
+    candidateMerge: draftAnalysis?.candidateMerge ?? null,
+    linkedDocuments: contexts.map((context) => ({
+      sourceUrl: context.sourceUrl,
+      documentId: context.documentId,
+      documentType: context.documentType,
+      title: context.title,
+      sourceVersion: context.sourceVersion,
+      status: context.status,
+      freshness: context.freshness,
+      completeness: context.completeness,
+      truncated: context.truncated,
+      lastError: context.lastError,
+      lastSuccessAt: context.lastSuccessAt,
+    })),
+    sourceRevision: sourceHash,
+    contextRevision: contextHash,
+  };
+  return JSON.stringify(analysis);
+}
+
+function candidateSnapshotRevision(candidate: CandidateRow, thread: RequirementThreadRow) {
+  return createHash('sha256').update(JSON.stringify({
+    candidateId: candidate.id,
+    candidateUpdatedAt: candidate.updated_at,
+    candidateState: candidate.state,
+    candidateDeletedAt: candidate.deleted_at,
+    candidateMergedInto: candidate.merged_into_candidate_id,
+    threadId: thread.id,
+    threadVersion: thread.version,
+    threadStatus: thread.status,
+    threadPrimarySourceEventId: thread.primary_source_event_id,
+  })).digest('hex');
+}
+
+function candidateGroupVersionHash(candidates: Array<Pick<CandidateRow, 'id' | 'version' | 'updated_at'>>) {
+  return createHash('sha256')
+    .update(JSON.stringify([...candidates]
+      .map((candidate) => ({ id: candidate.id, version: candidate.version, updatedAt: candidate.updated_at }))
+      .sort((left, right) => left.id.localeCompare(right.id))))
+    .digest('hex');
+}
+
+function candidatePairVersionHash(current: CandidateRow, target: CandidateRow) {
+  return candidateGroupVersionHash([current, target]);
+}
+
+function isExplicitOwnerAuthFailure(error: unknown) {
+  const value = error as { code?: unknown; status?: unknown; statusCode?: unknown; response?: { code?: unknown; status?: unknown; data?: { code?: unknown } } };
+  const code = String(value?.status ?? value?.statusCode ?? value?.code ?? value?.response?.status ?? value?.response?.code ?? value?.response?.data?.code ?? '');
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /401|9999166[34]|invalid.?token|token.*expired|授权已失效|revok|撤销/i.test(`${code} ${message}`);
+}
+
+function createManualCandidate(content: string, proposerName: string, occurredAt: string) {
+  const title = content.replace(/[，。！？\n]/g, ' ').trim().slice(0, 80) || '人工补录的数据需求';
+  const describe = content.length > 180 ? content.slice(0, 177) + '…' : content;
+  return {
+    title,
+    proposerName,
+    background: content,
+    validationQuestion: '人工补录后仍需由系统主人确认需求范围、交付形式和排期。',
+    describe,
+    confidence: 1,
+    analysis: {
+      timeRange: timeRangeFromSource(content, occurredAt),
+      fieldBasis: { background: 'fact' as const, validationQuestion: 'inferred' as const, describe: 'fact' as const },
+      recognitionEvidence: ['系统主人通过人工补录明确要求把这条内容记录为需求。'],
+    },
+  };
+}
+
+function taskAuditSnapshot(task: TaskRecord | null) {
+  if (!task) return null;
+  return {
+    id: task.id,
+    title: task.title,
+    proposer_name: task.proposer_name,
+    describe: task.describe,
+    status: task.status,
+    schedule_at: task.schedule_at,
+    planned_start_at: task.planned_start_at,
+    planned_due_at: task.planned_due_at,
+    next_step: task.next_step,
+    risk: task.risk,
+    waiting_reason: task.waiting_reason,
+    version: task.version,
+    completed_at: task.completed_at,
+    archived_at: task.archived_at,
+    deleted_at: task.deleted_at,
+    record_state: task.record_state,
+    merged_into_task_id: task.merged_into_task_id,
+    auto_update_paused: Boolean(task.auto_update_paused),
+  };
+}
+
+function stableSourceOrder(left: SourceEventRow, right: SourceEventRow) {
+  const leftTime = Date.parse(left.occurred_at);
+  const rightTime = Date.parse(right.occurred_at);
+  const byTime = (Number.isFinite(leftTime) ? leftTime : 0) - (Number.isFinite(rightTime) ? rightTime : 0);
+  return byTime || left.external_id.localeCompare(right.external_id);
+}
+
+function isMessageSource(source: SourceEventRow) {
+  return source.source_type === 'owner_dm' || source.source_type === 'group' || source.source_type === 'bot_dm';
+}
+
+function explicitMessageKeys(source: SourceEventRow) {
+  const markers = threadMarkers(source);
+  return [...new Set([
+    `message:${source.external_id}`,
+    markers.rootId ? `message:${markers.rootId}` : null,
+    markers.parentId ? `message:${markers.parentId}` : null,
+    markers.sessionId ? `session:${markers.sessionId}` : null,
+    markers.threadId ? `thread:${markers.threadId}` : null,
+  ].filter((value): value is string => Boolean(value)))];
+}
+
+function combinedBatchClassificationRevision(
+  sources: SourceEventRow[],
+  contextsBySource: Map<string, SourceDocumentContext[]>,
+) {
+  const ordered = [...sources].sort(stableSourceOrder);
+  const sourceEntries = ordered.map((source) => ({ id: source.id, revision: sourceRevision(source) }));
+  const contextEntries = ordered.map((source) => ({ id: source.id, revision: sourceContextRevision(contextsBySource.get(source.id) ?? []) }));
+  const sourceHash = createHash('sha256').update(JSON.stringify(sourceEntries)).digest('hex');
+  const contextHash = createHash('sha256').update(JSON.stringify(contextEntries)).digest('hex');
+  return {
+    sourceHash,
+    contextHash,
+    revision: createHash('sha256').update(`${sourceHash}:${contextHash}`).digest('hex'),
+  };
+}
+
+function guidanceRevision(guidance?: string) {
+  return createHash('sha256').update(guidance?.slice(0, 2_000) ?? '').digest('hex').slice(0, 16);
+}
+
+function aggregateClassificationSource(sources: SourceEventRow[], primary: SourceEventRow, forcedThreadId?: string | null) {
+  const ordered = [...sources].sort(stableSourceOrder);
+  const latest = ordered[ordered.length - 1] ?? primary;
+  const metadata = parseMetadata(primary.metadata_json);
+  const activeSources = ordered.filter((source) => {
+    const item = parseMetadata(source.metadata_json);
+    return !Boolean(item.deleted || item.withdrawn || item.recalled);
+  });
+  // Ordering metadata is already carried by classificationSources.  Keep the
+  // aggregate message free of synthetic ISO labels so neither the model nor a
+  // deterministic parser can mistake an internal timestamp for user evidence.
+  const content = ordered.map((source) => source.content).join('\n\n');
+  return {
+    ...primary,
+    content,
+    occurred_at: latest.occurred_at,
+    metadata_json: JSON.stringify({
+      ...metadata,
+      deleted: activeSources.length === 0,
+      classificationBatch: ordered.length > 1,
+      classificationBatchSize: ordered.length,
+      classificationBatchSourceIds: ordered.map((source) => source.id),
+      ...(forcedThreadId ? { internalRequirementThreadId: forcedThreadId } : {}),
+    }),
+  } satisfies SourceEventRow;
+}
+
+function normalizeTaskRecord(task: TaskRecord | null | undefined): TaskRecord | null {
+  if (!task) return null;
+  return {
+    ...task,
+    planned_start_at: task.planned_start_at ?? null,
+    planned_due_at: task.planned_due_at ?? task.schedule_at ?? null,
+    deleted_at: task.deleted_at ?? null,
+    auto_update_paused: Boolean(task.auto_update_paused),
+  };
+}
+
+function threadAuditSnapshot(thread: RequirementThreadRow | null | undefined) {
+  if (!thread) return null;
+  return {
+    id: thread.id,
+    title: thread.title,
+    background: thread.background,
+    validation_question: thread.validation_question,
+    describe: thread.describe,
+    analysis_json: thread.analysis_json,
+    status: thread.status,
+    version: thread.version,
+    last_activity_at: thread.last_activity_at,
+  };
+}
+
+function candidateFullAuditSnapshot(candidate: CandidateRow | null | undefined) {
+  if (!candidate) return null;
+  return {
+    id: candidate.id,
+    title: candidate.title,
+    proposer_name: candidate.proposer_name,
+    background: candidate.background,
+    validation_question: candidate.validation_question,
+    describe: candidate.describe,
+    analysis_json: candidate.analysis_json,
+    confidence: candidate.confidence,
+    state: candidate.state,
+  };
+}
+
+function candidateSnapshotsEqual(left: TaskUpdateProposalSnapshot['candidate'], right: ReturnType<typeof candidateFullAuditSnapshot>) {
+  if (left === null || right === null) return left === right;
+  return left.id === right.id
+    && left.title === right.title
+    && left.proposer_name === right.proposer_name
+    && left.background === right.background
+    && left.validation_question === right.validation_question
+    && left.describe === right.describe
+    && left.analysis_json === right.analysis_json
+    && left.confidence === right.confidence
+    && left.state === right.state;
+}
+
+function candidateRevisionPayloadMatchesSnapshot(
+  revision: CandidateRevisionPayloadRow | null | undefined,
+  snapshot: TaskUpdateProposalSnapshot['candidate'],
+) {
+  if (!revision || !snapshot) return false;
+  return revision.candidate_id === snapshot.id
+    && revision.title === snapshot.title
+    && revision.proposer_name === snapshot.proposer_name
+    && revision.background === snapshot.background
+    && revision.validation_question === snapshot.validation_question
+    && revision.describe === snapshot.describe
+    && revision.analysis_json === snapshot.analysis_json
+    && revision.confidence === snapshot.confidence;
+}
+
+function candidateAuditSnapshot(candidate: CandidateRow | null) {
+  if (!candidate) return null;
+  return {
+    id: candidate.id,
+    source_event_id: candidate.source_event_id,
+    proposer_name: candidate.proposer_name,
+    describe: candidate.describe,
+    state: candidate.state,
+    accepted_task_id: candidate.accepted_task_id,
+  };
+}
+
+export class PmService {
+  private readonly runtime: PmRuntime;
+  private readonly retryCoordinator: RetryCoordinator;
+  private readonly feishuSync?: FeishuSyncRunner;
+  private readonly feishuOwnerSync?: FeishuOwnerSyncRunner;
+  private readonly feishuCalendarSync?: FeishuCalendarSyncRunner;
+  private readonly feishuMinutesSync?: FeishuMinutesSyncRunner;
+  private readonly feishuDocumentContext: FeishuDocumentContextService;
+  private readonly feishuDocumentSync?: FeishuDocumentContextSyncRunner;
+  private feishuStarted = false;
+  private feishuBotStarted = false;
+  private feishuLifecycle: Promise<void> = Promise.resolve();
+  private ownerRefreshSequence = 0;
+  private privacyLifecycle: Promise<void> = Promise.resolve();
+  private runtimeRecoveryPromise: Promise<{ processed: number; recovered: number }> = Promise.resolve({ processed: 0, recovered: 0 });
+  private runtimeRecoveryRunning = false;
+  private runtimeRecoveryTimer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(
+    private readonly database: AppDatabase,
+    private readonly adapters: ReturnTypeOfAdapters,
+    private readonly config: AppConfig,
+  ) {
+    const retryCoordinator = new RetryCoordinator({ store: new SqliteRetryCooldownStore(database.raw) });
+    this.retryCoordinator = retryCoordinator;
+    this.runtime = new PmRuntime(database, { retryCoordinator });
+    const classifier = this.adapters.classifier as typeof this.adapters.classifier & {
+      setRetryCoordinator?: (coordinator: RetryCoordinator) => void;
+    };
+    classifier.setRetryCoordinator?.(retryCoordinator);
+    this.runtime.recoverExpired();
+    this.reconcileRetiredOwnerDecisions();
+    this.feishuDocumentContext = new FeishuDocumentContextService(database, adapters.feishu);
+    if (adapters.feishu instanceof LiveFeishuAdapter) {
+      this.feishuSync = new FeishuSyncRunner(
+        config.feishu,
+        database,
+        adapters.feishu,
+        (event, context) => this.ingestSource(event, undefined, {}, context),
+        (level, summary, context) => this.log('integration', level, 'feishu.sync', summary, context),
+        (events, context) => this.ingestSourceBatch(events, undefined, {}, context),
+        (events, context) => this.captureSourceBatch(events, context),
+      );
+      this.feishuOwnerSync = new FeishuOwnerSyncRunner(
+        config.feishu,
+        database,
+        adapters.feishu,
+        (event, context) => this.ingestSource(event, undefined, {}, context),
+        (level, summary, context) => this.log('integration', level, 'feishu.owner_sync', summary, context),
+        undefined,
+        (events, context) => this.ingestSourceBatch(events, undefined, {}, context),
+        (events, context) => this.captureSourceBatch(events, context),
+      );
+      this.feishuCalendarSync = new FeishuCalendarSyncRunner(config.feishu, database, adapters.feishu, (event, context) => this.ingestSource(event, undefined, {}, context), (level, summary, context) => this.log('integration', level, 'feishu.calendar_sync', summary, context));
+      this.feishuMinutesSync = new FeishuMinutesSyncRunner(config.feishu, database, adapters.feishu, (event, context) => this.ingestSource(event, undefined, {}, context), (level, summary, context) => this.log('integration', level, 'feishu.minutes_sync', summary, context));
+      this.feishuDocumentSync = new FeishuDocumentContextSyncRunner(
+        config.feishu,
+        database,
+        this.feishuDocumentContext,
+        async (sourceEventId, context) => {
+          const source = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(sourceEventId) as SourceEventRow | undefined;
+          if (source) await this.classifySourceWithStoredBatch(source, undefined, true, false, context);
+        },
+        (level, summary, context) => this.log('integration', level, 'feishu.document_sync', summary, context),
+      );
+    }
+    this.ensureOwnerSourceStates();
+    this.cleanupLogs(config.logging.retentionDays);
+  }
+
+  /**
+   * Real-time bot events have a stricter boundary than polling: the source
+   * row must be committed before the provider callback is allowed to return.
+   * Semantic classification is scheduled only after that durable receipt.
+   */
+  async captureFeishuBotEvent(event: NormalizedSourceEvent): Promise<DurableEventReceipt> {
+    const normalized = this.adapters.feishu.normalizeSource(event);
+    const metadata = normalized.metadata ?? {};
+    if (normalized.sourceType !== 'bot_dm' && normalized.sourceType !== 'group') {
+      throw new Error('飞书实时事件来源类型不属于机器人补充入口；已拒绝确认。');
+    }
+    if (metadata.sourceScope !== 'bot_supplement' || metadata.ownerScope !== DATA04_OWNER_SCOPE) {
+      throw new Error('飞书实时事件来源或主人范围不匹配；已拒绝确认。');
+    }
+    if (normalized.sourceType === 'group' && !this.isBotEventInScope(normalized)) {
+      throw new Error('飞书实时事件不属于已授权的机器人补充范围；已拒绝确认。');
+    }
+    const persisted = this.persistSourceEvent(normalized);
+    const source = persisted.row;
+    // The durable source row is committed before this asynchronous work.
+    void this.classifyCapturedSourceWithDiagnostics(source, persisted.deduplicated);
+    return {
+      externalId: source.external_id,
+      sourceEventId: source.id,
+      deduplicated: persisted.deduplicated,
+      capturedAt: source.captured_at,
+    };
+  }
+
+  private isBotEventInScope(event: NormalizedSourceEvent) {
+    if (event.sourceType !== 'group') return true;
+    return event.ownerMentioned === true
+      || (this.config.feishu.groupIds.length > 0 && this.config.feishu.groupIds.includes(event.conversationId));
+  }
+
+  private async classifyCapturedSourceWithDiagnostics(source: SourceEventRow, deduplicated: boolean) {
+    try {
+      await this.classifySourceWithStoredBatch(source, undefined, deduplicated);
+    } catch (error) {
+      // The source and Runtime job are already durable. Keep diagnostics
+      // bounded and let the normal Runtime recovery path retry classification.
+      this.log('runtime', 'warn', 'feishu.websocket.classification_deferred', '实时消息已耐久保存，需求判断等待 Runtime 恢复。', {
+        sourceEventId: source.id,
+        errorType: error instanceof Error ? error.name : 'unknown',
+      });
+    }
+  }
+
+  /**
+   * One staged classification can issue several provider turns, each with its
+   * own retry budget. Keep the lease longer than that worst-case envelope so a
+   * healthy worker does not lose ownership while the provider is still being
+   * retried; the Runtime heartbeat extends it while a call is in flight.
+   */
+  private runtimeLeaseMs() {
+    const timeoutMs = this.config.llm.timeoutMs;
+    const providerAttempts = this.config.llm.maxRetries + 1;
+    const stagedTurns = 8;
+    const backoffMs = Math.min(2_000, 250 * 2 ** Math.min(this.config.llm.maxRetries, 3));
+    return Math.max(600_000, timeoutMs * providerAttempts * stagedTurns + backoffMs * stagedTurns + 60_000);
+  }
+
+  /**
+   * A final provider failure must fence other jobs for at least the durable
+   * Runtime backoff window. The adapter's local retry delay is intentionally
+   * short, but allowing a second job to pass after that delay would defeat
+   * the shared cooldown contract.
+   */
+  private extendProviderCooldown(retry: RetryFailureMetadata | null, failed: RuntimeJobRow | null) {
+    if (!retry?.retryable || !failed || failed.status !== 'queued') return;
+    const availableAt = Date.parse(failed.available_at);
+    const now = this.retryCoordinator.nowMs();
+    const remaining = Number.isFinite(availableAt) ? Math.max(0, availableAt - now) : 0;
+    this.retryCoordinator.setCooldown(retry.providerKey, Math.max(30_000, remaining));
+  }
+
+  /**
+   * Validate the durable source/job relation before any recovery stage (and
+   * therefore before provider cooldown checks or context writes). A tampered
+   * or partial payload is terminally invalid, not a new retryable failure.
+   */
+  private hasValidClassificationJobRelations(job: RuntimeJobRow, payload: Record<string, unknown>) {
+    const rawIds = payload.sourceEventIds;
+    if (!Array.isArray(rawIds) || !rawIds.every((value) => typeof value === 'string' && Boolean(value))) return false;
+    const sourceEventIds = rawIds as string[];
+    if (!sourceEventIds.length || new Set(sourceEventIds).size !== sourceEventIds.length) return false;
+    if (typeof payload.sourceRevision !== 'string' || !/^[a-f0-9]{64}$/u.test(payload.sourceRevision)) return false;
+    if (job.job_type === 'classify_source') {
+      if (sourceEventIds.length !== 1 || payload.sourceEventId !== sourceEventIds[0] || job.source_event_id !== sourceEventIds[0]) return false;
+    } else if (job.job_type === 'classify_source_batch') {
+      if (!job.source_event_id || !sourceEventIds.includes(job.source_event_id)) return false;
+    } else {
+      return true;
+    }
+    const placeholders = sourceEventIds.map(() => '?').join(',');
+    const sourceRows = this.database.raw.prepare(`SELECT id FROM source_event WHERE id IN (${placeholders})`).all(...sourceEventIds) as Array<{ id: string }>;
+    if (sourceRows.length !== sourceEventIds.length) return false;
+    // New classification jobs carry a second immutable copy of the start-time
+    // revision. If a recovery payload is tampered after creation, the two
+    // durable values must still agree. Older jobs without the copy remain
+    // readable for backward compatibility and keep the existing stale fence.
+    if (Object.prototype.hasOwnProperty.call(payload, 'sourceRevisionCanonical')
+      && (typeof payload.sourceRevisionCanonical !== 'string'
+        || payload.sourceRevisionCanonical !== payload.sourceRevision)) return false;
+    // The source revision is a durable start-time fence, not a requirement
+    // that the source still has the same live revision at recovery time. A
+    // candidate/task change may legitimately make the revision stale; the
+    // classification path's source/candidate fences then settle stale or
+    // re-evaluate without re-binding an old owner decision. Missing or
+    // malformed metadata is still rejected above.
+    const linkedRows = this.database.raw.prepare(
+      'SELECT source_event_id FROM job_source_link WHERE job_id = ? ORDER BY source_event_id ASC',
+    ).all(job.id) as Array<{ source_event_id: string }>;
+    const linkedIds = linkedRows.map((row) => row.source_event_id);
+    return linkedIds.length === sourceEventIds.length
+      && new Set(linkedIds).size === linkedIds.length
+      && linkedIds.every((sourceEventId) => sourceEventIds.includes(sourceEventId));
+  }
+
+  /**
+   * Drain due, recoverable Runtime jobs once after process startup. The
+   * durable job row remains the source of truth; a fresh lease owner fences
+   * workers from a previous process and failed jobs keep their backoff.
+   */
+  resumeRuntimeJobs(limit = 100) {
+    if (this.runtimeRecoveryRunning) return this.runtimeRecoveryPromise;
+    const recoveryOwner = id('runtime-recovery');
+    this.runtimeRecoveryRunning = true;
+    this.runtimeRecoveryPromise = (async () => {
+      this.runtime.recoverExpired();
+      await this.recoverOrphanedFeishuEvents(Math.min(limit, 100));
+      const due = this.runtime.listDueRecoverable(
+        ['classify_source', 'classify_source_batch', 'reprocess_candidate', 'owner_decision'],
+        Math.max(1, Math.min(limit, 500)),
+      );
+      let processed = 0;
+      let recovered = 0;
+      for (const job of due) {
+        const claimed = this.runtime.claim(job.id, recoveryOwner, this.runtimeLeaseMs());
+        if (!claimed.acquired || !claimed.lease_owner) continue;
+        processed += 1;
+        let countedRecovery = false;
+        const recoveryPayload = parseMetadata(claimed.payload_json);
+        const countCompletedRecovery = () => {
+          if (countedRecovery) return;
+          // Owner-authored classification carries a durable target snapshot;
+          // its recovery count tracks the attempted state-machine turn even
+          // when malformed/retired targets settle fail-closed. Other
+          // classification and reprocess jobs retain RUN-02's completed-only
+          // recovery count. A standalone owner_decision job is not counted
+          // unless it reaches completed, preserving zero-write failures.
+          const ownerClassificationRecovery = (claimed.job_type === 'classify_source' || claimed.job_type === 'classify_source_batch')
+            && Object.prototype.hasOwnProperty.call(recoveryPayload, 'ownerTargetSnapshots');
+          if (ownerClassificationRecovery) {
+            recovered += 1;
+            countedRecovery = true;
+            return;
+          }
+          if (this.runtime.get(claimed.id)?.status !== 'completed') return;
+          recovered += 1;
+          countedRecovery = true;
+        };
+        const payload = recoveryPayload;
+        const operationContext = isOperationContext(payload.observability)
+          ? payload.observability
+          : undefined;
+        const sourceEventId = typeof payload.sourceEventId === 'string' ? payload.sourceEventId : null;
+        const guidance = typeof payload.guidance === 'string' ? payload.guidance.slice(0, 2_000) : undefined;
+        try {
+          if (claimed.job_type === 'classify_source') {
+            if (!this.hasValidClassificationJobRelations(claimed, payload)) throw new Error('Runtime 来源关系不完整，已停止恢复。');
+            if (!sourceEventId) throw new Error('Runtime 工作项缺少 sourceEventId。');
+            const source = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(sourceEventId) as SourceEventRow | undefined;
+            if (!source) throw new Error('Runtime 工作项关联的来源不存在。');
+            const result = await this.classifyCapturedSourceInternal(source, guidance, true, 0, claimed.id, claimed.lease_owner, [source], operationContext);
+            this.settleClassificationRuntimeJob(claimed.id, claimed.lease_owner, result, { sourceEventId });
+          } else if (claimed.job_type === 'classify_source_batch') {
+            if (!this.hasValidClassificationJobRelations(claimed, payload)) throw new Error('Runtime 来源关系不完整，已停止恢复。');
+            const sourceEventIds = Array.isArray(payload.sourceEventIds)
+              ? payload.sourceEventIds.filter((value): value is string => typeof value === 'string' && Boolean(value))
+              : [];
+            if (!sourceEventIds.length) throw new Error('Runtime 连续消息工作项缺少 sourceEventIds。');
+            const placeholders = sourceEventIds.map(() => '?').join(',');
+            const sources = (this.database.raw.prepare(`SELECT * FROM source_event WHERE id IN (${placeholders})`).all(...sourceEventIds) as SourceEventRow[]).sort(stableSourceOrder);
+            if (sources.length !== sourceEventIds.length) throw new Error('Runtime 连续消息工作项关联的来源不完整。');
+            const result = await this.classifyCapturedSourceInternal(sources[0]!, guidance, true, 0, claimed.id, claimed.lease_owner, sources, operationContext);
+            this.settleClassificationRuntimeJob(claimed.id, claimed.lease_owner, result, { sourceEventIds });
+          } else if (claimed.job_type === 'owner_decision') {
+            let decisionId = typeof payload.decisionId === 'string' ? payload.decisionId : null;
+            if (!decisionId && sourceEventId) {
+              const sourceRevisionValue = typeof payload.sourceRevision === 'string' ? payload.sourceRevision : null;
+              if (sourceRevisionValue) {
+                const row = this.ownerDecisionRow(sourceEventId, sourceRevisionValue);
+                decisionId = row?.id ?? null;
+              }
+            }
+            if (!decisionId) throw new Error('主人判断工作项缺少 decisionId。');
+            const decision = this.database.raw.prepare('SELECT * FROM owner_decision WHERE id = ?').get(decisionId) as OwnerDecisionRow | undefined;
+            if (!decision) throw new Error('主人判断工作项关联的记录不存在。');
+            // A process may have requeued the durable Runtime job after the
+            // decision row was created but before its action was committed.
+            // Re-open that row before executing; the executor still fences on
+            // the Runtime lease and target versions.
+            this.database.raw.prepare(
+              "UPDATE owner_decision SET state = 'running', error = NULL WHERE id = ? AND state IN ('queued','failed')",
+            ).run(decisionId);
+            await this.runOwnerDecisionJob(claimed.id, claimed.lease_owner, decisionId);
+          } else {
+            const candidateId = typeof payload.candidateId === 'string' ? payload.candidateId : null;
+            if (!candidateId) throw new Error('Runtime 重新整理工作项缺少 candidateId。');
+            const candidateVersion = typeof payload.candidateVersion === 'number' && Number.isInteger(payload.candidateVersion) && payload.candidateVersion > 0
+              ? payload.candidateVersion
+              : null;
+            if (candidateVersion === null) throw new CandidateVersionConflictError();
+            await this.reprocessCandidate(candidateId, guidance, { jobId: claimed.id, leaseOwner: claimed.lease_owner }, candidateVersion, operationContext);
+          }
+          countCompletedRecovery();
+        } catch (error) {
+          const invalidClassificationRelations = (claimed.job_type === 'classify_source' || claimed.job_type === 'classify_source_batch')
+            && !this.hasValidClassificationJobRelations(claimed, payload);
+          const failed = this.runtime.fail(claimed.id, error, {
+            leaseOwner: claimed.lease_owner,
+            retryable: invalidClassificationRelations ? false : undefined,
+            retry: classifyRetryFailure(error, this.adapters.classifier.provider),
+          });
+          if (!invalidClassificationRelations && !(error instanceof OwnerTargetSnapshotPersistenceError)) {
+            this.recordRuntimeClassificationFailure(
+              claimed.id,
+              failed,
+              error,
+              error instanceof RuntimeCooldownDeferredError ? 'MODEL_RATE_LIMITED' : undefined,
+            );
+          }
+          // A completion may have been durably committed before a later
+          // projection/diagnostic step raised.  Count only that terminal fact;
+          // queued retry, deferred, failed, and cancelled jobs stay processed
+          // but not recovered.
+          countCompletedRecovery();
+        }
+      }
+      return { processed, recovered };
+    })().finally(() => {
+      this.runtimeRecoveryRunning = false;
+    });
+    return this.runtimeRecoveryPromise;
+  }
+
+  /**
+   * Recover the narrow crash window after a WebSocket source commit but
+   * before the classification Runtime job was created. Only explicitly
+   * tagged bot-supplement rows in the primary owner scope are eligible;
+   * polling and manually entered sources are never swept by this path.
+   */
+  private async recoverOrphanedFeishuEvents(limit: number) {
+    const rows = this.database.raw.prepare(
+      `SELECT source_event.*
+       FROM source_event
+       WHERE source_event.owner_scope = ?
+         AND json_extract(source_event.metadata_json, '$.sourceScope') = 'bot_supplement'
+         AND json_extract(source_event.metadata_json, '$.ownerScope') = ?
+         AND json_extract(source_event.metadata_json, '$.classificationRevision') IS NULL
+         AND NOT EXISTS (
+           SELECT 1
+           FROM job_source_link
+           JOIN job ON job.id = job_source_link.job_id
+           WHERE job_source_link.source_event_id = source_event.id
+             AND job.job_type IN ('classify_source', 'classify_source_batch')
+             AND job.status NOT IN ('completed', 'cancelled')
+         )
+       ORDER BY source_event.occurred_at ASC, source_event.external_id ASC
+       LIMIT ?`,
+    ).all(DATA04_OWNER_SCOPE, DATA04_OWNER_SCOPE, Math.max(1, Math.min(limit, 100))) as SourceEventRow[];
+    let recovered = 0;
+    for (const source of rows) {
+      try {
+        await this.classifySourceWithStoredBatch(source, undefined, true);
+        recovered += 1;
+      } catch {
+        // The helper persists a retryable Runtime job before returning. Keep
+        // recovery bounded and let the next sweep handle remaining rows.
+      }
+    }
+    return recovered;
+  }
+
+  async awaitRuntimeRecovery() {
+    return this.runtimeRecoveryPromise;
+  }
+
+  startRuntimeRecovery(intervalMs = 30_000) {
+    if (this.runtimeRecoveryTimer) return { started: false, intervalMs };
+    void this.resumeRuntimeJobs();
+    this.runtimeRecoveryTimer = setInterval(() => {
+      void this.resumeRuntimeJobs();
+    }, Math.max(5_000, intervalMs));
+    this.runtimeRecoveryTimer.unref?.();
+    return { started: true, intervalMs: Math.max(5_000, intervalMs) };
+  }
+
+  async stopRuntimeRecovery(timeoutMs = 5_000) {
+    const hadTimer = Boolean(this.runtimeRecoveryTimer);
+    if (this.runtimeRecoveryTimer) {
+      clearInterval(this.runtimeRecoveryTimer);
+      this.runtimeRecoveryTimer = null;
+    }
+    const shutdown = await this.runtime.shutdown(timeoutMs);
+    return { stopped: hadTimer || shutdown.stopped, timedOut: shutdown.timedOut };
+  }
+
+  automationPolicy() {
+    const row = this.database.raw.prepare("SELECT value_json, updated_at FROM app_setting WHERE key = 'automation.policy'").get() as { value_json: string; updated_at: string } | undefined;
+    const value = parseMetadata(row?.value_json);
+    const mode: AutomationMode = row ? value.mode === 'auto' ? 'auto' : 'suggest' : 'auto';
+    return {
+      mode,
+      associationThreshold: AUTO_ASSOCIATION_CONFIDENCE,
+      updateThreshold: AUTO_UPDATE_CONFIDENCE,
+      policyVersion: AUTO_UPDATE_POLICY_VERSION,
+      updatedAt: row?.updated_at ?? null,
+    };
+  }
+
+  updateAutomationPolicy(mode: AutomationMode) {
+    const timestamp = nowIso();
+    this.database.raw.prepare(
+      `INSERT INTO app_setting (key, value_json, updated_at) VALUES ('automation.policy', ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+    ).run(JSON.stringify({ mode }), timestamp);
+    this.log('runtime', 'info', 'automation.policy_updated', mode === 'auto' ? '已启用 AI 自动维护私人任务。' : '已切换为仅建议模式。', { mode });
+    return this.automationPolicy();
+  }
+
+  updateTaskAutomation(taskId: string, paused: boolean, expectedVersion?: number) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error('任务不存在。');
+    if (task.record_state === 'invalidated' || task.deleted_at) throw new Error('无效或回收站任务不能修改自动维护设置。');
+    if (expectedVersion !== undefined && expectedVersion !== task.version) throw new Error('任务已被其他操作更新，请刷新后重试。');
+    if (task.auto_update_paused === paused) return this.getTaskDetail(taskId);
+    const timestamp = nowIso();
+    const nextVersion = task.version + 1;
+    this.database.transaction(() => {
+      const updated = this.database.raw.prepare(
+        'UPDATE task SET auto_update_paused = ?, version = ?, updated_at = ? WHERE id = ? AND version = ?',
+      ).run(paused ? 1 : 0, nextVersion, timestamp, taskId, task.version);
+      if (updated.changes !== 1) throw new Error('任务已被其他操作更新，请刷新后重试。');
+      this.database.raw.prepare(
+        `INSERT INTO task_event
+          (id, task_id, event_type, actor_type, visibility, summary, source_event_id, before_json, after_json, occurred_at, recorded_at, version)
+         VALUES (?, ?, 'automation_policy_updated', 'user', 'private', ?, NULL, ?, ?, ?, ?, ?)`,
+      ).run(
+        id('evt'),
+        taskId,
+        paused ? '系统主人暂停了这项任务的 AI 自动维护；后续来源仍会保留并进入待确认。' : '系统主人恢复了这项任务的 AI 自动维护。',
+        JSON.stringify(taskAuditSnapshot(task)),
+        JSON.stringify({ ...taskAuditSnapshot(task), auto_update_paused: paused, version: nextVersion }),
+        timestamp,
+        timestamp,
+        nextVersion,
+      );
+    });
+    this.projectTaskMemory(taskId);
+    return this.getTaskDetail(taskId);
+  }
+
+  private observabilityDependencies() {
+    const observedAt = nowIso();
+    const dependencies: Record<string, { status: 'ready' | 'degraded' | 'not_ready' | 'unknown'; error_code: string | null; observed_at: string; details: Record<string, string | number | boolean | null> }> = {};
+    const reasons: SafeReason[] = [];
+    let databaseReady = true;
+    try {
+      this.database.raw.prepare('SELECT 1 AS ok').get();
+      dependencies.database = { status: 'ready', error_code: null, observed_at: observedAt, details: { provider: this.config.database.provider } };
+    } catch {
+      databaseReady = false;
+      dependencies.database = { status: 'not_ready', error_code: 'DATABASE_UNAVAILABLE', observed_at: observedAt, details: {} };
+      reasons.push({ code: 'DATABASE_UNAVAILABLE', message: '本地数据库当前不可用。' });
+    }
+
+    try {
+      const failedJobs = (this.database.raw.prepare("SELECT COUNT(*) AS count FROM job WHERE status = 'failed'").get() as { count: number }).count;
+      const pendingJobs = (this.database.raw.prepare("SELECT COUNT(*) AS count FROM job WHERE status IN ('pending','queued','running')").get() as { count: number }).count;
+      dependencies.runner = {
+        status: failedJobs > 0 ? 'degraded' : 'ready',
+        error_code: failedJobs > 0 ? 'RUNTIME_FAILED_JOBS' : null,
+        observed_at: observedAt,
+        details: { failed_jobs: failedJobs, pending_jobs: pendingJobs },
+      };
+      dependencies.queue = {
+        status: failedJobs > 0 ? 'degraded' : 'ready',
+        error_code: failedJobs > 0 ? 'OBS_QUEUE_DEGRADED' : null,
+        observed_at: observedAt,
+        details: { failed_jobs: failedJobs, pending_jobs: pendingJobs },
+      };
+      if (failedJobs > 0 && databaseReady) reasons.push({ code: 'OBS_QUEUE_DEGRADED', message: '本地队列存在需要处理的工作项。' });
+    } catch {
+      dependencies.runner = { status: 'not_ready', error_code: 'OBS_RUNNER_UNAVAILABLE', observed_at: observedAt, details: {} };
+      dependencies.queue = { status: 'not_ready', error_code: 'OBS_QUEUE_DEGRADED', observed_at: observedAt, details: {} };
+      if (databaseReady) reasons.push({ code: 'OBS_RUNNER_UNAVAILABLE', message: '本地运行器当前不可用。' });
+    }
+
+    try {
+      const sourceRows = this.database.raw.prepare(
+        `SELECT source_kind, enabled, status, last_success_at, updated_at FROM information_source_state ORDER BY source_kind`,
+      ).all() as Array<{ source_kind: string; enabled: number; status: string; last_success_at: string | null; updated_at: string }>;
+      const staleSources = sourceRows.filter((row) => row.enabled && row.last_success_at && Date.now() - Date.parse(row.last_success_at) > 24 * 60 * 60 * 1000);
+      dependencies.freshness = {
+        status: staleSources.length ? 'degraded' : 'ready',
+        error_code: staleSources.length ? 'OBS_DATA_STALE' : null,
+        observed_at: observedAt,
+        details: { stale_sources: staleSources.length, observed_sources: sourceRows.length },
+      };
+      if (staleSources.length) reasons.push({ code: 'OBS_DATA_STALE', message: '部分来源数据已陈旧。' });
+      const cooldownRows = this.database.raw.prepare(
+        `SELECT COUNT(*) AS count FROM sync_cursor WHERE last_error IS NOT NULL AND last_error <> ''`,
+      ).get() as { count: number };
+      dependencies.backoff = {
+        status: cooldownRows.count > 0 ? 'degraded' : 'ready',
+        error_code: cooldownRows.count > 0 ? 'OBS_RETRY_COOLDOWN' : null,
+        observed_at: observedAt,
+        details: { active_cooldowns: cooldownRows.count },
+      };
+      if (cooldownRows.count > 0) reasons.push({ code: 'OBS_RETRY_COOLDOWN', message: '部分来源仍在退避冷却中。' });
+    } catch {
+      dependencies.freshness = { status: 'unknown', error_code: 'OBS_DATA_STALE', observed_at: observedAt, details: {} };
+      dependencies.backoff = { status: 'unknown', error_code: 'OBS_RETRY_COOLDOWN', observed_at: observedAt, details: {} };
+      reasons.push({ code: 'OBS_DATA_STALE', message: '来源新鲜度当前无法确认。' });
+      reasons.push({ code: 'OBS_RETRY_COOLDOWN', message: '来源退避状态当前无法确认。' });
+    }
+
+    try {
+      const owner = this.database.raw.prepare("SELECT oauth_status FROM owner_profile WHERE id = 'primary'").get() as { oauth_status?: string } | undefined;
+      const rawTokenState = owner?.oauth_status;
+      const knownTokenState = rawTokenState === 'mock' || rawTokenState === 'authorized' || rawTokenState === 'expired' || rawTokenState === 'revoked';
+      const tokenStatus = !knownTokenState
+        ? 'unknown'
+        : rawTokenState === 'revoked' || rawTokenState === 'expired' ? 'degraded' : 'ready';
+      dependencies.token = {
+        status: tokenStatus,
+        error_code: tokenStatus === 'ready' ? null : 'OBS_TOKEN_STATE',
+        observed_at: observedAt,
+        details: { state: rawTokenState ?? 'unknown' },
+      };
+      if (tokenStatus === 'degraded') reasons.push({ code: 'OBS_TOKEN_STATE', message: '授权状态需要重新确认。' });
+      if (tokenStatus === 'unknown') reasons.push({ code: 'OBS_TOKEN_STATE', message: '授权状态当前无法确认。' });
+    } catch {
+      dependencies.token = { status: 'unknown', error_code: 'OBS_TOKEN_STATE', observed_at: observedAt, details: {} };
+      reasons.push({ code: 'OBS_TOKEN_STATE', message: '授权状态当前无法确认。' });
+    }
+
+    const liveFeishu = (this.adapters.feishu as { kind: string }).kind === 'live';
+    dependencies.listener = {
+      status: liveFeishu && !this.feishuStarted ? 'degraded' : 'ready',
+      error_code: liveFeishu && !this.feishuStarted ? 'OBS_LISTENER_UNAVAILABLE' : null,
+      observed_at: observedAt,
+      details: { live_adapter: liveFeishu, running: this.feishuStarted },
+    };
+    if (liveFeishu && !this.feishuStarted) reasons.push({ code: 'OBS_LISTENER_UNAVAILABLE', message: '信息流监听当前未就绪。' });
+
+    try {
+      const availableBytes = this.availableDiskBytes();
+      const diskKnown = Number.isFinite(availableBytes);
+      const diskReady = diskKnown && availableBytes >= 100 * 1024 * 1024;
+      dependencies.disk = {
+        status: !diskKnown ? 'unknown' : diskReady ? 'ready' : 'degraded',
+        error_code: diskKnown && diskReady ? null : 'OBS_DISK_UNAVAILABLE',
+        observed_at: observedAt,
+        details: { available_bytes: diskKnown ? Math.floor(availableBytes) : null },
+      };
+      if (!diskReady) reasons.push({ code: 'OBS_DISK_UNAVAILABLE', message: diskKnown ? '本地诊断存储空间不足。' : '本地诊断存储状态无法确认。' });
+    } catch {
+      dependencies.disk = { status: 'unknown', error_code: 'OBS_DISK_UNAVAILABLE', observed_at: observedAt, details: {} };
+      reasons.push({ code: 'OBS_DISK_UNAVAILABLE', message: '本地诊断存储状态当前无法确认。' });
+    }
+
+    if (!databaseReady) {
+      return { dependencies, reasons: [{ code: 'DATABASE_UNAVAILABLE', message: '本地数据库当前不可用。' }] };
+    }
+    return { dependencies, reasons };
+  }
+
+  private availableDiskBytes() {
+    const stats = statfsSync(process.cwd());
+    return Number(stats.bavail) * Number(stats.bsize);
+  }
+
+  health(requestId?: string, readiness = this.readiness()) {
+    const feishuKind = (this.adapters.feishu as { kind: string }).kind;
+    const classifierKind = (this.adapters.classifier as { kind: string }).kind;
+    const workspaceKind = (this.adapters.workspace as { kind: string }).kind;
+    const dependencyState = this.observabilityDependencies();
+    const databaseUnavailable = readiness.status === 'not_ready'
+      && readiness.reasons.some((reason) => reason.code === 'DATABASE_UNAVAILABLE');
+    const combinedReasons = (databaseUnavailable ? readiness.reasons : [...readiness.reasons, ...dependencyState.reasons])
+      .filter((reason, index, all) => all.findIndex((item) => item.code === reason.code) === index);
+    const hasUnknownRequiredDependency = Object.values(dependencyState.dependencies)
+      .some((dependency) => dependency.status === 'unknown' || dependency.status === 'not_ready');
+    const combinedReadiness: { status: ReadinessStatus; reasons: SafeReason[] } = {
+      status: hasUnknownRequiredDependency || readiness.status === 'not_ready'
+        ? 'not_ready'
+        : combinedReasons.length ? 'degraded' : readiness.status,
+      reasons: combinedReasons,
+    };
+    return {
+      status: 'ok',
+      operation_id: randomUUID(),
+      request_id: requestId ?? randomUUID(),
+      trace_id: randomUUID(),
+      span_id: randomUUID(),
+      liveness: { status: 'alive' },
+      readiness: { status: combinedReadiness.status, reasons: combinedReadiness.reasons.map((reason) => ({ ...reason })) },
+      dependencies: dependencyState.dependencies,
+      release: this.releaseIdentity(),
+      // A live model does not imply that Feishu is connected. Keep each
+      // integration explicit so the UI cannot overstate capabilities.
+      mode: feishuKind === 'live' || classifierKind === 'live' ? 'configured' : 'local-shell',
+      externalConnections: feishuKind === 'live' || classifierKind === 'live',
+      database: this.config.database.provider,
+      integrations: {
+        feishu: feishuKind,
+        classifier: classifierKind,
+        workspace: workspaceKind,
+      },
+      timestamp: nowIso(),
+    };
+  }
+
+  releaseIdentity() {
+    return releaseIdentity(this.config.release);
+  }
+
+  readiness(): { status: ReadinessStatus; reasons: SafeReason[] } {
+    try {
+      const reasons: SafeReason[] = [];
+      this.database.raw.prepare('SELECT 1 AS ok').get();
+      const sourceStates = this.database.raw
+        .prepare("SELECT status FROM information_source_state WHERE enabled = 1 AND status IN ('unauthorized','admin_required','partial','error')")
+        .all() as Array<{ status: string }>;
+      if (sourceStates.some((row) => row.status === 'error')) {
+        reasons.push({ code: 'SOURCE_ERROR', message: '至少一个已启用信息源处于错误状态。' });
+      }
+      if (sourceStates.some((row) => row.status === 'unauthorized')) {
+        reasons.push({ code: 'FEISHU_AUTHORIZATION_REQUIRED', message: '至少一个已启用飞书信息源需要系统主人重新授权。' });
+      }
+      if (sourceStates.some((row) => row.status === 'admin_required')) {
+        reasons.push({ code: 'FEISHU_ADMIN_APPROVAL_REQUIRED', message: '至少一个已启用飞书信息源需要管理员批准权限。' });
+      }
+      if (sourceStates.some((row) => row.status === 'partial')) {
+        reasons.push({ code: 'SOURCE_PARTIAL', message: '至少一个已启用信息源只能部分工作。' });
+      }
+      const failedJobs = (this.database.raw.prepare("SELECT COUNT(*) AS count FROM job WHERE status = 'failed'").get() as { count: number }).count;
+      if (failedJobs > 0) reasons.push({ code: 'RUNTIME_FAILED_JOBS', message: '存在已失败且需人工查看的本地工作项。' });
+      return { status: reasons.length ? 'degraded' : 'ready', reasons };
+    } catch {
+      return { status: 'not_ready', reasons: [{ code: 'DATABASE_UNAVAILABLE', message: '本地数据库当前不可用。' }] };
+    }
+  }
+
+  ownerInformation() {
+    const state = this.ownerInformationInternal();
+    // The HTTP/UI contract intentionally omits stable owner identifiers and
+    // source implementation details. They remain server-side facts used by
+    // OAuth and sync guards, never renderer data.
+    return ownerInformationDtoSchema.parse({
+      owner: state.owner
+        ? {
+            name: state.owner.name,
+            oauthStatus: state.owner.oauthStatus,
+            configuredScopes: state.owner.configuredScopes,
+            lastSyncedAt: state.owner.lastSyncedAt,
+            updatedAt: state.owner.updatedAt,
+          }
+        : null,
+      sources: state.sources.map((source) => ({
+        kind: source.kind,
+        enabled: source.enabled,
+        status: source.status,
+        scopeSummary: ownerSourceScopeSummary(source.kind, source.status),
+        requiresAdmin: source.requiresAdmin,
+        requiresBotInChat: source.requiresBotInChat,
+        syncMode: source.syncMode,
+        lastSuccessAt: source.lastSuccessAt,
+        issue: ownerSourceIssue(source.status),
+        updatedAt: source.updatedAt,
+      })),
+    });
+  }
+
+  private ownerInformationInternal() {
+    const owner = this.database.raw.prepare('SELECT * FROM owner_profile WHERE id = ?').get('primary') as OwnerProfileRow | undefined;
+    const sourceRows = this.database.raw
+      .prepare('SELECT * FROM information_source_state ORDER BY CASE source_kind WHEN \'owner_dm\' THEN 1 WHEN \'owner_mentions\' THEN 2 WHEN \'calendar\' THEN 3 WHEN \'minutes\' THEN 4 ELSE 5 END')
+      .all() as InformationSourceStateRow[];
+    return {
+      owner: owner
+        ? {
+            openId: owner.open_id,
+            unionId: owner.union_id,
+            userId: owner.user_id,
+            name: owner.name,
+            tenantKey: owner.tenant_key,
+            oauthStatus: owner.oauth_status,
+            configuredScopes: JSON.parse(owner.granted_scopes_json) as string[],
+            lastSyncedAt: owner.last_synced_at,
+            updatedAt: owner.updated_at,
+          }
+        : null,
+      sources: sourceRows.map((source) => ({
+        kind: source.source_kind,
+        enabled: Boolean(source.enabled),
+        status: source.status,
+        scopeSummary: source.scope_summary,
+        requiresAdmin: Boolean(source.requires_admin),
+        requiresBotInChat: Boolean(source.requires_bot_in_chat),
+        syncMode: source.sync_mode,
+        lastSuccessAt: source.last_success_at,
+        lastError: source.last_error,
+        details: JSON.parse(source.details_json) as Record<string, unknown>,
+        updatedAt: source.updated_at,
+      })),
+    };
+  }
+
+  private async withPrivacyLifecycleLock<T>(work: () => Promise<T>) {
+    const previous = this.privacyLifecycle;
+    let release!: () => void;
+    this.privacyLifecycle = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await work();
+    } finally {
+      release();
+    }
+  }
+
+  private lifecycleIntent(operationType: PrivacyLifecycleOperationType) {
+    return operationType === 'hard_delete' ? PRIVACY_DELETION_INTENT : PRIVACY_OWNER_ACTION_INTENT;
+  }
+
+  private lifecycleCapabilityBinding(binding?: PrivacyCapabilityBinding): PrivacyCapabilityBinding {
+    if (binding) {
+      privacyCapabilityBindingHash(binding);
+      return binding;
+    }
+    // Direct service tests do not have an HTTP capability header. Keep that
+    // path explicitly synthetic while still persisting a real binding in v6.
+    return {
+      tokenHash: createHash('sha256').update('synthetic-internal-owner-action-token').digest('hex'),
+      csrfTokenHash: createHash('sha256').update('synthetic-internal-owner-action-csrf').digest('hex'),
+      origin: 'app://local',
+    };
+  }
+
+  private claimPrivacyLifecycle(
+    operationType: PrivacyLifecycleOperationType,
+    expectedVersion: number | undefined,
+    capabilityBinding: PrivacyCapabilityBinding | undefined,
+    snapshot: PrivacyCollectionSnapshot | PrivacyAuthorizationSnapshot,
+    mutate: (control: PrivacyControlRow, claimedVersion: number) => void,
+  ) {
+    const ownerOpenId = this.assertPrivacyOwnerAuthorization();
+    const binding = this.lifecycleCapabilityBinding(capabilityBinding);
+    const operationId = id('privacy-lifecycle');
+    const operationToken = randomUUID().replaceAll('-', '');
+    const now = nowIso();
+    const expiresAt = new Date(Date.parse(now) + PRIVACY_LIFECYCLE_LEASE_MS).toISOString();
+    const durableSnapshot = 'adapterState' in snapshot
+      ? { control: snapshot.control, sourceStates: snapshot.sourceStates, owner: snapshot.owner, cursors: snapshot.cursors, monitorTargets: snapshot.monitorTargets }
+      : snapshot;
+    return this.database.transaction(() => {
+      const control = this.privacyControl();
+      if (expectedVersion !== undefined && expectedVersion !== control.version) {
+        throw new Error('隐私状态已发生变化，请刷新后重试。');
+      }
+      // All lifecycle operations share one durable conflict domain. An
+      // active stop/revoke/delete must not be bypassed by a start or update
+      // from another process. Expired claims are reclaimed by an atomic
+      // identity+token+version CAS before the new claim is inserted.
+      const reclaimedClaims = this.assertNoActivePrivacyLifecycleClaim(Date.parse(now));
+      const reclaimedParent = reclaimedClaims.find((candidate) => candidate.claimed_version === control.version);
+      const claimedVersion = control.version + 1;
+      mutate(control, claimedVersion);
+      const claim = this.database.raw.prepare(
+        `INSERT INTO privacy_lifecycle_claim
+         (operation_id, operation_token, operation_type, owner_open_id,
+          capability_token_hash, capability_csrf_hash, capability_origin, intent,
+          expected_version, claimed_version, status, expires_at, heartbeat_at,
+          snapshot_json, reclaimed_from_operation_id, reclaimed_from_operation_token,
+          reclaimed_from_expected_version, reclaimed_from_claimed_version, reclaim_count,
+          created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        operationId,
+        operationToken,
+        operationType,
+        ownerOpenId,
+        binding.tokenHash,
+        binding.csrfTokenHash,
+        binding.origin,
+        this.lifecycleIntent(operationType),
+        control.version,
+        claimedVersion,
+        expiresAt,
+        now,
+        JSON.stringify(durableSnapshot),
+        reclaimedParent?.operation_id ?? null,
+        reclaimedParent?.operation_token ?? null,
+        reclaimedParent?.expected_version ?? null,
+        reclaimedParent?.claimed_version ?? null,
+        reclaimedParent ? reclaimedParent.reclaim_count + 1 : 0,
+        now,
+        now,
+      );
+      if (claim.changes !== 1) throw new Error('隐私操作 claim 无法持久化。');
+      return this.database.raw.prepare(
+        'SELECT * FROM privacy_lifecycle_claim WHERE operation_id = ?',
+      ).get(operationId) as PrivacyLifecycleClaimRow;
+    });
+  }
+
+  private reclaimExpiredPrivacyLifecycleClaims(nowMs: number) {
+    const now = new Date(nowMs).toISOString();
+    const activeClaims = this.database.raw.prepare(
+      `SELECT operation_id, operation_token, operation_type, owner_open_id,
+              capability_token_hash, capability_csrf_hash, capability_origin,
+              intent, expected_version, claimed_version, final_version, status,
+              expires_at, heartbeat_at, snapshot_json, recovery_code, last_error,
+              reclaimed_from_operation_id, reclaimed_from_operation_token,
+              reclaimed_from_expected_version, reclaimed_from_claimed_version, reclaim_count,
+              created_at, updated_at
+       FROM privacy_lifecycle_claim
+       WHERE status IN ('claimed','compensating') ORDER BY created_at ASC`,
+    ).all() as PrivacyLifecycleClaimRow[];
+    const reclaimed: PrivacyLifecycleClaimRow[] = [];
+    for (const claim of activeClaims) {
+      const state = privacyLifecycleTimeState(claim, nowMs);
+      if (!state.expired) continue;
+      const expired = this.database.raw.prepare(
+        `UPDATE privacy_lifecycle_claim
+         SET status = 'expired', recovery_code = 'PRIVACY_LIFECYCLE_EXPIRED_RECLAIMED',
+             last_error = ?, updated_at = ?
+         WHERE operation_id = ? AND operation_token = ?
+           AND operation_type = ? AND owner_open_id = ?
+           AND capability_token_hash = ? AND capability_csrf_hash = ?
+           AND capability_origin = ? AND intent = ? AND created_at = ?
+           AND expected_version = ? AND claimed_version = ?
+           AND status = ? AND expires_at = ? AND heartbeat_at = ?`,
+      ).run(
+        'claim lease expired and was atomically reclaimed by a newer actor',
+        now,
+        claim.operation_id,
+        claim.operation_token,
+        claim.operation_type,
+        claim.owner_open_id,
+        claim.capability_token_hash,
+        claim.capability_csrf_hash,
+        claim.capability_origin,
+        claim.intent,
+        claim.created_at,
+        claim.expected_version,
+        claim.claimed_version,
+        claim.status,
+        claim.expires_at,
+        claim.heartbeat_at,
+      );
+      if (expired.changes !== 1) {
+        throw new Error('隐私生命周期 claim reclaim CAS 失败，请刷新后重试。');
+      }
+      reclaimed.push(claim);
+    }
+    return reclaimed;
+  }
+
+  /** Shared durable conflict gate for every owner-sensitive privacy mutation. */
+  private assertNoActivePrivacyLifecycleClaim(nowMs = Date.now()) {
+    const reclaimed = this.reclaimExpiredPrivacyLifecycleClaims(nowMs);
+    const active = this.database.raw.prepare(
+      `SELECT operation_id, operation_token, operation_type, owner_open_id,
+              capability_token_hash, capability_csrf_hash, capability_origin,
+              intent, expected_version, claimed_version, final_version, status,
+              expires_at, heartbeat_at, snapshot_json, recovery_code, last_error,
+              created_at, updated_at
+       FROM privacy_lifecycle_claim
+       WHERE status IN ('claimed','compensating')
+       ORDER BY created_at DESC LIMIT 1`,
+    ).get() as PrivacyLifecycleClaimRow | undefined;
+    if (!active) return reclaimed;
+    const state = privacyLifecycleTimeState(active, nowMs);
+    if (state.expired) {
+      this.reclaimExpiredPrivacyLifecycleClaims(nowMs);
+      const remaining = this.database.raw.prepare(
+        `SELECT operation_id, operation_token, operation_type, owner_open_id,
+                capability_token_hash, capability_csrf_hash, capability_origin,
+                intent, expected_version, claimed_version, final_version, status,
+                expires_at, heartbeat_at, snapshot_json, recovery_code, last_error,
+                created_at, updated_at
+         FROM privacy_lifecycle_claim
+         WHERE status IN ('claimed','compensating')
+         ORDER BY created_at DESC LIMIT 1`,
+      ).get() as PrivacyLifecycleClaimRow | undefined;
+      if (!remaining) return reclaimed;
+      privacyLifecycleTimeState(remaining, nowMs);
+    }
+    throw new Error(`隐私操作 ${active.operation_type} 已有其他进程持有 durable claim，请稍后重试。`);
+  }
+
+  private privacyLifecycleClaimIdentityMatches(current: PrivacyLifecycleClaimRow, expected: PrivacyLifecycleClaimRow) {
+    return current.operation_id === expected.operation_id
+      && current.operation_token === expected.operation_token
+      && current.operation_type === expected.operation_type
+      && current.owner_open_id === expected.owner_open_id
+      && current.capability_token_hash === expected.capability_token_hash
+      && current.capability_csrf_hash === expected.capability_csrf_hash
+      && current.capability_origin === expected.capability_origin
+      && current.intent === expected.intent
+      && current.expected_version === expected.expected_version
+      && current.claimed_version === expected.claimed_version
+      && current.created_at === expected.created_at;
+  }
+
+  /** Renew and final-fence a claim immediately before any provider call. */
+  private renewPrivacyLifecycleClaim(claim: PrivacyLifecycleClaimRow) {
+    return this.database.transaction(() => {
+      const current = this.database.raw.prepare(
+        `SELECT operation_id, operation_token, operation_type, owner_open_id,
+                capability_token_hash, capability_csrf_hash, capability_origin,
+                intent, expected_version, claimed_version, final_version, status,
+                expires_at, heartbeat_at, snapshot_json, recovery_code, last_error,
+                created_at, updated_at
+         FROM privacy_lifecycle_claim WHERE operation_id = ? AND operation_token = ?`,
+      ).get(claim.operation_id, claim.operation_token) as PrivacyLifecycleClaimRow | undefined;
+      const nowMs = Date.now();
+      if (!current) throw new Error('隐私生命周期 claim 不存在；已拒绝 provider 副作用。');
+      const state = privacyLifecycleTimeState(current, nowMs);
+      if (state.expired) {
+        const expired = this.database.raw.prepare(
+          `UPDATE privacy_lifecycle_claim
+           SET status = 'expired', recovery_code = 'PRIVACY_LIFECYCLE_EXPIRED_RECLAIMED',
+               last_error = ?, updated_at = ?
+            WHERE operation_id = ? AND operation_token = ? AND operation_type = ?
+              AND owner_open_id = ? AND capability_token_hash = ? AND capability_csrf_hash = ?
+              AND capability_origin = ? AND intent = ? AND created_at = ?
+              AND expected_version = ? AND claimed_version = ? AND status = 'claimed'
+              AND expires_at = ? AND heartbeat_at = ?`,
+        ).run(
+          'claim expired before provider side effect',
+          new Date(nowMs).toISOString(),
+          current.operation_id,
+          current.operation_token,
+          current.operation_type,
+          current.owner_open_id,
+          current.capability_token_hash,
+          current.capability_csrf_hash,
+          current.capability_origin,
+          current.intent,
+          current.created_at,
+          current.expected_version,
+          current.claimed_version,
+          current.expires_at,
+          current.heartbeat_at,
+        );
+        if (expired.changes !== 1) throw new Error('隐私生命周期 claim 已被其他进程接管；已拒绝 provider 副作用。');
+        throw new Error('隐私生命周期 claim 已过期；已拒绝 provider 副作用。');
+      }
+      const control = this.privacyControl();
+      if (current.status !== 'claimed' || control.version !== current.claimed_version
+        || !this.privacyLifecycleClaimIdentityMatches(current, claim)) {
+        throw new Error('隐私生命周期 claim 已被其他进程推进；已拒绝 provider 副作用。');
+      }
+      const renewedAt = new Date(nowMs).toISOString();
+      const renewedUntil = new Date(nowMs + PRIVACY_LIFECYCLE_LEASE_MS).toISOString();
+      const renewed = this.database.raw.prepare(
+        `UPDATE privacy_lifecycle_claim
+         SET heartbeat_at = ?, expires_at = ?, updated_at = ?
+         WHERE operation_id = ? AND operation_token = ? AND operation_type = ?
+           AND owner_open_id = ? AND capability_token_hash = ? AND capability_csrf_hash = ?
+           AND capability_origin = ? AND intent = ? AND created_at = ?
+           AND expected_version = ? AND claimed_version = ? AND status = 'claimed'
+           AND heartbeat_at = ? AND expires_at = ?`,
+      ).run(
+        renewedAt,
+        renewedUntil,
+        renewedAt,
+        current.operation_id,
+        current.operation_token,
+        current.operation_type,
+        current.owner_open_id,
+        current.capability_token_hash,
+        current.capability_csrf_hash,
+        current.capability_origin,
+        current.intent,
+        current.created_at,
+        current.expected_version,
+        current.claimed_version,
+        current.heartbeat_at,
+        current.expires_at,
+      );
+      if (renewed.changes !== 1) throw new Error('隐私生命周期 heartbeat CAS 失败；已拒绝 provider 副作用。');
+      return this.database.raw.prepare(
+        'SELECT * FROM privacy_lifecycle_claim WHERE operation_id = ? AND operation_token = ?',
+      ).get(current.operation_id, current.operation_token) as PrivacyLifecycleClaimRow;
+    });
+  }
+
+  private markPrivacyLifecycleClaim(claim: PrivacyLifecycleClaimRow, status: PrivacyLifecycleClaimRow['status'], error?: unknown, finalVersion?: number) {
+    const message = error instanceof Error ? error.message.slice(0, 500) : error ? 'UNKNOWN' : null;
+    this.database.transaction(() => {
+      this.database.raw.prepare(
+        `UPDATE privacy_lifecycle_claim
+         SET status = ?, final_version = COALESCE(?, final_version), last_error = ?, updated_at = ?
+         WHERE operation_id = ? AND operation_token = ? AND status IN ('claimed','compensating')`,
+      ).run(status, finalVersion ?? null, message, nowIso(), claim.operation_id, claim.operation_token);
+    });
+  }
+
+  private markPrivacyLifecycleRecoveryRequired(claim: PrivacyLifecycleClaimRow, error?: unknown) {
+    const message = error instanceof Error ? error.message.slice(0, 500) : error ? 'UNKNOWN' : null;
+    this.database.transaction(() => {
+      const updated = this.database.raw.prepare(
+        `UPDATE privacy_lifecycle_claim
+         SET status = 'recovery_required', recovery_code = 'PRIVACY_LIFECYCLE_RECOVERY_REQUIRED',
+             last_error = ?, updated_at = ?
+         WHERE operation_id = ? AND operation_token = ?
+           AND status NOT IN ('recovery_required','failed')`,
+      ).run(message, nowIso(), claim.operation_id, claim.operation_token);
+      if (updated.changes !== 1) {
+        const current = this.database.raw.prepare(
+          'SELECT status FROM privacy_lifecycle_claim WHERE operation_id = ? AND operation_token = ?',
+        ).get(claim.operation_id, claim.operation_token) as { status: string } | undefined;
+        if (!current || !['recovery_required', 'failed'].includes(current.status)) {
+          throw new Error('生命周期 recovery 状态无法持久化。');
+        }
+      }
+    });
+  }
+
+  private finalizePrivacyLifecycleClaim(claim: PrivacyLifecycleClaimRow, work: () => void) {
+    return this.database.transaction(() => {
+      const current = this.database.raw.prepare(
+        'SELECT * FROM privacy_lifecycle_claim WHERE operation_id = ? AND operation_token = ?',
+      ).get(claim.operation_id, claim.operation_token) as PrivacyLifecycleClaimRow | undefined;
+      const control = this.privacyControl();
+      if (current && !this.privacyLifecycleClaimIdentityMatches(current, claim)) {
+        return false;
+      }
+      if (current?.status === 'claimed' && privacyLifecycleTimeState(current, Date.now()).expired) {
+        const expired = this.database.raw.prepare(
+          `UPDATE privacy_lifecycle_claim
+           SET status = 'expired', recovery_code = 'PRIVACY_LIFECYCLE_EXPIRED_RECLAIMED',
+               last_error = ?, updated_at = ?
+           WHERE operation_id = ? AND operation_token = ? AND operation_type = ?
+             AND owner_open_id = ? AND capability_token_hash = ? AND capability_csrf_hash = ?
+             AND capability_origin = ? AND intent = ? AND created_at = ? AND status = 'claimed'
+             AND expected_version = ? AND claimed_version = ?
+             AND expires_at = ? AND heartbeat_at = ?`,
+        ).run(
+          'claim expired before finalize',
+          nowIso(),
+          current.operation_id,
+          current.operation_token,
+          current.operation_type,
+          current.owner_open_id,
+          current.capability_token_hash,
+          current.capability_csrf_hash,
+          current.capability_origin,
+          current.intent,
+          current.created_at,
+          current.expected_version,
+          current.claimed_version,
+          current.expires_at,
+          current.heartbeat_at,
+        );
+        if (expired.changes !== 1) throw new Error('隐私生命周期 claim 已被其他进程接管；finalize 被拒绝。');
+        return false;
+      }
+      if (!current || current.status !== 'claimed' || control.version !== current.claimed_version) {
+        if (current?.status === 'claimed') {
+          this.database.raw.prepare(
+            `UPDATE privacy_lifecycle_claim SET status = 'recovery_required', recovery_code = 'PRIVACY_LIFECYCLE_FENCE_LOST', last_error = ?, updated_at = ?
+             WHERE operation_id = ? AND operation_token = ? AND status = 'claimed'`,
+          ).run('生命周期 finalize fencing 校验失败。', nowIso(), claim.operation_id, claim.operation_token);
+        }
+        return false;
+      }
+      work();
+      const updated = this.database.raw.prepare(
+        `UPDATE privacy_lifecycle_claim SET status = 'committed', final_version = ?, heartbeat_at = ?, updated_at = ?
+         WHERE operation_id = ? AND operation_token = ? AND operation_type = ?
+           AND owner_open_id = ? AND capability_token_hash = ? AND capability_csrf_hash = ?
+           AND capability_origin = ? AND intent = ? AND created_at = ?
+           AND status = 'claimed' AND expected_version = ? AND claimed_version = ?`,
+      ).run(
+        control.version,
+        nowIso(),
+        nowIso(),
+        claim.operation_id,
+        claim.operation_token,
+        claim.operation_type,
+        claim.owner_open_id,
+        claim.capability_token_hash,
+        claim.capability_csrf_hash,
+        claim.capability_origin,
+        claim.intent,
+        claim.created_at,
+        current.expected_version,
+        current.claimed_version,
+      );
+      if (updated.changes !== 1) throw new Error('生命周期 claim finalize CAS 失败。');
+      return true;
+    });
+  }
+
+  private restoreLifecycleSnapshotInTransaction(snapshot: PrivacyCollectionSnapshot | PrivacyAuthorizationSnapshot, version: number) {
+    this.database.raw.prepare(
+      `UPDATE privacy_control SET collection_status = ?, oauth_status = ?, retention_status = ?, version = ?, updated_at = ?, created_at = ?
+       WHERE singleton_key = 1`,
+    ).run(
+      snapshot.control.collection_status,
+      snapshot.control.oauth_status,
+      snapshot.control.retention_status,
+      version,
+      nowIso(),
+      snapshot.control.created_at,
+    );
+    const updateSource = this.database.raw.prepare(
+      `UPDATE information_source_state SET enabled = ?, status = ?, last_success_at = ?, last_error = ?, updated_at = ? WHERE source_kind = ?`,
+    );
+    for (const source of snapshot.sourceStates) {
+      updateSource.run(source.enabled as number, source.status as string, source.last_success_at as string | null, source.last_error as string | null, nowIso(), source.source_kind as string);
+    }
+    if ('owner' in snapshot) {
+      if (snapshot.owner) {
+        this.database.raw.prepare(
+          `UPDATE owner_profile SET oauth_status = ?, last_synced_at = ?, updated_at = ? WHERE id = ?`,
+        ).run(snapshot.owner.oauth_status as string, snapshot.owner.last_synced_at as string | null, nowIso(), snapshot.owner.id as string);
+      }
+      this.database.raw.prepare("DELETE FROM sync_cursor WHERE integration LIKE 'feishu_%'").run();
+      const insertCursor = this.database.raw.prepare(
+        `INSERT INTO sync_cursor (integration, scope_key, cursor, last_success_at, last_error, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+      );
+      for (const cursor of snapshot.cursors) {
+        insertCursor.run(cursor.integration as string, cursor.scope_key as string, cursor.cursor as string | null, cursor.last_success_at as string | null, cursor.last_error as string | null, nowIso());
+      }
+      const updateTarget = this.database.raw.prepare('UPDATE feishu_monitor_target SET enabled = ?, updated_at = ? WHERE id = ?');
+      for (const target of snapshot.monitorTargets) updateTarget.run(target.enabled as number, nowIso(), target.id as string);
+    }
+  }
+
+  private compensatePrivacyLifecycleClaim(claim: PrivacyLifecycleClaimRow, snapshot: PrivacyCollectionSnapshot | PrivacyAuthorizationSnapshot) {
+    return this.database.transaction(() => {
+      const current = this.database.raw.prepare(
+        'SELECT * FROM privacy_lifecycle_claim WHERE operation_id = ? AND operation_token = ?',
+      ).get(claim.operation_id, claim.operation_token) as PrivacyLifecycleClaimRow | undefined;
+      const control = this.privacyControl();
+      if (current && !this.privacyLifecycleClaimIdentityMatches(current, claim)) {
+        return false;
+      }
+      if (current?.status === 'claimed' && privacyLifecycleTimeState(current, Date.now()).expired) {
+        const expired = this.database.raw.prepare(
+          `UPDATE privacy_lifecycle_claim
+           SET status = 'expired', recovery_code = 'PRIVACY_LIFECYCLE_EXPIRED_RECLAIMED',
+               last_error = ?, updated_at = ?
+           WHERE operation_id = ? AND operation_token = ? AND operation_type = ?
+             AND owner_open_id = ? AND capability_token_hash = ? AND capability_csrf_hash = ?
+             AND capability_origin = ? AND intent = ? AND created_at = ? AND status = 'claimed'
+             AND expected_version = ? AND claimed_version = ?
+             AND expires_at = ? AND heartbeat_at = ?`,
+        ).run(
+          'claim expired before compensation',
+          nowIso(),
+          current.operation_id,
+          current.operation_token,
+          current.operation_type,
+          current.owner_open_id,
+          current.capability_token_hash,
+          current.capability_csrf_hash,
+          current.capability_origin,
+          current.intent,
+          current.created_at,
+          current.expected_version,
+          current.claimed_version,
+          current.expires_at,
+          current.heartbeat_at,
+        );
+        if (expired.changes !== 1) throw new Error('隐私生命周期 claim 已被其他进程接管；compensation 被拒绝。');
+        return false;
+      }
+      if (!current || current.status !== 'claimed' || control.version !== current.claimed_version) {
+        if (current?.status === 'claimed') {
+          this.database.raw.prepare(
+            `UPDATE privacy_lifecycle_claim SET status = 'recovery_required', recovery_code = 'PRIVACY_LIFECYCLE_FENCE_LOST', last_error = ?, updated_at = ?
+             WHERE operation_id = ? AND operation_token = ? AND status = 'claimed'`,
+          ).run('生命周期 compensation fencing 校验失败；新 actor 已推进状态。', nowIso(), claim.operation_id, claim.operation_token);
+        }
+        return false;
+      }
+      const compensating = this.database.raw.prepare(
+        `UPDATE privacy_lifecycle_claim SET status = 'compensating', heartbeat_at = ?, updated_at = ?
+          WHERE operation_id = ? AND operation_token = ? AND operation_type = ?
+            AND owner_open_id = ? AND capability_token_hash = ? AND capability_csrf_hash = ?
+            AND capability_origin = ? AND intent = ? AND created_at = ?
+            AND status = 'claimed' AND expected_version = ? AND claimed_version = ?`,
+      ).run(
+        nowIso(),
+        nowIso(),
+        claim.operation_id,
+        claim.operation_token,
+        claim.operation_type,
+        claim.owner_open_id,
+        claim.capability_token_hash,
+        claim.capability_csrf_hash,
+        claim.capability_origin,
+        claim.intent,
+        claim.created_at,
+        current.expected_version,
+        current.claimed_version,
+      );
+      if (compensating.changes !== 1) return false;
+      const restoredVersion = current.claimed_version + 1;
+      this.restoreLifecycleSnapshotInTransaction(snapshot, restoredVersion);
+      const restored = this.database.raw.prepare(
+        `UPDATE privacy_lifecycle_claim SET status = 'compensated', final_version = ?, heartbeat_at = ?, updated_at = ?
+          WHERE operation_id = ? AND operation_token = ? AND operation_type = ?
+            AND owner_open_id = ? AND capability_token_hash = ? AND capability_csrf_hash = ?
+            AND capability_origin = ? AND intent = ? AND created_at = ?
+            AND status = 'compensating' AND expected_version = ? AND claimed_version = ?`,
+      ).run(
+        restoredVersion,
+        nowIso(),
+        nowIso(),
+        claim.operation_id,
+        claim.operation_token,
+        claim.operation_type,
+        claim.owner_open_id,
+        claim.capability_token_hash,
+        claim.capability_csrf_hash,
+        claim.capability_origin,
+        claim.intent,
+        claim.created_at,
+        current.expected_version,
+        current.claimed_version,
+      );
+      if (restored.changes !== 1) throw new Error('生命周期 claim compensation CAS 失败。');
+      return true;
+    });
+  }
+
+  private privacyControl() {
+    const row = this.database.raw.prepare(
+      'SELECT collection_status, oauth_status, retention_status, version, updated_at, created_at FROM privacy_control WHERE singleton_key = 1',
+    ).get() as PrivacyControlRow | undefined;
+    if (!row) throw new Error('隐私生命周期状态缺失；已拒绝继续。');
+    return row;
+  }
+
+  private capturePrivacyCollectionSnapshot(): PrivacyCollectionSnapshot {
+    const control = this.privacyControl();
+    const sourceStates = this.database.raw.prepare(
+      `SELECT source_kind, enabled, status, last_success_at, last_error, updated_at
+       FROM information_source_state ORDER BY source_kind`,
+    ).all() as Array<Record<string, unknown>>;
+    return { control, sourceStates };
+  }
+
+  private restorePrivacyCollectionSnapshot(snapshot: PrivacyCollectionSnapshot) {
+    this.database.transaction(() => {
+      this.database.raw.prepare(
+        `UPDATE privacy_control
+         SET collection_status = ?, oauth_status = ?, retention_status = ?, version = ?, updated_at = ?, created_at = ?
+         WHERE singleton_key = 1`,
+      ).run(
+        snapshot.control.collection_status,
+        snapshot.control.oauth_status,
+        snapshot.control.retention_status,
+        snapshot.control.version,
+        snapshot.control.updated_at,
+        snapshot.control.created_at,
+      );
+      const updateSource = this.database.raw.prepare(
+        `UPDATE information_source_state
+         SET enabled = ?, status = ?, last_success_at = ?, last_error = ?, updated_at = ?
+         WHERE source_kind = ?`,
+      );
+      for (const source of snapshot.sourceStates) {
+        updateSource.run(
+          source.enabled as number,
+          source.status as string,
+          source.last_success_at as string | null,
+          source.last_error as string | null,
+          source.updated_at as string,
+          source.source_kind as string,
+        );
+      }
+    });
+  }
+
+  private async capturePrivacyAuthorizationSnapshot(): Promise<PrivacyAuthorizationSnapshot> {
+    const collection = this.capturePrivacyCollectionSnapshot();
+    const owner = this.database.raw.prepare(
+      `SELECT id, oauth_status, last_synced_at, updated_at FROM owner_profile WHERE id = 'primary'`,
+    ).get() as Record<string, unknown> | undefined;
+    const cursors = this.database.raw.prepare(
+      `SELECT integration, scope_key, cursor, last_success_at, last_error, updated_at
+       FROM sync_cursor WHERE integration LIKE 'feishu_%' ORDER BY integration, scope_key`,
+    ).all() as Array<Record<string, unknown>>;
+    const monitorTargets = this.database.raw.prepare(
+      `SELECT id, enabled, updated_at FROM feishu_monitor_target ORDER BY id`,
+    ).all() as Array<Record<string, unknown>>;
+    const adapter = this.adapters.feishu as { captureAuthorizationState?: () => Promise<unknown> };
+    return {
+      ...collection,
+      owner,
+      cursors,
+      monitorTargets,
+      adapterState: adapter.captureAuthorizationState ? await adapter.captureAuthorizationState() : null,
+    };
+  }
+
+  privacyStatus() {
+    const control = this.privacyControl();
+    const retention = this.database.raw.prepare(
+      'SELECT source_days, derived_days, diagnostics_days, backup_count, updated_at FROM privacy_retention_policy WHERE singleton_key = 1',
+    ).get() as { source_days: number; derived_days: number; diagnostics_days: number; backup_count: number; updated_at: string } | undefined;
+    const deletion = this.database.raw.prepare(
+      `SELECT id, status, deleted_record_count, proof_hash, requested_at, confirmed_at, completed_at
+       FROM privacy_deletion ORDER BY requested_at DESC LIMIT 1`,
+    ).get() as { id: string; status: string; deleted_record_count: number; proof_hash: string | null; requested_at: string; confirmed_at: string | null; completed_at: string | null } | undefined;
+    const latestExport = this.database.raw.prepare(
+      `SELECT id, scope, format, status, payload_hash, record_count, created_at, completed_at
+      FROM privacy_export ORDER BY created_at DESC LIMIT 1`,
+    ).get() as { id: string; scope: string; format: string; status: string; payload_hash: string | null; record_count: number; created_at: string; completed_at: string | null } | undefined;
+    const latestBackup = this.database.raw.prepare(
+      `SELECT id, backup_file, schema_version, sha256, status, created_at, restored_at
+       FROM privacy_backup ORDER BY created_at DESC LIMIT 1`,
+    ).get() as { id: string; backup_file: string; schema_version: number; sha256: string; status: string; created_at: string; restored_at: string | null } | undefined;
+    return {
+      collectionStatus: control.collection_status,
+      oauthStatus: control.oauth_status,
+      retentionStatus: control.retention_status,
+      version: control.version,
+      updatedAt: control.updated_at,
+      retention: retention ? {
+        sourceDays: retention.source_days,
+        derivedDays: retention.derived_days,
+        diagnosticsDays: retention.diagnostics_days,
+        backupCount: retention.backup_count,
+        updatedAt: retention.updated_at,
+      } : null,
+      latestDeletion: deletion ? {
+        id: deletion.id,
+        status: deletion.status,
+        deletedRecordCount: deletion.deleted_record_count,
+        proofHash: deletion.proof_hash,
+        requestedAt: deletion.requested_at,
+        confirmedAt: deletion.confirmed_at,
+        completedAt: deletion.completed_at,
+      } : null,
+      latestExport: latestExport ? {
+        id: latestExport.id,
+        scope: latestExport.scope,
+        format: latestExport.format,
+        status: latestExport.status,
+        payloadHash: latestExport.payload_hash,
+        recordCount: latestExport.record_count,
+        createdAt: latestExport.created_at,
+        completedAt: latestExport.completed_at,
+      } : null,
+      latestBackup: latestBackup ? {
+        id: latestBackup.id,
+        fileName: latestBackup.backup_file,
+        schemaVersion: latestBackup.schema_version,
+        sha256: latestBackup.sha256,
+        status: latestBackup.status,
+        createdAt: latestBackup.created_at,
+        restoredAt: latestBackup.restored_at,
+      } : null,
+      platformRevocation: 'not_verified',
+    };
+  }
+
+  async stopPrivacyCollection(expectedVersion?: number, capabilityBinding?: PrivacyCapabilityBinding) {
+    this.assertPrivacyOwnerAuthorization();
+    return this.withPrivacyLifecycleLock(async () => {
+      const snapshot = this.capturePrivacyCollectionSnapshot();
+      const claim = this.claimPrivacyLifecycle('collection_stop', expectedVersion, capabilityBinding, snapshot, (control) => {
+        if (control.collection_status === 'stopped') throw new Error('隐私采集已停止，请刷新后重试。');
+        const updated = this.database.raw.prepare(
+          `UPDATE privacy_control SET collection_status = 'stopped', version = version + 1, updated_at = ?
+           WHERE singleton_key = 1 AND version = ? AND collection_status = 'running'`,
+        ).run(nowIso(), control.version);
+        if (updated.changes !== 1) throw new Error('隐私状态已被其他操作更新，请刷新后重试。');
+      });
+      let stopAttempted = false;
+      try {
+        this.renewPrivacyLifecycleClaim(claim);
+        stopAttempted = true;
+        await this.stopFeishu(claim);
+        const finalized = this.finalizePrivacyLifecycleClaim(claim, () => {
+          const now = nowIso();
+          this.database.raw.prepare('UPDATE information_source_state SET enabled = 0, updated_at = ?').run(now);
+          this.database.raw.prepare(
+            `INSERT INTO privacy_audit_event (id, event_type, operation_id, record_count, created_at)
+             VALUES (?, 'collection_stopped', ?, 0, ?)`,
+          ).run(id('privacy-audit'), claim.operation_id, now);
+        });
+        if (!finalized) throw new Error('生命周期 claim 已被其他进程推进；旧停止操作不再写入。');
+        return this.privacyStatus();
+      } catch (error) {
+        const compensationFailures: unknown[] = [];
+        let compensated = false;
+        if (stopAttempted) {
+          try { compensated = this.compensatePrivacyLifecycleClaim(claim, snapshot); } catch (restoreError) { compensationFailures.push(restoreError); }
+          if (compensated && snapshot.control.collection_status === 'running') {
+            try { await this.startFeishu({ refreshOwner: false }); } catch (restartError) { compensationFailures.push(restartError); }
+          }
+        }
+        if (!compensated && stopAttempted && !compensationFailures.length) {
+          try { this.markPrivacyLifecycleClaim(claim, 'recovery_required', error); } catch (claimError) { compensationFailures.push(claimError); }
+        }
+        throw compensationFailures.length
+          ? privacyFailure('停止采集失败且补偿未完成；状态需要恢复。', [error, ...compensationFailures])
+          : error;
+      }
+    });
+  }
+
+  async startPrivacyCollection(expectedVersion?: number, capabilityBinding?: PrivacyCapabilityBinding) {
+    return this.withPrivacyLifecycleLock(async () => {
+      if (this.privacyControl().oauth_status === 'revoked') {
+        throw new Error('授权已撤销，请重新授权后再恢复采集。');
+      }
+      this.assertPrivacyOwnerAuthorization();
+      const snapshot = this.capturePrivacyCollectionSnapshot();
+      const claim = this.claimPrivacyLifecycle('collection_start', expectedVersion, capabilityBinding, snapshot, (control) => {
+        if (control.oauth_status === 'revoked') throw new Error('授权已撤销，请重新授权后再恢复采集。');
+        const updated = this.database.raw.prepare(
+          `UPDATE privacy_control SET collection_status = 'running', version = version + 1, updated_at = ?
+           WHERE singleton_key = 1 AND version = ? AND collection_status = 'stopped'`,
+        ).run(nowIso(), control.version);
+        if (updated.changes !== 1) throw new Error('隐私状态已被其他操作更新，请刷新后重试。');
+      });
+      try {
+        const finalized = this.finalizePrivacyLifecycleClaim(claim, () => {
+          const now = nowIso();
+          this.database.raw.prepare(
+            `UPDATE information_source_state SET enabled = 1, updated_at = ?
+             WHERE source_kind IN ('owner_dm','owner_mentions','calendar','minutes','bot_supplement')`,
+          ).run(now);
+          this.database.raw.prepare(
+            `INSERT INTO privacy_audit_event (id, event_type, operation_id, record_count, created_at)
+             VALUES (?, 'collection_started', ?, 0, ?)`,
+          ).run(id('privacy-audit'), claim.operation_id, now);
+        });
+        if (!finalized) throw new Error('生命周期 claim 已被其他进程推进；旧启动操作不再写入。');
+        return this.privacyStatus();
+      } catch (error) {
+        const compensationFailures: unknown[] = [];
+        try {
+          if (!this.compensatePrivacyLifecycleClaim(claim, snapshot)) this.markPrivacyLifecycleClaim(claim, 'recovery_required', error);
+        } catch (restoreError) { compensationFailures.push(restoreError); }
+        throw compensationFailures.length
+          ? privacyFailure('恢复采集失败且补偿未完成；状态需要恢复。', [error, ...compensationFailures])
+          : error;
+      }
+    });
+  }
+
+  async revokePrivacyAuthorization(expectedVersion?: number, capabilityBinding?: PrivacyCapabilityBinding) {
+    this.assertPrivacyOwnerAuthorization();
+    return this.withPrivacyLifecycleLock(async () => {
+      const snapshot = await this.capturePrivacyAuthorizationSnapshot();
+      const claim = this.claimPrivacyLifecycle('authorization_revoke', expectedVersion, capabilityBinding, snapshot, (control) => {
+        if (control.oauth_status === 'revoked') throw new Error('授权已撤销，请刷新后重试。');
+        const updated = this.database.raw.prepare(
+          `UPDATE privacy_control
+           SET collection_status = 'stopped', oauth_status = 'revoked', version = version + 1, updated_at = ?
+           WHERE singleton_key = 1 AND version = ? AND oauth_status <> 'revoked'`,
+        ).run(nowIso(), control.version);
+        if (updated.changes !== 1) throw new Error('隐私状态已被其他操作更新，请刷新后重试。');
+      });
+      let externalAttempted = false;
+      try {
+        this.renewPrivacyLifecycleClaim(claim);
+        externalAttempted = true;
+        await this.stopFeishu(claim);
+        const revoke = (this.adapters.feishu as { revokeAuthorization?: () => Promise<{ localTokensCleared: boolean; providerRevoked: boolean }> }).revokeAuthorization;
+        this.renewPrivacyLifecycleClaim(claim);
+        const local = revoke ? await revoke.call(this.adapters.feishu) : { localTokensCleared: false, providerRevoked: false };
+        const finalized = this.finalizePrivacyLifecycleClaim(claim, () => {
+          const now = nowIso();
+          this.database.raw.prepare("UPDATE owner_profile SET oauth_status = 'revoked', last_synced_at = NULL, updated_at = ? WHERE id = 'primary'").run(now);
+          this.database.raw.prepare("UPDATE information_source_state SET enabled = 0, status = 'unauthorized', last_success_at = NULL, updated_at = ?").run(now);
+          this.database.raw.prepare("DELETE FROM sync_cursor WHERE integration LIKE 'feishu_%'").run();
+          this.database.raw.prepare('UPDATE feishu_monitor_target SET enabled = 0, updated_at = ?').run(now);
+          this.database.raw.prepare(
+            `INSERT INTO privacy_audit_event (id, event_type, operation_id, record_count, created_at)
+             VALUES (?, 'authorization_revoked', ?, 0, ?)`,
+          ).run(id('privacy-audit'), claim.operation_id, now);
+        });
+        if (!finalized) throw new Error('生命周期 claim 已被其他进程推进；旧撤权操作不再写入。');
+        return { ...this.privacyStatus(), localTokensCleared: local.localTokensCleared, platformRevoked: local.providerRevoked };
+      } catch (error) {
+        const compensationFailures: unknown[] = [];
+        let compensated = false;
+        if (externalAttempted) {
+          try { compensated = this.compensatePrivacyLifecycleClaim(claim, snapshot); } catch (restoreError) { compensationFailures.push(restoreError); }
+          if (compensated) {
+            try {
+              const adapter = this.adapters.feishu as { restoreAuthorizationState?: (state: unknown) => Promise<void> };
+              if (adapter.restoreAuthorizationState) await adapter.restoreAuthorizationState(snapshot.adapterState);
+              if (snapshot.control.collection_status === 'running') await this.startFeishu({ refreshOwner: false });
+            } catch (restartError) { compensationFailures.push(restartError); }
+          }
+        }
+        if (!compensated && externalAttempted && !compensationFailures.length) {
+          try { this.markPrivacyLifecycleClaim(claim, 'recovery_required', error); } catch (claimError) { compensationFailures.push(claimError); }
+        }
+        throw compensationFailures.length
+          ? privacyFailure('撤销授权失败且补偿未完成；状态需要恢复。', [error, ...compensationFailures])
+          : error;
+      }
+    });
+  }
+
+  private privacyExportPayload(scope: PrivacyScope, exportedAt: string) {
+    const payload: Record<string, unknown> = { version: 1, exportedAt, scope };
+    if (scope === 'all' || scope === 'sources') {
+      payload.sources = this.database.raw.prepare(
+        `SELECT id, source_type, sender_name, content, owner_mentioned, completeness,
+                discovery_reason, occurred_at, captured_at
+         FROM source_event ORDER BY occurred_at, id`,
+      ).all();
+      payload.sourceRevisions = this.database.raw.prepare(
+        `SELECT id, source_event_id, revision_number, revision_kind, external_id, source_type,
+                conversation_id, sender_id, sender_name, content, owner_mentioned, source_url,
+                completeness, discovery_reason, metadata_json, occurred_at, captured_at,
+                owner_scope, revision_hash, created_at
+         FROM source_event_revision ORDER BY source_event_id, revision_number`,
+      ).all();
+      payload.sourceContexts = this.database.raw.prepare(
+        `SELECT id, source_event_id, context_type, document_type, source_version,
+                content_hash, status, freshness, completeness, truncated,
+                last_success_at, checked_at, created_at, updated_at
+         FROM source_context ORDER BY created_at, id`,
+      ).all();
+      payload.demandUnits = this.database.raw.prepare(
+        `SELECT id, anchor_source_event_id, unit_key, unit_kind, state, classification_revision,
+                reason, created_at, updated_at
+         FROM source_demand_unit ORDER BY created_at, id`,
+      ).all();
+    }
+    if (scope === 'all' || scope === 'tasks') {
+      payload.candidates = this.database.raw.prepare(
+        `SELECT id, source_event_id, demand_unit_id, title, proposer_name, background,
+                validation_question, describe, confidence, state, accepted_task_id,
+                merged_into_candidate_id, merged_at, deleted_at, created_at, updated_at
+         FROM candidate_request ORDER BY created_at, id`,
+      ).all();
+      payload.threads = this.database.raw.prepare(
+        `SELECT id, status, title, background, validation_question, describe, conversation_id,
+                active_task_id, primary_source_event_id, primary_reason, primary_confidence,
+                version, last_activity_at, created_at, updated_at
+         FROM requirement_thread ORDER BY created_at, id`,
+      ).all();
+      payload.tasks = this.database.raw.prepare(
+        `SELECT id, title, proposer_name, describe, status, schedule_at, planned_start_at,
+                planned_due_at, next_step, risk, waiting_reason, version, completed_at,
+                archived_at, deleted_at, record_state, thread_id, created_at, updated_at
+         FROM task ORDER BY created_at, id`,
+      ).all();
+      payload.references = this.database.raw.prepare(
+        `SELECT id, task_id, access_mode, created_at FROM reference_binding ORDER BY created_at, id`,
+      ).all();
+    }
+    if (scope === 'all' || scope === 'audit') {
+      payload.taskEvents = this.database.raw.prepare(
+        `SELECT id, task_id, event_type, actor_type, visibility, source_event_id,
+                demand_unit_id, occurred_at, recorded_at, version
+         FROM task_event ORDER BY recorded_at, id`,
+      ).all();
+      payload.aiDecisions = this.database.raw.prepare(
+        `SELECT id, source_event_id, demand_unit_id, candidate_id, is_data_request, confidence,
+                used_fallback, http_status, attempts, structured_mode, input_hash,
+                input_char_count, fallback_mode, latency_ms, created_at
+         FROM ai_decision_log ORDER BY created_at, id`,
+      ).all();
+      payload.aiDecisionSourceRevisions = this.database.raw.prepare(
+        `SELECT ai_decision_id, source_event_id, revision_id, source_order
+         FROM ai_decision_source_revision ORDER BY ai_decision_id, source_order`,
+      ).all();
+      payload.ownerDecisions = this.database.raw.prepare(
+        `SELECT id, source_event_id, source_revision, candidate_id, thread_id, task_id, action,
+                disposition, confidence, state, applied_task_version, applied_thread_version,
+                created_at, applied_at FROM owner_decision ORDER BY created_at, id`,
+      ).all();
+      payload.corrections = this.database.raw.prepare(
+        `SELECT id, task_id, candidate_id, source_event_id, demand_unit_id, correction_type,
+                visibility, operation, created_at FROM correction_event ORDER BY created_at, id`,
+      ).all();
+      payload.integrityGaps = this.database.raw.prepare(
+        `SELECT id, source_event_id, demand_unit_id, candidate_id, thread_id, task_id,
+                record_table, status, correction_event_id, created_at, updated_at
+         FROM data_integrity_gap ORDER BY created_at, id`,
+      ).all();
+    }
+    if (scope === 'all') {
+      // Export the relationship graph and operational state with explicit
+      // projections. Provider payloads, secrets, raw diagnostics and local
+      // absolute paths are intentionally excluded from the owner export.
+      payload.relationships = {
+        sourceDemandUnitSources: this.database.raw.prepare(
+          `SELECT demand_unit_id, source_event_id, source_key, source_role, sequence, created_at
+           FROM source_demand_unit_source ORDER BY created_at, demand_unit_id, source_event_id`,
+        ).all(),
+        threadSources: this.database.raw.prepare(
+          `SELECT thread_id, source_event_id, relation_type, confidence, source_role, created_at
+           FROM requirement_thread_source ORDER BY created_at, thread_id, source_event_id`,
+        ).all(),
+        threadUnits: this.database.raw.prepare(
+          `SELECT thread_id, demand_unit_id, relation_type, confidence, created_at
+           FROM requirement_thread_unit ORDER BY created_at, thread_id, demand_unit_id`,
+        ).all(),
+        taskSourceLinks: this.database.raw.prepare(
+          `SELECT task_id, source_event_id, demand_unit_id, relation_type, created_at
+           FROM task_source_link ORDER BY created_at, task_id, source_event_id, demand_unit_id`,
+        ).all(),
+        candidateRevisions: this.database.raw.prepare(
+          `SELECT id, candidate_id, source_event_id, demand_unit_id, ai_decision_id, source_revision,
+                  confidence, state, created_at
+           FROM candidate_revision ORDER BY created_at, id`,
+        ).all(),
+      };
+      payload.notifications = this.database.raw.prepare(
+        `SELECT id, task_id, task_event_id, candidate_id, notification_type, dedupe_key,
+                read_at, snoozed_until, archived_at, created_at
+         FROM notification ORDER BY created_at, id`,
+      ).all();
+      payload.reminders = this.database.raw.prepare(
+        `SELECT id, task_id, remind_at, relative_to, state, created_at
+         FROM reminder ORDER BY created_at, id`,
+      ).all();
+      payload.approvals = this.database.raw.prepare(
+        `SELECT id, task_id, action_type, status, created_at, decided_at
+         FROM approval ORDER BY created_at, id`,
+      ).all();
+      payload.outbox = this.database.raw.prepare(
+        `SELECT id, approval_id, action_type, status, idempotency_key, created_at, sent_at
+         FROM outbox ORDER BY created_at, id`,
+      ).all();
+      payload.runtime = {
+        jobs: this.database.raw.prepare(
+          `SELECT id, job_type, status, attempts, available_at, locked_until, lease_owner,
+                  max_attempts, retryable, backoff_seconds, cancel_requested_at, source_event_id,
+                  thread_id, task_id, trace_id, created_at, updated_at
+           FROM job ORDER BY created_at, id`,
+        ).all(),
+        checkpoints: this.database.raw.prepare(
+          `SELECT id, job_id, step, created_at FROM runtime_checkpoint ORDER BY created_at, id`,
+        ).all(),
+        toolCalls: this.database.raw.prepare(
+          `SELECT id, job_id, tool_name, policy, status, input_hash, started_at, finished_at
+           FROM runtime_tool_call ORDER BY started_at, id`,
+        ).all(),
+      };
+      payload.diagnostics = {
+        logs: this.database.raw.prepare(
+          `SELECT id, category, level, event_type, created_at FROM app_log ORDER BY created_at, id`,
+        ).all(),
+        health: this.database.raw.prepare(
+          `SELECT id, integration, status, latency_ms, checked_at FROM integration_health ORDER BY checked_at, id`,
+        ).all(),
+      };
+      payload.authorization = {
+        sources: this.database.raw.prepare(
+          `SELECT source_kind, enabled, status, requires_admin, requires_bot_in_chat,
+                  sync_mode, last_success_at, updated_at FROM information_source_state ORDER BY source_kind`,
+        ).all(),
+        monitorTargets: this.database.raw.prepare(
+          `SELECT id, target_kind, enabled, manual_excluded, read_policy, selection_source,
+                  access_status, last_discovered_at, last_resolved_at, last_success_at, created_at, updated_at
+           FROM feishu_monitor_target ORDER BY created_at, id`,
+        ).all(),
+        ownerStatus: this.database.raw.prepare(
+          `SELECT id, oauth_status, last_synced_at, created_at, updated_at
+           FROM owner_profile ORDER BY id`,
+        ).all(),
+      };
+    }
+    return payload;
+  }
+
+  exportPrivacyData(input: { scope?: PrivacyScope; format?: 'json'; idempotencyKey: string }) {
+    this.assertPrivacyOwnerAuthorization();
+    this.assertNoActivePrivacyLifecycleClaim();
+    const scope = input.scope ?? 'all';
+    const format = input.format ?? 'json';
+    assertPrivacyKey(input.idempotencyKey, '导出幂等键');
+    const existing = this.database.raw.prepare(
+      'SELECT id, scope, format, status, payload_json, payload_hash, record_count, completed_at FROM privacy_export WHERE idempotency_key = ?',
+    ).get(input.idempotencyKey) as {
+      id: string; scope: PrivacyScope; format: 'json'; status: string; payload_json: string | null;
+      payload_hash: string | null; record_count: number; completed_at: string | null;
+    } | undefined;
+    const exportId = existing?.id ?? id('privacy-export');
+    if (existing && (existing.scope !== scope || existing.format !== format)) {
+      throw new Error('导出幂等键已绑定不同范围或格式；请使用新的幂等键。');
+    }
+    if (existing?.status === 'completed' && existing.payload_json && existing.payload_hash) {
+      return {
+        id: existing.id,
+        scope: existing.scope,
+        format: existing.format,
+        status: 'completed' as const,
+        sha256: existing.payload_hash,
+        recordCount: existing.record_count,
+        data: JSON.parse(existing.payload_json) as Record<string, unknown>,
+      };
+    }
+    if (!existing) {
+      this.database.raw.prepare(
+        `INSERT INTO privacy_export (id, idempotency_key, scope, format, status, created_at)
+         VALUES (?, ?, ?, ?, 'running', ?)`,
+      ).run(exportId, input.idempotencyKey, scope, format, nowIso());
+    } else if (existing.status === 'failed') {
+      this.database.raw.prepare("UPDATE privacy_export SET status = 'running', error_code = NULL WHERE id = ?").run(exportId);
+    }
+    try {
+      const exportedAt = nowIso();
+      const data = this.privacyExportPayload(scope, exportedAt);
+      const serialized = JSON.stringify(data);
+      const recordCount = Object.values(data).reduce<number>((count, value) => count + (Array.isArray(value) ? value.length : 0), 0);
+      const payloadHash = privacyHash(data);
+      this.database.transaction(() => {
+        this.assertNoActivePrivacyLifecycleClaim(Date.parse(exportedAt));
+        this.database.raw.prepare(
+          `UPDATE privacy_export SET status = 'completed', payload_json = ?, payload_hash = ?, record_count = ?, completed_at = ?, error_code = NULL WHERE id = ?`,
+        ).run(JSON.stringify(data), payloadHash, recordCount, exportedAt, exportId);
+        this.database.raw.prepare(
+          `INSERT INTO privacy_audit_event (id, event_type, operation_id, export_id, record_count, proof_hash, created_at)
+           VALUES (?, 'export_completed', ?, ?, ?, ?, ?)`,
+        ).run(id('privacy-audit'), id('privacy-operation'), exportId, recordCount, payloadHash, exportedAt);
+      });
+      return { id: exportId, scope, format, status: 'completed' as const, sha256: payloadHash, recordCount, data: JSON.parse(serialized) as Record<string, unknown> };
+    } catch (error) {
+      this.database.raw.prepare("UPDATE privacy_export SET status = 'failed', error_code = 'PRIVACY_EXPORT_FAILED' WHERE id = ?").run(exportId);
+      throw error;
+    }
+  }
+
+  private assertPrivacyOwnerAuthorization() {
+    const owner = this.database.raw.prepare(
+      "SELECT open_id, oauth_status FROM owner_profile WHERE id = 'primary'",
+    ).get() as { open_id: string; oauth_status: string } | undefined;
+    if (!owner?.open_id) throw new PrivacyAuthorizationError(401, '当前没有可验证的系统主人身份。');
+    // `mock` is a deliberately explicit synthetic owner state used by the
+    // repository's rule-mock contract tests. A real desktop instance must
+    // reach the authorized state produced by the Feishu owner OAuth flow.
+    if (owner.oauth_status !== 'authorized' && !(this.config.nodeEnv === 'test' && owner.oauth_status === 'mock')) {
+      throw new PrivacyAuthorizationError(403, '系统主人授权状态不可用于此隐私操作。');
+    }
+    return owner.open_id;
+  }
+
+  requestPrivacyDeletion(input: { idempotencyKey: string; capabilityBinding: PrivacyCapabilityBinding }) {
+    const ownerOpenId = this.assertPrivacyOwnerAuthorization();
+    assertPrivacyKey(input.idempotencyKey, '删除幂等键');
+    const existing = this.database.raw.prepare(
+      'SELECT id, status, requested_at, confirmed_at, completed_at, proof_hash, deleted_record_count FROM privacy_deletion WHERE idempotency_key = ?',
+    ).get(input.idempotencyKey) as { id: string; status: string; requested_at: string; confirmed_at: string | null; completed_at: string | null; proof_hash: string | null; deleted_record_count: number } | undefined;
+    if (existing) return { deletionId: existing.id, status: existing.status, confirmationToken: null, requestedAt: existing.requested_at, confirmedAt: existing.confirmed_at, completedAt: existing.completed_at, proofHash: existing.proof_hash, deletedRecordCount: existing.deleted_record_count };
+    const control = this.privacyControl();
+    const deletionId = id('privacy-deletion');
+    const confirmationToken = randomUUID() + randomUUID();
+    const now = nowIso();
+    this.database.transaction(() => {
+      this.assertNoActivePrivacyLifecycleClaim(Date.parse(now));
+      this.database.raw.prepare(
+        `INSERT INTO privacy_deletion
+         (id, idempotency_key, confirmation_hash, owner_open_id, capability_token_hash,
+          capability_csrf_hash, capability_origin, intent, expected_version, status, requested_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_confirmation', ?)`,
+      ).run(
+        deletionId,
+        input.idempotencyKey,
+        privacyConfirmationHash(confirmationToken, ownerOpenId, deletionId, input.capabilityBinding),
+        ownerOpenId,
+        input.capabilityBinding.tokenHash,
+        input.capabilityBinding.csrfTokenHash,
+        input.capabilityBinding.origin,
+        PRIVACY_DELETION_INTENT,
+        control.version,
+        now,
+      );
+      this.database.raw.prepare(
+        `INSERT INTO privacy_audit_event (id, event_type, operation_id, deletion_id, record_count, created_at)
+         VALUES (?, 'deletion_requested', ?, ?, 0, ?)`,
+      ).run(id('privacy-audit'), id('privacy-operation'), deletionId, now);
+    });
+    return { deletionId, status: 'pending_confirmation' as const, confirmationToken, requestedAt: now, confirmedAt: null, completedAt: null, proofHash: null, deletedRecordCount: 0 };
+  }
+
+  /**
+   * Stage the complete system-owned task-memory projection before SQLite
+   * business rows are touched. The root and every path are validated first;
+   * unknown files, traversal, symlinks and junctions fail closed. A whole
+   * `tasks` directory is then moved into a quarantine directory so rollback
+   * restores the original bytes without creating a second content copy.
+   */
+  private stagePrivacyTaskMemoryPurge(): PrivacyTaskMemoryPurgeStage {
+    const rows = this.database.raw.prepare(
+      'SELECT root_path, relative_path, managed_files_json FROM memory_projection ORDER BY root_path, relative_path',
+    ).all() as Array<{ root_path: string; relative_path: string; managed_files_json: string }>;
+    const roots = new Map<string, { root: string; projectionDirs: Set<string>; files: Map<string, Set<string>> }>();
+    const configuredRoot = this.assertTaskMemoryRootSafe(resolve(this.config.taskMemoryRoot));
+    const configuredRootKey = process.platform === 'win32' ? configuredRoot.toLowerCase() : configuredRoot;
+    roots.set(configuredRootKey, { root: configuredRoot, projectionDirs: new Set<string>(), files: new Map<string, Set<string>>() });
+    const segmentPattern = /^[\p{L}\p{N}][\p{L}\p{N}._-]{0,200}$/u;
+    for (const row of rows) {
+      const root = this.assertTaskMemoryRootSafe(resolve(row.root_path));
+      if (!this.samePath(root, configuredRoot)) {
+        throw new Error('任务记忆投影根目录已变化，已拒绝硬删除。');
+      }
+      const rootKey = process.platform === 'win32' ? root.toLowerCase() : root;
+      const relativePath = this.normalizeManagedProjectionFile(row.relative_path);
+      const pathParts = relativePath.split('/');
+      if (pathParts.length !== 2 || pathParts[0] !== 'tasks' || !segmentPattern.test(pathParts[1]!)) {
+        throw new Error('任务记忆投影目录不符合受控路径 grammar，已拒绝硬删除。');
+      }
+      let files: unknown;
+      try {
+        files = JSON.parse(row.managed_files_json) as unknown;
+      } catch {
+        throw new Error('任务记忆托管文件清单不是有效 JSON，已拒绝硬删除。');
+      }
+      if (!Array.isArray(files)) {
+        throw new Error('任务记忆托管文件清单不是受控数组，已拒绝硬删除。');
+      }
+      const managedFiles = new Set<string>();
+      for (const file of files) {
+        if (typeof file !== 'string') throw new Error('任务记忆托管文件清单包含未知项，已拒绝硬删除。');
+        const normalized = this.normalizeManagedProjectionFile(file);
+        const parts = normalized.split('/');
+        if (!parts.every((part) => segmentPattern.test(part)) || parts[0] === 'tasks') {
+          throw new Error('任务记忆托管文件清单不符合受控路径 grammar，已拒绝硬删除。');
+        }
+        if (parts.length > 1 && parts[0] !== 'updates') {
+          throw new Error('任务记忆托管文件目录不符合受控路径 grammar，已拒绝硬删除。');
+        }
+        managedFiles.add(normalized);
+      }
+      const existing = roots.get(rootKey) ?? { root, projectionDirs: new Set<string>(), files: new Map<string, Set<string>>() };
+      existing.projectionDirs.add(relativePath);
+      existing.files.set(relativePath, managedFiles);
+      roots.set(rootKey, existing);
+    }
+
+    const staged: Array<{ root: string; original: string; temporary: string }> = [];
+    let count = 0;
+    try {
+      for (const entry of roots.values()) {
+        const root = entry.root;
+        if (!existsSync(root)) continue;
+        const rootStat = lstatSync(root);
+        if (rootStat.isSymbolicLink() || !rootStat.isDirectory() || !this.samePath(realpathSync(root), root)) {
+          throw new Error('任务记忆根目录不是受控普通目录，已拒绝硬删除。');
+        }
+        const rootEntries = readdirSync(root);
+        for (const name of rootEntries) {
+          if (name !== 'tasks' || !segmentPattern.test(name)) {
+            throw new Error('任务记忆根目录包含未知文件或目录，已拒绝硬删除。');
+          }
+        }
+        const tasks = join(root, 'tasks');
+        if (!existsSync(tasks)) continue;
+        const tasksStat = lstatSync(tasks);
+        if (tasksStat.isSymbolicLink() || !tasksStat.isDirectory() || !this.samePath(realpathSync(tasks), tasks)) {
+          throw new Error('任务记忆 tasks 目录不是受控普通目录，已拒绝硬删除。');
+        }
+        for (const taskDirName of readdirSync(tasks)) {
+          if (!segmentPattern.test(taskDirName)) throw new Error('任务记忆任务目录名称不符合受控路径 grammar，已拒绝硬删除。');
+          const relativeTaskDir = `tasks/${taskDirName}`;
+          const expectedFiles = entry.files.get(relativeTaskDir);
+          if (!expectedFiles) throw new Error('任务记忆包含未知任务目录，已拒绝硬删除。');
+          const taskDir = join(tasks, taskDirName);
+          const taskStat = lstatSync(taskDir);
+          if (taskStat.isSymbolicLink() || !taskStat.isDirectory() || !this.samePath(realpathSync(taskDir), taskDir)) {
+            throw new Error('任务记忆任务目录包含符号链接或 junction，已拒绝硬删除。');
+          }
+          const visit = (directory: string, relativeDirectory: string) => {
+            for (const childName of readdirSync(directory)) {
+              if (!segmentPattern.test(childName)) throw new Error('任务记忆文件名称不符合受控路径 grammar，已拒绝硬删除。');
+              const child = join(directory, childName);
+              const relativeChild = `${relativeDirectory}/${childName}`;
+              const childStat = lstatSync(child);
+              if (childStat.isSymbolicLink() || !this.samePath(realpathSync(child), child)) {
+                throw new Error('任务记忆不能经过符号链接或 junction，已拒绝硬删除。');
+              }
+              if (childStat.isDirectory()) {
+                if (relativeChild !== `${relativeTaskDir}/updates`) throw new Error('任务记忆包含未知子目录，已拒绝硬删除。');
+                visit(child, relativeChild);
+                continue;
+              }
+              if (!childStat.isFile() || childStat.nlink !== 1) throw new Error('任务记忆包含非受控普通文件，已拒绝硬删除。');
+              const managedRelative = relativeChild.slice(`${relativeTaskDir}/`.length);
+              if (!expectedFiles.has(managedRelative)) throw new Error('任务记忆包含未知文件，已拒绝硬删除。');
+              count += 1;
+            }
+          };
+          visit(taskDir, relativeTaskDir);
+        }
+        const quarantine = join(root, `.privacy-delete-${randomUUID().replaceAll('-', '')}`);
+        mkdirSync(quarantine);
+        const temporary = join(quarantine, 'tasks');
+        renameSync(tasks, temporary);
+        staged.push({ root, original: tasks, temporary });
+      }
+    } catch (error) {
+      const rollbackFailures: unknown[] = [];
+      for (const item of [...staged].reverse()) {
+        try {
+          if (existsSync(item.temporary)) {
+            if (existsSync(item.original)) throw new Error('任务记忆原路径在补偿期间重新出现。');
+            renameSync(item.temporary, item.original);
+          }
+          const quarantine = dirname(item.temporary);
+          if (existsSync(quarantine)) rmSync(quarantine, { recursive: true, force: false });
+        } catch (rollbackError) {
+          rollbackFailures.push(rollbackError);
+        }
+      }
+      if (rollbackFailures.length) throw privacyFailure('任务记忆暂存失败且补偿未完成；需要恢复任务记忆投影。', [error, ...rollbackFailures]);
+      throw error;
+    }
+    const proofHash = privacyHash({
+      count,
+      staged: staged.map((item) => ({ root: item.root, relative: relative(item.root, item.original).replaceAll('\\', '/') })),
+    });
+    let finalized = false;
+    return {
+      count,
+      proofHash,
+      finalize: () => {
+        if (finalized) return;
+        for (const item of staged) {
+          const quarantine = dirname(item.temporary);
+          if (existsSync(quarantine)) rmSync(quarantine, { recursive: true, force: false });
+        }
+        finalized = true;
+      },
+      rollback: () => {
+        if (finalized) return;
+        const failures: unknown[] = [];
+        for (const item of [...staged].reverse()) {
+          try {
+            if (existsSync(item.temporary)) {
+              if (existsSync(item.original)) throw new Error('任务记忆原路径已被其他文件占用。');
+              renameSync(item.temporary, item.original);
+            }
+            const quarantine = dirname(item.temporary);
+            if (existsSync(quarantine)) rmSync(quarantine, { recursive: true, force: false });
+          } catch (rollbackError) {
+            failures.push(rollbackError);
+          }
+        }
+        if (failures.length) throw privacyFailure('任务记忆投影补偿未完成；需要恢复任务记忆投影。', failures);
+      },
+    };
+  }
+
+  private assertPrivacyDeletionContract() {
+    const tables = (this.database.raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>).map((row) => row.name);
+    const unknown = tables.filter((table) => !PRIVACY_PRESERVED_TABLES.has(table) && !(PRIVACY_PURGE_TABLES as readonly string[]).includes(table));
+    if (unknown.length) throw new Error('数据库包含未纳入隐私删除合同的表；已拒绝删除。');
+  }
+
+  private claimPrivacyDeletion(input: {
+    deletionId: string;
+    confirmationToken: string;
+    expectedVersion?: number;
+    capabilityBinding: PrivacyCapabilityBinding;
+  }) {
+    const ownerOpenId = this.assertPrivacyOwnerAuthorization();
+    const binding = this.lifecycleCapabilityBinding(input.capabilityBinding);
+    assertPrivacyKey(input.deletionId, '删除请求 ID');
+    if (!input.confirmationToken || input.confirmationToken.length > 200) throw new Error('删除确认凭证格式不正确。');
+    return this.database.transaction(() => {
+      // Complete read/CAS gate: no runtime stop, token revoke, filesystem
+      // staging or provider call happens before this transaction succeeds.
+      const control = this.privacyControl();
+      const request = this.database.raw.prepare(
+        `SELECT id, confirmation_hash, owner_open_id, capability_token_hash,
+                capability_csrf_hash, capability_origin, intent,
+                expected_version, status, requested_at
+         FROM privacy_deletion WHERE id = ?`,
+      ).get(input.deletionId) as {
+        id: string;
+        confirmation_hash: string;
+        owner_open_id: string;
+        capability_token_hash: string;
+        capability_csrf_hash: string;
+        capability_origin: 'app://local';
+        intent: string;
+        expected_version: number;
+        status: string;
+        requested_at: string;
+      } | undefined;
+      if (!request || request.status !== 'pending_confirmation') throw new Error('删除请求不存在或已处理。');
+      if (
+        request.owner_open_id !== ownerOpenId
+        || request.capability_token_hash !== input.capabilityBinding.tokenHash
+        || request.capability_csrf_hash !== input.capabilityBinding.csrfTokenHash
+        || request.capability_origin !== input.capabilityBinding.origin
+        || request.intent !== PRIVACY_DELETION_INTENT
+      ) {
+        throw new Error('删除请求主人、操作能力或意图绑定不匹配。');
+      }
+      if (request.confirmation_hash !== privacyConfirmationHash(input.confirmationToken, ownerOpenId, input.deletionId, input.capabilityBinding)) {
+        throw new Error('删除二次确认不匹配。');
+      }
+      const requestedAt = Date.parse(request.requested_at);
+      const nowMs = Date.now();
+      if (!Number.isFinite(requestedAt) || nowMs - requestedAt > 15 * 60 * 1_000 || nowMs < requestedAt - 60 * 1_000) {
+        throw new Error('删除确认凭证已过期，请重新发起删除请求。');
+      }
+      const expectedVersion = input.expectedVersion ?? request.expected_version;
+      if (expectedVersion !== control.version || request.expected_version !== control.version) {
+        throw new Error('隐私状态已发生变化，请重新发起删除确认。');
+      }
+      // Hard delete participates in the same conflict domain as start/stop/
+      // revoke; no owner-sensitive mutation may bypass another active claim.
+      const reclaimedClaims = this.assertNoActivePrivacyLifecycleClaim(nowMs);
+      const reclaimedParent = reclaimedClaims.find((candidate) => candidate.claimed_version === control.version);
+      const sourceStates = this.database.raw.prepare(
+        `SELECT source_kind, enabled, status, last_success_at, last_error, updated_at
+         FROM information_source_state ORDER BY source_kind`,
+      ).all() as Array<Record<string, unknown>>;
+      const initialSnapshot: PrivacyCollectionSnapshot = { control, sourceStates };
+      const operationId = id('privacy-lifecycle');
+      const operationToken = randomUUID().replaceAll('-', '');
+      const claimedVersion = control.version + 1;
+      const claimedAt = nowIso();
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1_000).toISOString();
+      const lifecycleInserted = this.database.raw.prepare(
+        `INSERT INTO privacy_lifecycle_claim
+         (operation_id, operation_token, operation_type, owner_open_id,
+          capability_token_hash, capability_csrf_hash, capability_origin, intent,
+          expected_version, claimed_version, status, expires_at, heartbeat_at,
+          snapshot_json, reclaimed_from_operation_id, reclaimed_from_operation_token,
+          reclaimed_from_expected_version, reclaimed_from_claimed_version, reclaim_count,
+          created_at, updated_at)
+         VALUES (?, ?, 'hard_delete', ?, ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        operationId,
+        operationToken,
+        ownerOpenId,
+        binding.tokenHash,
+        binding.csrfTokenHash,
+        binding.origin,
+        PRIVACY_DELETION_INTENT,
+        control.version,
+        claimedVersion,
+        expiresAt,
+        claimedAt,
+        JSON.stringify(initialSnapshot),
+        reclaimedParent?.operation_id ?? null,
+        reclaimedParent?.operation_token ?? null,
+        reclaimedParent?.expected_version ?? null,
+        reclaimedParent?.claimed_version ?? null,
+        reclaimedParent ? reclaimedParent.reclaim_count + 1 : 0,
+        claimedAt,
+        claimedAt,
+      );
+      if (lifecycleInserted.changes !== 1) throw new Error('隐私删除 lifecycle claim 无法持久化。');
+      const advanced = this.database.raw.prepare(
+        `UPDATE privacy_control SET version = version + 1, updated_at = ?
+         WHERE singleton_key = 1 AND version = ?`,
+      ).run(claimedAt, control.version);
+      if (advanced.changes !== 1) throw new Error('隐私删除 lifecycle claim 版本 CAS 失败。');
+      const confirmedAt = nowIso();
+      const marked = this.database.raw.prepare(
+        `UPDATE privacy_deletion SET status = 'running', confirmed_at = ?, error_code = NULL
+         WHERE id = ? AND status = 'pending_confirmation' AND expected_version = ?`,
+      ).run(confirmedAt, input.deletionId, control.version);
+      if (marked.changes !== 1) throw new Error('删除请求已被其他操作处理。');
+      const lifecycleClaim = this.database.raw.prepare(
+        'SELECT * FROM privacy_lifecycle_claim WHERE operation_id = ? AND operation_token = ?',
+      ).get(operationId, operationToken) as PrivacyLifecycleClaimRow;
+      return { ownerOpenId, control, confirmedAt, lifecycleClaim, initialSnapshot };
+    });
+  }
+
+  private resetPrivacyDeletionClaim(deletionId: string) {
+    this.database.transaction(() => {
+      const reset = this.database.raw.prepare(
+        `UPDATE privacy_deletion
+         SET status = 'pending_confirmation', confirmed_at = NULL, proof_hash = NULL,
+             deleted_record_count = 0, completed_at = NULL, error_code = NULL
+         WHERE id = ? AND status = 'running'`,
+      ).run(deletionId);
+      if (reset.changes !== 1) throw new Error('删除请求状态无法安全恢复。');
+    });
+  }
+
+  private markPrivacyDeletionRecoveryRequired(deletionId: string, errorCode: string, recordCount = 0, proofHash: string | null = null) {
+    this.database.transaction(() => {
+      const failed = this.database.raw.prepare(
+        `UPDATE privacy_deletion SET status = 'failed', error_code = ?, proof_hash = ?, deleted_record_count = ?
+         WHERE id = ? AND status = 'running'`,
+      ).run(errorCode, proofHash, recordCount, deletionId);
+      if (failed.changes !== 1) throw new Error('删除请求恢复状态无法持久化。');
+      this.database.raw.prepare(
+        `INSERT INTO privacy_audit_event (id, event_type, operation_id, deletion_id, record_count, proof_hash, created_at)
+         VALUES (?, 'deletion_failed', ?, ?, ?, ?, ?)`,
+      ).run(id('privacy-audit'), id('privacy-operation'), deletionId, recordCount, proofHash, nowIso());
+    });
+  }
+
+  async confirmPrivacyDeletion(input: {
+    deletionId: string;
+    confirmationToken: string;
+    expectedVersion?: number;
+    capabilityBinding: PrivacyCapabilityBinding;
+  }) {
+    // All token, owner, capability, intent, expiry, replay, status, schema
+    // and version checks happen before any provider/runtime side effect.
+    const deletionClaim = this.claimPrivacyDeletion(input);
+    const lifecycleClaim = deletionClaim.lifecycleClaim;
+    const initialSnapshot = deletionClaim.initialSnapshot;
+    let backupPurge: ReturnType<AppDatabase['stagePrivacyBackupPurge']> | undefined;
+    let taskMemoryPurge: PrivacyTaskMemoryPurgeStage | undefined;
+    try {
+      this.assertPrivacyDeletionContract();
+      backupPurge = this.database.stagePrivacyBackupPurge();
+      taskMemoryPurge = this.stagePrivacyTaskMemoryPurge();
+    } catch (error) {
+      const rollbackFailures: unknown[] = [];
+      try { taskMemoryPurge?.rollback(); } catch (rollbackError) { rollbackFailures.push(rollbackError); }
+      try { backupPurge?.rollback(); } catch (rollbackError) { rollbackFailures.push(rollbackError); }
+      try {
+        if (rollbackFailures.length || (error instanceof Error && error.message.includes('数据库包含未纳入隐私删除合同'))) {
+          this.markPrivacyDeletionRecoveryRequired(input.deletionId, rollbackFailures.length ? 'PRIVACY_DELETE_RECOVERY_REQUIRED' : 'PRIVACY_DELETE_FAILED');
+          this.markPrivacyLifecycleRecoveryRequired(lifecycleClaim, error);
+        } else {
+          const compensated = this.compensatePrivacyLifecycleClaim(lifecycleClaim, initialSnapshot);
+          if (!compensated) this.markPrivacyLifecycleRecoveryRequired(lifecycleClaim, error);
+          this.resetPrivacyDeletionClaim(input.deletionId);
+        }
+      } catch (stateError) {
+        rollbackFailures.push(stateError);
+      }
+      throw rollbackFailures.length
+        ? privacyFailure('隐私删除暂存失败且补偿未完成；需要恢复后才能继续。', [error, ...rollbackFailures])
+        : error;
+    }
+
+    let authorizationSnapshot: PrivacyAuthorizationSnapshot;
+    try {
+      authorizationSnapshot = await this.capturePrivacyAuthorizationSnapshot();
+    } catch (error) {
+      const rollbackFailures: unknown[] = [];
+      try { taskMemoryPurge.rollback(); } catch (rollbackError) { rollbackFailures.push(rollbackError); }
+      try { backupPurge.rollback(); } catch (rollbackError) { rollbackFailures.push(rollbackError); }
+      try {
+        if (rollbackFailures.length) {
+          this.markPrivacyDeletionRecoveryRequired(input.deletionId, 'PRIVACY_DELETE_RECOVERY_REQUIRED');
+          this.markPrivacyLifecycleRecoveryRequired(lifecycleClaim, error);
+        } else {
+          const compensated = this.compensatePrivacyLifecycleClaim(lifecycleClaim, initialSnapshot);
+          if (!compensated) this.markPrivacyLifecycleRecoveryRequired(lifecycleClaim, error);
+          this.resetPrivacyDeletionClaim(input.deletionId);
+        }
+      } catch (stateError) {
+        rollbackFailures.push(stateError);
+      }
+      throw rollbackFailures.length
+        ? privacyFailure('隐私删除准备失败且补偿未完成；需要恢复后才能继续。', [error, ...rollbackFailures])
+        : error;
+    }
+    let local: { localTokensCleared: boolean; providerRevoked: boolean };
+    try {
+      // A throwing stop/revoke implementation may have partially changed
+      // runtime state, so compensation is attempted for every call attempt.
+      this.renewPrivacyLifecycleClaim(lifecycleClaim);
+      await this.stopFeishu(lifecycleClaim);
+      const revoke = (this.adapters.feishu as { revokeAuthorization?: () => Promise<{ localTokensCleared: boolean; providerRevoked: boolean }> }).revokeAuthorization;
+      this.renewPrivacyLifecycleClaim(lifecycleClaim);
+      local = revoke ? await revoke.call(this.adapters.feishu) : { localTokensCleared: false, providerRevoked: false };
+    } catch (error) {
+      const rollbackFailures: unknown[] = [];
+      try { taskMemoryPurge?.rollback(); } catch (rollbackError) { rollbackFailures.push(rollbackError); }
+      try { backupPurge?.rollback(); } catch (rollbackError) { rollbackFailures.push(rollbackError); }
+      const compensationFailures: unknown[] = [];
+      let compensated = false;
+      try { compensated = this.compensatePrivacyLifecycleClaim(lifecycleClaim, authorizationSnapshot); } catch (restoreError) { compensationFailures.push(restoreError); }
+      if (compensated) {
+        try {
+          const adapter = this.adapters.feishu as { restoreAuthorizationState?: (state: unknown) => Promise<void> };
+          if (adapter.restoreAuthorizationState) await adapter.restoreAuthorizationState(authorizationSnapshot.adapterState);
+          if (authorizationSnapshot.control.collection_status === 'running') await this.startFeishu({ refreshOwner: false });
+        } catch (restartError) { compensationFailures.push(restartError); }
+      }
+      try {
+        if (rollbackFailures.length || compensationFailures.length || !compensated) {
+          this.markPrivacyDeletionRecoveryRequired(input.deletionId, 'PRIVACY_DELETE_RECOVERY_REQUIRED');
+          this.markPrivacyLifecycleRecoveryRequired(lifecycleClaim, error);
+        } else this.resetPrivacyDeletionClaim(input.deletionId);
+      } catch (stateError) {
+        compensationFailures.push(stateError);
+      }
+      throw rollbackFailures.length || compensationFailures.length
+        ? privacyFailure('隐私撤权失败且补偿未完成；需要恢复后才能继续。', [error, ...rollbackFailures, ...compensationFailures])
+        : error;
+    }
+
+    const committedAt = nowIso();
+    let proofHash = '';
+    let deletedRecordCount = 0;
+    try {
+      const committed = this.database.transaction(() => {
+        const control = this.privacyControl();
+        const currentClaim = this.database.raw.prepare(
+          'SELECT * FROM privacy_lifecycle_claim WHERE operation_id = ? AND operation_token = ?',
+        ).get(lifecycleClaim.operation_id, lifecycleClaim.operation_token) as PrivacyLifecycleClaimRow | undefined;
+        if (!currentClaim || currentClaim.status !== 'claimed' || currentClaim.claimed_version !== control.version
+          || currentClaim.expected_version !== authorizationSnapshot.control.version - 1) {
+          throw new Error('隐私删除 lifecycle claim 已被其他进程推进，请重新发起删除确认。');
+        }
+        let deleted = 0;
+        for (const table of PRIVACY_PURGE_TABLES) {
+          deleted += (this.database.raw.prepare(`DELETE FROM ${table}`).run() as { changes: number }).changes;
+        }
+        this.database.raw.prepare("UPDATE privacy_backup SET status = 'rejected', restored_at = NULL").run();
+        const proof = {
+          deletionId: input.deletionId,
+          deletedRecordCount: deleted,
+          memoryFileCount: taskMemoryPurge?.count ?? 0,
+          memoryProofHash: taskMemoryPurge?.proofHash ?? null,
+          completedAt: committedAt,
+          schemaVersion: CURRENT_SCHEMA_VERSION,
+        };
+        const hash = privacyHash(proof);
+        const updatedControl = this.database.raw.prepare(
+          `UPDATE privacy_control SET collection_status = 'stopped', oauth_status = 'revoked', retention_status = 'paused', version = version + 1, updated_at = ? WHERE singleton_key = 1 AND version = ?`,
+        ).run(committedAt, control.version);
+        if (updatedControl.changes !== 1) throw new Error('隐私状态已被其他操作更新，请重新发起删除确认。');
+        const updatedDeletion = this.database.raw.prepare(
+          `UPDATE privacy_deletion SET proof_hash = ?, deleted_record_count = ?, error_code = NULL WHERE id = ? AND status = 'running'`,
+        ).run(hash, deleted, input.deletionId);
+        if (updatedDeletion.changes !== 1) throw new Error('删除请求状态已被其他操作更新。');
+        const updatedClaim = this.database.raw.prepare(
+          `UPDATE privacy_lifecycle_claim
+           SET status = 'committed', final_version = ?, heartbeat_at = ?, updated_at = ?
+           WHERE operation_id = ? AND operation_token = ? AND status = 'claimed'
+             AND claimed_version = ?`,
+        ).run(control.version + 1, committedAt, committedAt, lifecycleClaim.operation_id, lifecycleClaim.operation_token, control.version);
+        if (updatedClaim.changes !== 1) throw new Error('隐私删除 lifecycle claim finalize CAS 失败。');
+        return { proofHash: hash, deletedRecordCount: deleted };
+      });
+      proofHash = committed.proofHash;
+      deletedRecordCount = committed.deletedRecordCount;
+    } catch (error) {
+      const rollbackFailures: unknown[] = [];
+      try { taskMemoryPurge.rollback(); } catch (rollbackError) { rollbackFailures.push(rollbackError); }
+      try { backupPurge.rollback(); } catch (rollbackError) { rollbackFailures.push(rollbackError); }
+      let compensated = false;
+      try { compensated = this.compensatePrivacyLifecycleClaim(lifecycleClaim, authorizationSnapshot); } catch (restoreError) { rollbackFailures.push(restoreError); }
+      if (compensated) {
+        try {
+          const adapter = this.adapters.feishu as { restoreAuthorizationState?: (state: unknown) => Promise<void> };
+          if (adapter.restoreAuthorizationState) await adapter.restoreAuthorizationState(authorizationSnapshot.adapterState);
+          if (authorizationSnapshot.control.collection_status === 'running') await this.startFeishu({ refreshOwner: false });
+        } catch (restartError) { rollbackFailures.push(restartError); }
+      }
+      try {
+        if (rollbackFailures.length || !compensated) {
+          this.markPrivacyDeletionRecoveryRequired(input.deletionId, 'PRIVACY_DELETE_RECOVERY_REQUIRED');
+          this.markPrivacyLifecycleRecoveryRequired(lifecycleClaim, error);
+        } else this.resetPrivacyDeletionClaim(input.deletionId);
+      } catch (stateError) {
+        rollbackFailures.push(stateError);
+      }
+      throw rollbackFailures.length
+        ? privacyFailure('隐私删除提交失败且补偿未完成；需要恢复后才能继续。', [error, ...rollbackFailures])
+        : error;
+    }
+
+    try {
+      // SQLite commit is proven; only now may quarantine content be removed.
+      // A partial finalize stays recoverable and is recorded durably below.
+      taskMemoryPurge.finalize();
+      backupPurge.finalize();
+    } catch (error) {
+      let stateError: unknown;
+      try {
+        this.markPrivacyDeletionRecoveryRequired(input.deletionId, 'PRIVACY_DELETE_CLEANUP_PENDING', deletedRecordCount, proofHash);
+        this.markPrivacyLifecycleRecoveryRequired(lifecycleClaim, error);
+      } catch (markError) { stateError = markError; }
+      throw stateError ? privacyFailure('隐私删除已提交但文件清理未完成；需要恢复。', [error, stateError]) : error;
+    }
+
+    try {
+      this.database.transaction(() => {
+        const completed = this.database.raw.prepare(
+          `UPDATE privacy_deletion SET status = 'completed', completed_at = ?, error_code = NULL WHERE id = ? AND status = 'running'`,
+        ).run(committedAt, input.deletionId);
+        if (completed.changes !== 1) throw new Error('删除请求完成状态无法持久化。');
+        this.database.raw.prepare(
+          `INSERT INTO privacy_audit_event (id, event_type, operation_id, deletion_id, record_count, proof_hash, created_at)
+           VALUES (?, 'deletion_completed', ?, ?, ?, ?, ?)`,
+        ).run(id('privacy-audit'), id('privacy-operation'), input.deletionId, deletedRecordCount, proofHash, committedAt);
+      });
+    } catch (error) {
+      let stateError: unknown;
+      try {
+        this.markPrivacyDeletionRecoveryRequired(input.deletionId, 'PRIVACY_DELETE_FINALIZE_COMMIT_PENDING', deletedRecordCount, proofHash);
+        this.markPrivacyLifecycleRecoveryRequired(lifecycleClaim, error);
+      } catch (markError) { stateError = markError; }
+      throw stateError ? privacyFailure('隐私删除文件已清理但完成审计未持久化；需要恢复。', [error, stateError]) : error;
+    }
+    return { ...this.privacyStatus(), proofHash, deletedRecordCount, deletedMemoryFileCount: taskMemoryPurge.count, localTokensCleared: local.localTokensCleared, platformRevoked: local.providerRevoked };
+  }
+
+  updatePrivacyRetention(input: { expectedVersion?: number; sourceDays?: number; derivedDays?: number; diagnosticsDays?: number; backupCount?: number }) {
+    this.assertPrivacyOwnerAuthorization();
+    this.assertNoActivePrivacyLifecycleClaim();
+    const now = nowIso();
+    this.database.transaction(() => {
+      this.assertNoActivePrivacyLifecycleClaim(Date.parse(now));
+      const control = this.privacyControl();
+      const expected = input.expectedVersion ?? control.version;
+      const current = this.database.raw.prepare('SELECT source_days, derived_days, diagnostics_days, backup_count FROM privacy_retention_policy WHERE singleton_key = 1').get() as { source_days: number; derived_days: number; diagnostics_days: number; backup_count: number };
+      const values = {
+        sourceDays: input.sourceDays ?? current.source_days,
+        derivedDays: input.derivedDays ?? current.derived_days,
+        diagnosticsDays: input.diagnosticsDays ?? current.diagnostics_days,
+        backupCount: input.backupCount ?? current.backup_count,
+      };
+      if (values.sourceDays < 1 || values.sourceDays > 3650 || values.derivedDays < 1 || values.derivedDays > 3650 || values.diagnosticsDays < 1 || values.diagnosticsDays > 365 || values.backupCount < 1 || values.backupCount > 32) {
+        throw new Error('留存策略超出受控范围。');
+      }
+      const updated = this.database.raw.prepare(
+        `UPDATE privacy_retention_policy SET source_days = ?, derived_days = ?, diagnostics_days = ?, backup_count = ?, updated_at = ? WHERE singleton_key = 1`,
+      ).run(values.sourceDays, values.derivedDays, values.diagnosticsDays, values.backupCount, now);
+      if (updated.changes !== 1) throw new Error('留存策略不存在。');
+      const versioned = this.database.raw.prepare('UPDATE privacy_control SET version = version + 1, updated_at = ? WHERE singleton_key = 1 AND version = ?').run(now, expected);
+      if (versioned.changes !== 1) throw new Error('隐私状态已被其他操作更新，请刷新后重试。');
+    });
+    return this.privacyStatus();
+  }
+
+  createPrivacyBackup() {
+    this.assertPrivacyOwnerAuthorization();
+    this.assertNoActivePrivacyLifecycleClaim();
+    const backup = this.database.createPrivacyBackup();
+    const now = nowIso();
+    const backupId = id('privacy-backup');
+    try {
+      this.database.transaction(() => {
+        this.assertNoActivePrivacyLifecycleClaim(Date.parse(now));
+        this.database.raw.prepare(
+          `INSERT INTO privacy_backup (id, backup_file, schema_version, sha256, status, created_at)
+           VALUES (?, ?, ?, ?, 'created', ?)`,
+        ).run(backupId, backup.fileName, backup.schemaVersion, backup.sha256, now);
+        this.database.raw.prepare(
+          `INSERT INTO privacy_audit_event (id, event_type, operation_id, backup_id, record_count, proof_hash, created_at)
+           VALUES (?, 'backup_created', ?, ?, 0, ?, ?)`,
+        ).run(id('privacy-audit'), id('privacy-operation'), backupId, backup.sha256, now);
+      });
+      return { id: backupId, ...backup };
+    } catch (error) {
+      try {
+        this.database.discardPrivacyBackup(backup.fileName);
+      } catch (discardError) {
+        try {
+          this.database.markPrivacyBackupCleanupRequired(backup.fileName, discardError);
+        } catch (markerError) {
+          throw privacyFailure('备份元数据失败且清理与恢复标记均未完成。', [error, discardError, markerError]);
+        }
+        throw privacyFailure('备份元数据失败；残留已登记为待清理状态。', [error, discardError]);
+      }
+      throw error;
+    }
+  }
+
+  verifyPrivacyBackup(fileName: string) {
+    this.assertPrivacyOwnerAuthorization();
+    this.assertNoActivePrivacyLifecycleClaim();
+    const verified = this.database.verifyPrivacyBackup(fileName);
+    const registered = this.database.raw.prepare(
+      'SELECT id, status, sha256 FROM privacy_backup WHERE backup_file = ?',
+    ).get(verified.fileName) as { id: string; status: 'created' | 'restored' | 'rejected'; sha256: string } | undefined;
+    if (!registered || registered.sha256 !== verified.sha256 || registered.status === 'rejected') {
+      throw new DatabaseUpgradeError('restore', '备份未登记或状态不允许验证；已拒绝继续。');
+    }
+    return verified;
+  }
+
+  restorePrivacyBackup(input: { fileName: string; expectedVersion?: number }) {
+    this.assertPrivacyOwnerAuthorization();
+    this.assertNoActivePrivacyLifecycleClaim();
+    if (!input.fileName || input.fileName.length > 255 || input.fileName !== input.fileName.split(/[\\/]/u).at(-1)) {
+      throw new Error('备份文件名格式不正确。');
+    }
+    const verified = this.database.verifyPrivacyBackup(input.fileName);
+    const now = nowIso();
+    let restored = false;
+    this.database.transaction(() => {
+      this.assertNoActivePrivacyLifecycleClaim(Date.parse(now));
+      const control = this.privacyControl();
+      const expected = input.expectedVersion ?? control.version;
+      if (expected !== control.version) throw new Error('隐私状态已发生变化，请刷新后重试。');
+      const backup = this.database.raw.prepare(
+        `SELECT id, sha256, status FROM privacy_backup WHERE backup_file = ?`,
+      ).get(input.fileName) as { id: string; sha256: string; status: 'created' | 'restored' | 'rejected' } | undefined;
+      if (!backup || backup.sha256 !== verified.sha256 || backup.status === 'rejected') {
+        throw new Error('备份未登记或状态不允许恢复；已拒绝继续。');
+      }
+      if (backup.status === 'restored') {
+        restored = true;
+        return;
+      }
+      this.database.raw.prepare(
+        `UPDATE privacy_backup SET status = 'restored', restored_at = ? WHERE id = ? AND status = 'created'`,
+      ).run(now, backup.id);
+      this.database.raw.prepare(
+        `UPDATE privacy_control SET collection_status = 'stopped', retention_status = 'paused', version = version + 1, updated_at = ?
+         WHERE singleton_key = 1 AND version = ?`,
+      ).run(now, control.version);
+      this.database.raw.prepare(
+        `INSERT INTO privacy_audit_event (id, event_type, operation_id, backup_id, record_count, proof_hash, created_at)
+         VALUES (?, 'backup_restored', ?, ?, 0, ?, ?)`,
+      ).run(id('privacy-audit'), id('privacy-operation'), backup.id, verified.sha256, now);
+      restored = true;
+    });
+    return {
+      fileName: verified.fileName,
+      sha256: verified.sha256,
+      schemaVersion: verified.schemaVersion,
+      createdAt: verified.createdAt,
+      status: restored ? 'restored' as const : 'created' as const,
+      requiresRestart: true,
+      replacementApplied: false,
+    };
+  }
+
+  runPrivacyRetention(input: { expectedVersion?: number; now?: string } = {}) {
+    this.assertPrivacyOwnerAuthorization();
+    this.assertNoActivePrivacyLifecycleClaim();
+    const now = input.now ?? nowIso();
+    const isoCutoff = (days: number) => new Date(Date.parse(now) - days * 24 * 60 * 60 * 1000).toISOString();
+    const result = this.database.transaction(() => {
+      this.assertNoActivePrivacyLifecycleClaim(Date.parse(now));
+      const control = this.privacyControl();
+      const expected = input.expectedVersion ?? control.version;
+      const policy = this.database.raw.prepare(
+        `SELECT source_days, derived_days, diagnostics_days, backup_count FROM privacy_retention_policy WHERE singleton_key = 1`,
+      ).get() as { source_days: number; derived_days: number; diagnostics_days: number; backup_count: number } | undefined;
+      if (!policy) throw new Error('留存策略缺失；已拒绝继续。');
+      if (expected !== control.version) throw new Error('隐私状态已发生变化，请刷新后重试。');
+      const cutoff = {
+        source: isoCutoff(policy.source_days),
+        derived: isoCutoff(policy.derived_days),
+        diagnostics: isoCutoff(policy.diagnostics_days),
+      };
+      const counts: Record<'source' | 'derived' | 'diagnostics', number> = { source: 0, derived: 0, diagnostics: 0 };
+      // Children are removed before their parents. Every table name and time
+      // column comes from the fixed local allowlist above; no user SQL is used.
+      const ordered = [
+        ...PRIVACY_RETENTION_OPERATIONS.filter((operation) => operation.kind === 'derived'),
+        ...PRIVACY_RETENTION_OPERATIONS.filter((operation) => operation.kind === 'diagnostics'),
+        ...PRIVACY_RETENTION_OPERATIONS.filter((operation) => operation.kind === 'source'),
+      ];
+      for (const operation of ordered) {
+        const changes = (this.database.raw.prepare(
+          `DELETE FROM ${operation.table} WHERE ${operation.timestamp} < ?`,
+        ).run(cutoff[operation.kind])).changes as number;
+        counts[operation.kind] += changes;
+      }
+      const versioned = this.database.raw.prepare(
+        `UPDATE privacy_control SET version = version + 1, updated_at = ? WHERE singleton_key = 1 AND version = ?`,
+      ).run(now, expected);
+      if (versioned.changes !== 1) throw new Error('隐私状态已被其他操作更新，请刷新后重试。');
+      return { cutoff, counts, backupCount: policy.backup_count };
+    });
+    return { ...this.privacyStatus(), retentionRun: result };
+  }
+
+  feishuMonitoringScope(): FeishuMonitoringScope {
+    const owner = this.database.raw.prepare('SELECT open_id, oauth_status, updated_at FROM owner_profile WHERE id = ?').get('primary') as {
+      open_id: string;
+      oauth_status: string;
+      updated_at: string;
+    } | undefined;
+    if (!owner?.open_id || owner.oauth_status !== 'authorized') {
+      return {
+        ownerAuthorized: false,
+        people: [],
+        groups: [],
+        selectedPersonCount: 0,
+        selectedGroupCount: 0,
+        limits: { people: maxFeishuMonitorPeople, groups: maxFeishuMonitorGroups },
+        updatedAt: owner?.updated_at ?? null,
+      };
+    }
+    const rows = this.database.raw.prepare(
+      `SELECT * FROM feishu_monitor_target
+       WHERE owner_open_id = ?
+       ORDER BY enabled DESC, COALESCE(last_discovered_at, updated_at) DESC, display_name COLLATE NOCASE`,
+    ).all(owner.open_id) as FeishuMonitorTargetRow[];
+    const people = rows.filter((row) => row.target_kind === 'person').map(monitorTargetView);
+    const groups = rows.filter((row) => row.target_kind === 'group').map(monitorTargetView);
+    return {
+      ownerAuthorized: true,
+      people,
+      groups,
+      selectedPersonCount: people.filter((item) => item.selected).length,
+      selectedGroupCount: groups.filter((item) => item.selected).length,
+      limits: { people: maxFeishuMonitorPeople, groups: maxFeishuMonitorGroups },
+      updatedAt: rows[0]?.updated_at ?? owner.updated_at,
+    };
+  }
+
+  async refreshFeishuMonitoringScope() {
+    const owner = this.requireAuthorizedOwner();
+    const adapter = this.adapters.feishu as {
+      listOwnerChats?: (input?: { types?: 'p2p' | 'group' | 'p2p,group'; pageToken?: string; pageSize?: number }) => Promise<unknown>;
+    };
+    if (!adapter.listOwnerChats) throw new Error('当前飞书适配器不支持会话范围发现。');
+    const discover = async (types: 'p2p' | 'group') => {
+      const items: unknown[] = [];
+      const discoveredAt = nowIso();
+      const sourceKind = types === 'p2p' ? 'owner_dm' : 'owner_mentions';
+      const previous = this.database.raw.prepare(
+        "SELECT last_success_at FROM sync_cursor WHERE integration = 'feishu_owner' AND scope_key = ?",
+      ).get(`discover:${sourceKind}:${owner.openId}`) as { last_success_at: string | null } | undefined;
+      let pageToken: string | undefined;
+      let pages = 0;
+      do {
+        if (++pages > 100) throw new Error('飞书会话发现分页超过安全上限。');
+        const page = objectValue(await adapter.listOwnerChats?.({ types, pageToken, pageSize: 50 }));
+        this.assertAuthorizedOwnerUnchanged(owner);
+        const pageItems = Array.isArray(page.items) ? page.items : [];
+        items.push(...pageItems);
+        const next = page.has_more ? firstText(page, 'page_token') : '';
+        if (page.has_more && !next) throw new Error('飞书会话发现返回下一页标记，但没有游标。');
+        if (next && next === pageToken) throw new Error('飞书会话发现游标没有前进。');
+        pageToken = next || undefined;
+      } while (pageToken);
+      return { items, discoveredAt, initialWatermark: previous?.last_success_at ?? discoveredAt };
+    };
+    const [p2pDiscovery, groupDiscovery] = await Promise.all([discover('p2p'), discover('group')]);
+    this.assertAuthorizedOwnerUnchanged(owner);
+    let peopleDiscovered = 0;
+    let groupsDiscovered = 0;
+    for (const item of p2pDiscovery.items) {
+      const openId = firstText(item, 'p2p_target_id', 'p2pTargetId');
+      const chatId = firstText(item, 'chat_id', 'chatId', 'id');
+      if (!openId || openId === owner.openId || !chatId) continue;
+      this.upsertFeishuMonitorTarget(owner.openId, {
+        kind: 'person',
+        targetKey: openId,
+        chatId,
+        name: firstText(item, 'name') || '最近私聊联系人',
+        secondaryLabel: '最近私聊',
+        source: 'chat_list',
+        accessStatus: 'unknown',
+        metadata: { external: Boolean(objectValue(item).external) },
+        autoEnable: false,
+        discoveryRank: peopleDiscovered,
+        discoveredAt: p2pDiscovery.discoveredAt,
+        initialWatermark: p2pDiscovery.initialWatermark,
+      });
+      peopleDiscovered += 1;
+    }
+    for (const item of groupDiscovery.items) {
+      const chatId = firstText(item, 'chat_id', 'chatId', 'id');
+      if (!chatId) continue;
+      this.upsertFeishuMonitorTarget(owner.openId, {
+        kind: 'group',
+        targetKey: chatId,
+        chatId,
+        name: firstText(item, 'name') || '未命名群聊',
+        secondaryLabel: firstText(item, 'description') || null,
+        source: 'chat_list',
+        accessStatus: 'unknown',
+        metadata: { external: Boolean(objectValue(item).external) },
+        discoveryRank: groupsDiscovered,
+        discoveredAt: groupDiscovery.discoveredAt,
+      });
+      groupsDiscovered += 1;
+    }
+    this.reconcileFeishuMonitoringStates({ peopleDiscovered, groupsDiscovered, discoveryError: null });
+    this.log('integration', 'info', 'feishu.monitoring_scope.refreshed', '已刷新可选择的个人和群聊范围。', { peopleDiscovered, groupsDiscovered });
+    return this.feishuMonitoringScope();
+  }
+
+  async searchFeishuPeople(query = '') {
+    const owner = this.requireAuthorizedOwner();
+    const adapter = this.adapters.feishu as {
+      searchOwnerUsers?: (input?: { query?: string; hasChatted?: boolean; pageToken?: string; pageSize?: number }) => Promise<unknown>;
+    };
+    if (!adapter.searchOwnerUsers) throw new Error('当前飞书适配器不支持联系人搜索。');
+    const normalizedQuery = query.trim();
+    if (normalizedQuery.length > 50) throw new Error('联系人姓名关键词不能超过 50 个字符。');
+    const page = objectValue(await adapter.searchOwnerUsers({ query: normalizedQuery || undefined, hasChatted: true, pageSize: 30 }));
+    this.assertAuthorizedOwnerUnchanged(owner);
+    const rows = Array.isArray(page.items) ? page.items : [];
+    const ids = new Set<string>();
+    for (const item of rows) {
+      const record = objectValue(item);
+      const meta = objectValue(record.meta_data ?? record.metaData);
+      const openId = firstText(record, 'id', 'open_id', 'openId');
+      if (!openId || openId === owner.openId) continue;
+      const names = objectValue(meta.i18n_names ?? meta.i18nNames);
+      const displayInfo = firstText(record, 'display_info', 'displayInfo').replace(/<\/?h>/g, '');
+      const displayLines = displayInfo.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+      const name = firstText(names, 'zh_cn', 'zh_hk', 'zh_tw', 'en_us') || displayLines[0] || '飞书联系人';
+      const department = displayLines.length > 1 && !/^\[.*\]$/.test(displayLines[1]!) ? displayLines[1]! : '';
+      const enterpriseEmail = firstText(meta, 'enterprise_mail_address', 'enterpriseMailAddress');
+      const mail = firstText(meta, 'mail_address', 'mailAddress');
+      const isExternal = Boolean(meta.is_cross_tenant ?? meta.isCrossTenant);
+      const secondary = [department, enterpriseEmail || mail, isExternal ? '外部联系人' : ''].filter(Boolean).join(' · ') || null;
+      const chatId = firstText(meta, 'chat_id', 'chatId');
+      const targetId = this.upsertFeishuMonitorTarget(owner.openId, {
+        kind: 'person',
+        targetKey: openId,
+        chatId: chatId || null,
+        name,
+        secondaryLabel: secondary,
+        source: 'contact_search',
+        accessStatus: 'unknown',
+        metadata: { hasChatted: Boolean(chatId), external: isExternal },
+      });
+      ids.add(targetId);
+    }
+    const scope = this.feishuMonitoringScope();
+    return {
+      items: scope.people.filter((item) => ids.has(item.id)),
+      hasMore: Boolean(page.has_more),
+      notice: firstText(page, 'notice') || null,
+    };
+  }
+
+  updateFeishuMonitoringScope(input: {
+    personIds?: string[];
+    personChanges?: Array<{ id: string; selected: boolean }>;
+    groupIds?: string[];
+  }) {
+    const owner = this.requireAuthorizedOwner();
+    const groupIdsProvided = input.groupIds !== undefined;
+    const groupIds = [...new Set((input.groupIds ?? []).map((value) => value.trim()).filter(Boolean))];
+    if (groupIds.length > maxFeishuMonitorGroups) throw new Error(`首版最多选择 ${maxFeishuMonitorGroups} 个群聊。`);
+    const available = this.database.raw.prepare('SELECT id, target_kind, enabled, manual_excluded FROM feishu_monitor_target WHERE owner_open_id = ?').all(owner.openId) as Array<{ id: string; target_kind: 'person' | 'group'; enabled: number; manual_excluded: number }>;
+    const availablePeople = new Set(available.filter((item) => item.target_kind === 'person').map((item) => item.id));
+    const availableGroups = new Set(available.filter((item) => item.target_kind === 'group').map((item) => item.id));
+    const legacyPersonIds = input.personIds
+      ? [...new Set(input.personIds.map((value) => value.trim()).filter(Boolean))]
+      : null;
+    if (legacyPersonIds && legacyPersonIds.length > maxFeishuMonitorPeople) throw new Error(`单次最多保存 ${maxFeishuMonitorPeople} 位联系人。`);
+    if (legacyPersonIds?.some((targetId) => !availablePeople.has(targetId))) {
+      throw new Error('监控范围包含未发现或不属于当前系统主人的对象，请先刷新列表。');
+    }
+    const personChanges = input.personChanges
+      ? [...new Map(input.personChanges.map((item) => [item.id.trim(), { id: item.id.trim(), selected: item.selected }])).values()].filter((item) => item.id)
+      : legacyPersonIds
+        ? legacyPersonIds.map((targetId) => ({ id: targetId, selected: true }))
+        : [];
+    if (personChanges.length > maxFeishuMonitorPeople) throw new Error(`单次最多修改 ${maxFeishuMonitorPeople} 位联系人。`);
+    if (personChanges.some((item) => !availablePeople.has(item.id)) || (groupIdsProvided && groupIds.some((targetId) => !availableGroups.has(targetId)))) {
+      throw new Error('监控范围包含未发现或不属于当前系统主人的对象，请先刷新列表。');
+    }
+    const previousEnabled = new Map(available.map((item) => [item.id, Boolean(item.enabled)]));
+    const previousExclusion = new Map(available.map((item) => [item.id, Boolean(item.manual_excluded)]));
+    const desiredGroups = new Set(groupIds);
+    const groupChanges = groupIdsProvided
+      ? available.filter((item) => item.target_kind === 'group' && Boolean(item.enabled) !== desiredGroups.has(item.id))
+      : [];
+    const personSelectionChanged = personChanges.some((change) => previousEnabled.get(change.id) !== change.selected
+      || previousExclusion.get(change.id) === change.selected);
+    const timestamp = nowIso();
+    this.database.transaction(() => {
+      const updatePerson = this.database.raw.prepare(
+        `UPDATE feishu_monitor_target SET enabled = ?, manual_excluded = ?,
+           selection_version = selection_version + CASE WHEN enabled <> ? THEN 1 ELSE 0 END,
+           updated_at = ?
+         WHERE owner_open_id = ? AND target_kind = 'person' AND id = ?`,
+      );
+      for (const change of personChanges) {
+        const enabled = change.selected ? 1 : 0;
+        updatePerson.run(enabled, change.selected ? 0 : 1, enabled, timestamp, owner.openId, change.id);
+        if (change.selected && !previousEnabled.get(change.id)) {
+          this.database.raw.prepare(
+            `INSERT INTO sync_cursor (integration, scope_key, cursor, last_success_at, last_error, updated_at)
+             VALUES ('feishu_owner', ?, ?, NULL, NULL, ?)
+             ON CONFLICT(integration, scope_key) DO UPDATE SET cursor = excluded.cursor,
+               last_success_at = NULL, last_error = NULL, updated_at = excluded.updated_at`,
+          ).run(`messages:owner_dm:${change.id}`, JSON.stringify({ version: 1, watermark: timestamp, filterMode: 'p2p_selected', hardStart: timestamp }), timestamp);
+        }
+      }
+      const updateGroup = this.database.raw.prepare('UPDATE feishu_monitor_target SET selection_version = selection_version + 1, enabled = ?, updated_at = ? WHERE owner_open_id = ? AND target_kind = \'group\' AND id = ?');
+      for (const group of groupChanges) updateGroup.run(desiredGroups.has(group.id) ? 1 : 0, timestamp, owner.openId, group.id);
+    });
+    this.reconcileFeishuMonitoringStates({ selectionChanged: personSelectionChanged || groupChanges.length > 0 });
+    const scope = this.feishuMonitoringScope();
+    this.log('integration', 'info', 'feishu.monitoring_scope.saved', '已保存个人私聊和群聊关注范围。', {
+      personCount: scope.selectedPersonCount,
+      changedPeople: personChanges.length,
+      groupCount: scope.selectedGroupCount,
+      changedGroups: groupChanges.length,
+    });
+    return scope;
+  }
+
+  private requireAuthorizedOwner() {
+    const row = this.database.raw.prepare('SELECT open_id, union_id, user_id, name, tenant_key, oauth_status FROM owner_profile WHERE id = ?').get('primary') as {
+      open_id: string;
+      union_id: string | null;
+      user_id: string | null;
+      name: string;
+      tenant_key: string | null;
+      oauth_status: string;
+    } | undefined;
+    if (!row?.open_id || row.oauth_status !== 'authorized') throw new Error('请先完成系统主人飞书 OAuth，再选择要关注的个人私聊或群聊。');
+    return { openId: row.open_id, unionId: row.union_id, userId: row.user_id, name: row.name, tenantKey: row.tenant_key } satisfies OwnerIdentity;
+  }
+
+  private assertAuthorizedOwnerUnchanged(expected: OwnerIdentity) {
+    const current = this.requireAuthorizedOwner();
+    if (current.openId !== expected.openId || current.tenantKey !== expected.tenantKey) {
+      throw new Error('系统主人身份已变化，请重新刷新人员和群聊列表。');
+    }
+  }
+
+  /**
+   * Resolve the currently authorized owner's stable Feishu identifiers from
+   * SQLite.  Source metadata is supplied by integrations and can be replayed
+   * or forged, so `isOwnerMessage`/`senderRole` alone are never sufficient to
+   * authorize a state-machine action.
+   */
+  private authorizedOwnerIds() {
+    const row = this.database.raw.prepare(
+      "SELECT open_id, union_id, user_id FROM owner_profile WHERE id = 'primary' AND oauth_status = 'authorized'",
+    ).get() as { open_id: string; union_id: string | null; user_id: string | null } | undefined;
+    return new Set([row?.open_id, row?.union_id, row?.user_id].filter((value): value is string => Boolean(value)));
+  }
+
+  private isTrustedOwnerSource(row: SourceEventRow) {
+    return isOwnerDecisionSource(parseMetadata(row.metadata_json), row.sender_id, this.authorizedOwnerIds());
+  }
+
+  private upsertFeishuMonitorTarget(ownerOpenId: string, input: {
+    kind: 'person' | 'group';
+    targetKey: string;
+    chatId: string | null;
+    name: string;
+    secondaryLabel: string | null;
+    source: 'chat_list' | 'contact_search';
+    accessStatus: 'unknown' | 'readable' | 'restricted' | 'not_found' | 'error';
+    metadata?: Record<string, unknown>;
+    autoEnable?: boolean;
+    discoveryRank?: number;
+    discoveredAt?: string;
+    initialWatermark?: string;
+  }) {
+    const existing = this.database.raw.prepare(
+      'SELECT id, enabled, manual_excluded, selection_source FROM feishu_monitor_target WHERE owner_open_id = ? AND target_kind = ? AND target_key = ?',
+    ).get(ownerOpenId, input.kind, input.targetKey) as { id: string; enabled: number; manual_excluded: number; selection_source: 'chat_list' | 'contact_search' } | undefined;
+    const targetId = existing?.id ?? id('monitor');
+    const timestamp = input.discoveredAt ?? nowIso();
+    const nextEnabled = input.kind === 'person' && input.autoEnable
+      ? existing?.manual_excluded ? 0 : 1
+      : existing?.enabled ?? 0;
+    const autoActivatedLegacy = Boolean(existing
+      && existing.selection_source === 'chat_list'
+      && existing.enabled === 0
+      && nextEnabled === 1);
+    if (existing) {
+      this.database.raw.prepare(
+        `UPDATE feishu_monitor_target SET
+           resolved_chat_id = COALESCE(NULLIF(?, ''), resolved_chat_id),
+           display_name = CASE WHEN ? <> '' THEN ? ELSE display_name END,
+           secondary_label = COALESCE(?, secondary_label),
+           enabled = ?,
+           selection_version = selection_version + ?,
+           selection_source = ?,
+           access_status = CASE
+             WHEN access_status = 'not_found' AND ? IS NOT NULL THEN 'unknown'
+             WHEN ? = 'unknown' THEN access_status
+             ELSE ?
+           END,
+           last_error = CASE WHEN access_status = 'not_found' AND ? IS NOT NULL THEN NULL ELSE last_error END,
+           last_discovered_at = ?,
+           last_resolved_at = COALESCE(?, last_resolved_at),
+           discovery_rank = COALESCE(?, discovery_rank),
+           metadata_json = ?,
+           updated_at = ?
+         WHERE id = ?`,
+      ).run(
+        input.chatId,
+        input.name,
+        input.name.slice(0, 160),
+        input.secondaryLabel?.slice(0, 240) ?? null,
+        nextEnabled,
+        existing.enabled === nextEnabled ? 0 : 1,
+        input.source,
+        input.chatId,
+        input.accessStatus,
+        input.accessStatus,
+        input.chatId,
+        timestamp,
+        input.chatId ? timestamp : null,
+        input.discoveryRank ?? null,
+        JSON.stringify(input.metadata ?? {}),
+        timestamp,
+        targetId,
+      );
+    } else {
+      this.database.raw.prepare(
+        `INSERT INTO feishu_monitor_target
+          (id, owner_open_id, target_kind, target_key, resolved_chat_id, display_name, secondary_label, enabled,
+           manual_excluded, discovery_rank, selection_version, read_policy, selection_source, access_status,
+           last_discovered_at, last_resolved_at, last_success_at, last_error, metadata_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)`,
+      ).run(
+        targetId,
+        ownerOpenId,
+        input.kind,
+        input.targetKey,
+        input.chatId,
+        input.name.slice(0, 160),
+        input.secondaryLabel?.slice(0, 240) ?? null,
+        nextEnabled,
+        input.discoveryRank ?? null,
+        input.kind === 'person' ? 'incoming_only' : 'owner_mentions',
+        input.source,
+        input.accessStatus,
+        timestamp,
+        input.chatId ? timestamp : null,
+        JSON.stringify(input.metadata ?? {}),
+        timestamp,
+        timestamp,
+      );
+    }
+    if (input.kind === 'person' && input.autoEnable && nextEnabled) {
+      const cursor = autoActivatedLegacy
+        ? { version: 1 as const, watermark: timestamp, filterMode: 'p2p_selected' as const, hardStart: timestamp }
+        : { version: 1 as const, watermark: input.initialWatermark ?? timestamp, filterMode: 'p2p_selected' as const };
+      const conflictUpdate = autoActivatedLegacy
+        ? 'cursor = excluded.cursor, last_success_at = NULL, last_error = NULL, updated_at = excluded.updated_at'
+        : `cursor = CASE WHEN sync_cursor.cursor IS NULL OR sync_cursor.cursor = '' THEN excluded.cursor ELSE sync_cursor.cursor END,
+           updated_at = CASE WHEN sync_cursor.cursor IS NULL OR sync_cursor.cursor = '' THEN excluded.updated_at ELSE sync_cursor.updated_at END`;
+      this.database.raw.prepare(
+        `INSERT INTO sync_cursor (integration, scope_key, cursor, last_success_at, last_error, updated_at)
+         VALUES ('feishu_owner', ?, ?, NULL, NULL, ?)
+         ON CONFLICT(integration, scope_key) DO UPDATE SET ${conflictUpdate}`,
+      ).run(`messages:owner_dm:${targetId}`, JSON.stringify(cursor), timestamp);
+    }
+    return targetId;
+  }
+
+  private reconcileFeishuMonitoringStates(extra: Record<string, unknown> = {}) {
+    const scope = this.feishuMonitoringScope();
+    if (!scope.ownerAuthorized) return;
+    const timestamp = nowIso();
+    const selectionChanged = Boolean(extra.selectionChanged);
+    const update = (kind: Extract<OwnerSourceKind, 'owner_dm' | 'owner_mentions'>, targets: FeishuMonitorTarget[], summary: string, discoveredCount: number) => {
+      const existing = this.database.raw.prepare(
+        'SELECT status, last_error, details_json FROM information_source_state WHERE source_kind = ?',
+      ).get(kind) as { status: OwnerSourceStatus; last_error: string | null; details_json: string } | undefined;
+      const selected = targets.filter((item) => item.selected);
+      const targetErrors = selected.map((item) => item.lastError).filter((value): value is string => Boolean(value));
+      const hasRestricted = selected.some((item) => item.accessStatus === 'restricted');
+      const status: OwnerSourceStatus = selected.length === 0
+        ? 'partial'
+        : targetErrors.length > 0
+          ? hasRestricted ? 'admin_required' : 'error'
+          : selectionChanged
+            ? 'partial'
+            : existing?.status === 'ready' ? 'ready' : 'partial';
+      const lastError = targetErrors.length ? targetErrors.slice(0, 2).join(' ').slice(0, 300) : null;
+      const details = {
+        ...parseMetadata(existing?.details_json),
+        selectedCount: selected.length,
+        discoveredCount,
+        realTenantValidated: status === 'ready',
+        ...extra,
+      };
+      this.database.raw.prepare(
+        `UPDATE information_source_state
+         SET status = ?, scope_summary = ?, requires_admin = 1, requires_bot_in_chat = 0,
+             sync_mode = 'periodic', last_error = ?, details_json = ?, updated_at = ?
+         WHERE source_kind = ?`,
+      ).run(status, summary, lastError, JSON.stringify(details), timestamp, kind);
+    };
+    update(
+      'owner_dm',
+      scope.people,
+      scope.selectedPersonCount
+        ? scope.selectedPersonCount > maxFeishuPeoplePerRun
+          ? `已关注 ${scope.selectedPersonCount} 个个人单聊；每轮读取近期 40 个和最久未扫描 10 个，未关注的联系人不会读取。`
+          : `已关注 ${scope.selectedPersonCount} 个个人单聊；每轮读取全部已关注会话，未关注的联系人不会读取。`
+        : `已发现 ${scope.people.length} 个个人单聊，但当前未关注任何人；可逐个选择或点击“关注所有人”。`,
+      scope.people.length,
+    );
+    update(
+      'owner_mentions',
+      scope.groups,
+      scope.selectedGroupCount
+        ? `周期读取你明确选择的 ${scope.selectedGroupCount} 个群聊，并只把真实 @你的消息送入候选判断。`
+        : '已支持按群名选择主人所在群；尚未选择任何群，不会读取群正文。',
+      scope.groups.length,
+    );
+  }
+
+  async refreshOwnerIdentity() {
+    const adapter = this.adapters.feishu as {
+      getCurrentUser?: () => Promise<OwnerIdentity>;
+      getGrantedScopes?: () => Promise<string[] | undefined>;
+      getGrantedScopeUpdate?: () => Promise<FeishuScopeUpdate>;
+      readAuthGeneration?: () => Promise<number | null>;
+    };
+    if (!adapter.getCurrentUser) throw new Error('当前飞书适配器不支持系统主人身份读取。');
+    const refreshSequence = ++this.ownerRefreshSequence;
+    try {
+      const expectedAuthGeneration = await adapter.readAuthGeneration?.() ?? null;
+      const owner = await adapter.getCurrentUser();
+      const rawScopeUpdate = await adapter.getGrantedScopeUpdate?.();
+      const scopeUpdate = rawScopeUpdate === undefined ? undefined : normalizeFeishuScopeUpdate(rawScopeUpdate);
+      const rawGrantedScopes = scopeUpdate === undefined ? await adapter.getGrantedScopes?.() : undefined;
+      const normalizedGrantedScopes = rawGrantedScopes === undefined ? undefined : feishuScopeUpdateOf(rawGrantedScopes);
+      const grantedScopes = scopeUpdate?.kind === 'set'
+        ? scopeUpdate.scopes
+        : scopeUpdate?.kind === 'omitted'
+          ? undefined
+          : normalizedGrantedScopes?.kind === 'set' ? normalizedGrantedScopes.scopes : undefined;
+      if (refreshSequence !== this.ownerRefreshSequence) throw new FeishuAuthStateStaleError();
+      if (expectedAuthGeneration !== null && adapter.readAuthGeneration && await adapter.readAuthGeneration() !== expectedAuthGeneration) {
+        throw new FeishuAuthStateStaleError();
+      }
+      this.saveOwnerIdentity(owner, grantedScopes, refreshSequence);
+      this.log('integration', 'info', 'feishu.owner.refreshed', '已更新系统主人身份和个人信息流能力状态。', {
+        ownerOpenIdPresent: Boolean(owner.openId),
+        tenantPresent: Boolean(owner.tenantKey),
+      });
+      // Internal lifecycle callers still receive the complete server-side
+      // state; HTTP routes project it through ownerInformation().
+      return this.ownerInformationInternal();
+    } catch (error) {
+      if (error instanceof FeishuAuthStateStaleError) throw error;
+      const message = error instanceof Error ? error.message : '系统主人身份读取失败。';
+      if (isExplicitOwnerAuthFailure(error)) this.markOwnerSourcesUnauthorized(message);
+      else this.markOwnerSourcesError(message);
+      throw error;
+    }
+  }
+
+  async ingestSource(event: NormalizedSourceEvent, guidance?: string, options: { retryFailed?: boolean } = {}, operationContext?: OperationContext) {
+    // Establish the envelope once at the ingestion boundary.  Downstream
+    // classification, owner-decision and Runtime layers must reuse this
+    // identity instead of inventing a job-specific trace.
+    const effectiveOperationContext = operationContext ?? createOperationContext({ requestId: randomUUID() });
+    const persisted = this.persistSourceEvent(event);
+    const backfill = await this.backfillConversationContext(persisted.row, effectiveOperationContext);
+    const classificationRow = backfill.rows.find((row) => row.id === persisted.row.id) ?? persisted.row;
+    const classified = await this.classifySourceWithStoredBatch(
+      classificationRow,
+      guidance,
+      persisted.deduplicated,
+      options.retryFailed === true,
+      effectiveOperationContext,
+    );
+    if (backfill.attempted) {
+      for (const candidate of classified.candidates ?? (classified.candidate ? [classified.candidate] : [])) {
+        this.applyCandidateContextState(candidate.id, backfill.complete, backfill.reason);
+      }
+      if (classified.candidate) classified.candidate = this.getCandidate(classified.candidate.id);
+      if (classified.candidates) classified.candidates = classified.candidates.map((candidate) => this.getCandidate(candidate.id)).filter((candidate): candidate is CandidateRow => Boolean(candidate));
+    }
+    return { ...classified, upgraded: persisted.upgraded };
+  }
+
+  private async backfillConversationContext(source: SourceEventRow, operationContext?: OperationContext) {
+    const unchanged = { rows: this.classificationRowsForSource(source), attempted: false, complete: true, reason: null as string | null };
+    if (!this.feishuOwnerSync || !looksLikeConversationContinuation(source.content) || (source.source_type !== 'owner_dm' && source.source_type !== 'group')) return unchanged;
+    const metadata = parseMetadata(source.metadata_json);
+    if (metadata.historyBackfill || metadata.contextOnly) return unchanged;
+    const strong = this.strongThreadContext([source]);
+    if (strong && strong.relationType !== 'batch_context') return unchanged;
+    const result = await this.feishuOwnerSync.backfillBeforeSource({
+      sourceEventId: source.id,
+      sourceExternalId: source.external_id,
+      conversationId: source.conversation_id,
+      sourceType: source.source_type,
+      occurredAt: source.occurred_at,
+      monitorTargetId: metadataText(metadata, 'monitorTargetId'),
+      operationContext,
+    });
+    // Keep the rows returned by the bounded history read.  They may already
+    // exist (for example after a retry), so use the persisted row returned by
+    // persistSourceEvent rather than the transient normalized event.
+    const backfilledRows = result.events.map((event) => this.persistSourceEvent(event).row);
+    const rowsById = new Map<string, SourceEventRow>();
+    for (const row of [...this.classificationRowsForSource(source), ...backfilledRows]) rowsById.set(row.id, row);
+    const rows = [...rowsById.values()].sort(stableSourceOrder);
+    return {
+      rows,
+      attempted: true,
+      complete: result.complete,
+      reason: result.reason ?? (result.complete ? null : '对话背景可能不完整。'),
+    };
+  }
+
+  private applyCandidateContextState(candidateId: string, complete: boolean, reason: string | null) {
+    const candidate = this.getCandidate(candidateId);
+    if (!candidate) return;
+    const contextState = complete ? 'complete' : 'possibly_incomplete';
+    const processingState = complete
+      ? candidate.processing_state
+      : ['organizing', 'retry_waiting', 'failed_visible'].includes(candidate.processing_state)
+        ? candidate.processing_state
+        : 'incomplete_context';
+    const updated = this.database.raw.prepare(
+      `UPDATE candidate_request
+       SET context_state = ?, context_reason = ?, processing_state = ?, updated_at = ?, version = version + 1
+       WHERE id = ? AND version = ?`,
+    ).run(contextState, complete ? null : (reason || '对话背景可能不完整。').slice(0, 300), processingState, nowIso(), candidateId, candidate.version);
+    if (updated.changes !== 1) throw new CandidateVersionConflictError();
+  }
+
+  /** Persist sources without starting AI classification. Used only while a
+   * paginated Feishu history window is incomplete; the old cursor guarantees
+   * a later complete scan will finalize the same durable rows. */
+  async captureSourceBatch(events: NormalizedSourceEvent[], _operationContext?: OperationContext) {
+    const persisted = events.map((event) => this.persistSourceEvent(event));
+    return {
+      messages: persisted.length,
+      deduplicated: persisted.filter((item) => item.deduplicated).length,
+    };
+  }
+
+  /**
+   * Persist every source independently, then classify semantic message groups
+   * once. Raw Feishu messages remain auditable rows; only the AI judgement is
+   * coalesced. Calendar events and minutes are always singleton groups.
+   */
+  async ingestSourceBatch(events: NormalizedSourceEvent[], guidance?: string, options: { retryFailed?: boolean } = {}, operationContext?: OperationContext) {
+    if (!events.length) return {
+      messages: 0,
+      deduplicated: 0,
+      classifications: 0,
+      classificationFailures: 0,
+      candidates: [] as CandidateRow[],
+      candidateIds: [] as string[],
+      demandUnitIds: [] as string[],
+      threadIds: [] as string[],
+    };
+    const effectiveOperationContext = operationContext ?? createOperationContext({ requestId: randomUUID() });
+    const persisted = events.map((event) => this.persistSourceEvent(event));
+    const changedIds = new Set(persisted
+      .filter((item) => item.changed
+        || options.retryFailed === true
+        || !metadataText(parseMetadata(item.row.metadata_json), 'classificationRevision'))
+      .map((item) => item.row.id));
+    // A periodic scan can encounter only a short follow-up such as “再补一项”。
+    // Before classifying the batch, perform one bounded history backfill per
+    // conversation so the classifier sees the missing earlier context. The
+    // backfill only persists source facts; it never advances the normal cursor.
+    const backfilledRows = new Map<string, SourceEventRow>();
+    if (this.feishuOwnerSync) {
+      const backfillCandidates = persisted
+        .map((item) => item.row)
+        .filter((row) => changedIds.has(row.id)
+          && isMessageSource(row)
+          && looksLikeConversationContinuation(row.content)
+          && !parseMetadata(row.metadata_json).contextOnly)
+        .sort(stableSourceOrder);
+      const seenConversations = new Set<string>();
+      for (const row of [...backfillCandidates].reverse()) {
+        if (seenConversations.has(row.conversation_id)) continue;
+        seenConversations.add(row.conversation_id);
+        try {
+          const backfill = await this.backfillConversationContext(row, effectiveOperationContext);
+          for (const backfilledRow of backfill.rows) backfilledRows.set(backfilledRow.id, backfilledRow);
+        } catch (error) {
+          this.log('integration', 'warn', 'source.context_backfill_failed', '周期同步的对话背景补扫失败，仍保留当前来源并继续整理。', {
+            sourceEventId: row.id,
+            error: sanitizeRuntimeError(error, 240),
+          });
+        }
+      }
+    }
+    const expandedRows = new Map<string, SourceEventRow>();
+    for (const item of persisted) {
+      for (const row of this.classificationRowsForSource(item.row)) expandedRows.set(row.id, row);
+    }
+    // Backfilled owner messages are context-only evidence and must not become
+    // independent candidates.  Other backfilled messages are valid members of
+    // the current semantic batch.  The group-level changedIds filter below
+    // still prevents unchanged historical rows from being classified alone.
+    for (const row of backfilledRows.values()) {
+      if (parseMetadata(row.metadata_json).contextOnly) continue;
+      expandedRows.set(row.id, row);
+    }
+    const groups = this.groupSourcesForClassification([...expandedRows.values()])
+      .filter((group) => options.retryFailed === true || group.some((row) => changedIds.has(row.id)));
+    const candidates: CandidateRow[] = [];
+    const candidateIds = new Set<string>();
+    const demandUnitIds = new Set<string>();
+    const threadIds = new Set<string>();
+    let classificationFailures = 0;
+    for (const group of groups) {
+      try {
+        const result = await this.classifyCapturedSourceBatch(group, guidance, options.retryFailed === true, effectiveOperationContext);
+        candidates.push(...(result.candidates ?? (result.candidate ? [result.candidate] : [])));
+        const ids = classificationResultIds(result);
+        ids.candidateIds?.forEach((value) => candidateIds.add(value));
+        ids.demandUnitIds?.forEach((value) => demandUnitIds.add(value));
+        ids.threadIds?.forEach((value) => threadIds.add(value));
+        if (result.classificationDeferred) {
+          classificationFailures += 1;
+          this.log('runtime', 'warn', 'source.batch_classification_deferred', '连续消息已保存，AI 判断暂时失败并将由 Runtime 重试。', {
+            sourceCount: group.length,
+            error: result.recoveryReason?.slice(0, 240) ?? 'AI 整理等待重试。',
+          });
+        }
+      } catch (error) {
+        // The source rows and durable Runtime job already exist. Advancing the
+        // Feishu cursor is safe; Runtime recovery will retry classification
+        // without re-capturing or duplicating the messages.
+        classificationFailures += 1;
+        this.log('runtime', 'warn', 'source.batch_classification_deferred', '连续消息已保存，AI 判断暂时失败并将由 Runtime 重试。', {
+          sourceCount: group.length,
+          error: sanitizeRuntimeError(error, 240),
+        });
+      }
+    }
+    return {
+      messages: persisted.length,
+      deduplicated: persisted.filter((item) => item.deduplicated).length,
+      classifications: groups.length - classificationFailures,
+      classificationFailures,
+      candidates,
+      candidateIds: [...candidateIds],
+      demandUnitIds: [...demandUnitIds],
+      threadIds: [...threadIds],
+    };
+  }
+
+  /** DATA-04: source_event is a current pointer; immutable body/history lives in revisions. */
+  private ensureSourceRevision(source: SourceEventRow, kind: 'ingest' | 'edit' | 'recall' | 'migration' = 'edit') {
+    const liveSource = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(source.id) as SourceEventRow | undefined;
+    if (!liveSource) throw new Error('来源记录已经不存在；已拒绝追加修订。');
+    source = liveSource;
+    const current = source.current_revision_id
+      ? this.database.raw.prepare(
+        `SELECT id, source_event_id, revision_number, revision_kind, external_id, source_type,
+                conversation_id, sender_id, sender_name, content, owner_mentioned, source_url,
+                completeness, discovery_reason, metadata_json, occurred_at, captured_at,
+                owner_scope, revision_hash
+           FROM source_event_revision WHERE id = ? AND source_event_id = ? AND owner_scope = ?`,
+      ).get(source.current_revision_id, source.id, source.owner_scope) as {
+        id: string; source_event_id: string; revision_number: number; revision_kind: string; external_id: string;
+        source_type: string; conversation_id: string; sender_id: string; sender_name: string; content: string;
+        owner_mentioned: number; source_url: string | null; completeness: string; discovery_reason: string;
+        metadata_json: string; occurred_at: string; captured_at: string; owner_scope: string; revision_hash: string;
+      } | undefined
+      : undefined;
+    if (current) {
+      const currentMatches = current.external_id === source.external_id
+        && current.source_type === source.source_type
+        && current.conversation_id === source.conversation_id
+        && current.sender_id === source.sender_id
+        && current.sender_name === source.sender_name
+        && current.content === source.content
+        && current.owner_mentioned === source.owner_mentioned
+        && current.source_url === source.source_url
+        && current.completeness === source.completeness
+        && current.discovery_reason === source.discovery_reason
+        && sourceRevisionMetadataJson(current.metadata_json) === sourceRevisionMetadataJson(source.metadata_json)
+        && current.occurred_at === source.occurred_at
+        && current.captured_at === source.captured_at;
+      if (currentMatches) return current.id;
+    }
+    const next = this.database.raw.prepare(
+      'SELECT COALESCE(MAX(revision_number), 0) + 1 AS next FROM source_event_revision WHERE source_event_id = ?',
+    ).get(source.id) as { next: number };
+    const revisionHash = canonicalRevisionHash({
+      ownerScope: source.owner_scope,
+      sourceEventId: source.id,
+      revisionNumber: next.next,
+      revisionKind: kind,
+      externalId: source.external_id,
+      sourceType: source.source_type,
+      conversationId: source.conversation_id,
+      senderId: source.sender_id,
+      senderName: source.sender_name,
+      content: source.content,
+      ownerMentioned: source.owner_mentioned,
+      sourceUrl: source.source_url,
+      completeness: source.completeness,
+      discoveryReason: source.discovery_reason,
+      metadataJson: source.metadata_json,
+      occurredAt: source.occurred_at,
+      capturedAt: source.captured_at,
+    });
+    const existing = this.database.raw.prepare(
+      'SELECT id FROM source_event_revision WHERE source_event_id = ? AND revision_hash = ? ORDER BY revision_number DESC LIMIT 1',
+    ).get(source.id, revisionHash) as { id: string } | undefined;
+    if (existing) return existing.id;
+    const revisionId = `source-revision:${source.id}:${next.next}:${revisionHash.slice(0, 16)}`;
+    this.database.raw.prepare(
+      `INSERT INTO source_event_revision
+       (id, source_event_id, revision_number, revision_kind, external_id, source_type, conversation_id,
+        sender_id, sender_name, content, owner_mentioned, source_url, completeness, discovery_reason,
+        metadata_json, occurred_at, captured_at, owner_scope, revision_hash, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      revisionId, source.id, next.next, kind, source.external_id, source.source_type, source.conversation_id,
+      source.sender_id, source.sender_name, source.content, source.owner_mentioned, source.source_url,
+      source.completeness, source.discovery_reason, source.metadata_json, source.occurred_at, source.captured_at,
+      source.owner_scope, revisionHash, nowIso(),
+    );
+    const updated = this.database.raw.prepare(
+      `UPDATE source_event
+          SET current_revision_id = ?, revision_generation = revision_generation + 1
+        WHERE id = ? AND owner_scope = ? AND revision_generation = ?
+          AND (current_revision_id IS NULL OR current_revision_id = ?)`,
+    ).run(revisionId, source.id, source.owner_scope, source.revision_generation, source.current_revision_id);
+    if (updated.changes !== 1) throw new Error('来源修订指针 CAS 失败；已回滚本次追加。');
+    return revisionId;
+  }
+
+  private sourceRevisionSet(sourceRows: SourceEventRow[]) {
+    const ordered = [...sourceRows].sort(stableSourceOrder);
+    const references: RevisionSetEntry[] = ordered.map((source, sourceOrder) => {
+      const revisionId = this.ensureSourceRevision(source);
+      const revision = this.database.raw.prepare(
+        'SELECT revision_hash FROM source_event_revision WHERE id = ? AND source_event_id = ? AND owner_scope = ?',
+      ).get(revisionId, source.id, source.owner_scope) as { revision_hash: string } | undefined;
+      if (!revision?.revision_hash || !/^[a-f0-9]{64}$/u.test(revision.revision_hash)) throw new Error('来源修订 hash 缺失；已拒绝绑定 AI 决策。');
+      return { sourceEventId: source.id, revisionId, revisionHash: revision.revision_hash, sourceOrder };
+    });
+    return {
+      references,
+      hash: canonicalRevisionSetHash(references),
+    };
+  }
+
+  private bindAiDecisionRevisions(decisionId: string, sourceRows: SourceEventRow[]) {
+    const revisionSet = this.sourceRevisionSet(sourceRows);
+    const insert = this.database.raw.prepare(
+      `INSERT INTO ai_decision_source_revision
+       (ai_decision_id, source_event_id, revision_id, source_order, revision_hash, owner_scope)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    revisionSet.references.forEach((reference) => insert.run(
+      decisionId, reference.sourceEventId, reference.revisionId, reference.sourceOrder, reference.revisionHash, DATA04_OWNER_SCOPE,
+    ));
+    const promptHash = privacyHash(this.adapters.classifier.promptVersion);
+    const modelConfigHash = privacyHash({ provider: this.adapters.classifier.provider, model: this.adapters.classifier.model, promptVersion: this.adapters.classifier.promptVersion });
+    this.database.raw.prepare(
+      `UPDATE ai_decision_log
+          SET revision_set_hash = ?, prompt_hash = ?, model_config_hash = ?,
+              replay_state = 'replayable', replay_state_reason = '', owner_scope = ?
+        WHERE id = ?`,
+    ).run(revisionSet.hash, promptHash, modelConfigHash, DATA04_OWNER_SCOPE, decisionId);
+    return revisionSet;
+  }
+
+  /**
+   * Register the current desktop capability as durable replay authorization.
+   * This is an explicit application-startup path called by buildApp; replay
+   * itself never trusts this caller-supplied secret or an optional bypass.
+   */
+  registerAuditReplayCapability(capability: AuditReplayCapabilitySecret): ReplayCapabilityBinding {
+    if (typeof capability.token !== 'string' || capability.token.length < 32
+      || typeof capability.csrfToken !== 'string' || capability.csrfToken.length < 32
+      || !Number.isFinite(capability.expiresAt) || capability.origin !== 'app://local') {
+      throw new ReplayAuthorizationError('AI 决策回放能力凭证无效；已拒绝访问。');
+    }
+    const tokenHash = createHash('sha256').update(capability.token).digest('hex');
+    const csrfTokenHash = createHash('sha256').update(capability.csrfToken).digest('hex');
+    const now = nowIso();
+    const expiresAt = new Date(capability.expiresAt).toISOString();
+    this.database.transaction(() => {
+      this.database.raw.prepare(
+        `INSERT INTO audit_replay_capability
+          (id, owner_scope, capability_token_hash, capability_csrf_hash, capability_origin,
+           intent, expires_at, status, created_at, updated_at, consumed_at, revoked_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL, NULL)
+         ON CONFLICT(owner_scope, intent) DO UPDATE SET
+           id = excluded.id,
+           capability_token_hash = excluded.capability_token_hash,
+           capability_csrf_hash = excluded.capability_csrf_hash,
+           capability_origin = excluded.capability_origin,
+           expires_at = excluded.expires_at,
+           status = 'active',
+           created_at = excluded.created_at,
+           updated_at = excluded.updated_at,
+           consumed_at = NULL,
+           revoked_at = NULL`,
+      ).run(
+        `audit-replay-capability:${DATA04_OWNER_SCOPE}`,
+        DATA04_OWNER_SCOPE,
+        tokenHash,
+        csrfTokenHash,
+        capability.origin,
+        AUDIT_REPLAY_INTENT,
+        expiresAt,
+        now,
+        now,
+      );
+    });
+    return { tokenHash, csrfTokenHash, origin: capability.origin };
+  }
+
+  /** Verify and atomically consume the current durable capability. */
+  private consumeAuditReplayCapability(binding: ReplayCapabilityBinding) {
+    if (!binding || typeof binding !== 'object'
+      || !/^[a-f0-9]{64}$/u.test(binding.tokenHash)
+      || !/^[a-f0-9]{64}$/u.test(binding.csrfTokenHash)
+      || binding.origin !== 'app://local') {
+      throw new ReplayAuthorizationError('AI 决策回放能力凭证无效；已拒绝访问。');
+    }
+    const now = nowIso();
+    const current = this.database.raw.prepare(
+        `SELECT id, owner_scope, capability_token_hash, capability_csrf_hash,
+                capability_origin, intent, expires_at, status
+           FROM audit_replay_capability
+          WHERE owner_scope = ? AND intent = ?`,
+    ).get(DATA04_OWNER_SCOPE, AUDIT_REPLAY_INTENT) as {
+        id: string; owner_scope: string; capability_token_hash: string; capability_csrf_hash: string;
+        capability_origin: string; intent: string; expires_at: string; status: 'active' | 'revoked' | 'consumed';
+    } | undefined;
+    if (!current
+        || current.intent !== AUDIT_REPLAY_INTENT
+        || current.capability_origin !== 'app://local'
+        || !replayHashEquals(binding.tokenHash, current.capability_token_hash)
+        || !replayHashEquals(binding.csrfTokenHash, current.capability_csrf_hash)
+        || current.status !== 'active'
+        || !Number.isFinite(Date.parse(current.expires_at))
+        || Date.parse(current.expires_at) <= Date.parse(now)) {
+      throw new ReplayAuthorizationError('AI 决策回放能力凭证无效、已过期或已使用；已拒绝访问。');
+    }
+    const claimed = this.database.raw.prepare(
+        `UPDATE audit_replay_capability
+            SET status = 'consumed', consumed_at = ?, updated_at = ?
+          WHERE id = ? AND owner_scope = ? AND intent = ? AND status = 'active' AND expires_at > ?`,
+    ).run(now, now, current.id, DATA04_OWNER_SCOPE, AUDIT_REPLAY_INTENT, now);
+    if (claimed.changes !== 1) throw new ReplayAuthorizationError('AI 决策回放能力凭证已被其他请求使用；已拒绝访问。');
+    return current.owner_scope;
+  }
+
+  /**
+   * Validate the complete persisted decision scope before any capability is
+   * consumed. Foreign-but-existing IDs are not enough: every edge must point
+   * at the same owner-bound demand unit, ordered source set and candidate/task
+   * lineage that produced this decision.
+   */
+  private validateReplayDecisionScope(decisionId: string) {
+    const decision = this.database.raw.prepare(
+      `SELECT id, source_event_id, source_revision, demand_unit_id, candidate_id, revision_set_hash,
+              replay_state, owner_scope
+         FROM ai_decision_log WHERE id = ?`,
+    ).get(decisionId) as {
+      id: string; source_event_id: string | null; source_revision: string | null; demand_unit_id: string | null;
+      candidate_id: string | null; revision_set_hash: string | null;
+      replay_state: 'replayable' | 'unreplayable_legacy'; owner_scope: string;
+    } | undefined;
+    if (!decision) throw new Error('AI 决策不存在。');
+    if (decision.owner_scope !== DATA04_OWNER_SCOPE) {
+      throw new ReplayAuthorizationError('AI 决策不属于当前系统主人范围；已拒绝访问。');
+    }
+    if (!decision.source_event_id || decision.replay_state !== 'replayable'
+      || !/^[a-f0-9]{64}$/u.test(decision.revision_set_hash ?? '')) {
+      throw new Error('AI 决策范围不完整或不可回放；已拒绝回放。');
+    }
+
+    const primarySource = this.database.raw.prepare(
+      `SELECT id, owner_scope FROM source_event WHERE id = ?`,
+    ).get(decision.source_event_id) as { id: string; owner_scope: string } | undefined;
+    if (!primarySource || primarySource.owner_scope !== decision.owner_scope) {
+      throw new ReplayAuthorizationError('AI 决策主来源跨主人或缺失；已拒绝访问。');
+    }
+
+    const demandUnit = decision.demand_unit_id
+      ? this.database.raw.prepare(
+        `SELECT id, anchor_source_event_id, ai_decision_id
+           FROM source_demand_unit WHERE id = ?`,
+      ).get(decision.demand_unit_id) as { id: string; anchor_source_event_id: string; ai_decision_id: string | null } | undefined
+      : undefined;
+    if (decision.demand_unit_id && (!demandUnit
+      || demandUnit.anchor_source_event_id !== decision.source_event_id
+      || demandUnit.ai_decision_id !== decision.id)) {
+      throw new Error('AI 决策与需求单元范围不一致；已拒绝回放。');
+    }
+
+    const references = this.database.raw.prepare(
+      `SELECT reference.source_event_id, reference.revision_id, reference.source_order,
+              reference.revision_hash AS reference_hash, reference.owner_scope AS reference_owner_scope,
+              source.owner_scope AS source_owner_scope,
+              revision.source_event_id AS revision_source_event_id, revision.owner_scope AS revision_owner_scope,
+              revision.revision_number, revision.revision_hash, revision.revision_kind,
+              revision.external_id, revision.source_type, revision.conversation_id,
+              revision.sender_id, revision.sender_name, revision.content, revision.owner_mentioned,
+              revision.source_url, revision.completeness, revision.discovery_reason, revision.metadata_json,
+              revision.occurred_at, revision.captured_at
+         FROM ai_decision_source_revision AS reference
+         LEFT JOIN source_event AS source ON source.id = reference.source_event_id
+         LEFT JOIN source_event_revision AS revision ON revision.id = reference.revision_id
+        WHERE reference.ai_decision_id = ? ORDER BY reference.source_order ASC`,
+    ).all(decision.id) as ReplayRevisionRow[];
+    if (!references.length) throw new Error('AI 决策缺少完整来源修订引用；已拒绝回放。');
+
+    const sourceIds: string[] = [];
+    const revisionIds = new Set<string>();
+    const entries: RevisionSetEntry[] = [];
+    references.forEach((reference, expectedOrder) => {
+      if (!reference.revision_id || reference.source_order !== expectedOrder
+        || sourceIds.includes(reference.source_event_id) || revisionIds.has(reference.revision_id)
+        || reference.source_event_id !== reference.revision_source_event_id
+        || reference.source_owner_scope !== decision.owner_scope
+        || reference.reference_owner_scope !== decision.owner_scope
+        || reference.revision_owner_scope !== decision.owner_scope
+        || reference.external_id === null || reference.source_type === null || reference.conversation_id === null
+        || reference.sender_id === null || reference.sender_name === null || reference.content === null
+        || reference.owner_mentioned === null || reference.completeness === null || reference.discovery_reason === null
+        || reference.metadata_json === null || reference.occurred_at === null || reference.captured_at === null
+        || !/^[a-f0-9]{64}$/u.test(reference.reference_hash ?? '')
+        || !/^[a-f0-9]{64}$/u.test(reference.revision_hash ?? '')) {
+        throw new Error('AI 决策来源修订引用缺失、重复、乱序或跨主人；已拒绝回放。');
+      }
+      const recomputed = canonicalRevisionHash({
+        ownerScope: reference.revision_owner_scope!, sourceEventId: reference.revision_source_event_id!,
+        revisionNumber: reference.revision_number!, revisionKind: reference.revision_kind!,
+        externalId: reference.external_id!, sourceType: reference.source_type!,
+        conversationId: reference.conversation_id!, senderId: reference.sender_id!,
+        senderName: reference.sender_name!, content: reference.content!,
+        ownerMentioned: reference.owner_mentioned!, sourceUrl: reference.source_url,
+        completeness: reference.completeness!, discoveryReason: reference.discovery_reason!,
+        metadataJson: reference.metadata_json!, occurredAt: reference.occurred_at!, capturedAt: reference.captured_at!,
+      });
+      if (!replayHashEquals(recomputed, reference.revision_hash!) || !replayHashEquals(recomputed, reference.reference_hash!)) {
+        throw new Error('AI 决策来源修订内容或 hash 已篡改；已拒绝回放。');
+      }
+      sourceIds.push(reference.source_event_id);
+      revisionIds.add(reference.revision_id);
+      entries.push({ sourceEventId: reference.source_event_id, revisionId: reference.revision_id, revisionHash: reference.revision_hash!, sourceOrder: reference.source_order });
+    });
+
+    if (!sourceIds.includes(decision.source_event_id)) {
+      throw new Error('AI 决策主来源范围不一致；已拒绝回放。');
+    }
+    if (decision.demand_unit_id) {
+      const unitSources = this.database.raw.prepare(
+        `SELECT source_event_id, source_role, sequence
+           FROM source_demand_unit_source
+          WHERE demand_unit_id = ? ORDER BY sequence ASC, source_event_id ASC`,
+      ).all(decision.demand_unit_id) as Array<{ source_event_id: string; source_role: string; sequence: number }>;
+      if (unitSources.length !== sourceIds.length
+        || unitSources.some((row, index) => row.source_event_id !== sourceIds[index] || row.sequence !== index)) {
+        throw new Error('AI 决策来源范围与需求单元不一致；已拒绝回放。');
+      }
+      const anchors = unitSources.filter((row) => row.source_role === 'anchor');
+      if (anchors.length !== 1 || anchors[0]!.source_event_id !== decision.source_event_id) {
+        throw new Error('AI 决策主来源范围不一致；已拒绝回放。');
+      }
+    }
+
+    const candidateRevisions = this.database.raw.prepare(
+      `SELECT id, candidate_id, source_event_id, demand_unit_id, ai_decision_id
+         FROM candidate_revision WHERE ai_decision_id = ? ORDER BY created_at, id`,
+    ).all(decision.id) as Array<{ id: string; candidate_id: string; source_event_id: string; demand_unit_id: string | null; ai_decision_id: string }>;
+    if (decision.candidate_id) {
+      const candidate = this.database.raw.prepare(
+        `SELECT candidate.id, candidate.source_event_id, candidate.demand_unit_id,
+                candidate.accepted_task_id, source.owner_scope AS source_owner_scope
+           FROM candidate_request AS candidate
+           LEFT JOIN source_event AS source ON source.id = candidate.source_event_id
+          WHERE candidate.id = ?`,
+      ).get(decision.candidate_id) as { id: string; source_event_id: string; demand_unit_id: string | null; accepted_task_id: string | null } | undefined;
+      if (!candidate || candidate.source_event_id !== decision.source_event_id || candidate.demand_unit_id !== decision.demand_unit_id
+        || (candidate as { source_owner_scope?: string | null }).source_owner_scope !== decision.owner_scope
+        || candidateRevisions.length !== 1 || candidateRevisions[0]!.candidate_id !== candidate.id
+        || candidateRevisions[0]!.source_event_id !== decision.source_event_id
+        || candidateRevisions[0]!.demand_unit_id !== decision.demand_unit_id
+        || candidateRevisions[0]!.ai_decision_id !== decision.id) {
+        throw new Error('AI 决策候选范围不一致；已拒绝回放。');
+      }
+      if (candidate.accepted_task_id) {
+        const task = this.database.raw.prepare(
+          `SELECT id, thread_id, record_state FROM task WHERE id = ?`,
+        ).get(candidate.accepted_task_id) as { id: string; thread_id: string | null; record_state: string } | undefined;
+        if (!task || task.record_state !== 'active') {
+          throw new Error('AI 决策任务范围不一致；已拒绝回放。');
+        }
+        const candidateThreads = decision.demand_unit_id
+          ? this.database.raw.prepare(
+            `SELECT requirement_thread.id, requirement_thread.active_task_id
+               FROM requirement_thread
+               JOIN requirement_thread_unit
+                 ON requirement_thread_unit.thread_id = requirement_thread.id
+              WHERE requirement_thread_unit.demand_unit_id = ?`,
+          ).all(decision.demand_unit_id) as Array<{ id: string; active_task_id: string | null }>
+          : [];
+        if (decision.demand_unit_id && (candidateThreads.length !== 1 || candidateThreads[0]!.active_task_id !== task.id
+          || task.thread_id !== candidateThreads[0]!.id)) {
+          throw new Error('AI 决策候选、任务与需求线程范围不一致；已拒绝回放。');
+        }
+        const taskSources = this.database.raw.prepare(
+          `SELECT task_source_link.source_event_id, task_source_link.demand_unit_id,
+                  source_event.owner_scope
+             FROM task_source_link
+             JOIN source_event ON source_event.id = task_source_link.source_event_id
+            WHERE task_source_link.task_id = ?
+            ORDER BY task_source_link.source_event_id, task_source_link.demand_unit_id`,
+        ).all(candidate.accepted_task_id) as Array<{ source_event_id: string; demand_unit_id: string | null; owner_scope: string }>;
+        const expectedTaskSources = [...sourceIds].sort();
+        if (taskSources.length !== expectedTaskSources.length
+          || taskSources.some((row, index) => row.source_event_id !== expectedTaskSources[index]
+            || row.demand_unit_id !== decision.demand_unit_id || row.owner_scope !== decision.owner_scope)) {
+          throw new Error('AI 决策任务来源范围不一致；已拒绝回放。');
+        }
+        if (task.thread_id) {
+          const thread = this.database.raw.prepare(
+            `SELECT id, active_task_id FROM requirement_thread WHERE id = ?`,
+          ).get(task.thread_id) as { id: string; active_task_id: string | null } | undefined;
+          if (!thread || thread.active_task_id !== task.id) {
+            throw new Error('AI 决策任务线程范围不一致；已拒绝回放。');
+          }
+          if (decision.demand_unit_id) {
+            const threadUnit = this.database.raw.prepare(
+              `SELECT 1 FROM requirement_thread_unit WHERE thread_id = ? AND demand_unit_id = ?`,
+            ).get(thread.id, decision.demand_unit_id);
+            if (!threadUnit) throw new Error('AI 决策任务需求单元范围不一致；已拒绝回放。');
+          }
+        }
+      }
+    } else if (candidateRevisions.length) {
+      throw new Error('AI 决策候选生成范围不一致；已拒绝回放。');
+    }
+
+    const revisionSetHash = canonicalRevisionSetHash(entries);
+    if (!replayHashEquals(decision.revision_set_hash ?? '', revisionSetHash)) throw new Error('AI 决策来源修订集合校验失败；已拒绝回放。');
+    return { sourceIds, references, revisionSetHash };
+  }
+
+  /** Reconstruct only from immutable revision rows; current source content is never consulted. */
+  replayAiDecision(decisionId: string, capabilityBinding: ReplayCapabilityBinding) {
+    assertPrivacyKey(decisionId, 'AI 决策 ID');
+    assertReplayCapabilityBinding(capabilityBinding);
+    return this.database.transaction(() => {
+      // Scope validation must complete before consuming a valid capability.
+      const scope = this.validateReplayDecisionScope(decisionId);
+      const decision = this.database.raw.prepare(
+      `SELECT id, input_hash, revision_set_hash, prompt_hash, model_config_hash,
+              replay_state, replay_state_reason, owner_scope, created_at
+       FROM ai_decision_log WHERE id = ?`,
+      ).get(decisionId) as {
+      id: string; input_hash: string | null; revision_set_hash: string | null; prompt_hash: string | null;
+      model_config_hash: string | null; replay_state: 'replayable' | 'unreplayable_legacy'; replay_state_reason: string | null;
+      owner_scope: string; created_at: string;
+      } | undefined;
+      if (!decision) throw new Error('AI 决策不存在。');
+      if (decision.owner_scope !== DATA04_OWNER_SCOPE) throw new ReplayAuthorizationError();
+      if (decision.replay_state !== 'replayable'
+      || !/^[a-f0-9]{64}$/u.test(decision.prompt_hash ?? '')
+      || !/^[a-f0-9]{64}$/u.test(decision.model_config_hash ?? '')
+      || !/^[a-f0-9]{64}$/u.test(decision.revision_set_hash ?? '')) {
+        throw new Error(`AI 决策不可回放：${decision.replay_state_reason ?? '缺少可重建的原始输入。'}`);
+      }
+      const ownerScope = this.consumeAuditReplayCapability(capabilityBinding);
+      if (ownerScope !== decision.owner_scope) throw new ReplayAuthorizationError();
+      return {
+      decisionId: decision.id,
+      sourceEventIds: scope.sourceIds,
+      revisionIds: scope.references.map((revision) => revision.revision_id),
+      revisionNumbers: scope.references.map((revision) => revision.revision_number),
+      revisionKinds: scope.references.map((revision) => revision.revision_kind),
+      revisionSetHash: scope.revisionSetHash,
+      inputHash: decision.input_hash,
+      promptHash: decision.prompt_hash,
+      modelConfigHash: decision.model_config_hash,
+      createdAt: decision.created_at,
+      };
+    });
+  }
+
+  private persistSourceEvent(event: NormalizedSourceEvent) {
+    return this.database.transaction(() => this.persistSourceEventUnsafe(event));
+  }
+
+  private persistSourceEventUnsafe(event: NormalizedSourceEvent) {
+    if (this.privacyControl().collection_status === 'stopped') {
+      throw new Error('隐私状态已停止采集；来源未写入。');
+    }
+    const normalized = this.adapters.feishu.normalizeSource(event);
+    const incomingIdentity = sourceDedupeIdentityOfEvent(normalized);
+    const existing = this.database.raw
+      .prepare('SELECT * FROM source_event WHERE external_id = ?')
+      .get(normalized.externalId) as SourceEventRow | undefined;
+    if (existing) {
+      const existingIdentity = sourceDedupeIdentityOfRow(existing);
+      if (!sourceDedupeIdentityMatches(existingIdentity, incomingIdentity)) {
+        throw new Error('来源 external_id 已绑定到不兼容的主人、入口或会话；已拒绝写入或确认。');
+      }
+      const rank = (value: NormalizedSourceEvent['completeness'] | undefined) => value === 'complete' ? 3 : value === 'partial' ? 2 : 1;
+      const incomingCompleteness = normalized.completeness ?? 'partial';
+      const currentMetadata = parseMetadata(existing.metadata_json);
+      const incomingMetadata = stripExternalFailureInbox(normalized.metadata ?? {});
+      const incomingVersion = metadataVersion(incomingMetadata);
+      const currentVersion = metadataVersion(currentMetadata);
+      const incomingIsNewer = incomingMetadataIsNewer(incomingVersion, currentVersion);
+      const incomingDeleted = Boolean(incomingMetadata.deleted || incomingMetadata.withdrawn || incomingMetadata.recalled);
+      const currentDeleted = Boolean(currentMetadata.deleted || currentMetadata.withdrawn || currentMetadata.recalled);
+      const mergedMetadata: Record<string, unknown> = { ...currentMetadata, ...incomingMetadata, ...(currentDeleted || incomingDeleted ? { deleted: true } : {}) };
+      // Channel provenance is immutable once an external id has been bound.
+      // A duplicate may enrich content, but it can never relabel an owner or
+      // source namespace (for example, owner history as bot_supplement).
+      if (Object.prototype.hasOwnProperty.call(currentMetadata, 'sourceScope')) {
+        mergedMetadata.sourceScope = currentMetadata.sourceScope;
+      } else {
+        delete mergedMetadata.sourceScope;
+      }
+      if (Object.prototype.hasOwnProperty.call(currentMetadata, 'ownerScope')) {
+        mergedMetadata.ownerScope = currentMetadata.ownerScope;
+      } else {
+        delete mergedMetadata.ownerScope;
+      }
+      const replaceContent = Boolean(normalized.content) && (incomingDeleted || incomingIsNewer || rank(incomingCompleteness) > rank(existing.completeness) || !existing.content);
+      const nextContent = currentDeleted || incomingDeleted ? '[飞书消息已撤回或删除，正文不再保留]' : replaceContent ? normalized.content : existing.content;
+      const nextCompleteness = currentDeleted || incomingDeleted ? 'limited' : (incomingIsNewer || rank(incomingCompleteness) > rank(existing.completeness)) ? incomingCompleteness : existing.completeness;
+      const nextSenderId = (incomingIsNewer || existing.sender_id === 'unknown-sender') && normalized.senderId ? normalized.senderId : existing.sender_id;
+      const nextSenderName = (incomingIsNewer || existing.sender_name === '飞书用户') && normalized.senderName ? normalized.senderName : existing.sender_name;
+      const nextOwnerMentioned = existing.owner_mentioned || (normalized.ownerMentioned ? 1 : 0);
+      const nextSourceUrl = normalized.sourceUrl ?? existing.source_url;
+      const nextReason = normalized.discoveryReason || existing.discovery_reason;
+      const changed = nextCompleteness !== existing.completeness
+        || nextContent !== existing.content
+        || nextOwnerMentioned !== existing.owner_mentioned
+        || nextSourceUrl !== existing.source_url
+        || nextReason !== existing.discovery_reason
+        || nextSenderId !== existing.sender_id
+        || nextSenderName !== existing.sender_name
+        || JSON.stringify(mergedMetadata) !== existing.metadata_json;
+      if (changed) {
+        const updated = this.database.raw.prepare(
+          `UPDATE source_event
+           SET content = ?, sender_id = ?, sender_name = ?, owner_mentioned = ?, source_url = ?, completeness = ?, discovery_reason = ?, metadata_json = ?
+           WHERE id = ? AND owner_scope = ? AND revision_generation = ? AND current_revision_id IS ?`,
+        ).run(
+          nextContent,
+          nextSenderId,
+          nextSenderName,
+          nextOwnerMentioned,
+          nextSourceUrl,
+          nextCompleteness,
+          nextReason,
+          JSON.stringify(mergedMetadata),
+          existing.id, existing.owner_scope, existing.revision_generation, existing.current_revision_id,
+        );
+        if (updated.changes !== 1) throw new Error('来源状态已被其他写入者更新；已回滚本次写入。');
+        const revised = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(existing.id) as SourceEventRow;
+        this.ensureSourceRevision(revised, incomingDeleted && !currentDeleted ? 'recall' : 'edit');
+        this.log('runtime', 'info', 'source.enriched', incomingDeleted ? '消息已撤回或删除，已清除原正文。' : '已用更新或更完整的授权来源更新原消息。', { sourceEventId: existing.id, completeness: nextCompleteness });
+      } else {
+        const current = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(existing.id) as SourceEventRow;
+        this.ensureSourceRevision(current);
+      }
+      const refreshed = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(existing.id) as SourceEventRow;
+      return { row: refreshed, deduplicated: true, upgraded: changed, changed };
+    }
+
+    const sourceEventId = id('src');
+    const capturedAt = nowIso();
+    this.database.raw
+      .prepare(
+        `INSERT INTO source_event
+          (id, external_id, source_type, conversation_id, sender_id, sender_name, content, owner_mentioned, source_url, completeness, discovery_reason, metadata_json, occurred_at, captured_at, owner_scope)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        sourceEventId,
+        normalized.externalId,
+        normalized.sourceType,
+        normalized.conversationId,
+        normalized.senderId,
+        normalized.senderName,
+        normalized.content,
+        normalized.ownerMentioned ? 1 : 0,
+        normalized.sourceUrl ?? null,
+        normalized.completeness ?? 'partial',
+        normalized.discoveryReason ?? '',
+        JSON.stringify(stripExternalFailureInbox(normalized.metadata ?? {})),
+        normalized.occurredAt,
+        capturedAt,
+        incomingIdentity.ownerScope,
+      );
+
+    this.log('runtime', 'info', 'source.captured', '已保存一条授权来源消息。', {
+      sourceEventId,
+      sourceType: normalized.sourceType,
+      senderIdPresent: Boolean(normalized.senderId),
+    });
+
+    const sourceRow = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(sourceEventId) as SourceEventRow;
+    this.ensureSourceRevision(sourceRow, 'ingest');
+    const refreshed = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(sourceEventId) as SourceEventRow;
+    return { row: refreshed, deduplicated: false, upgraded: false, changed: true };
+  }
+
+  private sourceThreadIds(sourceEventId: string) {
+    const rows = this.database.raw.prepare(
+      'SELECT DISTINCT thread_id FROM requirement_thread_source WHERE source_event_id = ? ORDER BY thread_id ASC',
+    ).all(sourceEventId) as Array<{ thread_id: string }>;
+    return rows.map((row) => row.thread_id).filter(Boolean);
+  }
+
+  /**
+   * A source can belong to more than one demand unit.  Source-only lookup is
+   * therefore a legacy convenience and is allowed to return a thread only
+   * when the relationship is unambiguous.
+   */
+  private sourceThreadId(sourceEventId: string) {
+    const threadIds = this.sourceThreadIds(sourceEventId);
+    return threadIds.length === 1 ? threadIds[0]! : null;
+  }
+
+  private strongThreadContext(rows: SourceEventRow[]) {
+    const matches: Array<{ threadId: string; relationType: 'reply_root' | 'reply_parent' | 'session' | 'batch_context' }> = [];
+    const add = (threadId: string | null | undefined, relationType: 'reply_root' | 'reply_parent' | 'session' | 'batch_context') => {
+      if (threadId) matches.push({ threadId, relationType });
+    };
+    for (const row of rows) {
+      const metadata = parseMetadata(row.metadata_json);
+      for (const existingThreadId of this.sourceThreadIds(row.id)) {
+        const existingRelation = this.database.raw.prepare(
+          'SELECT relation_type FROM requirement_thread_source WHERE thread_id = ? AND source_event_id = ?',
+        ).get(existingThreadId, row.id) as { relation_type: string } | undefined;
+        if (existingRelation && ['owner_corrected', 'owner_confirmed', 'reply_root', 'reply_parent', 'session', 'batch_context', 'batch_continuation'].includes(existingRelation.relation_type)) {
+          add(existingThreadId, existingRelation.relation_type === 'session' ? 'session' : 'batch_context');
+        }
+      }
+      const internalThreadId = metadataText(metadata, 'internalRequirementThreadId');
+      if (internalThreadId && rows.length > 1) add(internalThreadId, 'batch_context');
+      const markers = threadMarkers(row);
+      if (markers.rootId) {
+        const found = this.database.raw.prepare(
+          `SELECT DISTINCT requirement_thread.id FROM requirement_thread
+           JOIN requirement_thread_source ON requirement_thread_source.thread_id = requirement_thread.id
+           JOIN source_event ON source_event.id = requirement_thread_source.source_event_id
+           WHERE requirement_thread_source.root_id = ? OR source_event.external_id = ?`,
+        ).all(markers.rootId, markers.rootId) as Array<{ id: string }>;
+        for (const item of found) add(item.id, 'reply_root');
+      }
+      if (markers.parentId) {
+        const found = this.database.raw.prepare(
+          `SELECT DISTINCT requirement_thread.id FROM requirement_thread
+           JOIN requirement_thread_source ON requirement_thread_source.thread_id = requirement_thread.id
+           JOIN source_event ON source_event.id = requirement_thread_source.source_event_id
+           WHERE source_event.id = ? OR source_event.external_id = ?`,
+        ).all(markers.parentId, markers.parentId) as Array<{ id: string }>;
+        for (const item of found) add(item.id, 'reply_parent');
+      }
+      if (markers.sessionId) {
+        const found = this.database.raw.prepare(
+          `SELECT DISTINCT requirement_thread.id FROM requirement_thread
+           JOIN requirement_thread_source ON requirement_thread_source.thread_id = requirement_thread.id
+           WHERE requirement_thread_source.session_id = ?`,
+        ).all(markers.sessionId) as Array<{ id: string }>;
+        for (const item of found) add(item.id, 'session');
+      }
+    }
+    const threadIds = [...new Set(matches.map((item) => item.threadId))];
+    if (threadIds.length !== 1) return null;
+    const matchedThreadId = threadIds[0]!;
+    const thread = this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(matchedThreadId) as unknown as RequirementThreadRow | undefined;
+    if (!thread || thread.status === 'closed' || !thread.active_task_id) return null;
+    const task = this.getTask(thread.active_task_id);
+    if (!task || task.deleted_at || task.record_state !== 'active') return null;
+    const rank = { reply_root: 4, reply_parent: 3, session: 2, batch_context: 1 } as const;
+    const relationType = matches
+      .filter((item) => item.threadId === thread.id)
+      .sort((left, right) => rank[right.relationType] - rank[left.relationType])[0]?.relationType ?? 'batch_context';
+    return { thread, task, relationType };
+  }
+
+  private buildThreadClassificationContext(rows: SourceEventRow[]): ThreadClassificationContext {
+    const ordered = [...rows].sort(stableSourceOrder);
+    const latest = ordered[ordered.length - 1];
+    const occurredAt = latest && Number.isFinite(Date.parse(latest.occurred_at)) ? Date.parse(latest.occurred_at) : Date.now();
+    const conversations = new Set(ordered.map((row) => row.conversation_id).filter(Boolean));
+    const participants = new Set(ordered.flatMap((row) => threadParticipants(row)));
+    const content = ordered.map((row) => row.content).join('\n').normalize('NFKC').toLocaleLowerCase('zh-CN');
+    const threads = this.database.raw.prepare(
+      "SELECT * FROM requirement_thread WHERE status <> 'closed' AND active_task_id IS NOT NULL ORDER BY last_activity_at DESC, updated_at DESC",
+    ).all() as unknown as RequirementThreadRow[];
+    const ranked = threads.flatMap((thread) => {
+      const task = thread.active_task_id ? this.getTask(thread.active_task_id) : null;
+      if (!task || task.deleted_at || task.record_state !== 'active') return [];
+      const storedParticipants = parseJsonValue<string[]>(thread.participant_ids_json, []).filter(Boolean);
+      const participantOverlap = storedParticipants.some((participant) => participants.has(participant));
+      const sameConversation = Boolean(thread.conversation_id && conversations.has(thread.conversation_id));
+      const normalizedTitles = [thread.title, task.title]
+        .map((value) => value.trim().normalize('NFKC').toLocaleLowerCase('zh-CN'))
+        .filter((value) => value.length >= 4);
+      const explicitReference = content.includes(thread.id.toLocaleLowerCase())
+        || content.includes(task.id.toLocaleLowerCase())
+        || normalizedTitles.some((title) => content.includes(title));
+      const activity = Date.parse(thread.last_activity_at ?? thread.updated_at);
+      const ageMs = Math.max(0, occurredAt - (Number.isFinite(activity) ? activity : occurredAt));
+      const within72Hours = ageMs <= 72 * 60 * 60 * 1000;
+      const within30Days = ageMs <= 30 * 24 * 60 * 60 * 1000;
+      if (!explicitReference && !sameConversation && !participantOverlap) return [];
+      const autoEligible = explicitReference || (sameConversation && participantOverlap && within30Days) || (participantOverlap && within72Hours);
+      const rank = (explicitReference ? 1_000 : 0)
+        + (sameConversation && participantOverlap ? 500 : 0)
+        + (participantOverlap && within72Hours ? 300 : 0)
+        + (sameConversation ? 200 : 0)
+        + (participantOverlap ? 100 : 0)
+        - Math.min(ageMs / (24 * 60 * 60 * 1000), 90);
+      const recency: ModelThreadCandidate['recency'] = ageMs <= 24 * 60 * 60 * 1000
+        ? 'day'
+        : ageMs <= 7 * 24 * 60 * 60 * 1000
+          ? 'week'
+          : ageMs <= 30 * 24 * 60 * 60 * 1000 ? 'month' : 'older';
+      return [{ thread, task, autoEligible, sameConversation, participantOverlap, explicitReference, recency, rank }];
+    }).sort((left, right) => right.rank - left.rank || (right.thread.last_activity_at ?? '').localeCompare(left.thread.last_activity_at ?? '') || left.thread.id.localeCompare(right.thread.id));
+    const candidateSetComplete = ranked.length <= 6;
+    const candidates = ranked.slice(0, 6).map((item, index): ModelThreadCandidate => ({
+      candidateKey: `c${index + 1}`,
+      threadId: item.thread.id,
+      taskId: item.task.id,
+      threadVersion: item.thread.version,
+      taskVersion: item.task.version,
+      autoEligible: item.autoEligible,
+      threadTitle: item.thread.title,
+      threadDescribe: item.thread.describe,
+      validationQuestion: item.thread.validation_question,
+      taskTitle: item.task.title,
+      taskDescribe: item.task.describe,
+      taskStatus: item.task.status,
+      recency: item.recency,
+      signals: {
+        sameConversation: item.sameConversation,
+        participantOverlap: item.participantOverlap,
+        explicitReference: item.explicitReference,
+      },
+    }));
+    const candidateSetHash = createHash('sha256').update(JSON.stringify({
+      candidateSetComplete,
+      candidates: candidates.map((candidate) => ({
+        candidateKey: candidate.candidateKey,
+        threadId: candidate.threadId,
+        taskId: candidate.taskId,
+        threadVersion: candidate.threadVersion,
+        taskVersion: candidate.taskVersion,
+        autoEligible: candidate.autoEligible,
+        signals: candidate.signals,
+      })),
+    })).digest('hex');
+    return { candidates, candidateSetHash, candidateSetComplete };
+  }
+
+  private buildCandidateMergeContext(rows: SourceEventRow[]): CandidateMergeClassificationContext {
+    const ordered = [...rows].sort(stableSourceOrder);
+    const latest = ordered[ordered.length - 1];
+    const occurredAt = latest && Number.isFinite(Date.parse(latest.occurred_at)) ? Date.parse(latest.occurred_at) : Date.now();
+    const excludedSourceIds = new Set(ordered.map((row) => row.id));
+    const conversations = new Set(ordered.map((row) => row.conversation_id).filter(Boolean));
+    const participants = new Set(ordered.flatMap((row) => threadParticipants(row)));
+    const content = ordered.map((row) => row.content).join('\n').normalize('NFKC').toLocaleLowerCase('zh-CN');
+    const currentCandidates = ordered.length
+      ? this.database.raw.prepare(
+          `SELECT * FROM candidate_request WHERE source_event_id IN (${ordered.map(() => '?').join(',')})`,
+        ).all(...ordered.map((row) => row.id)) as CandidateRow[]
+      : [];
+    const currentRoots = [...new Map(currentCandidates.map((candidate) => {
+      const root = this.candidateGroupRoot(candidate);
+      return [root.id, root] as const;
+    })).values()];
+    const rowsWithThreads = this.database.raw.prepare(
+      `SELECT candidate_request.*, source_event.occurred_at AS source_occurred_at,
+              source_event.conversation_id AS source_conversation_id,
+              requirement_thread.id AS pending_thread_id,
+              requirement_thread.version AS pending_thread_version,
+              requirement_thread.status AS pending_thread_status,
+              requirement_thread.title AS pending_thread_title,
+              requirement_thread.background AS pending_thread_background,
+              requirement_thread.validation_question AS pending_thread_validation_question,
+              requirement_thread.describe AS pending_thread_describe,
+              requirement_thread.participant_ids_json AS pending_thread_participants,
+              requirement_thread.primary_source_event_id AS pending_thread_primary_source,
+              requirement_thread.updated_at AS pending_thread_updated_at,
+              requirement_thread.last_activity_at AS pending_thread_last_activity_at
+       FROM candidate_request
+       JOIN source_event ON source_event.id = candidate_request.source_event_id
+       JOIN requirement_thread_source ON requirement_thread_source.source_event_id = source_event.id
+       JOIN requirement_thread ON requirement_thread.id = requirement_thread_source.thread_id
+       WHERE candidate_request.state IN ('pending','snoozed')
+         AND candidate_request.accepted_task_id IS NULL
+         AND candidate_request.deleted_at IS NULL
+         AND candidate_request.merged_into_candidate_id IS NULL
+         AND requirement_thread.active_task_id IS NULL
+         AND requirement_thread.status <> 'closed'
+       ORDER BY requirement_thread.last_activity_at DESC, candidate_request.updated_at DESC`,
+    ).all() as Array<CandidateRow & {
+      source_occurred_at: string;
+      source_conversation_id: string;
+      pending_thread_id: string;
+      pending_thread_version: number;
+      pending_thread_status: RequirementThreadRow['status'];
+      pending_thread_title: string;
+      pending_thread_background: string;
+      pending_thread_validation_question: string;
+      pending_thread_describe: string;
+      pending_thread_participants: string;
+      pending_thread_primary_source: string | null;
+      pending_thread_updated_at: string;
+      pending_thread_last_activity_at: string;
+    }>;
+    const seenCandidates = new Set<string>();
+    const ranked = rowsWithThreads.flatMap((row) => {
+      if (seenCandidates.has(row.id) || excludedSourceIds.has(row.source_event_id)) return [];
+      if (currentRoots.some((current) => this.candidateMergeExcluded(current, row))) return [];
+      seenCandidates.add(row.id);
+      const storedParticipants = parseJsonValue<string[]>(row.pending_thread_participants, []).filter(Boolean);
+      const participantOverlap = storedParticipants.some((participant) => participants.has(participant));
+      const sameConversation = Boolean(row.source_conversation_id && conversations.has(row.source_conversation_id));
+      const normalizedTitles = [row.title, row.pending_thread_title]
+        .map((value) => value.trim().normalize('NFKC').toLocaleLowerCase('zh-CN'))
+        .filter((value) => value.length >= 4);
+      const explicitContinuation = looksLikeConversationContinuation(content)
+        || normalizedTitles.some((title) => content.includes(title));
+      if (!sameConversation && !participantOverlap && !explicitContinuation) return [];
+      const activity = Date.parse(row.pending_thread_last_activity_at || row.source_occurred_at || row.pending_thread_updated_at);
+      const ageMs = Math.max(0, occurredAt - (Number.isFinite(activity) ? activity : occurredAt));
+      const recency = ageMs <= 24 * 60 * 60 * 1000
+        ? 'day' as const
+        : ageMs <= 7 * 24 * 60 * 60 * 1000
+          ? 'week' as const
+          : ageMs <= 30 * 24 * 60 * 60 * 1000 ? 'month' as const : 'older' as const;
+      const rank = (explicitContinuation ? 1_000 : 0)
+        + (sameConversation && participantOverlap ? 500 : 0)
+        + (sameConversation ? 200 : 0)
+        + (participantOverlap ? 100 : 0)
+        - Math.min(ageMs / (24 * 60 * 60 * 1000), 90);
+      const thread = {
+        id: row.pending_thread_id,
+        version: row.pending_thread_version,
+        status: row.pending_thread_status,
+        primary_source_event_id: row.pending_thread_primary_source,
+      } as RequirementThreadRow;
+      return [{ row, thread, sameConversation, participantOverlap, explicitContinuation, recency, rank }];
+    }).sort((left, right) => right.rank - left.rank || right.row.updated_at.localeCompare(left.row.updated_at) || left.row.id.localeCompare(right.row.id));
+    const candidateSetComplete = ranked.length <= 6;
+    const candidates = ranked.slice(0, 6).map((item, index) => ({
+      candidateKey: `c${index + 1}`,
+      candidateId: item.row.id,
+      threadId: item.row.pending_thread_id,
+      snapshotRevision: candidateSnapshotRevision(item.row, item.thread),
+      title: item.row.title,
+      background: item.row.background,
+      validationQuestion: item.row.validation_question,
+      describe: item.row.describe,
+        occurredAt: item.row.source_occurred_at,
+        lastActivityAt: item.row.pending_thread_last_activity_at,
+      recency: item.recency,
+      signals: {
+        sameConversation: item.sameConversation,
+        participantOverlap: item.participantOverlap,
+        explicitContinuation: item.explicitContinuation,
+      },
+    }));
+    const candidateSetHash = createHash('sha256').update(JSON.stringify({
+      candidateSetComplete,
+      candidates: candidates.map((candidate) => ({
+        candidateKey: candidate.candidateKey,
+        candidateId: candidate.candidateId,
+        threadId: candidate.threadId,
+        snapshotRevision: candidate.snapshotRevision,
+        signals: candidate.signals,
+      })),
+    })).digest('hex');
+    return { candidates, candidateSetHash, candidateSetComplete };
+  }
+
+  private classificationRevisionContext(rows: SourceEventRow[]) {
+    const strong = this.strongThreadContext(rows);
+    const association = strong
+      ? { candidates: [], candidateSetComplete: true, candidateSetHash: createHash('sha256').update(`strong:${strong.thread.id}:${strong.task.id}`).digest('hex') }
+      : this.buildThreadClassificationContext(rows);
+    const candidateMerge = strong
+      ? { candidates: [], candidateSetComplete: true, candidateSetHash: createHash('sha256').update(`strong-pending:${strong.thread.id}:${strong.task.id}`).digest('hex') }
+      : this.buildCandidateMergeContext(rows);
+    return {
+      strong,
+      revision: createHash('sha256').update(JSON.stringify({
+        strong: strong ? {
+          taskId: strong.task.id,
+          taskVersion: strong.task.version,
+          taskTitle: strong.task.title,
+          taskDescribe: strong.task.describe,
+          taskStatus: strong.task.status,
+          threadId: strong.thread.id,
+          threadVersion: strong.thread.version,
+          threadTitle: strong.thread.title,
+          threadBackground: strong.thread.background,
+          threadValidationQuestion: strong.thread.validation_question,
+          threadDescribe: strong.thread.describe,
+        } : null,
+        candidateSetHash: association.candidateSetHash,
+        candidateMergeSetHash: candidateMerge.candidateSetHash,
+      })).digest('hex'),
+      association,
+      candidateMerge,
+    };
+  }
+
+  private sourceWithConfirmedContext(
+    source: NormalizedSourceEvent,
+    context: ReturnType<PmService['strongThreadContext']>,
+    classificationContext?: ThreadClassificationContext,
+    candidateMergeContext?: CandidateMergeClassificationContext,
+  ) {
+    if (!context) return { ...source, classificationContext, candidateMergeContext };
+    return {
+      ...source,
+      classificationContext,
+      candidateMergeContext,
+      metadata: {
+        ...(source.metadata ?? {}),
+        confirmedTask: {
+          id: context.task.id,
+          version: context.task.version,
+          title: context.task.title,
+          describe: context.task.describe,
+          status: context.task.status,
+        },
+        confirmedThread: {
+          id: context.thread.id,
+          version: context.thread.version,
+          title: context.thread.title,
+          background: context.thread.background,
+          validationQuestion: context.thread.validation_question,
+          describe: context.thread.describe,
+        },
+      },
+    } satisfies NormalizedSourceEvent;
+  }
+
+  private semanticThreadAssociation(
+    classification: ClassificationResult,
+    context: ThreadClassificationContext,
+  ) {
+    const candidates = context.candidates;
+    const pendingThreadIds = candidates.map((candidate) => candidate.threadId);
+    const fail = (reason: string) => ({ thread: null as RequirementThreadRow | null, confidence: 0, evidence: [reason], pendingThreadIds });
+    const decision = classification.threadAssociation;
+    if (!decision || classification.usedFallback) return fail('模型未提供可验证的需求归属，等待主人确认。');
+    if (decision.candidateSetHash !== context.candidateSetHash || decision.candidateSetComplete !== context.candidateSetComplete) return fail('模型归属结果与当前候选快照不一致。');
+    const expectedPairs = new Map(candidates.map((candidate) => [`${candidate.threadId}\u0000${candidate.taskId}`, candidate]));
+    if (decision.scores.length !== expectedPairs.size) return fail('模型没有完整评分全部需求候选。');
+    const seen = new Set<string>();
+    for (const score of decision.scores) {
+      const key = `${score.threadId}\u0000${score.taskId}`;
+      if (!expectedPairs.has(key) || seen.has(key) || !Number.isFinite(score.confidence) || score.confidence < 0 || score.confidence > 1) {
+        return fail('模型返回了未知、重复或无效的需求候选评分。');
+      }
+      seen.add(key);
+    }
+    if (!decision.targetThreadId || !decision.targetTaskId || decision.confidence === null) {
+      return { ...fail(decision.reason || '模型认为当前消息不能唯一归入现有需求。'), evidence: [...decision.evidence, decision.reason].filter(Boolean) };
+    }
+    const targetKey = `${decision.targetThreadId}\u0000${decision.targetTaskId}`;
+    const target = expectedPairs.get(targetKey);
+    if (!target) return fail('模型返回的目标不在服务端候选范围内。');
+    const sorted = [...decision.scores].sort((left, right) => right.confidence - left.confidence);
+    const top = sorted[0];
+    const runnerUp = sorted[1];
+    if (!top || top.threadId !== target.threadId || top.taskId !== target.taskId || Math.abs(top.confidence - decision.confidence) > 1e-9) {
+      return fail('模型目标不是唯一最高分候选，或目标置信度不一致。');
+    }
+    const margin = top.confidence - (runnerUp?.confidence ?? 0);
+    const liveThread = this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(target.threadId) as unknown as RequirementThreadRow | undefined;
+    const liveTask = this.getTask(target.taskId);
+    if (!liveThread || liveThread.status === 'closed' || liveThread.active_task_id !== target.taskId
+      || liveThread.version !== target.threadVersion || !liveTask || liveTask.version !== target.taskVersion
+      || liveTask.deleted_at || liveTask.record_state !== 'active') return fail('目标任务或需求线程已变化，不能自动关联。');
+    if (this.automationPolicy().mode !== 'auto' || liveTask.auto_update_paused) return fail('全局或当前任务已暂停 AI 自动维护。');
+    const classificationConfidence = classification.draft?.confidence
+      ?? classification.semanticAnalysis?.updateConfidence
+      ?? classification.messageAction?.confidence
+      ?? 0;
+    if (!context.candidateSetComplete || !target.autoEligible || classificationConfidence < AUTO_ASSOCIATION_CONFIDENCE
+      || top.confidence < AUTO_SEMANTIC_ASSOCIATION_CONFIDENCE || margin < AUTO_SEMANTIC_ASSOCIATION_MARGIN
+      || (runnerUp?.confidence ?? 0) > 0.8) return fail('语义归属未达到唯一高置信自动关联门槛。');
+    return {
+      thread: liveThread,
+      confidence: top.confidence,
+      evidence: [...decision.evidence, decision.reason, `服务端校验：最高分 ${top.confidence.toFixed(2)}，与第二名分差 ${margin.toFixed(2)}。`].filter(Boolean),
+      pendingThreadIds: [] as string[],
+    };
+  }
+
+  private candidateMergeResolution(
+    classification: ClassificationResult,
+    context: CandidateMergeClassificationContext,
+    currentCandidate?: CandidateRow | null,
+  ) {
+    const fail = (reason: string) => ({
+      targetCandidate: null as CandidateRow | null,
+      targetThread: null as RequirementThreadRow | null,
+      decision: classification.candidateMerge ?? null,
+      automatic: false,
+      reason,
+    });
+    const decision = classification.candidateMerge;
+    if (!decision || classification.usedFallback) return fail('模型未提供可验证的候选归并结果。');
+    if (decision.candidateSetHash !== context.candidateSetHash || decision.candidateSetComplete !== context.candidateSetComplete) {
+      return fail('模型归并结果与当前待确认候选快照不一致。');
+    }
+    const expected = new Map(context.candidates.map((candidate) => [`${candidate.candidateId}\u0000${candidate.threadId}`, candidate]));
+    if (decision.scores.length !== expected.size) return fail('模型没有完整评分全部待确认候选。');
+    const seen = new Set<string>();
+    for (const score of decision.scores) {
+      const key = `${score.candidateId}\u0000${score.threadId}`;
+      if (!expected.has(key) || seen.has(key) || !Number.isFinite(score.confidence) || score.confidence < 0 || score.confidence > 1) {
+        return fail('模型返回了未知、重复或无效的待确认候选评分。');
+      }
+      seen.add(key);
+    }
+    if (!decision.sameRequirement || !decision.targetCandidateId || !decision.targetThreadId || decision.confidence === null
+      || !decision.primary || decision.primaryConfidence === null || !decision.currentRole || !decision.targetRole) {
+      return fail(decision.reason || '模型认为当前消息不能唯一归入待确认候选。');
+    }
+    const targetKey = `${decision.targetCandidateId}\u0000${decision.targetThreadId}`;
+    const snapshot = expected.get(targetKey);
+    if (!snapshot) return fail('模型返回的待确认候选不在服务端候选集内。');
+    const sorted = [...decision.scores].sort((left, right) => right.confidence - left.confidence);
+    const top = sorted[0];
+    const runnerUp = sorted[1];
+    if (!top || top.candidateId !== snapshot.candidateId || top.threadId !== snapshot.threadId
+      || Math.abs(top.confidence - decision.confidence) > 1e-9) {
+      return fail('模型归并目标不是唯一最高分候选，或目标置信度不一致。');
+    }
+    const liveCandidate = this.getCandidate(snapshot.candidateId);
+    const liveThread = this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(snapshot.threadId) as unknown as RequirementThreadRow | undefined;
+    if (!liveCandidate || !liveThread || liveCandidate.state === 'accepted' || liveCandidate.accepted_task_id
+      || liveCandidate.deleted_at || liveCandidate.merged_into_candidate_id || liveThread.active_task_id
+      || liveThread.status === 'closed' || candidateSnapshotRevision(liveCandidate, liveThread) !== snapshot.snapshotRevision) {
+      return fail('目标候选或需求线程已变化，不能自动归并。');
+    }
+    if (currentCandidate && this.candidateMergeExcluded(currentCandidate, liveCandidate)) {
+      return fail('系统主人已明确将这两项保留为独立需求，不能再次建议或自动归并。');
+    }
+    const margin = top.confidence - (runnerUp?.confidence ?? 0);
+    const primaryRole = decision.primary === 'current' ? decision.currentRole : decision.targetRole;
+    const classificationConfidence = classification.draft?.confidence
+      ?? classification.semanticAnalysis?.updateConfidence
+      ?? classification.messageAction?.confidence
+      ?? 0;
+    const automatic = context.candidateSetComplete
+      && this.automationPolicy().mode === 'auto'
+      && classificationConfidence >= AUTO_CANDIDATE_DRAFT_CONFIDENCE
+      && top.confidence >= AUTO_CANDIDATE_MERGE_CONFIDENCE
+      && margin >= AUTO_CANDIDATE_MERGE_MARGIN
+      && (runnerUp?.confidence ?? 0) <= 0.8
+      && decision.primaryConfidence >= AUTO_CANDIDATE_PRIMARY_CONFIDENCE
+      && primaryRole === 'owner_delivery';
+    return {
+      targetCandidate: liveCandidate,
+      targetThread: liveThread,
+      decision,
+      automatic,
+      reason: automatic
+        ? `候选归并通过安全门：同需求 ${top.confidence.toFixed(2)}，主体 ${decision.primaryConfidence.toFixed(2)}，分差 ${margin.toFixed(2)}。`
+        : '候选归并未达到自动门槛，保留为主人可见建议。',
+    };
+  }
+
+  private candidateGroupRows(rootCandidateId: string) {
+    return this.database.raw.prepare(
+      `SELECT * FROM candidate_request
+       WHERE id = ? OR merged_into_candidate_id = ?
+       ORDER BY created_at ASC, id ASC`,
+    ).all(rootCandidateId, rootCandidateId) as CandidateRow[];
+  }
+
+  private candidateMergePair(leftCandidateId: string, rightCandidateId: string) {
+    return leftCandidateId < rightCandidateId
+      ? [leftCandidateId, rightCandidateId] as const
+      : [rightCandidateId, leftCandidateId] as const;
+  }
+
+  private candidateMergeExcluded(left: CandidateRow, right: CandidateRow) {
+    const leftRoot = this.candidateGroupRoot(left);
+    const rightRoot = this.candidateGroupRoot(right);
+    const leftMembers = this.candidateGroupRows(leftRoot.id);
+    const rightMembers = this.candidateGroupRows(rightRoot.id);
+    const lookup = this.database.raw.prepare(
+      'SELECT 1 FROM candidate_merge_exclusion WHERE candidate_a_id = ? AND candidate_b_id = ? LIMIT 1',
+    );
+    return leftMembers.some((leftMember) => rightMembers.some((rightMember) => {
+      if (leftMember.id === rightMember.id) return false;
+      const [candidateA, candidateB] = this.candidateMergePair(leftMember.id, rightMember.id);
+      return Boolean(lookup.get(candidateA, candidateB));
+    }));
+  }
+
+  private recordCandidateMergeExclusion(left: CandidateRow, right: CandidateRow, reason: string, timestamp = nowIso()) {
+    const leftRoot = this.candidateGroupRoot(left);
+    const rightRoot = this.candidateGroupRoot(right);
+    const leftMembers = this.candidateGroupRows(leftRoot.id);
+    const rightMembers = this.candidateGroupRows(rightRoot.id);
+    const insert = this.database.raw.prepare(
+      `INSERT OR IGNORE INTO candidate_merge_exclusion
+        (candidate_a_id, candidate_b_id, reason, created_at)
+       VALUES (?, ?, ?, ?)`,
+    );
+    for (const leftMember of leftMembers) {
+      for (const rightMember of rightMembers) {
+        if (leftMember.id === rightMember.id) continue;
+        const [candidateA, candidateB] = this.candidateMergePair(leftMember.id, rightMember.id);
+        insert.run(candidateA, candidateB, reason, timestamp);
+      }
+    }
+  }
+
+  private candidateMergeSuggestionMatches(
+    suggestion: Record<string, unknown>,
+    current: CandidateRow,
+    currentThread: RequirementThreadRow,
+    target: CandidateRow,
+    targetThread: RequirementThreadRow,
+  ) {
+    const storedCurrentMembers = Array.isArray(suggestion.currentGroupMemberIds)
+      ? suggestion.currentGroupMemberIds.filter((value): value is string => typeof value === 'string').sort()
+      : [];
+    const storedTargetMembers = Array.isArray(suggestion.targetGroupMemberIds)
+      ? suggestion.targetGroupMemberIds.filter((value): value is string => typeof value === 'string').sort()
+      : [];
+    const currentMembers = this.candidateGroupRows(current.id).map((candidate) => candidate.id).sort();
+    const targetMembers = this.candidateGroupRows(target.id).map((candidate) => candidate.id).sort();
+    const currentGroupVersionHash = candidateGroupVersionHash(this.candidateGroupRows(current.id));
+    const targetGroupVersionHash = candidateGroupVersionHash(this.candidateGroupRows(target.id));
+    return suggestion.suggestionVersion === 1
+      && typeof suggestion.suggestionId === 'string'
+      && Boolean(suggestion.suggestionId)
+      && suggestion.currentCandidateId === current.id
+      && suggestion.currentRootCandidateId === current.id
+      && suggestion.currentThreadId === currentThread.id
+      && suggestion.currentThreadVersion === currentThread.version
+      && suggestion.currentSnapshotRevision === candidateSnapshotRevision(current, currentThread)
+      && suggestion.targetCandidateId === target.id
+      && suggestion.targetRootCandidateId === target.id
+      && suggestion.targetThreadId === targetThread.id
+      && suggestion.targetThreadVersion === targetThread.version
+      && suggestion.targetSnapshotRevision === candidateSnapshotRevision(target, targetThread)
+      && JSON.stringify(storedCurrentMembers) === JSON.stringify(currentMembers)
+      && JSON.stringify(storedTargetMembers) === JSON.stringify(targetMembers)
+      && suggestion.currentGroupVersionHash === currentGroupVersionHash
+      && suggestion.targetGroupVersionHash === targetGroupVersionHash
+      && !current.merged_into_candidate_id
+      && !target.merged_into_candidate_id
+      && !current.deleted_at
+      && !target.deleted_at
+      && !current.accepted_task_id
+      && !target.accepted_task_id
+      && (current.state === 'pending' || current.state === 'snoozed')
+      && (target.state === 'pending' || target.state === 'snoozed')
+      && !currentThread.active_task_id
+      && !targetThread.active_task_id
+      && currentThread.status === 'open'
+      && targetThread.status === 'open';
+  }
+
+  private applyCandidateMerge(input: {
+    currentCandidate: CandidateRow;
+    currentThread: RequirementThreadRow;
+    targetCandidate: CandidateRow;
+    targetThread: RequirementThreadRow;
+    decision: CandidateMergeDecision;
+    actor: 'ai' | 'user';
+    reason: string;
+  }) {
+    const { currentCandidate, currentThread, targetCandidate, targetThread, decision, actor } = input;
+    const sameThread = currentThread.id === targetThread.id;
+    const currentRootId = currentCandidate.merged_into_candidate_id ?? currentCandidate.id;
+    const targetRootId = targetCandidate.merged_into_candidate_id ?? targetCandidate.id;
+    const currentGroup = this.candidateGroupRows(currentRootId);
+    const targetGroup = this.candidateGroupRows(targetRootId);
+    const members = [...new Map([...currentGroup, ...targetGroup].map((candidate) => [candidate.id, candidate])).values()];
+    const currentUnitIds = this.demandUnitIdsForCandidates(currentGroup);
+    if (members.some((candidate) => candidate.accepted_task_id || candidate.state === 'accepted' || candidate.deleted_at)) {
+      throw new Error('候选组已经被接受或移入回收站，不能继续归并。');
+    }
+    const primaryCandidate = decision.primary === 'current' ? currentCandidate : targetCandidate;
+    const primaryRole = decision.primary === 'current' ? decision.currentRole : decision.targetRole;
+    if (!primaryRole) throw new Error('候选归并缺少主体角色。');
+    const timestamp = nowIso();
+    const before = {
+      currentCandidateId: currentCandidate.id,
+      currentThreadId: currentThread.id,
+      targetCandidateId: targetCandidate.id,
+      targetThreadId: targetThread.id,
+      memberIds: members.map((candidate) => candidate.id),
+    };
+    const currentSourceIds = [...new Set(currentGroup.flatMap((candidate) => this.sourceRowsForDemandUnit(
+      candidate.demand_unit_id,
+      this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(candidate.source_event_id) as SourceEventRow,
+    ).map((row) => row.id)))];
+    const sourceRelations = sameThread || !currentSourceIds.length ? [] : this.database.raw.prepare(
+      `SELECT * FROM requirement_thread_source
+       WHERE thread_id = ? AND source_event_id IN (${currentSourceIds.map(() => '?').join(',')})
+       ORDER BY created_at ASC`,
+    ).all(currentThread.id, ...currentSourceIds) as Array<RequirementThreadSourceRow & {
+      session_id: string | null;
+      conversation_id: string | null;
+      participant_ids_json: string;
+      source_revision: string | null;
+      source_role: string;
+      role_reason: string;
+    }>;
+    for (const relation of sourceRelations) {
+      const isCurrentAnchor = relation.source_event_id === currentCandidate.source_event_id;
+      const role = isCurrentAnchor ? decision.currentRole ?? 'unknown' : relation.source_role || 'unknown';
+      const roleReason = isCurrentAnchor ? decision.reason : relation.role_reason || '';
+      this.database.raw.prepare(
+        `INSERT INTO requirement_thread_source
+          (thread_id, source_event_id, demand_unit_id, relation_type, confidence, evidence_json, root_id, parent_id, session_id,
+           conversation_id, participant_ids_json, source_revision, source_role, role_reason, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(thread_id, source_event_id) DO UPDATE SET
+           relation_type = excluded.relation_type,
+           confidence = excluded.confidence,
+           evidence_json = excluded.evidence_json,
+           root_id = excluded.root_id,
+           parent_id = excluded.parent_id,
+           session_id = excluded.session_id,
+           conversation_id = excluded.conversation_id,
+           participant_ids_json = excluded.participant_ids_json,
+           source_revision = excluded.source_revision,
+           source_role = excluded.source_role,
+           role_reason = excluded.role_reason`,
+      ).run(
+        targetThread.id,
+        relation.source_event_id,
+        relation.demand_unit_id ?? this.uniqueSourceDemandUnitId(relation.source_event_id),
+        isCurrentAnchor ? (actor === 'ai' ? 'candidate_auto_merge' : 'owner_candidate_merge') : relation.relation_type,
+        isCurrentAnchor ? decision.confidence : relation.confidence,
+        isCurrentAnchor ? JSON.stringify([...decision.evidence, decision.reason].filter(Boolean)) : relation.evidence_json,
+        relation.root_id,
+        relation.parent_id,
+        relation.session_id,
+        relation.conversation_id,
+        relation.participant_ids_json,
+        relation.source_revision,
+        role,
+        roleReason,
+        relation.created_at,
+      );
+    }
+    if (!sameThread) {
+      this.moveDemandUnitsToThread(currentUnitIds, currentThread.id, targetThread.id, timestamp);
+      for (const sourceEventId of currentSourceIds) {
+        if (!this.sourceUsedByOtherThreadUnit(currentThread.id, sourceEventId, currentUnitIds)) {
+          this.database.raw.prepare('DELETE FROM requirement_thread_source WHERE thread_id = ? AND source_event_id = ?').run(currentThread.id, sourceEventId);
+        }
+      }
+    }
+    const allUnitIds = this.demandUnitIdsForCandidates(members);
+    if (allUnitIds.length) {
+      this.database.raw.prepare(
+        `UPDATE requirement_thread_unit
+         SET relation_type = 'supporting'
+         WHERE thread_id = ? AND demand_unit_id IN (${allUnitIds.map(() => '?').join(',')})`,
+      ).run(targetThread.id, ...allUnitIds);
+      if (primaryCandidate.demand_unit_id) {
+        this.database.raw.prepare(
+          "UPDATE requirement_thread_unit SET relation_type = 'primary' WHERE thread_id = ? AND demand_unit_id = ?",
+        ).run(targetThread.id, primaryCandidate.demand_unit_id);
+      }
+    }
+    this.database.raw.prepare(
+      `UPDATE requirement_thread_source
+       SET relation_type = ?, confidence = ?, evidence_json = ?, source_role = ?, role_reason = ?
+       WHERE thread_id = ? AND source_event_id = ?`,
+    ).run(
+      actor === 'ai' ? 'candidate_auto_merge' : 'owner_candidate_merge',
+      decision.confidence,
+      JSON.stringify([...decision.evidence, decision.reason].filter(Boolean)),
+      decision.currentRole ?? 'unknown',
+      decision.reason,
+      targetThread.id,
+      currentCandidate.source_event_id,
+    );
+    this.database.raw.prepare(
+      `UPDATE requirement_thread_source
+       SET source_role = ?, role_reason = ?, confidence = COALESCE(?, confidence)
+       WHERE thread_id = ? AND source_event_id = ?`,
+    ).run(decision.targetRole ?? 'unknown', decision.reason, decision.confidence, targetThread.id, targetCandidate.source_event_id);
+    for (const member of members) {
+      if (member.id === primaryCandidate.id) {
+        const updated = this.database.raw.prepare(
+          'UPDATE candidate_request SET merged_into_candidate_id = NULL, merged_at = NULL, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?',
+        ).run(timestamp, member.id, member.version);
+        if (updated.changes !== 1) throw new CandidateVersionConflictError();
+      } else {
+        const updated = this.database.raw.prepare(
+          'UPDATE candidate_request SET merged_into_candidate_id = ?, merged_at = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?',
+        ).run(primaryCandidate.id, timestamp, timestamp, member.id, member.version);
+        if (updated.changes !== 1) throw new CandidateVersionConflictError();
+        this.database.raw.prepare(
+          'UPDATE notification SET archived_at = COALESCE(archived_at, ?) WHERE candidate_id = ?',
+        ).run(timestamp, member.id);
+      }
+    }
+    const combinedParticipants = [...new Set([
+      ...parseJsonValue<string[]>(targetThread.participant_ids_json, []),
+      ...parseJsonValue<string[]>(currentThread.participant_ids_json, []),
+    ])];
+    const targetThreadUpdate = this.database.raw.prepare(
+      `UPDATE requirement_thread
+       SET title = ?, background = ?, validation_question = ?, describe = ?, analysis_json = ?,
+           participant_ids_json = ?, ambiguity_json = '[]', status = 'open',
+           primary_source_event_id = ?, primary_reason = ?, primary_confidence = ?,
+           last_activity_at = CASE
+             WHEN last_activity_at IS NULL OR (COALESCE(?, '') <> '' AND last_activity_at < ?) THEN ?
+             ELSE last_activity_at
+           END,
+           version = version + 1, updated_at = ?
+       WHERE id = ? AND active_task_id IS NULL AND version = ?`,
+    ).run(
+      primaryCandidate.title,
+      primaryCandidate.background,
+      primaryCandidate.validation_question,
+      primaryCandidate.describe,
+      primaryCandidate.analysis_json,
+      JSON.stringify(combinedParticipants),
+      primaryCandidate.source_event_id,
+      input.reason,
+      decision.primaryConfidence,
+      currentThread.last_activity_at,
+      currentThread.last_activity_at,
+      currentThread.last_activity_at,
+      timestamp,
+      targetThread.id,
+      targetThread.version,
+    );
+    if (targetThreadUpdate.changes !== 1) throw new CandidateVersionConflictError();
+    if (!sameThread) {
+      const remainingUnits = this.database.raw.prepare('SELECT COUNT(*) AS count FROM requirement_thread_unit WHERE thread_id = ?').get(currentThread.id) as { count: number };
+      if (remainingUnits.count === 0) {
+        const currentThreadUpdate = this.database.raw.prepare(
+          `UPDATE requirement_thread
+           SET status = 'closed', ambiguity_json = '[]', updated_at = ?
+           WHERE id = ? AND active_task_id IS NULL AND version = ?`,
+        ).run(timestamp, currentThread.id, currentThread.version);
+        if (currentThreadUpdate.changes !== 1) throw new CandidateVersionConflictError();
+        this.database.raw.prepare(
+          "UPDATE requirement_thread_revision SET state = 'stale', decided_at = ? WHERE thread_id = ? AND state = 'proposed'",
+        ).run(timestamp, currentThread.id);
+      }
+    }
+    const idempotencyKey = `${actor === 'ai' ? 'candidate-auto-merge' : 'candidate-owner-merge'}:${currentCandidate.id}:${targetCandidate.id}:${decision.candidateSetHash}`;
+    this.database.raw.prepare(
+      `INSERT OR IGNORE INTO correction_event
+        (id, idempotency_key, task_id, candidate_id, source_event_id, demand_unit_id, correction_type,
+         before_json, after_json, note, visibility, operation, created_at)
+       VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 'private', 'apply', ?)`,
+    ).run(
+      id('correction'),
+      idempotencyKey,
+      primaryCandidate.id,
+      currentCandidate.source_event_id,
+      primaryCandidate.demand_unit_id,
+      actor === 'ai' ? 'candidate_auto_merge' : 'candidate_owner_merge',
+      JSON.stringify(before),
+      JSON.stringify({
+        threadId: targetThread.id,
+        primaryCandidateId: primaryCandidate.id,
+        primarySourceEventId: primaryCandidate.source_event_id,
+        memberIds: members.map((candidate) => candidate.id),
+        currentRole: decision.currentRole,
+        targetRole: decision.targetRole,
+        confidence: decision.confidence,
+        primaryConfidence: decision.primaryConfidence,
+      }),
+      input.reason,
+      timestamp,
+    );
+    const thread = this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(targetThread.id) as unknown as RequirementThreadRow;
+    return { primaryCandidate: this.getCandidate(primaryCandidate.id)!, thread, memberCount: members.length };
+  }
+
+  private classificationRowsForSource(source: SourceEventRow) {
+    const metadata = parseMetadata(source.metadata_json);
+    const batchIds = Array.isArray(metadata.classificationBatchSourceIds)
+      ? metadata.classificationBatchSourceIds.filter((value): value is string => typeof value === 'string' && Boolean(value))
+      : [];
+    if (!batchIds.length) return [source];
+    const ids = [...new Set([source.id, ...batchIds])];
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = this.database.raw.prepare(`SELECT * FROM source_event WHERE id IN (${placeholders})`).all(...ids) as SourceEventRow[];
+    return rows.length === ids.length ? rows.sort(stableSourceOrder) : [source];
+  }
+
+  /**
+   * Convert the model's optional multi-demand output into durable units.  The
+   * legacy top-level classification is deliberately wrapped as u1 so older
+   * providers and rule mocks keep the same behaviour.
+   */
+  private normalizeClassificationUnits(classification: ClassificationResult, orderedRows: SourceEventRow[]): PersistableClassificationUnit[] {
+    const sourceByKey = new Map(orderedRows.map((row, index) => [`s${index + 1}`, row]));
+    const legacy = classification.units?.length
+      ? classification.units
+      : [{
+          unitKey: 'u1',
+          sourceKeys: orderedRows.map((_, index) => `s${index + 1}`),
+          isDataRequest: classification.isDataRequest,
+          draft: classification.draft,
+          reason: classification.reason,
+        } satisfies ClassificationUnitResult];
+    const seenUnitKeys = new Set<string>();
+    return legacy.map((unit, index) => {
+      const unitKey = unit.unitKey;
+      if (!/^u[1-8]$/u.test(unitKey) || seenUnitKeys.has(unitKey)) {
+        throw new Error(`需求单元编号无效或重复：${unitKey || `u${index + 1}`}。`);
+      }
+      seenUnitKeys.add(unitKey);
+      if (!unit.sourceKeys.length || new Set(unit.sourceKeys).size !== unit.sourceKeys.length) {
+        throw new Error(`需求单元 ${unitKey} 的来源编号为空或重复。`);
+      }
+      const unknownSourceKey = unit.sourceKeys.find((key) => !sourceByKey.has(key));
+      if (unknownSourceKey) throw new Error(`需求单元 ${unitKey} 引用了不存在的来源编号 ${unknownSourceKey}。`);
+      const sourceRows = [...new Map(unit.sourceKeys.map((key) => [sourceByKey.get(key)!.id, sourceByKey.get(key)!])).values()];
+      const safeRows = sourceRows.sort(stableSourceOrder);
+      const anchor = safeRows.find((row) => row.id === orderedRows[0]?.id) ?? safeRows[0] ?? orderedRows[0];
+      if (!anchor) throw new Error('需求单元没有可关联的来源。');
+      return {
+        unitKey,
+        sourceKeys: [...unit.sourceKeys],
+        sourceKeyById: new Map(unit.sourceKeys.map((key) => [sourceByKey.get(key)?.id, key]).filter((entry): entry is [string, string] => Boolean(entry[0]))),
+        sourceRows: safeRows,
+        anchor,
+        isDataRequest: unit.isDataRequest,
+        draft: unit.draft,
+        reason: unit.reason || classification.reason,
+      };
+    });
+  }
+
+  private upsertDemandUnit(input: {
+    anchor: SourceEventRow;
+    unitKey: string;
+    unitKind: 'demand' | 'context_only';
+    state: 'provisional' | 'ready' | 'needs_confirmation' | 'incomplete_context' | 'failed_visible';
+    classificationRevision: string;
+    analysisJson: string;
+    reason: string;
+    createdAt?: string;
+  }) {
+    const timestamp = input.createdAt ?? nowIso();
+    const unitId = `unit_${input.anchor.id}_${input.unitKey}`;
+    this.database.raw.prepare(
+      `INSERT INTO source_demand_unit
+        (id, anchor_source_event_id, unit_key, unit_kind, state, classification_revision, ai_decision_id, analysis_json, reason, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+       ON CONFLICT(anchor_source_event_id, unit_key) DO UPDATE SET
+         unit_kind = excluded.unit_kind,
+         state = excluded.state,
+         classification_revision = excluded.classification_revision,
+         analysis_json = excluded.analysis_json,
+         reason = excluded.reason,
+         updated_at = excluded.updated_at`,
+    ).run(
+      unitId,
+      input.anchor.id,
+      input.unitKey,
+      input.unitKind,
+      input.state,
+      input.classificationRevision,
+      input.analysisJson,
+      input.reason,
+      timestamp,
+      timestamp,
+    );
+    return this.database.raw.prepare('SELECT * FROM source_demand_unit WHERE anchor_source_event_id = ? AND unit_key = ?')
+      .get(input.anchor.id, input.unitKey) as { id: string; unit_kind: string; state: string };
+  }
+
+  /**
+   * Older single-candidate rows predate demand_unit_id. When a later semantic
+   * message is attached to such a pending candidate, promote it into the
+   * durable unit graph first so the candidate card can expose every source.
+   */
+  private ensureCandidateDemandUnit(candidate: CandidateRow, thread: RequirementThreadRow, timestamp = nowIso()) {
+    const unitId = this.ensureCandidateDemandUnitRecord(candidate, timestamp);
+    this.database.raw.prepare(
+      `INSERT OR IGNORE INTO requirement_thread_unit
+         (thread_id, demand_unit_id, relation_type, confidence, evidence_json, created_at)
+       VALUES (?, ?, 'primary', 1, ?, ?)`,
+    ).run(thread.id, unitId, JSON.stringify(['候选需求单元已绑定到需求线程。']), timestamp);
+    this.database.raw.prepare(
+      'UPDATE requirement_thread_source SET demand_unit_id = ? WHERE thread_id = ? AND demand_unit_id IS NULL',
+    ).run(unitId, thread.id);
+    return unitId;
+  }
+
+  private ensureCandidateDemandUnitRecord(candidate: CandidateRow, timestamp = nowIso()) {
+    if (candidate.demand_unit_id) return candidate.demand_unit_id;
+    const existing = this.database.raw.prepare(
+      `SELECT id FROM source_demand_unit
+        WHERE anchor_source_event_id = ? AND unit_key = 'legacy'`,
+    ).get(candidate.source_event_id) as { id: string } | undefined;
+    const unitId = existing?.id ?? `unit_candidate_${candidate.id}`;
+    if (!existing) {
+      this.database.raw.prepare(
+        `INSERT INTO source_demand_unit
+          (id, anchor_source_event_id, unit_key, unit_kind, state, classification_revision, ai_decision_id, analysis_json, reason, created_at, updated_at)
+         VALUES (?, ?, 'legacy', 'demand', 'ready', 'legacy', NULL, ?, ?, ?, ?)`,
+      ).run(unitId, candidate.source_event_id, candidate.analysis_json, '从旧版候选升级为可持续关联的需求单元。', timestamp, timestamp);
+    }
+    const updated = this.database.raw.prepare(
+      'UPDATE candidate_request SET demand_unit_id = ?, updated_at = ?, version = version + 1 WHERE id = ? AND demand_unit_id IS NULL AND version = ?',
+    ).run(unitId, timestamp, candidate.id, candidate.version);
+    if (updated.changes !== 1) {
+      const current = this.getCandidate(candidate.id);
+      if (!current?.demand_unit_id) throw new CandidateVersionConflictError();
+    }
+    const originalSource = this.database.raw.prepare('SELECT id FROM source_event WHERE id = ?').get(candidate.source_event_id) as { id: string } | undefined;
+    if (originalSource) {
+      this.database.raw.prepare(
+        `INSERT OR IGNORE INTO source_demand_unit_source
+           (demand_unit_id, source_event_id, source_key, source_role, sequence, created_at)
+         VALUES (?, ?, 's1', 'anchor', 0, ?)`,
+      ).run(unitId, originalSource.id, timestamp);
+    }
+    return unitId;
+  }
+
+  private uniqueThreadDemandUnitId(threadId: string) {
+    const rows = this.database.raw.prepare(
+      'SELECT DISTINCT demand_unit_id FROM requirement_thread_unit WHERE thread_id = ? ORDER BY demand_unit_id',
+    ).all(threadId) as Array<{ demand_unit_id: string }>;
+    return rows.length === 1 ? rows[0]!.demand_unit_id : null;
+  }
+
+  private uniqueSourceDemandUnitId(sourceEventId: string) {
+    const rows = this.database.raw.prepare(
+      'SELECT DISTINCT demand_unit_id FROM source_demand_unit_source WHERE source_event_id = ? ORDER BY demand_unit_id',
+    ).all(sourceEventId) as Array<{ demand_unit_id: string }>;
+    return rows.length === 1 ? rows[0]!.demand_unit_id : null;
+  }
+
+  private ensureDemandUnitSourceEdge(demandUnitId: string, sourceEventId: string, timestamp: string) {
+    const existing = this.database.raw.prepare(
+      `SELECT 1 FROM source_demand_unit_source
+        WHERE demand_unit_id = ? AND source_event_id = ?`,
+    ).get(demandUnitId, sourceEventId);
+    if (existing) return;
+    const sequence = (this.database.raw.prepare(
+      'SELECT COALESCE(MAX(sequence), -1) + 1 AS sequence FROM source_demand_unit_source WHERE demand_unit_id = ?',
+    ).get(demandUnitId) as { sequence: number }).sequence;
+    this.database.raw.prepare(
+      `INSERT OR IGNORE INTO source_demand_unit_source
+        (demand_unit_id, source_event_id, source_key, source_role, sequence, created_at)
+       VALUES (?, ?, ?, 'evidence', ?, ?)`,
+    ).run(demandUnitId, sourceEventId, `owner_${sourceEventId}`, sequence, timestamp);
+  }
+
+  /**
+   * Close exactly one durable task/source integrity gap after the repaired
+   * relation is present.  The correction event and gap update deliberately
+   * happen in the caller's transaction so a later failure rolls both back.
+   */
+  private closeTaskSourceIntegrityGap(input: {
+    gapTaskId: string;
+    sourceEventId: string;
+    resolutionTaskId: string;
+    demandUnitId: string;
+    timestamp: string;
+    correctionEventId?: string;
+    correctionTaskId?: string;
+  }) {
+    const recordId = `${input.gapTaskId}:${input.sourceEventId}`;
+    const gap = this.database.raw.prepare(
+      `SELECT id, task_id, candidate_id, source_event_id, demand_unit_id, record_table, record_id,
+              reason, status, correction_event_id
+         FROM data_integrity_gap
+        WHERE record_table = 'task_source_link'
+          AND record_id = ?
+          AND reason = 'missing_or_ambiguous_demand_unit'
+          AND status = 'open'`,
+    ).get(recordId) as {
+      id: string;
+      task_id: string | null;
+      candidate_id: string | null;
+      source_event_id: string | null;
+      demand_unit_id: string | null;
+      record_table: string;
+      record_id: string;
+      reason: string;
+      status: string;
+      correction_event_id: string | null;
+    } | undefined;
+    if (!gap) return null;
+    if (gap.task_id !== input.gapTaskId
+      || gap.source_event_id !== input.sourceEventId
+      || (gap.demand_unit_id !== null && gap.demand_unit_id !== input.demandUnitId)) {
+      throw new Error('完整性缺口结构化绑定不匹配，已拒绝关闭缺口。');
+    }
+
+    const sourceDemandUnit = this.database.raw.prepare(
+      `SELECT 1 AS present
+         FROM source_demand_unit_source
+        WHERE demand_unit_id = ? AND source_event_id = ?`,
+    ).get(input.demandUnitId, input.sourceEventId);
+    if (!sourceDemandUnit) {
+      throw new Error('来源与需求单元关系尚未完成精确修复，完整性缺口保持打开。');
+    }
+    const repairedRelation = this.database.raw.prepare(
+      `SELECT 1 AS present
+         FROM task_source_link
+        WHERE task_id = ? AND source_event_id = ? AND demand_unit_id = ?`,
+    ).get(input.resolutionTaskId, input.sourceEventId, input.demandUnitId);
+    if (!repairedRelation) {
+      throw new Error('任务来源关系尚未完成精确修复，完整性缺口保持打开。');
+    }
+    const unresolvedLegacyEdge = this.database.raw.prepare(
+      `SELECT 1 AS present
+         FROM task_source_link
+        WHERE task_id = ? AND source_event_id = ? AND demand_unit_id IS NULL`,
+    ).get(input.gapTaskId, input.sourceEventId);
+    if (unresolvedLegacyEdge) return null;
+
+    const idempotencyKey = `integrity-gap:${gap.id}`;
+    const deterministicCorrectionId = `corr-integrity-${createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 32)}`;
+    let correctionId = input.correctionEventId ?? deterministicCorrectionId;
+    if (!input.correctionEventId) {
+      const existing = this.database.raw.prepare(
+        'SELECT id FROM correction_event WHERE idempotency_key = ?',
+      ).get(idempotencyKey) as { id: string } | undefined;
+      if (existing) {
+        correctionId = existing.id;
+      } else {
+        this.database.raw.prepare(
+          `INSERT OR IGNORE INTO correction_event
+            (id, idempotency_key, task_id, candidate_id, source_event_id, demand_unit_id, correction_type,
+             before_json, after_json, note, visibility, operation, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'integrity_gap_closed', ?, ?,
+                   '系统已验证精确任务-来源-需求单元关系，关闭完整性缺口。', 'private', 'apply', ?)`,
+        ).run(
+          deterministicCorrectionId,
+          idempotencyKey,
+          gap.task_id ?? input.resolutionTaskId,
+          gap.candidate_id,
+          input.sourceEventId,
+          input.demandUnitId,
+          JSON.stringify({ record_table: gap.record_table, record_id: gap.record_id, reason: gap.reason, status: 'open' }),
+          JSON.stringify({ record_table: gap.record_table, record_id: gap.record_id, reason: gap.reason, status: 'corrected', demand_unit_id: input.demandUnitId }),
+          input.timestamp,
+        );
+      }
+    }
+    const correction = this.database.raw.prepare(
+      `SELECT id, task_id, correction_type FROM correction_event
+        WHERE id = ? AND source_event_id = ? AND demand_unit_id = ?
+          AND visibility = 'private' AND operation = 'apply'
+          AND (? IS NULL OR task_id = ?)
+          AND (? IS NULL OR correction_type = 'wrong_association')`,
+    ).get(
+      correctionId,
+      input.sourceEventId,
+      input.demandUnitId,
+      input.correctionEventId ? (input.correctionTaskId ?? input.gapTaskId) : null,
+      input.correctionEventId ? (input.correctionTaskId ?? input.gapTaskId) : null,
+      input.correctionEventId ? 1 : null,
+    ) as { id: string; task_id: string | null; correction_type: string } | undefined;
+    if (!correction) throw new Error('完整性缺口纠正事件未能持久化，已拒绝关闭缺口。');
+    const updated = this.database.raw.prepare(
+      `UPDATE data_integrity_gap
+          SET status = 'corrected', correction_event_id = ?, updated_at = ?
+        WHERE id = ?
+          AND record_table = 'task_source_link'
+          AND record_id = ?
+          AND reason = 'missing_or_ambiguous_demand_unit'
+          AND status = 'open'
+          AND task_id = ?
+          AND source_event_id = ?
+          AND demand_unit_id IS ?`,
+    ).run(
+      correction.id,
+      input.timestamp,
+      gap.id,
+      recordId,
+      input.gapTaskId,
+      input.sourceEventId,
+      gap.demand_unit_id,
+    );
+    if (updated.changes !== 1) {
+      const current = this.database.raw.prepare(
+        `SELECT id, task_id, source_event_id, demand_unit_id, record_table, record_id, reason,
+                status, correction_event_id
+           FROM data_integrity_gap
+          WHERE id = ?
+            AND record_table = 'task_source_link'
+            AND record_id = ?
+            AND reason = 'missing_or_ambiguous_demand_unit'
+            AND task_id = ?
+            AND source_event_id = ?
+            AND demand_unit_id IS ?`,
+      ).get(
+        gap.id,
+        recordId,
+        input.gapTaskId,
+        input.sourceEventId,
+        gap.demand_unit_id,
+      ) as {
+        id: string;
+        task_id: string | null;
+        source_event_id: string | null;
+        demand_unit_id: string | null;
+        record_table: string;
+        record_id: string;
+        reason: string;
+        status: string;
+        correction_event_id: string | null;
+      } | undefined;
+      if (!current
+        || current.id !== gap.id
+        || current.task_id !== input.gapTaskId
+        || current.source_event_id !== input.sourceEventId
+        || (current.demand_unit_id !== null && current.demand_unit_id !== input.demandUnitId)
+        || current.record_table !== 'task_source_link'
+        || current.record_id !== recordId
+        || current.reason !== 'missing_or_ambiguous_demand_unit'
+        || current.status !== 'corrected'
+        || current.correction_event_id !== correction.id) {
+        throw new Error('完整性缺口状态更新失败，已拒绝继续。');
+      }
+    }
+    return correction.id;
+  }
+
+  /**
+   * Every new task/source edge must name the demand unit it represents.  A
+   * source may intentionally support more than one unit, so inference is
+   * allowed only when the relation is unique; otherwise the write stops and
+   * leaves all business rows unchanged.
+   */
+  private linkTaskSource(
+    taskId: string,
+    sourceEventId: string,
+    relationType: string,
+    timestamp: string,
+    explicitDemandUnitId?: string | null,
+    options?: { deferIntegrityGapClosure?: boolean },
+  ) {
+    let demandUnitId = explicitDemandUnitId ?? null;
+    const existingRows = this.database.raw.prepare(
+      'SELECT demand_unit_id, relation_type FROM task_source_link WHERE task_id = ? AND source_event_id = ? ORDER BY demand_unit_id',
+    ).all(taskId, sourceEventId) as Array<{ demand_unit_id: string | null; relation_type: string }>;
+    const explicitRows = existingRows.filter((row): row is { demand_unit_id: string; relation_type: string } => row.demand_unit_id !== null);
+    if (demandUnitId) {
+      const linked = this.database.raw.prepare(
+        `SELECT 1 FROM source_demand_unit_source
+         WHERE demand_unit_id = ? AND source_event_id = ?`,
+      ).get(demandUnitId, sourceEventId);
+      if (!linked) throw new Error('需求单元与来源不匹配，已拒绝写入任务来源链。');
+      const exact = explicitRows.find((row) => row.demand_unit_id === demandUnitId);
+      if (exact) {
+        this.database.raw.prepare(
+          `UPDATE task_source_link
+              SET relation_type = ?
+            WHERE task_id = ? AND source_event_id = ? AND demand_unit_id = ?`,
+        ).run(relationType, taskId, sourceEventId, demandUnitId);
+        return demandUnitId;
+      }
+      const unresolvedLegacyEdge = existingRows.find((row) => row.demand_unit_id === null);
+      // An explicit caller can deterministically repair a sole legacy edge.
+      // If another explicit unit already exists, retain the nullable edge as a
+      // separate unresolved historical relation instead of choosing a winner.
+      if (unresolvedLegacyEdge && explicitRows.length === 0) {
+        this.database.raw.prepare(
+          `UPDATE task_source_link
+              SET demand_unit_id = ?, relation_type = ?
+            WHERE task_id = ? AND source_event_id = ? AND demand_unit_id IS NULL`,
+        ).run(demandUnitId, relationType, taskId, sourceEventId);
+        if (!options?.deferIntegrityGapClosure) {
+          this.closeTaskSourceIntegrityGap({
+            gapTaskId: taskId,
+            sourceEventId,
+            resolutionTaskId: taskId,
+            demandUnitId,
+            timestamp,
+          });
+        }
+        return demandUnitId;
+      }
+      // Explicit unit edges are additive. An older nullable edge remains as
+      // an unresolved historical relation and must not be overwritten.
+      this.database.raw.prepare(
+        `INSERT INTO task_source_link (task_id, source_event_id, demand_unit_id, relation_type, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(taskId, sourceEventId, demandUnitId, relationType, timestamp);
+      return demandUnitId;
+    }
+    if (explicitRows.length > 1) {
+      throw new Error('任务来源链已经绑定多个需求单元，隐式来源绑定已拒绝。');
+    }
+    if (explicitRows.length === 1) {
+      return explicitRows[0]!.demand_unit_id;
+    }
+    {
+      const sourceScopedRows = this.database.raw.prepare(
+        `SELECT DISTINCT source_demand_unit_source.demand_unit_id AS demand_unit_id
+           FROM source_demand_unit_source
+           JOIN candidate_request
+             ON candidate_request.demand_unit_id = source_demand_unit_source.demand_unit_id
+            AND candidate_request.accepted_task_id = ?
+          WHERE source_demand_unit_source.source_event_id = ?
+         UNION
+         SELECT DISTINCT source_demand_unit_source.demand_unit_id AS demand_unit_id
+           FROM source_demand_unit_source
+           JOIN task ON task.id = ?
+           JOIN requirement_thread_unit
+             ON requirement_thread_unit.thread_id = task.thread_id
+            AND requirement_thread_unit.demand_unit_id = source_demand_unit_source.demand_unit_id
+          WHERE source_demand_unit_source.source_event_id = ?
+         UNION
+         SELECT DISTINCT requirement_thread_source.demand_unit_id AS demand_unit_id
+           FROM task
+           JOIN requirement_thread_source
+             ON requirement_thread_source.thread_id = task.thread_id
+            AND requirement_thread_source.source_event_id = ?
+          WHERE task.id = ?
+            AND requirement_thread_source.demand_unit_id IS NOT NULL
+         ORDER BY demand_unit_id`,
+      ).all(taskId, sourceEventId, taskId, sourceEventId, sourceEventId, taskId) as Array<{ demand_unit_id: string }>;
+      const scopedRows = this.database.raw.prepare(
+        `SELECT DISTINCT candidate_request.demand_unit_id AS demand_unit_id
+           FROM candidate_request
+          WHERE candidate_request.accepted_task_id = ?
+            AND candidate_request.demand_unit_id IS NOT NULL
+         UNION
+         SELECT DISTINCT requirement_thread_unit.demand_unit_id AS demand_unit_id
+           FROM task
+           JOIN requirement_thread_unit ON requirement_thread_unit.thread_id = task.thread_id
+          WHERE task.id = ?
+            AND requirement_thread_unit.demand_unit_id IS NOT NULL
+         ORDER BY demand_unit_id`,
+      ).all(taskId, taskId) as Array<{ demand_unit_id: string }>;
+      const fallbackRows = sourceScopedRows.length === 0 && scopedRows.length === 0
+        ? this.database.raw.prepare(
+          'SELECT DISTINCT demand_unit_id FROM source_demand_unit_source WHERE source_event_id = ? ORDER BY demand_unit_id',
+        ).all(sourceEventId) as Array<{ demand_unit_id: string }>
+        : [];
+      const ids = [...new Set((sourceScopedRows.length ? sourceScopedRows : scopedRows.length ? scopedRows : fallbackRows)
+        .map((row) => row.demand_unit_id))];
+      if (ids.length !== 1) {
+        throw new Error(ids.length === 0
+          ? '来源没有可唯一确认的需求单元，已拒绝写入任务来源链。'
+          : '来源对应多个需求单元，已拒绝随机选择任务来源链。');
+      }
+      demandUnitId = ids[0]!;
+    }
+    const unresolvedLegacyEdge = existingRows.find((row) => row.demand_unit_id === null);
+    if (unresolvedLegacyEdge) {
+      this.database.raw.prepare(
+        `UPDATE task_source_link
+            SET demand_unit_id = ?, relation_type = ?
+          WHERE task_id = ? AND source_event_id = ? AND demand_unit_id IS NULL`,
+      ).run(demandUnitId, relationType, taskId, sourceEventId);
+      if (!options?.deferIntegrityGapClosure) {
+        this.closeTaskSourceIntegrityGap({
+          gapTaskId: taskId,
+          sourceEventId,
+          resolutionTaskId: taskId,
+          demandUnitId,
+          timestamp,
+        });
+      }
+    } else {
+      this.database.raw.prepare(
+        `INSERT INTO task_source_link (task_id, demand_unit_id, source_event_id, relation_type, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(taskId, demandUnitId, sourceEventId, relationType, timestamp);
+    }
+    return demandUnitId;
+  }
+
+  private linkDemandUnitSources(unitId: string, unit: PersistableClassificationUnit, timestamp = nowIso()) {
+    const sourceIds = unit.sourceRows.map((row) => row.id);
+    if (sourceIds.length) {
+      const placeholders = sourceIds.map(() => '?').join(',');
+      this.database.raw.prepare(
+        `DELETE FROM source_demand_unit_source
+         WHERE demand_unit_id = ?
+           AND source_event_id NOT IN (${placeholders})
+           AND NOT EXISTS (
+             SELECT 1
+             FROM task_source_link
+             WHERE task_source_link.demand_unit_id = source_demand_unit_source.demand_unit_id
+               AND task_source_link.source_event_id = source_demand_unit_source.source_event_id
+           )`,
+      ).run(unitId, ...sourceIds);
+    } else {
+      // Keep source pairs that are still referenced by accepted task edges so
+      // the composite task↔unit↔source FK preserves the historical audit
+      // chain. Unused stale unit pairs can still be removed as before.
+      this.database.raw.prepare(
+        `DELETE FROM source_demand_unit_source
+         WHERE demand_unit_id = ?
+           AND NOT EXISTS (
+             SELECT 1
+             FROM task_source_link
+             WHERE task_source_link.demand_unit_id = source_demand_unit_source.demand_unit_id
+               AND task_source_link.source_event_id = source_demand_unit_source.source_event_id
+           )`,
+      ).run(unitId);
+    }
+    const insert = this.database.raw.prepare(
+      `INSERT INTO source_demand_unit_source
+        (demand_unit_id, source_event_id, source_key, source_role, sequence, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(demand_unit_id, source_event_id) DO UPDATE SET
+         source_key = excluded.source_key,
+         source_role = excluded.source_role,
+         sequence = excluded.sequence`,
+    );
+    unit.sourceRows.forEach((row, index) => insert.run(
+      unitId,
+      row.id,
+      unit.sourceKeyById.get(row.id) ?? `s${index + 1}`,
+      row.id === unit.anchor.id ? 'anchor' : 'evidence',
+      index,
+      timestamp,
+    ));
+  }
+
+  private getCandidatesForSource(sourceEventId: string) {
+    return this.database.raw.prepare(
+      `SELECT DISTINCT candidate_request.*
+       FROM candidate_request
+       LEFT JOIN source_demand_unit
+         ON source_demand_unit.id = candidate_request.demand_unit_id
+       LEFT JOIN source_demand_unit_source
+         ON source_demand_unit_source.demand_unit_id = candidate_request.demand_unit_id
+       WHERE (candidate_request.source_event_id = ? OR source_demand_unit_source.source_event_id = ?)
+         AND (candidate_request.demand_unit_id IS NULL OR source_demand_unit.state <> 'superseded')
+       ORDER BY candidate_request.created_at ASC, candidate_request.id ASC`,
+    ).all(sourceEventId, sourceEventId) as CandidateRow[];
+  }
+
+  private getCandidatesForSources(sourceEventIds: string[]) {
+    const ids = [...new Set(sourceEventIds.filter(Boolean))];
+    if (!ids.length) return [] as CandidateRow[];
+    const placeholders = ids.map(() => '?').join(',');
+    return this.database.raw.prepare(
+      `SELECT DISTINCT candidate_request.*
+       FROM candidate_request
+       LEFT JOIN source_demand_unit
+         ON source_demand_unit.id = candidate_request.demand_unit_id
+       LEFT JOIN source_demand_unit_source
+         ON source_demand_unit_source.demand_unit_id = candidate_request.demand_unit_id
+       WHERE (candidate_request.source_event_id IN (${placeholders})
+          OR source_demand_unit_source.source_event_id IN (${placeholders}))
+         AND (candidate_request.demand_unit_id IS NULL OR source_demand_unit.state <> 'superseded')
+       ORDER BY candidate_request.created_at ASC, candidate_request.id ASC`,
+    ).all(...ids, ...ids) as CandidateRow[];
+  }
+
+  private candidateRuntimeFenceForSources(sourceEventIds: string[], additionalCandidateIds: string[] = []): CandidateRuntimeFence[] {
+    const candidates = new Map<string, CandidateRow>();
+    for (const candidate of this.getCandidatesForSources(sourceEventIds)) candidates.set(candidate.id, candidate);
+    for (const candidateId of additionalCandidateIds) {
+      const candidate = this.getCandidate(candidateId);
+      if (!candidate) continue;
+      const root = this.candidateGroupRoot(candidate);
+      for (const member of this.candidateGroupRows(root.id)) candidates.set(member.id, member);
+    }
+    return [...candidates.values()]
+      .map((candidate) => ({ candidateId: candidate.id, version: candidate.version }))
+      .sort((left, right) => left.candidateId.localeCompare(right.candidateId));
+  }
+
+  private parseCandidateRuntimeFence(value: unknown): CandidateRuntimeFence[] | null {
+    const parsed = candidateRuntimeFenceSchema.safeParse(value);
+    return parsed.success && parsed.data.length > 0
+      ? [...parsed.data].sort((left, right) => left.candidateId.localeCompare(right.candidateId))
+      : null;
+  }
+
+  private assertCandidateRuntimeFence(sourceEventIds: string[], expected: CandidateRuntimeFence[]) {
+    const actual = this.candidateRuntimeFenceForSources(sourceEventIds, expected.map((row) => row.candidateId));
+    if (actual.length !== expected.length || actual.some((row, index) => (
+      row.candidateId !== expected[index]?.candidateId || row.version !== expected[index]?.version
+    ))) {
+      throw new CandidateVersionConflictError();
+    }
+  }
+
+  private supersedeMissingDemandUnits(sourceEventIds: string[], activeUnitIds: Set<string>, timestamp: string) {
+    const ids = [...new Set(sourceEventIds.filter(Boolean))];
+    if (!ids.length) return;
+    const placeholders = ids.map(() => '?').join(',');
+    const previous = this.database.raw.prepare(
+      `SELECT DISTINCT source_demand_unit.id
+       FROM source_demand_unit
+       LEFT JOIN source_demand_unit_source
+         ON source_demand_unit_source.demand_unit_id = source_demand_unit.id
+       WHERE source_demand_unit.state <> 'superseded'
+         AND (source_demand_unit.anchor_source_event_id IN (${placeholders})
+              OR source_demand_unit_source.source_event_id IN (${placeholders}))`,
+    ).all(...ids, ...ids) as Array<{ id: string }>;
+    const staleUnitIds = previous.map((row) => row.id).filter((unitId) => !activeUnitIds.has(unitId));
+    for (const unitId of staleUnitIds) {
+      const candidate = this.database.raw.prepare('SELECT * FROM candidate_request WHERE demand_unit_id = ?').get(unitId) as CandidateRow | undefined;
+      const threads = this.database.raw.prepare(
+        `SELECT requirement_thread.*
+         FROM requirement_thread
+         JOIN requirement_thread_unit ON requirement_thread_unit.thread_id = requirement_thread.id
+         WHERE requirement_thread_unit.demand_unit_id = ?`,
+      ).all(unitId) as unknown as RequirementThreadRow[];
+      this.database.raw.prepare("UPDATE source_demand_unit SET state = 'superseded', updated_at = ? WHERE id = ?").run(timestamp, unitId);
+      this.database.raw.prepare(
+        `DELETE FROM source_demand_unit_source
+         WHERE demand_unit_id = ?
+           AND NOT EXISTS (
+             SELECT 1
+             FROM task_source_link
+             WHERE task_source_link.demand_unit_id = source_demand_unit_source.demand_unit_id
+               AND task_source_link.source_event_id = source_demand_unit_source.source_event_id
+           )`,
+      ).run(unitId);
+      this.database.raw.prepare("UPDATE candidate_revision SET state = 'superseded' WHERE demand_unit_id = ? AND state IN ('current','proposed')").run(unitId);
+      this.database.raw.prepare("UPDATE requirement_thread_revision SET state = 'stale', decided_at = ? WHERE demand_unit_id = ? AND state = 'proposed'").run(timestamp, unitId);
+      this.database.raw.prepare("UPDATE task_update_proposal SET state = 'stale', decided_at = ? WHERE demand_unit_id = ? AND state = 'awaiting_approval'").run(timestamp, unitId);
+      if (candidate && !candidate.accepted_task_id) {
+        this.database.raw.prepare('UPDATE notification SET archived_at = COALESCE(archived_at, ?) WHERE candidate_id = ?').run(timestamp, candidate.id);
+      }
+      for (const thread of threads) {
+        if (thread.active_task_id) continue;
+        const remaining = this.database.raw.prepare(
+          `SELECT COUNT(*) AS count
+           FROM requirement_thread_unit
+           JOIN source_demand_unit ON source_demand_unit.id = requirement_thread_unit.demand_unit_id
+           WHERE requirement_thread_unit.thread_id = ? AND source_demand_unit.state <> 'superseded'`,
+        ).get(thread.id) as { count: number };
+        if (remaining.count === 0) {
+          this.database.raw.prepare("UPDATE requirement_thread SET status = 'closed', updated_at = ? WHERE id = ? AND active_task_id IS NULL").run(timestamp, thread.id);
+        }
+      }
+    }
+  }
+
+  /**
+   * Resolve a candidate's thread without using the source event as a loose
+   * lookup key.  A single source may intentionally belong to several demand
+   * units, and therefore several threads.  Unit-bound candidates must resolve
+   * through requirement_thread_unit; legacy candidates may use the source only
+   * while that source still maps to one unique thread.
+   */
+  private threadForCandidate(candidate: Pick<CandidateRow, 'demand_unit_id' | 'source_event_id'>) {
+    if (candidate.demand_unit_id) {
+      const rows = this.database.raw.prepare(
+        `SELECT DISTINCT requirement_thread.*
+         FROM requirement_thread
+         JOIN requirement_thread_unit
+           ON requirement_thread_unit.thread_id = requirement_thread.id
+         WHERE requirement_thread_unit.demand_unit_id = ?
+         ORDER BY requirement_thread.updated_at DESC, requirement_thread.id ASC`,
+      ).all(candidate.demand_unit_id) as unknown as RequirementThreadRow[];
+      if (rows.length > 1) {
+        throw new Error('需求单元对应多个需求线程，数据关系不一致，已停止随机选择。');
+      }
+      return rows[0];
+    }
+    return this.threadForSource(candidate.source_event_id);
+  }
+
+  private sourceRowsForDemandUnit(demandUnitId: string | null, fallback: SourceEventRow) {
+    if (!demandUnitId) return this.classificationRowsForSource(fallback);
+    const rows = this.database.raw.prepare(
+      `SELECT source_event.*
+       FROM source_demand_unit_source
+       JOIN source_event ON source_event.id = source_demand_unit_source.source_event_id
+       WHERE source_demand_unit_source.demand_unit_id = ?
+       ORDER BY source_demand_unit_source.sequence ASC, source_event.occurred_at ASC, source_event.id ASC`,
+    ).all(demandUnitId) as SourceEventRow[];
+    return rows.length ? rows : [fallback];
+  }
+
+  private demandUnitIdsForCandidates(candidates: CandidateRow[]) {
+    return [...new Set(candidates.map((candidate) => candidate.demand_unit_id).filter((value): value is string => Boolean(value)))];
+  }
+
+  private sourceUsedByOtherThreadUnit(threadId: string, sourceEventId: string, excludedUnitIds: string[]) {
+    const exclusions = [...new Set(excludedUnitIds.filter(Boolean))];
+    const exclusionSql = exclusions.length ? ` AND requirement_thread_unit.demand_unit_id NOT IN (${exclusions.map(() => '?').join(',')})` : '';
+    const row = this.database.raw.prepare(
+      `SELECT COUNT(*) AS count
+       FROM requirement_thread_unit
+       JOIN source_demand_unit_source
+         ON source_demand_unit_source.demand_unit_id = requirement_thread_unit.demand_unit_id
+       JOIN source_demand_unit
+         ON source_demand_unit.id = requirement_thread_unit.demand_unit_id
+       WHERE requirement_thread_unit.thread_id = ?
+         AND source_demand_unit_source.source_event_id = ?
+         AND source_demand_unit.state <> 'superseded'${exclusionSql}`,
+    ).get(threadId, sourceEventId, ...exclusions) as { count: number };
+    return row.count > 0;
+  }
+
+  private sourceUsedByThreadUnits(threadId: string, sourceEventId: string, unitIds: string[]) {
+    const ids = [...new Set(unitIds.filter(Boolean))];
+    if (!ids.length) return false;
+    const row = this.database.raw.prepare(
+      `SELECT COUNT(*) AS count
+       FROM requirement_thread_unit
+       JOIN source_demand_unit_source
+         ON source_demand_unit_source.demand_unit_id = requirement_thread_unit.demand_unit_id
+       JOIN source_demand_unit
+         ON source_demand_unit.id = requirement_thread_unit.demand_unit_id
+       WHERE requirement_thread_unit.thread_id = ?
+         AND source_demand_unit_source.source_event_id = ?
+         AND source_demand_unit.state <> 'superseded'
+         AND requirement_thread_unit.demand_unit_id IN (${ids.map(() => '?').join(',')})`,
+    ).get(threadId, sourceEventId, ...ids) as { count: number };
+    return row.count > 0;
+  }
+
+  private moveDemandUnitsToThread(unitIds: string[], sourceThreadId: string, targetThreadId: string, timestamp: string) {
+    const ids = [...new Set(unitIds.filter(Boolean))];
+    if (!ids.length || sourceThreadId === targetThreadId) return;
+    for (const unitId of ids) {
+      const relation = this.database.raw.prepare(
+        'SELECT * FROM requirement_thread_unit WHERE thread_id = ? AND demand_unit_id = ?',
+      ).get(sourceThreadId, unitId) as { relation_type: string; confidence: number | null; evidence_json: string; created_at: string } | undefined;
+      if (!relation) throw new Error('需求单元与原需求线程关系不完整，已停止搬迁。');
+      this.database.raw.prepare('DELETE FROM requirement_thread_unit WHERE thread_id = ? AND demand_unit_id = ?').run(sourceThreadId, unitId);
+      this.database.raw.prepare(
+        `INSERT INTO requirement_thread_unit
+          (thread_id, demand_unit_id, relation_type, confidence, evidence_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(thread_id, demand_unit_id) DO UPDATE SET
+           relation_type = excluded.relation_type,
+           confidence = excluded.confidence,
+           evidence_json = excluded.evidence_json`,
+      ).run(targetThreadId, unitId, relation.relation_type, relation.confidence, relation.evidence_json, relation.created_at || timestamp);
+    }
+  }
+
+  private ensureDemandUnitThread(input: {
+    unit: PersistableClassificationUnit;
+    unitId: string;
+    draft: CandidateDraft;
+    classificationRevision: string;
+    timestamp: string;
+  }) {
+    const existingRows = this.database.raw.prepare(
+      `SELECT DISTINCT requirement_thread.* FROM requirement_thread
+       JOIN requirement_thread_unit ON requirement_thread_unit.thread_id = requirement_thread.id
+       WHERE requirement_thread_unit.demand_unit_id = ?
+       ORDER BY requirement_thread.updated_at DESC, requirement_thread.id ASC`,
+    ).all(input.unitId) as unknown as RequirementThreadRow[];
+    if (existingRows.length > 1) throw new Error('需求单元对应多个需求线程，数据关系不一致，已停止随机选择。');
+    const existing = existingRows[0];
+    if (existing) return existing;
+    const threadId = id('thread');
+    const participants = [...new Set(input.unit.sourceRows.flatMap((row) => threadParticipants(row)))];
+    const primary = input.unit.anchor;
+    this.database.raw.prepare(
+      `INSERT INTO requirement_thread
+        (id, status, title, background, validation_question, describe, analysis_json, conversation_id,
+         participant_ids_json, ambiguity_json, active_task_id, primary_source_event_id, primary_reason,
+         primary_confidence, version, last_activity_at, created_at, updated_at)
+       VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, '[]', NULL, ?, ?, ?, 1, ?, ?, ?)`,
+    ).run(
+      threadId,
+      input.draft.title,
+      input.draft.background,
+      input.draft.validationQuestion,
+      input.draft.describe,
+      JSON.stringify(input.draft.analysis ?? {}),
+      primary.conversation_id,
+      JSON.stringify(participants),
+      primary.id,
+      input.draft.analysis?.ownerAction?.required
+        ? `系统识别到主人需要推进：${input.draft.analysis.ownerAction.summary}`
+        : '该需求单元由来源独立识别，等待主人确认。',
+      input.draft.analysis?.ownerAction?.confidence ?? input.draft.confidence,
+      primary.occurred_at,
+      input.timestamp,
+      input.timestamp,
+    );
+    const sourceInsert = this.database.raw.prepare(
+      `INSERT INTO requirement_thread_source
+        (thread_id, source_event_id, demand_unit_id, relation_type, confidence, evidence_json, root_id, parent_id, session_id,
+         conversation_id, participant_ids_json, source_revision, source_role, role_reason, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(thread_id, source_event_id) DO UPDATE SET
+         relation_type = excluded.relation_type, confidence = excluded.confidence,
+         evidence_json = excluded.evidence_json, source_role = excluded.source_role,
+         role_reason = excluded.role_reason`,
+    );
+    for (const row of input.unit.sourceRows) {
+      const markers = threadMarkers(row);
+      const isAnchor = row.id === primary.id;
+      sourceInsert.run(
+        threadId,
+        row.id,
+        input.unitId,
+        isAnchor ? 'primary' : 'unit_evidence',
+        isAnchor ? input.draft.confidence : Math.min(1, input.draft.confidence),
+        JSON.stringify(isAnchor ? (input.draft.analysis?.recognitionEvidence ?? []) : ['同一需求单元的补充来源。']),
+        markers.rootId,
+        markers.parentId,
+        markers.sessionId,
+        row.conversation_id,
+        JSON.stringify(threadParticipants(row)),
+        sourceRevision(row),
+        isAnchor && input.draft.analysis?.ownerAction?.required ? 'owner_delivery' : 'evidence',
+        isAnchor && input.draft.analysis?.ownerAction?.required ? input.draft.analysis.ownerAction.summary : '',
+        input.timestamp,
+      );
+    }
+    this.database.raw.prepare(
+      `INSERT OR IGNORE INTO requirement_thread_unit
+        (thread_id, demand_unit_id, relation_type, confidence, evidence_json, created_at)
+       VALUES (?, ?, 'primary', ?, ?, ?)`,
+    ).run(
+      threadId,
+      input.unitId,
+      input.draft.confidence,
+      JSON.stringify(input.draft.analysis?.recognitionEvidence ?? []),
+      input.timestamp,
+    );
+    return this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(threadId) as unknown as RequirementThreadRow;
+  }
+
+  private persistMultiUnitClassification(input: {
+    sourceRow: SourceEventRow;
+    orderedRows: SourceEventRow[];
+    classification: ClassificationResult;
+    contextsBySource: Map<string, SourceDocumentContext[]>;
+    sourceHash: string;
+    contextHash: string;
+    revision: string;
+    deduplicated: boolean;
+    candidateFence?: CandidateRuntimeFence[];
+    runtimeJobId?: string;
+    leaseOwner?: string;
+  }): ClassificationPersistResult {
+    const units = this.normalizeClassificationUnits(input.classification, input.orderedRows);
+    const candidates: CandidateRow[] = [];
+    const demandUnitIds = new Set<string>();
+    const threadIds = new Set<string>();
+    const timestamp = nowIso();
+    let staleRows: SourceEventRow[] | null = null;
+    this.database.transaction(() => {
+      this.assertRuntimeActive(input.runtimeJobId, input.leaseOwner);
+      const placeholders = input.orderedRows.map(() => '?').join(',');
+      const currentRows = (this.database.raw.prepare(`SELECT * FROM source_event WHERE id IN (${placeholders})`)
+        .all(...input.orderedRows.map((row) => row.id)) as SourceEventRow[]).sort(stableSourceOrder);
+      if (currentRows.length !== input.orderedRows.length) throw new Error('待判断的来源记录已经不存在。');
+      const currentContextsBySource = new Map(currentRows.map((row) => [row.id, this.feishuDocumentContext.list(row.id)]));
+      const currentBaseRevision = currentRows.length === 1
+        ? combinedClassificationRevision(currentRows[0]!, currentContextsBySource.get(currentRows[0]!.id) ?? [])
+        : combinedBatchClassificationRevision(currentRows, currentContextsBySource);
+      const currentConfirmedContextRevision = this.classificationRevisionContext(currentRows).revision;
+      const currentRevision = currentConfirmedContextRevision
+        ? createHash('sha256').update(`${currentBaseRevision.revision}:${currentConfirmedContextRevision}`).digest('hex')
+        : currentBaseRevision.revision;
+      if (currentRevision !== input.revision) {
+        staleRows = currentRows;
+        return;
+      }
+      if (input.candidateFence) this.assertCandidateRuntimeFence(input.orderedRows.map((row) => row.id), input.candidateFence);
+      for (const unit of units) {
+        const unitSourceHash = createHash('sha256').update(JSON.stringify(unit.sourceRows.map((row) => ({ id: row.id, revision: sourceRevision(row) })))).digest('hex');
+        const unitContextRows = unit.sourceRows.flatMap((row) => input.contextsBySource.get(row.id) ?? []);
+        const unitContextHash = sourceContextRevision(unitContextRows);
+        const unitAnalysis = unit.draft
+          ? candidateAnalysisJson(unit.draft.analysis, unitContextRows, unitSourceHash, unitContextHash)
+          : JSON.stringify({ reason: unit.reason, sourceRevision: unitSourceHash, contextRevision: unitContextHash });
+        const unitState = input.classification.usedFallback ? 'provisional' : 'ready';
+        const unitRow = this.upsertDemandUnit({
+          anchor: unit.anchor,
+          unitKey: unit.unitKey,
+          unitKind: unit.isDataRequest && unit.draft ? 'demand' : 'context_only',
+          state: unitState,
+          classificationRevision: input.revision,
+          analysisJson: unitAnalysis,
+          reason: unit.reason,
+          createdAt: timestamp,
+        });
+        demandUnitIds.add(unitRow.id);
+        this.linkDemandUnitSources(unitRow.id, unit, timestamp);
+        const decisionId = id('ai');
+        this.database.raw.prepare(
+          `INSERT INTO ai_decision_log
+            (id, source_event_id, source_revision, demand_unit_id, candidate_id, provider, model, prompt_version, is_data_request, confidence,
+             reason, output_json, used_fallback, http_status, provider_request_id, attempts, structured_mode, input_hash,
+             input_char_count, fallback_mode, latency_ms, created_at)
+           VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ,
+        ).run(
+          decisionId,
+          unit.anchor.id,
+          input.revision,
+          unitRow.id,
+          this.adapters.classifier.provider,
+          this.adapters.classifier.model,
+          this.adapters.classifier.promptVersion,
+          unit.isDataRequest ? 1 : 0,
+          unit.draft?.confidence ?? null,
+          unit.reason,
+          JSON.stringify({ outcome: input.classification.outcome ?? 'valid', unitKey: unit.unitKey, sourceKeys: unit.sourceKeys, isDataRequest: unit.isDataRequest }),
+          input.classification.usedFallback ? 1 : 0,
+          input.classification.metadata?.httpStatus ?? null,
+          input.classification.metadata?.requestId ?? null,
+          input.classification.metadata?.attempts ?? null,
+          input.classification.metadata?.structuredMode ?? null,
+          input.classification.metadata?.inputHash ?? null,
+          input.classification.metadata?.inputCharCount ?? null,
+          input.classification.metadata?.fallbackMode ?? (input.classification.usedFallback ? 'rule_fallback' : 'llm'),
+          0,
+          timestamp,
+        );
+        this.bindAiDecisionRevisions(decisionId, unit.sourceRows);
+        this.database.raw.prepare('UPDATE source_demand_unit SET ai_decision_id = ?, updated_at = ? WHERE id = ?').run(decisionId, timestamp, unitRow.id);
+        if (!unit.draft || !unit.isDataRequest) continue;
+        const existing = this.database.raw.prepare('SELECT * FROM candidate_request WHERE demand_unit_id = ?').get(unitRow.id) as CandidateRow | undefined;
+        let candidateId = existing?.id ?? id('cand');
+        const analysisJson = unitAnalysis;
+        if (!existing) {
+          this.database.raw.prepare(
+            `INSERT INTO candidate_request
+              (id, source_event_id, demand_unit_id, title, proposer_name, background, validation_question, describe,
+               analysis_json, confidence, state, snoozed_until, accepted_task_id, processing_state, processing_job_id,
+               processing_error, context_state, context_reason, recovered_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, 'ready', NULL, NULL, 'complete', NULL, NULL, ?, ?)`,
+          ).run(candidateId, unit.anchor.id, unitRow.id, unit.draft.title, unit.draft.proposerName, unit.draft.background,
+            unit.draft.validationQuestion, unit.draft.describe, analysisJson, unit.draft.confidence, timestamp, timestamp);
+        } else if (!existing.accepted_task_id && !existing.deleted_at) {
+          const updatedExistingCandidate = this.database.raw.prepare(
+            `UPDATE candidate_request SET source_event_id = ?, title = ?, proposer_name = ?, background = ?, validation_question = ?,
+             describe = ?, analysis_json = ?, confidence = ?, processing_state = 'ready', processing_error = NULL, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?`,
+          ).run(unit.anchor.id, unit.draft.title, unit.draft.proposerName, unit.draft.background, unit.draft.validationQuestion,
+            unit.draft.describe, analysisJson, unit.draft.confidence, timestamp, existing.id, existing.version);
+          if (updatedExistingCandidate.changes !== 1) throw new CandidateVersionConflictError();
+        }
+        candidateId = existing?.id ?? candidateId;
+        this.database.raw.prepare('UPDATE ai_decision_log SET candidate_id = ? WHERE id = ?').run(candidateId, decisionId);
+        const revisionId = id('candidate-revision');
+        this.database.raw.prepare('UPDATE candidate_revision SET state = \'superseded\' WHERE candidate_id = ? AND state = \'current\'').run(candidateId);
+        this.database.raw.prepare(
+          `INSERT INTO candidate_revision
+            (id, candidate_id, source_event_id, demand_unit_id, ai_decision_id, source_revision, title, proposer_name,
+             background, validation_question, describe, analysis_json, confidence, evidence_json, provider, model,
+             prompt_version, state, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', ?)`,
+        ).run(revisionId, candidateId, unit.anchor.id, unitRow.id, decisionId, unitSourceHash, unit.draft.title, unit.draft.proposerName,
+          unit.draft.background, unit.draft.validationQuestion, unit.draft.describe, analysisJson, unit.draft.confidence,
+          JSON.stringify(unit.draft.analysis?.recognitionEvidence ?? []), this.adapters.classifier.provider, this.adapters.classifier.model,
+          this.adapters.classifier.promptVersion, timestamp);
+        const thread = this.ensureDemandUnitThread({ unit, unitId: unitRow.id, draft: unit.draft, classificationRevision: input.revision, timestamp });
+        threadIds.add(thread.id);
+        const threadRevisionId = id('thread-revision');
+        this.database.raw.prepare(
+          `INSERT OR IGNORE INTO requirement_thread_revision
+            (id, thread_id, source_event_id, demand_unit_id, base_thread_version, patch_json, evidence_json, state, idempotency_key, created_at, decided_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, NULL)`,
+        ).run(threadRevisionId, thread.id, unit.anchor.id, unitRow.id, thread.version, JSON.stringify({ unitKey: unit.unitKey, title: unit.draft.title }),
+          JSON.stringify(unit.draft.analysis?.recognitionEvidence ?? []), `unit-thread:${unitRow.id}:${input.revision}`, timestamp);
+        this.database.raw.prepare(
+          `INSERT OR IGNORE INTO notification
+            (id, task_id, task_event_id, candidate_id, notification_type, dedupe_key, reason, read_at, snoozed_until, archived_at, created_at)
+           VALUES (?, NULL, NULL, ?, 'immediate', ?, ?, NULL, NULL, NULL, ?)`,
+        ).run(id('notice'), candidateId, `candidate:${candidateId}:unit:${unitRow.id}:${input.revision}`, '发现一条新的候选数据需求。', timestamp);
+        const refreshed = this.getCandidate(candidateId);
+        if (refreshed) candidates.push(refreshed);
+      }
+      this.supersedeMissingDemandUnits(currentRows.map((row) => row.id), demandUnitIds, timestamp);
+      for (const row of currentRows) {
+        const metadata = parseMetadata(row.metadata_json);
+        metadata.classificationRevision = input.revision;
+        metadata.classificationBatchSourceIds = input.orderedRows.map((item) => item.id);
+        this.database.raw.prepare('UPDATE source_event SET metadata_json = ? WHERE id = ?').run(JSON.stringify(metadata), row.id);
+      }
+    });
+    if (staleRows) throw new ClassificationRevisionChangedError(staleRows);
+    return {
+      deduplicated: input.deduplicated,
+      sourceEventId: input.sourceRow.id,
+      candidate: candidates[0] ?? null,
+      candidates,
+      candidateIds: candidates.map((candidate) => candidate.id),
+      demandUnitIds: [...demandUnitIds],
+      threadIds: [...threadIds],
+    };
+  }
+
+  /**
+   * Load a small, bounded recent conversation window as model context. These
+   * rows remain evidence only and never become candidates merely because they
+   * appear here. Calendar/minutes keep the stricter contextOnly restriction.
+   */
+  private readConversationContextRows(rows: SourceEventRow[]) {
+    const ordered = [...rows].sort(stableSourceOrder);
+    const anchor = ordered[0];
+    const latest = ordered.at(-1);
+    if (!anchor || !latest) return [] as SourceEventRow[];
+    const classificationSourceIds = new Set(ordered.map((row) => row.id));
+    // A requester turn such as “下周一能给到吗” needs the original demand and
+    // intervening owner messages just as much as an owner reply needs them.
+    const includeRecentConversation = isMessageSource(anchor);
+    const anchorMillis = Date.parse(anchor.occurred_at);
+    const floor = Number.isFinite(anchorMillis) ? anchorMillis - 72 * 60 * 60 * 1000 : Date.now() - 72 * 60 * 60 * 1000;
+    const candidates = this.database.raw.prepare(
+      `SELECT * FROM source_event
+       WHERE conversation_id = ?
+         AND occurred_at <= ?
+         AND occurred_at >= ?
+         AND (? = 1 OR json_extract(metadata_json, '$.contextOnly') = 1
+              OR json_extract(metadata_json, '$.historyBackfill') = 1)
+       ORDER BY occurred_at DESC, external_id DESC
+       LIMIT 32`,
+    ).all(
+      anchor.conversation_id,
+      latest.occurred_at,
+      new Date(floor).toISOString(),
+      includeRecentConversation ? 1 : 0,
+    ) as SourceEventRow[];
+    const selected: SourceEventRow[] = [];
+    let chars = 0;
+    for (const row of candidates.reverse()) {
+      if (classificationSourceIds.has(row.id)) continue;
+      if (selected.length >= 12) break;
+      const next = Math.max(0, row.content.length);
+      if (chars + next > 8_000 && selected.length > 0) break;
+      selected.push(row);
+      chars += next;
+    }
+    return selected;
+  }
+
+  private classifySourceWithStoredBatch(
+    source: SourceEventRow,
+    guidance: string | undefined,
+    deduplicated: boolean,
+    retryFailed = false,
+    operationContext?: OperationContext,
+  ) {
+    const rows = this.classificationRowsForSource(source);
+    return rows.length > 1
+      ? this.classifyCapturedSourceBatch(rows, guidance, retryFailed, operationContext)
+      : this.classifyCapturedSource(source, guidance, deduplicated, 0, retryFailed, operationContext);
+  }
+
+  /**
+   * Build the small, server-owned target set for a主人消息.  The model may
+   * describe the owner's intent, but it never gets to choose a database row.
+   * Reply/root/session relations are preferred; a same-conversation match is
+   * only safe when it leaves one candidate.
+   */
+  private ownerDecisionCandidateRows(source: SourceEventRow, retiredAtSource = false): OwnerDecisionCandidateRow[] {
+    if (!retiredAtSource) {
+      return this.database.raw.prepare(
+        `SELECT DISTINCT candidate_request.*, source_event.occurred_at AS source_occurred_at
+         FROM candidate_request
+         JOIN source_event ON source_event.id = candidate_request.source_event_id
+         WHERE candidate_request.deleted_at IS NULL
+           AND candidate_request.state IN ('pending','snoozed','accepted')
+           AND source_event.conversation_id = ?
+         ORDER BY candidate_request.updated_at DESC, candidate_request.id ASC`,
+      ).all(source.conversation_id) as OwnerDecisionCandidateRow[];
+    }
+    // A model call can finish after its target was retired. Reconstruct only
+    // targets that already existed when this owner message happened; a new
+    // message must never be silently attached to an old task.
+    // `updated_at` is not a retirement fact: unrelated edits can advance it
+    // after an ignored candidate was retired. Deletion and task invalidation
+    // retain dedicated retirement timestamps. Ignored candidates use the
+    // immutable correction_event written in the same transaction as the
+    // state change, and additionally require a strong source/thread relation
+    // or a durable same-source owner-decision link.
+    const rows = this.database.raw.prepare(
+      `SELECT DISTINCT candidate_request.*, source_event.occurred_at AS source_occurred_at
+       FROM candidate_request
+       JOIN source_event ON source_event.id = candidate_request.source_event_id
+       LEFT JOIN task AS accepted_task ON accepted_task.id = candidate_request.accepted_task_id
+       WHERE source_event.conversation_id = ?
+         AND source_event.occurred_at <= ?
+         AND ((candidate_request.deleted_at IS NOT NULL AND ? <= candidate_request.deleted_at)
+              OR (accepted_task.deleted_at IS NOT NULL AND ? <= accepted_task.deleted_at)
+              OR (accepted_task.record_state = 'invalidated'
+                  AND accepted_task.archived_at IS NOT NULL
+                  AND ? <= accepted_task.archived_at))
+       ORDER BY candidate_request.updated_at DESC, candidate_request.id ASC`,
+    ).all(source.conversation_id, source.occurred_at, source.occurred_at, source.occurred_at, source.occurred_at) as OwnerDecisionCandidateRow[];
+    const ignoredRows = this.database.raw.prepare(
+      `SELECT DISTINCT candidate_request.*, source_event.occurred_at AS source_occurred_at
+       FROM candidate_request
+       JOIN source_event ON source_event.id = candidate_request.source_event_id
+       JOIN correction_event AS retirement
+         ON retirement.candidate_id = candidate_request.id
+        AND retirement.correction_type IN ('candidate_ignored','owner_decline','owner_delegate','false_positive')
+       WHERE candidate_request.state = 'ignored'
+         AND source_event.conversation_id = ?
+         AND source_event.occurred_at <= ?
+         AND source_event.occurred_at <= retirement.created_at
+       ORDER BY retirement.created_at DESC, candidate_request.updated_at DESC, candidate_request.id ASC`,
+    ).all(source.conversation_id, source.occurred_at) as OwnerDecisionCandidateRow[];
+    const stronglyRelatedIgnored = ignoredRows.filter((candidate) => {
+      const sameSourceDecision = this.database.raw.prepare(
+        'SELECT 1 FROM owner_decision WHERE source_event_id = ? AND candidate_id = ? LIMIT 1',
+      ).get(source.id, candidate.id);
+      return Boolean(sameSourceDecision) || this.ownerDecisionCandidateHasStrongRelation(source, candidate);
+    });
+    return [...rows, ...stronglyRelatedIgnored.filter((candidate) => !rows.some((row) => row.id === candidate.id))];
+  }
+
+  private ownerDecisionCandidateHasStrongRelation(source: SourceEventRow, candidate: CandidateRow) {
+    const markers = threadMarkers(source);
+    const thread = this.threadForCandidate(candidate);
+    if (!thread) return false;
+    if (markers.threadId && thread.id === markers.threadId) return true;
+    if (markers.rootId) {
+      const hit = this.database.raw.prepare(
+        `SELECT 1 FROM requirement_thread_source
+         WHERE thread_id = ? AND (root_id = ? OR source_event_id = ?)
+         LIMIT 1`,
+      ).get(thread.id, markers.rootId, markers.rootId);
+      if (hit) return true;
+    }
+    if (markers.parentId) {
+      const hit = this.database.raw.prepare(
+        `SELECT 1 FROM requirement_thread_source
+         WHERE thread_id = ? AND (parent_id = ? OR source_event_id = ?)
+         LIMIT 1`,
+      ).get(thread.id, markers.parentId, markers.parentId);
+      if (hit) return true;
+    }
+    if (markers.sessionId) {
+      const hit = this.database.raw.prepare(
+        'SELECT 1 FROM requirement_thread_source WHERE thread_id = ? AND session_id = ? LIMIT 1',
+      ).get(thread.id, markers.sessionId);
+      if (hit) return true;
+    }
+    return false;
+  }
+
+  private ownerDecisionTargets(
+    source: SourceEventRow,
+    action?: OwnerIntentDecision['action'] | null,
+    rows = this.ownerDecisionCandidateRows(source),
+  ): OwnerDecisionTarget[] {
+    if (!rows.length) return [];
+    const markers = threadMarkers(source);
+    const hasStrongMarker = Boolean(markers.rootId || markers.parentId || markers.sessionId || markers.threadId);
+    const relationMatches = (candidate: CandidateRow) => this.ownerDecisionCandidateHasStrongRelation(source, candidate);
+    let filtered = hasStrongMarker ? rows.filter(relationMatches) : rows;
+    // A long private conversation can create provisional candidates for
+    // follow-up questions such as “下周一可以吗？” even though the owner has
+    // already accepted the underlying requirement.  The latest applied owner
+    // decision is a durable confirmation boundary.  For owner actions that
+    // maintain an existing task, reuse that boundary when it is in the same
+    // conversation and before the current message; do not apply this shortcut
+    // to decline/delegate, where a new unaccepted candidate may be the object
+    // being rejected or handed off.
+    if (!hasStrongMarker && action && ['continue', 'confirm_schedule', 'request_context'].includes(action)) {
+      const previous = this.database.raw.prepare(
+        `SELECT owner_decision.candidate_id, owner_decision.task_id
+         FROM owner_decision
+         JOIN source_event ON source_event.id = owner_decision.source_event_id
+         WHERE source_event.conversation_id = ?
+           AND source_event.occurred_at < ?
+           AND owner_decision.state = 'applied'
+           AND owner_decision.disposition IN ('accept_candidate','apply_task_patch')
+         ORDER BY source_event.occurred_at DESC, owner_decision.created_at DESC
+         LIMIT 1`,
+      ).get(source.conversation_id, source.occurred_at) as { candidate_id: string | null; task_id: string | null } | undefined;
+      if (previous) {
+        const previousMatch = filtered.find((candidate) => {
+          if (previous.candidate_id && candidate.id === previous.candidate_id) return true;
+          if (previous.task_id && candidate.accepted_task_id === previous.task_id) return true;
+          const thread = this.threadForCandidate(candidate);
+          return Boolean(previous.task_id && thread?.active_task_id === previous.task_id);
+        });
+        if (previousMatch) filtered = [previousMatch];
+      }
+    }
+    // Without reply/root/session markers, a private chat may contain several
+    // unrelated demands.  For an explicit owner action, prefer only the most
+    // recent candidate group before the owner message.  This keeps the model
+    // out of ID selection while still handling the common immediate reply.
+    if (!hasStrongMarker && filtered.length > 1 && action
+      && ['continue', 'confirm_schedule', 'request_context', 'decline', 'delegate'].includes(action)) {
+      const ownerAt = Date.parse(source.occurred_at);
+      const recentWindowMs = 2 * 60 * 60 * 1_000;
+      const byRoot = new Map<string, { candidate: CandidateRow & { source_occurred_at: string }; occurredAt: number }>();
+      for (const candidate of filtered) {
+        if (candidate.state === 'accepted' || candidate.accepted_task_id) continue;
+        const candidateAt = Date.parse(candidate.source_occurred_at);
+        if (!Number.isFinite(ownerAt) || !Number.isFinite(candidateAt) || candidateAt > ownerAt || ownerAt - candidateAt > recentWindowMs) continue;
+        const root = this.candidateGroupRoot(candidate);
+        const existing = byRoot.get(root.id);
+        if (!existing || candidateAt > existing.occurredAt) byRoot.set(root.id, { candidate, occurredAt: candidateAt });
+      }
+      const latestAt = Math.max(...[...byRoot.values()].map((item) => item.occurredAt));
+      const latest = [...byRoot.values()].filter((item) => item.occurredAt === latestAt);
+      filtered = latest.length === 1 ? [latest[0]!.candidate] : [];
+    }
+    return filtered.map((candidate): OwnerDecisionTarget => {
+      const thread = this.threadForCandidate(candidate);
+      const taskId = candidate.accepted_task_id ?? thread?.active_task_id ?? null;
+      const task = taskId ? this.getTask(taskId) : null;
+      return {
+        candidateId: candidate.id,
+        candidateVersion: candidate.version,
+        candidateGroupVersionHash: candidateGroupVersionHash(this.candidateGroupRows(this.candidateGroupRoot(candidate).id)),
+        candidateState: candidate.state,
+        acceptedTaskId: candidate.accepted_task_id,
+        threadId: thread?.id ?? null,
+        taskId: task?.id ?? taskId,
+        taskStatus: task?.status ?? null,
+        taskVersion: task?.version ?? null,
+        threadVersion: thread?.version ?? null,
+        sourceMatched: true,
+        candidateDeleted: Boolean(candidate.deleted_at),
+        taskDeleted: Boolean(task?.deleted_at),
+        taskInvalidated: task?.record_state === 'invalidated',
+      };
+    });
+  }
+
+  private captureOwnerDecisionTargets(source: SourceEventRow, includeRetiredFallback = false): OwnerDecisionTargetSnapshots {
+    // Jobs created before target snapshots were introduced may first be seen
+    // during recovery, after their only candidate has already been retired.
+    // Preserve the narrow legacy compatibility path by capturing a retired
+    // target only when no active row exists and its durable retirement/strong
+    // relation evidence is available.  New jobs still capture active rows
+    // only; an explicit persisted empty snapshot remains authoritative.
+    const activeRows = this.ownerDecisionCandidateRows(source);
+    const rows = activeRows.length || !includeRetiredFallback
+      ? activeRows
+      : this.ownerDecisionCandidateRows(source, true);
+    const actions: OwnerIntentDecision['action'][] = ['continue', 'confirm_schedule', 'request_context', 'decline', 'delegate', 'uncertain'];
+    return {
+      schemaVersion: 1,
+      contextCount: rows.length,
+      targets: Object.fromEntries(actions.map((action) => [action, this.ownerDecisionTargets(source, action, rows)])),
+    } as OwnerDecisionTargetSnapshots;
+  }
+
+  private runtimeOwnerDecisionTargets(jobId?: string): OwnerDecisionTargetSnapshots | null {
+    if (!jobId) return null;
+    const job = this.runtime.get(jobId);
+    if (!job) return null;
+    const payload = parseMetadata(job.payload_json);
+    if (!Object.prototype.hasOwnProperty.call(payload, 'ownerTargetSnapshots')) return null;
+    const parsed = ownerDecisionTargetSnapshotsSchema.safeParse(payload.ownerTargetSnapshots);
+    if (!parsed.success) {
+      throw new Error('Runtime 主人判断目标快照格式无效，拒绝回退重扫候选。');
+    }
+    return parsed.data as OwnerDecisionTargetSnapshots;
+  }
+
+  private persistRuntimeOwnerDecisionTargets(jobId: string, leaseOwner: string, snapshots: OwnerDecisionTargetSnapshots) {
+    const job = this.runtime.get(jobId);
+    if (!job) throw new Error('Runtime 主人判断工作项不存在。');
+    const payload = { ...parseMetadata(job.payload_json), ownerTargetSnapshots: snapshots };
+    const timestamp = nowIso();
+    let updated: { changes: number | bigint };
+    try {
+      updated = this.database.raw.prepare(
+        `UPDATE job
+            SET payload_json = ?, updated_at = ?
+          WHERE id = ?
+            AND status = 'running'
+            AND lease_owner = ?
+            AND cancel_requested_at IS NULL
+            AND locked_until IS NOT NULL
+            AND locked_until > ?`,
+      ).run(JSON.stringify(payload), timestamp, jobId, leaseOwner, timestamp);
+    } catch (error) {
+      throw new OwnerTargetSnapshotPersistenceError('Runtime 主人判断目标快照持久化失败，拒绝调用 provider。', { cause: error });
+    }
+    if (updated.changes !== 1) {
+      throw new OwnerTargetSnapshotPersistenceError('Runtime 主人判断工作项租约已失效，拒绝写入目标快照。');
+    }
+  }
+
+  private ownerScheduleEvidence(source: SourceEventRow, intent: OwnerIntentDecision, rows: SourceEventRow[]): OwnerScheduleEvidence | null {
+    if (intent.action !== 'confirm_schedule') return null;
+    const candidates = [...rows]
+      .filter((row) => row.id !== source.id && row.conversation_id === source.conversation_id && Date.parse(row.occurred_at) <= Date.parse(source.occurred_at))
+      .sort(stableSourceOrder)
+      .reverse();
+    const sourceText = intent.scheduleText?.trim() || source.content;
+    // Prefer the full owner message so delivery verbs such as “周五给到”
+    // can distinguish a deadline from a start date. The model's short
+    // schedule_text is only a fallback because it may contain just “周五”.
+    const directFromSource = timeRangeFromSource(source.content, source.occurred_at);
+    if (directFromSource.status !== 'unknown') {
+      return {
+        sourceText: directFromSource.sourceText ?? sourceText,
+        startAt: directFromSource.startAt,
+        dueAt: directFromSource.endAt,
+        needsConfirmation: directFromSource.needsConfirmation,
+      };
+    }
+    const directFromSchedule = timeRangeFromSource(sourceText, source.occurred_at);
+    if (directFromSchedule.status !== 'unknown') {
+      return {
+        sourceText,
+        startAt: directFromSchedule.startAt,
+        dueAt: directFromSchedule.endAt,
+        needsConfirmation: directFromSchedule.needsConfirmation,
+      };
+    }
+    // “可以/行” is common after the requester supplied the date.  Reuse only
+    // the latest bounded, parseable date in the same conversation; never infer
+    // a date from the owner's reply timestamp.
+    for (const previous of candidates.slice(0, 24)) {
+      const range = timeRangeFromSource(previous.content, previous.occurred_at);
+      if (range.status === 'unknown') continue;
+      return { sourceText: range.sourceText ?? previous.content, startAt: range.startAt, dueAt: range.endAt, needsConfirmation: range.needsConfirmation };
+    }
+    return { sourceText, startAt: null, dueAt: null, needsConfirmation: true };
+  }
+
+  private ownerDecisionRow(sourceEventId: string, sourceRevisionValue: string) {
+    return this.database.raw.prepare(
+      'SELECT * FROM owner_decision WHERE source_event_id = ? AND source_revision = ?',
+    ).get(sourceEventId, sourceRevisionValue) as OwnerDecisionRow | undefined;
+  }
+
+  private recordCandidateIgnoredRetirement(candidate: CandidateRow, timestamp: string, previousState = candidate.state) {
+    this.database.raw.prepare(
+      `INSERT OR IGNORE INTO correction_event
+       (id, idempotency_key, task_id, candidate_id, source_event_id, demand_unit_id, correction_type,
+        before_json, after_json, note, visibility, operation, created_at)
+       VALUES (?, ?, NULL, ?, ?, ?, 'candidate_ignored', ?, ?, ?, 'private', 'apply', ?)`,
+    ).run(
+      id('correction'),
+      `candidate-ignore:${candidate.id}:${timestamp}`,
+      candidate.id,
+      candidate.source_event_id,
+      candidate.demand_unit_id,
+      JSON.stringify({ candidateId: candidate.id, state: previousState }),
+      JSON.stringify({ candidateId: candidate.id, state: 'ignored', retirementAt: timestamp }),
+      '候选已被系统主人移出活动范围。',
+      timestamp,
+    );
+  }
+
+  private reconcileRetiredOwnerDecisions() {
+    const reason = '主人判断对应的候选或任务已经进入已忽略、回收站或无效状态；仅保留审计。';
+    const mutableStates = "('queued','running','review','failed')";
+    this.database.raw.prepare(
+      `UPDATE owner_decision
+       SET state = 'stale', error = ?, applied_at = NULL
+       WHERE state IN ${mutableStates}
+         AND (candidate_id IN (
+                SELECT id FROM candidate_request WHERE deleted_at IS NOT NULL OR state = 'ignored'
+              )
+              OR task_id IN (
+                SELECT id FROM task WHERE deleted_at IS NOT NULL OR record_state = 'invalidated'
+              ))`,
+    ).run(reason);
+    // Older builds could write a new unassigned row for the same source after
+    // an earlier linked decision had already been applied. Keep both audit
+    // rows, but retire only this provable orphan when its historical target is
+    // gone.
+    this.database.raw.prepare(
+      `UPDATE owner_decision
+       SET state = 'stale', error = ?, applied_at = NULL
+       WHERE state IN ${mutableStates}
+         AND candidate_id IS NULL
+         AND task_id IS NULL
+         AND EXISTS (
+           SELECT 1
+           FROM owner_decision AS historical
+           LEFT JOIN candidate_request AS historical_candidate ON historical_candidate.id = historical.candidate_id
+           LEFT JOIN task AS historical_task ON historical_task.id = historical.task_id
+           WHERE historical.source_event_id = owner_decision.source_event_id
+             AND historical.rowid <> owner_decision.rowid
+             AND ((historical_candidate.id IS NOT NULL
+                   AND (historical_candidate.deleted_at IS NOT NULL OR historical_candidate.state = 'ignored'))
+                  OR (historical_task.id IS NOT NULL
+                      AND (historical_task.deleted_at IS NOT NULL OR historical_task.record_state = 'invalidated')))
+         )`,
+    ).run(reason);
+    // Do not infer an orphan from conversation and time alone.  Without a
+    // strong source/thread/root/parent/session relation, or a same-source
+    // historical linked decision (the query above), the row remains review.
+  }
+
+  private staleOwnerDecisionsForRetiredTargets(input: { candidateIds?: string[]; taskId?: string | null }) {
+    const candidateIds = [...new Set(input.candidateIds ?? [])];
+    const clauses: string[] = [];
+    const args: string[] = [];
+    if (candidateIds.length) {
+      clauses.push(`candidate_id IN (${candidateIds.map(() => '?').join(',')})`);
+      args.push(...candidateIds);
+    }
+    if (input.taskId) {
+      clauses.push('(task_id = ? OR candidate_id IN (SELECT id FROM candidate_request WHERE accepted_task_id = ?))');
+      args.push(input.taskId, input.taskId);
+    }
+    if (!clauses.length) return 0;
+    const result = this.database.raw.prepare(
+      `UPDATE owner_decision
+       SET state = 'stale', error = ?, applied_at = NULL
+       WHERE state IN ('queued','running','review','failed')
+         AND (${clauses.join(' OR ')})`,
+    ).run('主人判断的目标已经被主人移出活动范围；仅保留审计，不再执行或显示提醒。', ...args);
+    return result.changes;
+  }
+
+  /** Recover the structured owner intent from the durable classification log.
+   * The source revision may already be stamped when a process stopped between
+   * classification persistence and owner-decision execution. */
+  private storedOwnerIntents(sourceEventId: string): OwnerIntentDecision[] {
+    const row = this.database.raw.prepare(
+      'SELECT output_json FROM ai_decision_log WHERE source_event_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1',
+    ).get(sourceEventId) as { output_json: string } | undefined;
+    if (!row) return [];
+    const output = parseMetadata(row.output_json);
+    const parse = (value: unknown): OwnerIntentDecision | null => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+      const intent = value as Partial<OwnerIntentDecision>;
+      if (!['continue', 'confirm_schedule', 'request_context', 'decline', 'delegate', 'uncertain'].includes(String(intent.action))) return null;
+      if (typeof intent.confidence !== 'number' || typeof intent.summary !== 'string' || !Array.isArray(intent.evidence)) return null;
+      return {
+        action: intent.action as OwnerIntentDecision['action'],
+        confidence: intent.confidence,
+        summary: intent.summary,
+        delegateTo: typeof intent.delegateTo === 'string' ? intent.delegateTo : null,
+        scheduleText: typeof intent.scheduleText === 'string' ? intent.scheduleText : null,
+        evidence: intent.evidence.filter((item): item is string => typeof item === 'string').slice(0, 20),
+        reason: typeof intent.reason === 'string' ? intent.reason : '',
+      };
+    };
+    const values = Array.isArray(output.ownerIntents) ? output.ownerIntents : [];
+    const parsed = values.map(parse).filter((item): item is OwnerIntentDecision => Boolean(item));
+    const primary = parse(output.ownerIntent);
+    if (primary && !parsed.some((item) => item.action === primary.action)) parsed.unshift(primary);
+    return parsed.filter((item, index, items) => items.findIndex((candidate) => candidate.action === item.action) === index);
+  }
+
+  private storedOwnerIntent(sourceEventId: string): OwnerIntentDecision | null {
+    return this.storedOwnerIntents(sourceEventId)[0] ?? null;
+  }
+
+  private ownerTargetSnapshot(target: OwnerDecisionTarget | null) {
+    return target ? {
+      candidateId: target.candidateId,
+      candidateVersion: target.candidateVersion ?? null,
+      candidateGroupVersionHash: target.candidateGroupVersionHash ?? null,
+      candidateState: target.candidateState,
+      acceptedTaskId: target.acceptedTaskId,
+      threadId: target.threadId,
+      taskId: target.taskId,
+      taskStatus: target.taskStatus,
+      taskVersion: target.taskVersion,
+      threadVersion: target.threadVersion,
+      candidateDeleted: Boolean(target.candidateDeleted),
+      taskDeleted: Boolean(target.taskDeleted),
+      taskInvalidated: Boolean(target.taskInvalidated),
+    } : {};
+  }
+
+  private insertOwnerDecision(input: {
+    source: SourceEventRow;
+    sourceRevision: string;
+    intent: OwnerIntentDecision;
+    result: OwnerDecisionResult;
+    runtimeJobId?: string | null;
+    state: OwnerDecisionRow['state'];
+    error?: string | null;
+  }) {
+    const timestamp = nowIso();
+    const existing = this.ownerDecisionRow(input.source.id, input.sourceRevision);
+    if (existing) return existing;
+    const demandUnitId = input.result.target?.candidateId
+      ? this.getCandidate(input.result.target.candidateId)?.demand_unit_id ?? null
+      : input.result.target?.threadId ? this.uniqueThreadDemandUnitId(input.result.target.threadId) : null;
+    this.database.raw.prepare(
+      `INSERT OR IGNORE INTO owner_decision
+       (id, source_event_id, source_revision, demand_unit_id, candidate_id, thread_id, task_id, action, disposition,
+        confidence, summary, delegate_to, schedule_text, patch_json, evidence_json, reason,
+        provider, model, prompt_version, runtime_job_id, state, target_snapshot_json, error, created_at, applied_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id('owner-decision'), input.source.id, input.sourceRevision,
+      demandUnitId,
+      input.result.target?.candidateId ?? null,
+      input.result.target?.threadId ?? null,
+      input.result.target?.taskId ?? null,
+      input.intent.action, input.result.disposition, input.result.confidence,
+      input.intent.summary.slice(0, 1_000), input.result.delegateTo,
+      input.intent.scheduleText, JSON.stringify(input.result.patch),
+      JSON.stringify(input.intent.evidence.slice(0, 20)), input.result.reason.slice(0, 1_000),
+      this.adapters.classifier.provider, this.adapters.classifier.model,
+      this.adapters.classifier.promptVersion, input.runtimeJobId ?? null,
+      input.state, JSON.stringify(this.ownerTargetSnapshot(input.result.target)),
+      input.error ? redactDiagnosticText(input.error, 500) : null, timestamp,
+      input.state === 'applied' ? timestamp : null,
+    );
+    return this.ownerDecisionRow(input.source.id, input.sourceRevision);
+  }
+
+  private ownerTargetMatchesCurrent(target: OwnerDecisionTarget) {
+    const candidate = target.candidateId ? this.getCandidate(target.candidateId) : null;
+    if (target.candidateId && !candidate) return false;
+    if (candidate?.deleted_at) return false;
+    if (target.candidateId && (typeof target.candidateVersion !== 'number' || candidate!.version !== target.candidateVersion)) return false;
+    if (candidate && (typeof target.candidateGroupVersionHash !== 'string'
+      || candidateGroupVersionHash(this.candidateGroupRows(this.candidateGroupRoot(candidate).id)) !== target.candidateGroupVersionHash)) return false;
+    if (candidate && candidate.state !== target.candidateState) return false;
+    if (candidate && candidate.accepted_task_id !== target.acceptedTaskId) return false;
+    if (!candidate && (target.candidateId || target.candidateState || target.acceptedTaskId)) return false;
+    const taskId = candidate?.accepted_task_id ?? target.taskId;
+    const task = taskId ? this.getTask(taskId) : null;
+    if (taskId !== target.taskId) return false;
+    if (task?.deleted_at || task?.record_state === 'invalidated') return false;
+    if (target.taskId && (!task || task.version !== target.taskVersion || task.status !== target.taskStatus)) return false;
+    if (!target.taskId && (target.taskVersion !== null || target.taskStatus !== null || task)) return false;
+    const thread = candidate
+      ? this.threadForCandidate(candidate)
+      : target.threadId
+        ? this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(target.threadId) as RequirementThreadRow | undefined
+        : null;
+    if (thread?.id !== target.threadId) return false;
+    if (target.threadId && (!thread || thread.version !== target.threadVersion)) return false;
+    if (!target.threadId && (target.threadVersion !== null || thread)) return false;
+    return true;
+  }
+
+  private linkOwnerSource(source: SourceEventRow, threadId: string | null, taskId: string | null, timestamp: string) {
+    if (threadId) {
+      const markers = threadMarkers(source);
+      this.database.raw.prepare(
+        `INSERT INTO requirement_thread_source
+         (thread_id, source_event_id, demand_unit_id, relation_type, confidence, evidence_json, root_id, parent_id, session_id,
+          conversation_id, participant_ids_json, source_revision, source_role, role_reason, created_at)
+         VALUES (?, ?, ?, 'owner_confirmed', 1, ?, ?, ?, ?, ?, ?, ?, 'owner_delivery', ?, ?)
+         ON CONFLICT(thread_id, source_event_id) DO UPDATE SET relation_type = 'owner_confirmed', confidence = 1,
+           evidence_json = excluded.evidence_json, source_revision = excluded.source_revision,
+           source_role = excluded.source_role, role_reason = excluded.role_reason`,
+      ).run(
+        threadId, source.id, this.uniqueThreadDemandUnitId(threadId), JSON.stringify([source.content.slice(0, 500)]), markers.rootId, markers.parentId,
+        markers.sessionId, source.conversation_id, JSON.stringify(threadParticipants(source)), sourceRevision(source),
+        '主人消息确认了需求归属。', timestamp,
+      );
+    }
+    if (taskId) {
+      const task = this.getTask(taskId);
+      const effectiveThreadId = threadId ?? task?.thread_id ?? null;
+      const relation = effectiveThreadId
+        ? this.database.raw.prepare(
+          `SELECT demand_unit_id
+             FROM requirement_thread_source
+            WHERE thread_id = ? AND source_event_id = ?`,
+        ).get(effectiveThreadId, source.id) as { demand_unit_id: string | null } | undefined
+        : undefined;
+      const demandUnitId = relation?.demand_unit_id ?? (effectiveThreadId ? this.uniqueThreadDemandUnitId(effectiveThreadId) : null);
+      if (demandUnitId) this.ensureDemandUnitSourceEdge(demandUnitId, source.id, timestamp);
+      this.linkTaskSource(
+        taskId,
+        source.id,
+        'owner_update',
+        timestamp,
+        demandUnitId,
+      );
+    }
+  }
+
+  private acceptCandidateForOwner(
+    candidateId: string,
+    source: SourceEventRow,
+    patch: OwnerDecisionResult['patch'],
+    timestamp: string,
+  ) {
+    const requested = this.getCandidate(candidateId);
+    if (!requested) throw new Error('主人消息对应的候选需求不存在。');
+    const candidate = this.candidateGroupRoot(requested);
+    const group = this.candidateGroupRows(candidate.id);
+    this.assertCandidateActive(candidate);
+    if (candidate.state === 'accepted' && candidate.accepted_task_id) {
+      const task = this.getTask(candidate.accepted_task_id);
+      if (!task) throw new Error('候选关联的正式任务不存在。');
+      return { candidate, task, thread: this.threadForCandidate(candidate) };
+    }
+    if (candidate.state !== 'pending' && candidate.state !== 'snoozed') throw new Error('候选当前不能自动承接。');
+    const thread = this.threadForCandidate(candidate);
+    if (thread && parseJsonValue<string[]>(thread.ambiguity_json, []).length > 0) throw new Error('候选需求归属存在歧义。');
+    const status = patch.status ?? 'in_progress';
+    const plannedStartAt = patch.plannedStartAt ?? null;
+    const plannedDueAt = patch.plannedDueAt ?? null;
+    assertShanghaiCalendarPlanRange(plannedStartAt, plannedDueAt);
+    const nextStep = patch.nextStep?.trim() || '确认需求边界、关键问题和可用数据源。';
+    let task: TaskRecord;
+    if (thread?.active_task_id) {
+      const existing = this.getTask(thread.active_task_id);
+      if (!existing) throw new Error('需求线程关联的正式任务不存在。');
+      task = existing;
+    } else {
+      const taskId = id('task');
+      this.database.raw.prepare(
+        `INSERT INTO task
+         (id, title, proposer_name, describe, status, schedule_at, planned_start_at, planned_due_at,
+          next_step, risk, waiting_reason, version, completed_at, archived_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'medium', ?, 1, NULL, NULL, ?, ?)`,
+      ).run(taskId, candidate.title, candidate.proposer_name, candidate.describe, status,
+        plannedDueAt, plannedStartAt, plannedDueAt, nextStep, patch.waitingReason ?? null, timestamp, timestamp);
+      this.database.raw.prepare(
+        `INSERT INTO task_event
+         (id, task_id, event_type, actor_type, visibility, summary, source_event_id, demand_unit_id, before_json, after_json, occurred_at, recorded_at, version)
+         VALUES (?, ?, 'task_created', 'ai', 'private', ?, ?, ?, NULL, ?, ?, ?, 1)`,
+      ).run(id('evt'), taskId, patch.note?.trim() || '主人明确承接候选，AI 自动建立私人任务并开始推进。', source.id,
+        candidate.demand_unit_id,
+        JSON.stringify({ status, plannedStartAt, plannedDueAt, nextStep, waitingReason: patch.waitingReason ?? null }), source.occurred_at, timestamp);
+      task = this.getTask(taskId)!;
+      if (thread) {
+        this.database.raw.prepare('UPDATE task SET thread_id = ? WHERE id = ?').run(thread.id, taskId);
+        const linked = this.database.raw.prepare(
+          `UPDATE requirement_thread SET active_task_id = ?, status = 'open', version = version + 1, updated_at = ?
+           WHERE id = ? AND active_task_id IS NULL`,
+        ).run(taskId, timestamp, thread.id);
+        if (linked.changes !== 1) throw new Error('需求线程已经绑定其他任务。');
+      }
+    }
+    this.linkTaskSource(task.id, candidate.source_event_id, 'origin', timestamp, candidate.demand_unit_id);
+    for (const member of group) {
+      const updated = this.database.raw.prepare(
+        `UPDATE candidate_request SET state = 'accepted', accepted_task_id = ?, snoozed_until = NULL, updated_at = ?, version = version + 1
+         WHERE id = ? AND version = ? AND state <> 'accepted' AND accepted_task_id IS NULL`,
+      ).run(task.id, timestamp, member.id, member.version);
+      if (updated.changes !== 1) throw new CandidateVersionConflictError();
+    }
+    this.linkOwnerSource(source, thread?.id ?? null, task.id, timestamp);
+    return { candidate: this.getCandidate(candidate.id)!, task: this.getTask(task.id)!, thread: thread ? this.threadForCandidate(candidate) : null };
+  }
+
+  private applyOwnerTaskPatchInTransaction(task: TaskRecord, source: SourceEventRow, result: OwnerDecisionResult, timestamp: string) {
+    const patch = result.patch;
+    if (!this.ownerTargetMatchesCurrent(result.target!)) throw new Error('主人消息对应的任务已经发生变化。');
+    const taskPatch: TaskPatch = {
+      status: patch.status,
+      plannedStartAt: patch.plannedStartAt,
+      plannedDueAt: patch.plannedDueAt,
+      nextStep: patch.nextStep,
+      waitingReason: patch.waitingReason,
+      note: patch.note,
+      expectedVersion: task.version,
+    };
+    const next = this.resolveTaskPatch(task, taskPatch);
+    const nextVersion = task.version + 1;
+    const eventId = id('evt');
+    const demandUnitId = this.uniqueSourceDemandUnitId(source.id)
+      ?? (result.target!.threadId ? this.uniqueThreadDemandUnitId(result.target!.threadId) : null);
+    const updated = this.database.raw.prepare(
+      `UPDATE task SET status = ?, schedule_at = ?, planned_start_at = ?, planned_due_at = ?, next_step = ?,
+       risk = ?, waiting_reason = ?, version = ?, completed_at = ?, archived_at = ?, updated_at = ?
+       WHERE id = ? AND version = ?`,
+    ).run(next.status, next.plannedDueAt, next.plannedStartAt, next.plannedDueAt, next.nextStep, next.risk,
+      next.waitingReason, nextVersion,
+      next.status === 'completed' ? task.completed_at ?? timestamp : next.status === 'archived' ? task.completed_at : null,
+      next.status === 'archived' ? task.archived_at ?? timestamp : null, timestamp, task.id, task.version);
+    if (updated.changes !== 1) throw new Error('任务已经被其他操作更新。');
+    this.database.raw.prepare(
+      `INSERT INTO task_event
+       (id, task_id, event_type, actor_type, visibility, summary, source_event_id, demand_unit_id, before_json, after_json, occurred_at, recorded_at, version)
+       VALUES (?, ?, 'task_auto_updated', 'ai', 'private', ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(eventId, task.id, patch.note?.trim() || '主人消息已自动维护私人任务。', source.id, demandUnitId,
+      JSON.stringify(taskAuditSnapshot(task)), JSON.stringify({ ...taskAuditSnapshot(task), ...next, version: nextVersion, updated_at: timestamp }),
+      source.occurred_at, timestamp, nextVersion);
+    this.linkOwnerSource(source, result.target!.threadId, task.id, timestamp);
+    return { task: this.getTask(task.id)!, eventId };
+  }
+
+  private applyOwnerCandidateDisposition(candidateId: string, source: SourceEventRow, result: OwnerDecisionResult, timestamp: string) {
+    const requested = this.getCandidate(candidateId);
+    if (!requested) throw new Error('候选需求不存在。');
+    const candidate = this.candidateGroupRoot(requested);
+    const group = this.candidateGroupRows(candidate.id);
+    this.assertCandidateActive(candidate);
+    if (!this.ownerTargetMatchesCurrent(result.target!)) throw new Error('候选已经发生变化。');
+    if (candidate.state === 'accepted' || candidate.accepted_task_id) throw new Error('已接受候选不能自动拒绝或转交。');
+    for (const member of group) {
+      const updated = this.database.raw.prepare(
+        `UPDATE candidate_request SET state = 'ignored', snoozed_until = NULL, updated_at = ?, version = version + 1
+         WHERE id = ? AND version = ? AND state <> 'accepted' AND accepted_task_id IS NULL`,
+      ).run(timestamp, member.id, member.version);
+      if (updated.changes !== 1) throw new CandidateVersionConflictError();
+    }
+    this.database.raw.prepare(
+      'UPDATE notification SET archived_at = COALESCE(archived_at, ?) WHERE candidate_id IN (SELECT id FROM candidate_request WHERE id = ? OR merged_into_candidate_id = ?)',
+    ).run(timestamp, candidate.id, candidate.id);
+    this.closeUnassignedThreadForCandidate(candidate, timestamp);
+    this.database.raw.prepare(
+      `INSERT OR IGNORE INTO correction_event
+       (id, idempotency_key, task_id, candidate_id, source_event_id, demand_unit_id, correction_type, before_json, after_json, note, visibility, operation, created_at)
+       VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 'private', 'apply', ?)`,
+    ).run(id('correction'), `owner-disposition:${source.id}:${result.action}`, candidate.id, source.id, candidate.demand_unit_id,
+      result.action === 'delegate' ? 'owner_delegate' : 'owner_decline',
+      JSON.stringify({ state: 'pending', candidateId: candidate.id }),
+      JSON.stringify({ state: 'ignored', delegateTo: result.delegateTo }),
+      result.reason, timestamp);
+    return this.getCandidate(candidate.id)!;
+  }
+
+  private async runOwnerDecisionJob(jobId: string, leaseOwner: string, decisionId: string) {
+    const decision = this.database.raw.prepare('SELECT * FROM owner_decision WHERE id = ?').get(decisionId) as OwnerDecisionRow | undefined;
+    if (!decision) throw new Error('主人判断记录不存在。');
+    // The business transaction and Runtime completion are separate durable
+    // writes.  If the process stops after the transaction commits, recovery
+    // must settle the Runtime row without applying the same action again.
+    if (decision.state === 'applied' || decision.state === 'noop' || decision.state === 'stale' || decision.state === 'review') {
+      this.runtime.complete(jobId, { decisionId, state: decision.state, taskId: decision.task_id }, leaseOwner);
+      if (decision.task_id && decision.state === 'applied') this.projectTaskMemory(decision.task_id);
+      return decision;
+    }
+    if (decision.state === 'failed' || decision.state === 'queued') {
+      const reopened = this.database.raw.prepare(
+        "UPDATE owner_decision SET state = 'running', error = NULL WHERE id = ? AND state IN ('failed','queued')",
+      ).run(decision.id);
+      if (reopened.changes !== 1) {
+        const current = this.database.raw.prepare('SELECT * FROM owner_decision WHERE id = ?').get(decision.id) as OwnerDecisionRow | undefined;
+        if (!current || current.state !== 'running') throw new Error('主人判断工作项状态已经变化，请稍后重试。');
+      }
+    }
+    const source = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(decision.source_event_id) as SourceEventRow | undefined;
+    if (!source) throw new Error('主人判断对应的来源不存在。');
+    const result: OwnerDecisionResult = {
+      eligible: true,
+      action: decision.action,
+      disposition: decision.disposition as OwnerDecisionResult['disposition'],
+      target: JSON.parse(decision.target_snapshot_json) as OwnerDecisionTarget,
+      patch: parseMetadata(decision.patch_json) as OwnerDecisionResult['patch'],
+      delegateTo: decision.delegate_to,
+      reason: decision.reason,
+      confidence: decision.confidence,
+    };
+    let taskId: string | null = decision.task_id;
+    let threadId: string | null = decision.thread_id;
+    let taskVersion: number | null = null;
+    let threadVersion: number | null = null;
+    const timestamp = nowIso();
+    try {
+      const execution = this.runtime.executeToolSync({
+        jobId,
+        toolName: 'task.auto_apply_update',
+        toolInput: { decisionId, disposition: decision.disposition },
+        leaseOwner,
+        run: () => this.database.transaction(() => {
+          if (!this.runtime.assertLease(jobId, leaseOwner)) throw new Error('主人判断 Runtime 租约已失效。');
+          if (result.target && !this.ownerTargetMatchesCurrent(result.target)) {
+            throw new OwnerDecisionStaleError();
+          }
+        if (decision.disposition === 'accept_candidate') {
+          const accepted = this.acceptCandidateForOwner(decision.candidate_id!, source, result.patch, timestamp);
+          taskId = accepted.task.id;
+          threadId = accepted.thread?.id ?? null;
+          taskVersion = accepted.task.version;
+          threadVersion = accepted.thread?.version ?? null;
+        } else if (decision.disposition === 'apply_task_patch') {
+          const task = decision.task_id ? this.getTask(decision.task_id) : null;
+          if (!task) throw new Error('主人判断对应的正式任务不存在。');
+          const applied = this.applyOwnerTaskPatchInTransaction(task, source, result, timestamp);
+          taskId = applied.task.id;
+          taskVersion = applied.task.version;
+          const thread = result.target?.threadId ? this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(result.target.threadId) as RequirementThreadRow | undefined : null;
+          threadVersion = thread?.version ?? null;
+        } else if (decision.disposition === 'decline_candidate' || decision.disposition === 'delegate_candidate') {
+          this.applyOwnerCandidateDisposition(decision.candidate_id!, source, result, timestamp);
+        } else {
+          throw new Error('主人判断当前不允许自动执行。');
+        }
+        const applied = this.database.raw.prepare(
+          `UPDATE owner_decision SET state = 'applied', task_id = ?, thread_id = ?, applied_task_version = ?, applied_thread_version = ?, applied_at = ?, error = NULL WHERE id = ? AND state = 'running'`,
+        ).run(taskId, threadId, taskVersion, threadVersion, timestamp, decision.id);
+        if (applied.changes !== 1) throw new Error('主人判断已经被其他操作处理。');
+        return this.database.raw.prepare('SELECT * FROM owner_decision WHERE id = ?').get(decision.id) as OwnerDecisionRow;
+        }),
+        auditResult: (value) => ({ decisionId: value.id, taskId: value.task_id, state: value.state }),
+      });
+      this.runtime.complete(jobId, { decisionId, state: execution.state, taskId }, leaseOwner);
+      if (taskId) this.projectTaskMemory(taskId);
+      return execution;
+    } catch (error) {
+      if (!(error instanceof OwnerDecisionStaleError)) throw error;
+      const message = sanitizeRuntimeError(error, 500);
+      this.database.raw.prepare(
+        "UPDATE owner_decision SET state = 'stale', error = ?, applied_at = NULL WHERE id = ? AND state IN ('running','failed','queued')",
+      ).run(message, decision.id);
+      this.runtime.complete(jobId, { decisionId, state: 'stale', taskId: decision.task_id }, leaseOwner);
+      return this.database.raw.prepare('SELECT * FROM owner_decision WHERE id = ?').get(decision.id) as OwnerDecisionRow;
+    }
+  }
+
+  private ownerIntentsForClassification(classification: ClassificationResult) {
+    const values = [
+      ...(classification.ownerIntents ?? []),
+      classification.ownerIntent ?? classification.draft?.analysis?.ownerIntent ?? null,
+    ].filter((item): item is OwnerIntentDecision => Boolean(item));
+    return values.filter((item, index, items) => items.findIndex((candidate) => candidate.action === item.action) === index);
+  }
+
+  /**
+   * Merge several safe owner-side task patches from one turn into one durable
+   * owner decision.  Destructive or ambiguous combinations stay in review;
+   * only multiple updates to the same active task can be co-applied.
+   */
+  private compoundOwnerDecision(
+    source: SourceEventRow,
+    intents: OwnerIntentDecision[],
+    targets: OwnerDecisionTarget[],
+    contextRows: SourceEventRow[],
+    trustedOwnerIds: Iterable<string>,
+  ) {
+    const decisions = intents.map((intent) => ({
+      intent,
+      result: decideOwnerIntent({
+        senderId: source.sender_id,
+        metadata: parseMetadata(source.metadata_json),
+        trustedOwnerIds,
+        intent,
+        targets,
+        schedule: this.ownerScheduleEvidence(source, intent, contextRows),
+      }),
+    }));
+    if (decisions.length === 1) return decisions[0]!;
+
+    const combinedIntent: OwnerIntentDecision = {
+      action: decisions.at(-1)?.intent.action ?? 'uncertain',
+      confidence: Math.min(...decisions.map((item) => item.intent.confidence)),
+      summary: decisions.map((item) => item.intent.summary.trim()).filter(Boolean).join('；').slice(0, 500),
+      delegateTo: decisions.find((item) => item.intent.delegateTo)?.intent.delegateTo ?? null,
+      scheduleText: decisions.find((item) => item.intent.scheduleText)?.intent.scheduleText ?? null,
+      evidence: [...new Set(decisions.flatMap((item) => item.intent.evidence))].slice(0, 20),
+      reason: decisions.map((item) => item.intent.reason.trim()).filter(Boolean).join('；').slice(0, 1_000),
+    };
+    const resultTargets = decisions.map((item) => item.result.target).filter((target): target is OwnerDecisionTarget => Boolean(target));
+    const targetKeys = new Set(resultTargets.map((target) => `${target.candidateId ?? ''}\u0000${target.threadId ?? ''}\u0000${target.taskId ?? ''}`));
+    const allAcceptingSameCandidate = decisions.every((item) => item.result.eligible && item.result.disposition === 'accept_candidate');
+    if (allAcceptingSameCandidate && resultTargets.length === decisions.length && targetKeys.size === 1) {
+      const patch = Object.assign({}, ...decisions.map((item) => item.result.patch));
+      patch.status = 'in_progress';
+      patch.waitingReason = null;
+      patch.note = combinedIntent.summary || '主人在同一条消息中承接需求并确认了私人计划。';
+      return {
+        intent: combinedIntent,
+        result: {
+          eligible: true,
+          action: combinedIntent.action,
+          disposition: 'accept_candidate',
+          target: resultTargets[0]!,
+          patch,
+          delegateTo: null,
+          reason: `同一条主人消息包含 ${decisions.length} 个高置信承接动作，已合并为一次建任务事务。`,
+          confidence: combinedIntent.confidence,
+        } satisfies OwnerDecisionResult,
+      };
+    }
+    const acceptance = decisions.find((item) => item.result.eligible && item.result.disposition === 'accept_candidate');
+    const acceptanceCompatible = Boolean(acceptance)
+      && decisions.every((item) => item === acceptance
+        || (item.result.eligible && item.result.disposition === 'apply_task_patch'));
+    if (acceptanceCompatible && resultTargets.length === decisions.length && targetKeys.size === 1) {
+      const patch = Object.assign({}, ...decisions.map((item) => item.result.patch));
+      patch.status = 'in_progress';
+      patch.waitingReason = null;
+      patch.note = combinedIntent.summary || '主人在同一条消息中承接需求并确认了私人计划。';
+      return {
+        intent: combinedIntent,
+        result: {
+          eligible: true,
+          action: combinedIntent.action,
+          disposition: 'accept_candidate',
+          target: resultTargets[0]!,
+          patch,
+          delegateTo: null,
+          reason: `同一条主人消息包含 ${decisions.length} 个高置信动作，已合并为一次承接事务。`,
+          confidence: combinedIntent.confidence,
+        } satisfies OwnerDecisionResult,
+      };
+    }
+    const allPatchable = decisions.every((item) => item.result.eligible && item.result.disposition === 'apply_task_patch');
+    if (!allPatchable || resultTargets.length !== decisions.length || targetKeys.size !== 1) {
+      return {
+        intent: combinedIntent,
+        result: {
+          eligible: false,
+          action: combinedIntent.action,
+          disposition: 'review',
+          target: targetKeys.size === 1 ? resultTargets[0] ?? null : null,
+          patch: {},
+          delegateTo: combinedIntent.delegateTo,
+          reason: '同一条主人消息包含多个动作，但它们没有全部落到同一个可安全修改的正式任务，保留待确认。',
+          confidence: combinedIntent.confidence,
+        } satisfies OwnerDecisionResult,
+      };
+    }
+
+    const patch = Object.assign({}, ...decisions.map((item) => item.result.patch));
+    const actionSet = new Set(intents.map((intent) => intent.action));
+    if (actionSet.has('request_context')) {
+      patch.status = 'waiting';
+    } else if (actionSet.has('continue')) {
+      patch.status = 'in_progress';
+      patch.waitingReason = null;
+    }
+    patch.note = combinedIntent.summary || '主人在同一条消息中确认了多个内部任务更新。';
+    return {
+      intent: combinedIntent,
+      result: {
+        eligible: true,
+        action: combinedIntent.action,
+        disposition: 'apply_task_patch',
+        target: resultTargets[0]!,
+        patch,
+        delegateTo: null,
+        reason: `同一条主人消息包含 ${decisions.length} 个高置信动作，已合并为一次版本安全的私人任务更新。`,
+        confidence: combinedIntent.confidence,
+      } satisfies OwnerDecisionResult,
+    };
+  }
+
+  private async processOwnerIntent(
+    source: SourceEventRow,
+    classification: ClassificationResult,
+    revision: string,
+    contextRows: SourceEventRow[],
+    capturedTargets?: OwnerDecisionTargetSnapshots | null,
+    ownerTargetSnapshotRetry = false,
+    operationContext?: OperationContext,
+  ) {
+    const intents = this.ownerIntentsForClassification(classification);
+    const trustedOwnerIds = this.authorizedOwnerIds();
+    if (!intents.length || !isOwnerDecisionSource(parseMetadata(source.metadata_json), source.sender_id, trustedOwnerIds)) return null;
+    const action = intents[0]!.action;
+    const hasCapturedTargets = Boolean(
+      capturedTargets
+      && Object.prototype.hasOwnProperty.call(capturedTargets.targets, action),
+    );
+    const captured = hasCapturedTargets ? capturedTargets?.targets[action] ?? [] : [];
+    const activeRows = hasCapturedTargets ? [] : this.ownerDecisionCandidateRows(source);
+    const activeTargets = hasCapturedTargets ? [] : this.ownerDecisionTargets(source, action, activeRows);
+    const markers = threadMarkers(source);
+    const hasStrongMarker = Boolean(markers.rootId || markers.parentId || markers.sessionId || markers.threadId);
+    const canUseRetiredTargets = !hasCapturedTargets
+      && activeTargets.length === 0
+      && (activeRows.length === 0 || hasStrongMarker);
+    const retiredRows = canUseRetiredTargets ? this.ownerDecisionCandidateRows(source, true) : [];
+    const retiredTargets = retiredRows.length ? this.ownerDecisionTargets(source, action, retiredRows) : [];
+    const targets = hasCapturedTargets ? captured : activeTargets.length ? activeTargets : retiredTargets;
+    const capturedStale = hasCapturedTargets && captured.length > 0
+      && captured.every((target) => !this.ownerTargetMatchesCurrent(target)
+        // A legacy recovery snapshot may intentionally contain a target that
+        // was already retired before the first retry attempt.  Its current
+        // ignored/deleted/invalid state is still a durable stale boundary;
+        // treating it as an ordinary matching target would downgrade the
+        // compatibility path to a fresh review.
+        || target.candidateState === 'ignored'
+        || target.candidateDeleted
+        || target.taskDeleted
+        || target.taskInvalidated);
+    const retiredOnly = capturedStale || (!hasCapturedTargets && activeTargets.length === 0 && retiredTargets.length > 0);
+    const { intent, result: computedResult } = this.compoundOwnerDecision(source, intents, targets, contextRows, trustedOwnerIds);
+    const hasEmptyCapturedSnapshotOnRetry = ownerTargetSnapshotRetry
+      && hasCapturedTargets
+      && capturedTargets?.contextCount === 0
+      && captured.length === 0;
+    // A durable empty target snapshot is an authoritative negative result for
+    // this owner action.  It must not fall back to a completion-time rescan,
+    // and it must not create a new pending reminder for an object that did not
+    // exist when the owner turn began.  Keep the owner message in the audit
+    // trail as an explicit no-op so a later retry remains idempotent.
+    const result = hasEmptyCapturedSnapshotOnRetry
+      ? {
+          ...computedResult,
+          eligible: false,
+          disposition: 'noop' as const,
+          target: null,
+          patch: {},
+          reason: '主人消息开始处理时已持久化空目标快照；未发现可安全关联的候选或任务，未重新扫描后来对象。',
+        }
+      : computedResult;
+    const existing = this.ownerDecisionRow(source.id, revision);
+    if (existing?.state === 'applied' || existing?.state === 'review' || existing?.state === 'noop' || existing?.state === 'stale') return existing;
+    if (hasEmptyCapturedSnapshotOnRetry) {
+      return this.insertOwnerDecision({ source, sourceRevision: revision, intent, result, state: 'noop' });
+    }
+    if (retiredOnly) {
+      return this.insertOwnerDecision({
+        source,
+        sourceRevision: revision,
+        intent,
+        result,
+        state: 'stale',
+        error: '主人消息原本对应的候选或任务已经进入已忽略、回收站或无效状态；判断仅保留审计，不再执行或显示提醒。',
+      });
+    }
+    if (!result.eligible) {
+      return this.insertOwnerDecision({ source, sourceRevision: revision, intent, result, state: 'review' });
+    }
+    const runtimeJob = this.runtime.begin({
+      jobType: 'owner_decision',
+      payload: {
+        sourceEventId: source.id,
+        sourceRevision: revision,
+        ...(operationContext ? { observability: operationContext } : {}),
+      },
+      idempotencyKey: `owner-decision:${source.id}:${revision}`, sourceEventId: source.id,
+      threadId: result.target?.threadId ?? null, taskId: result.target?.taskId ?? null,
+      traceId: operationContext?.trace_id ?? null,
+      leaseMs: this.runtimeLeaseMs(),
+    });
+    if (!runtimeJob.acquired || !runtimeJob.lease_owner) return this.ownerDecisionRow(source.id, revision);
+    // Link the original source before the decision row is written.  If the
+    // process stops in the small gap between these two durable writes, the
+    // Runtime job is still traceable and recovery can backfill the decision.
+    this.linkRuntimeJobSources(runtimeJob.id, [source.id]);
+    const row = this.insertOwnerDecision({ source, sourceRevision: revision, intent, result, runtimeJobId: runtimeJob.id, state: 'running' });
+    if (!row) throw new Error('主人判断记录写入失败。');
+    const payload = {
+      ...parseMetadata(this.runtime.get(runtimeJob.id)?.payload_json),
+      sourceEventId: source.id,
+      sourceRevision: revision,
+      decisionId: row.id,
+      candidateId: result.target?.candidateId ?? null,
+      candidateVersion: result.target?.candidateVersion ?? null,
+      candidateGroupVersionHash: result.target?.candidateGroupVersionHash ?? null,
+    };
+    const payloadTimestamp = nowIso();
+    const payloadUpdated = this.database.raw.prepare(
+      `UPDATE job
+          SET payload_json = ?, updated_at = ?
+        WHERE id = ?
+          AND status = 'running'
+          AND lease_owner = ?
+          AND cancel_requested_at IS NULL
+          AND locked_until IS NOT NULL
+          AND locked_until > ?`,
+    ).run(JSON.stringify(payload), payloadTimestamp, runtimeJob.id, runtimeJob.lease_owner, payloadTimestamp);
+    if (payloadUpdated.changes !== 1) throw new Error('主人判断 Runtime 租约已失效，拒绝写入工作项 payload。');
+    try {
+      return await this.runOwnerDecisionJob(runtimeJob.id, runtimeJob.lease_owner, row.id);
+    } catch (error) {
+      this.database.raw.prepare("UPDATE owner_decision SET state = 'failed', error = ? WHERE id = ? AND state = 'running'")
+        .run(sanitizeRuntimeError(error, 500), row.id);
+      this.runtime.fail(runtimeJob.id, error, {
+        leaseOwner: runtimeJob.lease_owner,
+        retry: classifyRetryFailure(error, this.adapters.classifier.provider),
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Resolve an explicit stage-1 action to a server-owned thread target. The
+   * model may only select from the bounded anonymous context; IDs and version
+   * checks are re-established here before any durable relation is written.
+   */
+  private resolveThreadCentricTarget(
+    rows: SourceEventRow[],
+    classification: ClassificationResult,
+    context: ReturnType<PmService['classificationRevisionContext']>,
+  ) {
+    const strong = this.strongThreadContext(rows);
+    if (strong) return {
+      thread: strong.thread,
+      task: strong.task,
+      candidate: null as CandidateRow | null,
+      confidence: 1,
+      evidence: [`已有强关联 ${strong.relationType}。`],
+      relationType: strong.relationType,
+    };
+    // Reuse the existing server-owned validators.  The thread-centric path
+    // must not introduce a weaker interpretation of model scores, hashes,
+    // versions, candidate completeness or automation policy.
+    const association = this.semanticThreadAssociation(classification, context.association);
+    if (association.thread?.active_task_id) {
+      const task = this.getTask(association.thread.active_task_id);
+      if (task) return {
+        thread: association.thread,
+        task,
+        candidate: null as CandidateRow | null,
+        confidence: association.confidence,
+        evidence: association.evidence,
+        relationType: 'semantic_unique',
+      };
+    }
+    const merge = this.candidateMergeResolution(classification, context.candidateMerge, null);
+    if (merge.automatic && merge.targetCandidate && merge.targetThread) {
+      return {
+        thread: merge.targetThread,
+        task: null,
+        candidate: merge.targetCandidate,
+        confidence: merge.decision?.confidence ?? 0,
+        evidence: [...(merge.decision?.evidence ?? []), merge.reason].filter(Boolean),
+        relationType: 'semantic_pending',
+      };
+    }
+    return null;
+  }
+
+  /** Build a sparse-update draft without copying the old thread summary into a new candidate. */
+  private semanticDraftForThread(
+    sourceRows: SourceEventRow[],
+    thread: RequirementThreadRow,
+    classification: ClassificationResult,
+  ): CandidateDraft | null {
+    const analysis = classification.semanticAnalysis ?? classification.draft?.analysis;
+    if (!analysis) return null;
+    const ordered = [...sourceRows].sort(stableSourceOrder);
+    const latest = ordered.at(-1) ?? sourceRows[0];
+    const mergedAnalysis = {
+      ...analysis,
+      // The model owns the semantic role and confirmation requirement. A
+      // source-level date parser is deliberately not used here: the source
+      // may contain a requester's unconfirmed proposal (for example
+      // “下周一能给到吗”), which must not become the owner's private plan.
+      timeRange: analysis.timeRange,
+    };
+    return {
+      title: classification.draft?.title?.trim() || thread.title,
+      proposerName: projectUntrustedSenderName(latest?.sender_name),
+      background: classification.draft?.background?.trim() || thread.background,
+      validationQuestion: classification.draft?.validationQuestion?.trim() || thread.validation_question,
+      describe: classification.draft?.describe?.trim() || thread.describe,
+      confidence: classification.draft?.confidence ?? analysis.updateConfidence ?? 0,
+      analysis: mergedAnalysis,
+    };
+  }
+
+  private updatePendingCandidateFromSemantic(input: {
+    candidate: CandidateRow;
+    draft: CandidateDraft;
+    sourceRows: SourceEventRow[];
+    sourceHash: string;
+    contextHash: string;
+    decisionId: string;
+    timestamp: string;
+    evidenceContent: string;
+  }) {
+    const currentCandidate = this.getCandidate(input.candidate.id);
+    if (!currentCandidate) throw new Error('候选需求不存在。');
+    this.assertCandidateVersion(currentCandidate, input.candidate.version);
+    const currentAnalysis = parseMetadata(currentCandidate.analysis_json);
+    const updates: CandidateNarrativeUpdates = input.draft.analysis?.narrativeUpdates ?? {};
+    const safeValue = (
+      current: string,
+      update: CandidateNarrativeUpdates[keyof CandidateNarrativeUpdates],
+      field: NarrativeReplacementField,
+      maxLength: number,
+      allowAppend: boolean,
+    ) => {
+      if (!update || update.confidence < AUTO_UPDATE_CONFIDENCE || !['fact', 'document'].includes(update.basis)) return undefined;
+      const value = update.value.trim();
+      if (!value || value.length > maxLength) return undefined;
+      if (update.mode === 'replace') {
+        if (!hasExplicitNarrativeReplacement(input.evidenceContent, field)) return undefined;
+        return value !== current ? value : undefined;
+      }
+      if (!allowAppend) return undefined;
+      const appended = appendNarrativeValue(current, value);
+      return appended !== current && appended.length <= maxLength ? appended : undefined;
+    };
+    const nextTitle = safeValue(currentCandidate.title, updates.threadTitle ?? updates.taskTitle, 'title', 160, false);
+    const nextBackground = safeValue(currentCandidate.background, updates.threadBackground, 'background', 2_000, true);
+    const nextValidationQuestion = safeValue(currentCandidate.validation_question, updates.threadValidationQuestion, 'validationQuestion', 1_000, true);
+    const nextDescribe = safeValue(currentCandidate.describe, updates.threadDescribe ?? updates.taskDescribe, 'describe', 2_000, true);
+    const nextAnalysis = {
+      ...currentAnalysis,
+      ...(input.draft.analysis ?? {}),
+      sourceRevision: input.sourceHash,
+      contextRevision: input.contextHash,
+    };
+    const changed = nextTitle !== undefined || nextBackground !== undefined || nextValidationQuestion !== undefined
+      || nextDescribe !== undefined || JSON.stringify(nextAnalysis) !== JSON.stringify(currentAnalysis);
+    if (!changed) return;
+    this.database.raw.prepare('UPDATE candidate_revision SET state = \'superseded\' WHERE candidate_id = ? AND state = \'current\'')
+      .run(input.candidate.id);
+    const updatedCandidate = this.database.raw.prepare(
+      `UPDATE candidate_request SET
+         title = COALESCE(?, title), background = COALESCE(?, background),
+         validation_question = COALESCE(?, validation_question), describe = COALESCE(?, describe),
+         analysis_json = ?, updated_at = ?, version = version + 1
+       WHERE id = ? AND version = ? AND deleted_at IS NULL AND accepted_task_id IS NULL`,
+    ).run(nextTitle ?? null, nextBackground ?? null, nextValidationQuestion ?? null, nextDescribe ?? null,
+      JSON.stringify(nextAnalysis), input.timestamp, currentCandidate.id, currentCandidate.version);
+    if (updatedCandidate.changes !== 1) throw new CandidateVersionConflictError();
+    const latest = this.database.raw.prepare('SELECT * FROM candidate_request WHERE id = ?').get(currentCandidate.id) as CandidateRow | undefined;
+    if (!latest) return;
+    const source = input.sourceRows.at(-1) ?? input.sourceRows[0];
+    if (!source) return;
+    this.database.raw.prepare(
+      `INSERT INTO candidate_revision
+        (id, candidate_id, source_event_id, demand_unit_id, ai_decision_id, source_revision, title, proposer_name, background,
+         validation_question, describe, analysis_json, confidence, evidence_json, provider, model, prompt_version, state, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', ?)`,
+    ).run(
+      id('candidate-revision'), latest.id, source.id, latest.demand_unit_id, input.decisionId, input.sourceHash,
+      latest.title, latest.proposer_name, latest.background, latest.validation_question, latest.describe,
+      latest.analysis_json, latest.confidence, JSON.stringify(input.draft.analysis?.recognitionEvidence ?? []),
+      this.adapters.classifier.provider, this.adapters.classifier.model, this.adapters.classifier.promptVersion, input.timestamp,
+    );
+  }
+
+  /**
+   * Persist `update_existing`/`context_only`/`uncertain` without manufacturing
+   * another inbox candidate. Sources remain durable and can be replayed after
+   * a semantic retry; only a validated target receives a thread/task relation.
+   */
+  private async persistThreadCentricAction(input: {
+    sourceRow: SourceEventRow;
+    orderedRows: SourceEventRow[];
+    classification: ClassificationResult;
+    contextsBySource: Map<string, SourceDocumentContext[]>;
+    sourceHash: string;
+    contextHash: string;
+    revision: string;
+    contextRows: SourceEventRow[];
+    deduplicated: boolean;
+    candidateFence?: CandidateRuntimeFence[];
+    runtimeJobId?: string;
+    leaseOwner?: string;
+  }): Promise<ClassificationPersistResult> {
+    const rawActionRecord = input.classification.messageAction ?? { action: 'uncertain' as const, confidence: 0, evidence: [], reason: '' };
+    const actionRecord = rawActionRecord.confidence >= MIN_EXPLICIT_MESSAGE_ACTION_CONFIDENCE
+      ? rawActionRecord
+      : {
+          ...rawActionRecord,
+          action: 'uncertain' as const,
+          reason: `${rawActionRecord.reason || '模型没有给出足够确定的消息动作。'} 已转为待确认，不自动归入或修改任务。`,
+        };
+    const classification = actionRecord === rawActionRecord
+      ? input.classification
+      : { ...input.classification, messageAction: actionRecord };
+    const action = actionRecord.action;
+    const targetContext = this.classificationRevisionContext(input.orderedRows);
+    const target = this.resolveThreadCentricTarget(input.orderedRows, classification, targetContext);
+    let linkedTaskId: string | null = null;
+    let threadId: string | null = null;
+    let demandUnitId: string | null = null;
+    let proposalId: string | null = null;
+    let decisionId = id('ai');
+    const timestamp = nowIso();
+    this.database.transaction(() => {
+      this.assertRuntimeActive(input.runtimeJobId, input.leaseOwner);
+      const liveRows = (this.database.raw.prepare(
+        `SELECT * FROM source_event WHERE id IN (${input.orderedRows.map(() => '?').join(',')})`,
+      ).all(...input.orderedRows.map((row) => row.id)) as SourceEventRow[]).sort(stableSourceOrder);
+      if (liveRows.length !== input.orderedRows.length) throw new Error('待更新的来源记录已经不存在。');
+      const liveContextsBySource = new Map(liveRows.map((row) => [row.id, this.feishuDocumentContext.list(row.id)]));
+      const liveBaseRevision = liveRows.length === 1
+        ? combinedClassificationRevision(liveRows[0]!, liveContextsBySource.get(liveRows[0]!.id) ?? [])
+        : combinedBatchClassificationRevision(liveRows, liveContextsBySource);
+      const liveConfirmedContextRevision = this.classificationRevisionContext(liveRows).revision;
+      const liveRevision = liveConfirmedContextRevision
+        ? createHash('sha256').update(`${liveBaseRevision.revision}:${liveConfirmedContextRevision}`).digest('hex')
+        : liveBaseRevision.revision;
+      if (liveRevision !== input.revision) throw new ClassificationRevisionChangedError(liveRows);
+      if (input.candidateFence) this.assertCandidateRuntimeFence(input.orderedRows.map((row) => row.id), input.candidateFence);
+      this.database.raw.prepare(
+        `INSERT OR IGNORE INTO ai_decision_log
+          (id, source_event_id, source_revision, candidate_id, provider, model, prompt_version, is_data_request, confidence, reason, output_json, used_fallback, http_status, provider_request_id, attempts, structured_mode, input_hash, input_char_count, fallback_mode, latency_ms, created_at)
+         VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        decisionId,
+        input.sourceRow.id,
+        input.sourceHash,
+        this.adapters.classifier.provider,
+        this.adapters.classifier.model,
+        this.adapters.classifier.promptVersion,
+        classification.isDataRequest ? 1 : 0,
+        classification.draft?.confidence ?? classification.semanticAnalysis?.updateConfidence ?? actionRecord.confidence,
+        classification.reason,
+        JSON.stringify({
+          outcome: classification.outcome ?? 'valid',
+          messageAction: actionRecord,
+          ownerIntent: classification.ownerIntent ?? null,
+          ownerIntents: classification.ownerIntents ?? [],
+          semanticOnly: true,
+          targetThreadId: target?.thread.id ?? null,
+          targetTaskId: target?.task?.id ?? null,
+          sourceCount: input.orderedRows.length,
+          sourceRevision: input.sourceHash,
+          contextRevision: input.contextHash,
+        }),
+        classification.usedFallback ? 1 : 0,
+        classification.metadata?.httpStatus ?? null,
+        classification.metadata?.requestId ?? null,
+        classification.metadata?.attempts ?? null,
+        classification.metadata?.structuredMode ?? null,
+        classification.metadata?.inputHash ?? null,
+        classification.metadata?.inputCharCount ?? null,
+        classification.metadata?.fallbackMode ?? (classification.usedFallback ? 'rule_fallback' : 'llm'),
+        0,
+        timestamp,
+      );
+
+      if (target) {
+        threadId = target.thread.id;
+        linkedTaskId = target.task?.id ?? null;
+        const expectedTarget = target.candidate
+          ? input.candidateFence?.find((item) => item.candidateId === target.candidate!.id)
+          : undefined;
+        if (target.candidate && (!expectedTarget || expectedTarget.version !== target.candidate.version)) {
+          throw new CandidateVersionConflictError();
+        }
+        demandUnitId = target.candidate
+          ? this.ensureCandidateDemandUnit(target.candidate, target.thread, timestamp)
+          : this.uniqueThreadDemandUnitId(target.thread.id);
+        const relationType = action === 'context_only' ? 'context_only' : action === 'uncertain' ? 'semantic_pending' : target.relationType;
+        const evidence = [...(actionRecord.evidence ?? []), actionRecord.reason, ...target.evidence].filter(Boolean).slice(0, 20);
+        if (demandUnitId) liveRows.forEach((row) => this.ensureDemandUnitSourceEdge(demandUnitId!, row.id, timestamp));
+        const existingDecision = demandUnitId
+          ? this.database.raw.prepare(
+            `SELECT id FROM ai_decision_log
+             WHERE source_event_id = ? AND source_revision = ? AND demand_unit_id = ?
+             ORDER BY created_at ASC, id ASC LIMIT 1`,
+          ).get(input.sourceRow.id, input.sourceHash, demandUnitId) as { id: string } | undefined
+          : undefined;
+        if (existingDecision && existingDecision.id !== decisionId) {
+          this.database.raw.prepare('DELETE FROM ai_decision_log WHERE id = ?').run(decisionId);
+          decisionId = existingDecision.id;
+        }
+        for (const row of liveRows) {
+          const markers = threadMarkers(row);
+          this.database.raw.prepare(
+            `INSERT INTO requirement_thread_source
+              (thread_id, source_event_id, demand_unit_id, relation_type, confidence, evidence_json, root_id, parent_id, session_id,
+               conversation_id, participant_ids_json, source_revision, source_role, role_reason, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?, ?)
+             ON CONFLICT(thread_id, source_event_id) DO UPDATE SET
+               relation_type = excluded.relation_type, confidence = excluded.confidence,
+               evidence_json = excluded.evidence_json, source_revision = excluded.source_revision`,
+          ).run(
+            target.thread.id,
+            row.id,
+            demandUnitId,
+            relationType,
+            target.confidence,
+            JSON.stringify(evidence),
+            markers.rootId,
+            markers.parentId,
+            markers.sessionId,
+            row.conversation_id,
+            JSON.stringify(threadParticipants(row)),
+            sourceRevision(row),
+            actionRecord.reason || 'LLM 判断当前消息属于已有需求线程。',
+            timestamp,
+          );
+          if (linkedTaskId) {
+            this.linkTaskSource(linkedTaskId, row.id, 'thread_update', timestamp, demandUnitId);
+          }
+        }
+        const draft = action === 'update_existing'
+          ? this.semanticDraftForThread(liveRows, target.thread, classification)
+          : null;
+        if (draft && target.task) {
+          const patch = this.taskPatchFromDraft(target.task, draft, target.thread, 'safe_sparse', liveRows.map((row) => row.content).join('\n'));
+          if (Object.keys(patch).length) {
+            const threadRevisionKey = `thread-semantic:${target.thread.id}:${input.sourceRow.id}:${input.revision}`;
+            this.database.raw.prepare(
+              `INSERT OR IGNORE INTO requirement_thread_revision
+                (id, thread_id, source_event_id, demand_unit_id, base_thread_version, patch_json, evidence_json, state, idempotency_key, created_at, decided_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, NULL)`,
+            ).run(
+              id('thread-revision'),
+              target.thread.id,
+              input.sourceRow.id,
+              demandUnitId,
+              target.thread.version,
+              JSON.stringify(patch),
+              JSON.stringify([...(actionRecord.evidence ?? []), actionRecord.reason]),
+              threadRevisionKey,
+              timestamp,
+            );
+            const threadRevision = this.database.raw.prepare('SELECT id FROM requirement_thread_revision WHERE idempotency_key = ?').get(threadRevisionKey) as { id: string };
+            const proposal = this.createTaskUpdateProposal({
+              task: target.task,
+              threadId: target.thread.id,
+              sourceEventId: input.sourceRow.id,
+              demandUnitId,
+              candidateRevisionId: null,
+              threadRevisionId: threadRevision.id,
+              baseThreadVersion: target.thread.version,
+              patch,
+              reason: '阶段一语义判断确认这是已有需求的稀疏更新。',
+              evidence: {
+                action: actionRecord,
+                target: target.evidence,
+                relationType: target.relationType,
+                analysis: draft.analysis ?? null,
+                sourceEventIds: liveRows.map((row) => row.id),
+              },
+              origin: 'follow_up',
+              associationConfidence: target.confidence,
+              updateConfidence: classification.semanticAnalysis?.updateConfidence ?? draft.analysis?.updateConfidence ?? null,
+              usedFallback: classification.usedFallback,
+              idempotencyKey: `task-update-semantic:${target.task.id}:${input.sourceRow.id}:${input.revision}`,
+              createdAt: timestamp,
+            });
+            proposalId = proposal.id;
+            this.database.raw.prepare("UPDATE requirement_thread SET status = 'needs_confirmation', updated_at = ? WHERE id = ?").run(timestamp, target.thread.id);
+          }
+        } else if (draft && target.candidate && action === 'update_existing') {
+          this.updatePendingCandidateFromSemantic({
+            candidate: target.candidate,
+            draft,
+            sourceRows: liveRows,
+            sourceHash: input.sourceHash,
+            contextHash: input.contextHash,
+            decisionId,
+            timestamp,
+            evidenceContent: liveRows.map((row) => row.content).join('\n'),
+          });
+        }
+        if (action === 'uncertain') {
+          this.database.raw.prepare("UPDATE requirement_thread SET status = 'needs_confirmation', updated_at = ? WHERE id = ? AND status <> 'closed'").run(timestamp, target.thread.id);
+        }
+        this.database.raw.prepare(
+          `UPDATE requirement_thread SET
+             last_activity_at = CASE WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ? ELSE last_activity_at END,
+             updated_at = ? WHERE id = ?`,
+        ).run(liveRows.at(-1)?.occurred_at ?? input.sourceRow.occurred_at, liveRows.at(-1)?.occurred_at ?? input.sourceRow.occurred_at, timestamp, target.thread.id);
+      } else {
+        const reviewCandidate = targetContext.candidateMerge.candidates.length === 1
+          ? targetContext.candidateMerge.candidates[0]?.candidateId ?? null
+          : null;
+        const unit = this.upsertDemandUnit({
+          anchor: input.sourceRow,
+          unitKey: 'semantic',
+          unitKind: 'context_only',
+          // Every unresolved semantic action remains visible to the owner. It
+          // is not a confirmed demand and must not disappear as an invisible
+          // provisional/context-only row.
+          state: 'needs_confirmation',
+          classificationRevision: input.revision,
+          analysisJson: JSON.stringify(classification.semanticAnalysis ?? {}),
+          reason: actionRecord.reason || classification.reason,
+          createdAt: timestamp,
+        });
+        demandUnitId = unit.id;
+        const unitRows = liveRows.map((row, index) => ({
+          source: row,
+          sourceKey: `s${index + 1}`,
+        }));
+        const placeholders = unitRows.map(() => '?').join(',');
+        this.database.raw.prepare(`DELETE FROM source_demand_unit_source WHERE demand_unit_id = ? AND source_event_id NOT IN (${placeholders})`).run(unit.id, ...unitRows.map((row) => row.source.id));
+        for (const [index, row] of unitRows.entries()) {
+          this.database.raw.prepare(
+            `INSERT INTO source_demand_unit_source (demand_unit_id, source_event_id, source_key, source_role, sequence, created_at)
+             VALUES (?, ?, ?, 'context', ?, ?)
+             ON CONFLICT(demand_unit_id, source_event_id) DO UPDATE SET source_key = excluded.source_key, sequence = excluded.sequence`,
+          ).run(unit.id, row.source.id, row.sourceKey, index, timestamp);
+        }
+        this.database.raw.prepare(
+          `INSERT OR IGNORE INTO notification
+             (id, task_id, task_event_id, candidate_id, notification_type, dedupe_key, reason, read_at, snoozed_until, archived_at, created_at)
+           VALUES (?, NULL, NULL, ?, 'immediate', ?, ?, NULL, NULL, NULL, ?)`,
+        ).run(
+          id('notice'),
+          reviewCandidate,
+          `semantic-review:${input.sourceRow.id}:${input.revision}`,
+          '这条消息已保存，但 AI 无法安全判断它属于哪个需求；已进入待确认，不会创建新候选或修改任务。',
+          timestamp,
+        );
+      }
+      if (!demandUnitId) {
+        const existingDecision = this.database.raw.prepare(
+          `SELECT id FROM ai_decision_log
+           WHERE source_event_id = ? AND source_revision = ? AND demand_unit_id IS NULL
+           ORDER BY created_at ASC, id ASC LIMIT 1`,
+        ).get(input.sourceRow.id, input.sourceHash) as { id: string } | undefined;
+        if (existingDecision && existingDecision.id !== decisionId) {
+          this.database.raw.prepare('DELETE FROM ai_decision_log WHERE id = ?').run(decisionId);
+          decisionId = existingDecision.id;
+        }
+      }
+      this.database.raw.prepare(
+        'UPDATE ai_decision_log SET demand_unit_id = ?, candidate_id = ? WHERE id = ?',
+      ).run(demandUnitId, target?.candidate?.id ?? null, decisionId);
+      if (target && action === 'uncertain') {
+        this.database.raw.prepare(
+          `INSERT OR IGNORE INTO notification
+             (id, task_id, task_event_id, candidate_id, notification_type, dedupe_key, reason, read_at, snoozed_until, archived_at, created_at)
+           VALUES (?, ?, NULL, ?, 'immediate', ?, ?, NULL, NULL, NULL, ?)`,
+        ).run(
+          id('notice'),
+          linkedTaskId,
+          target.candidate?.id ?? null,
+          `semantic-review:${input.sourceRow.id}:${input.revision}`,
+          '这条消息已保存，但 AI 只达到待确认置信度；来源已挂到当前上下文，未自动修改任务。',
+          timestamp,
+        );
+      }
+      for (const row of liveRows) {
+        const metadata = parseMetadata(row.metadata_json);
+        metadata.classificationRevision = input.revision;
+        metadata.messageAction = action;
+        this.database.raw.prepare('UPDATE source_event SET metadata_json = ? WHERE id = ?').run(JSON.stringify(metadata), row.id);
+      }
+      this.assertRuntimeActive(input.runtimeJobId, input.leaseOwner);
+    });
+    if (proposalId) this.dispatchTaskUpdateProposal(proposalId, input.runtimeJobId ?? null, input.leaseOwner ?? null);
+    if (linkedTaskId) this.projectTaskMemory(linkedTaskId);
+    const result = this.classificationResultWithIds({
+      deduplicated: input.deduplicated,
+      sourceEventId: input.sourceRow.id,
+      candidate: null,
+      candidateIds: [],
+      demandUnitIds: demandUnitId ? [demandUnitId] : [],
+      threadIds: threadId ? [threadId] : [],
+    });
+    if (input.runtimeJobId) this.runtime.checkpoint(input.runtimeJobId, 'semantic_action_persisted', { action, threadId, taskId: linkedTaskId, proposalId }, input.leaseOwner);
+    return result;
+  }
+
+  private groupSourcesForClassification(rows: SourceEventRow[]) {
+    const ordered = [...rows].sort(stableSourceOrder);
+    const singleton: SourceEventRow[][] = [];
+    const partitions = new Map<string, Array<{ row: SourceEventRow; threadId: string | null }>>();
+    for (const row of ordered) {
+      if (!isMessageSource(row)) {
+        singleton.push([row]);
+        continue;
+      }
+      // A system-owner turn is a state-machine command, not an ordinary
+      // conversation fragment.  Never coalesce adjacent owner turns: doing so
+      // lets a later request-context message overwrite an earlier acceptance
+      // or schedule confirmation in the same periodic Feishu batch.  Each
+      // owner turn is classified with its own bounded conversation context and
+      // applied in occurredAt order.
+      if (this.isTrustedOwnerSource(row)) {
+        singleton.push([row]);
+        continue;
+      }
+      // Partition by source/conversation first. Explicit reply/session links
+      // may connect different senders; plain time-window grouping below still
+      // requires the same sender.
+      const key = `${row.source_type}\u0000${row.conversation_id}`;
+      const partition = partitions.get(key) ?? [];
+      partition.push({ row, threadId: this.sourceThreadId(row.id) });
+      partitions.set(key, partition);
+    }
+
+    const grouped: SourceEventRow[][] = [];
+    for (const partition of partitions.values()) {
+      const parent = partition.map((_, index) => index);
+      const storedBatchMarkers = partition.map((item) => {
+        const metadata = parseMetadata(item.row.metadata_json);
+        const batchIds = Array.isArray(metadata.classificationBatchSourceIds)
+          ? metadata.classificationBatchSourceIds.filter((value): value is string => typeof value === 'string' && Boolean(value)).sort()
+          : [];
+        return batchIds.length > 1 ? `batch:${createHash('sha256').update(JSON.stringify(batchIds)).digest('hex')}` : null;
+      });
+      const strongMarkers = partition.map((item) => {
+        const markers = threadMarkers(item.row);
+        const index = partition.indexOf(item);
+        return new Set([markers.rootId, markers.sessionId, markers.threadId, storedBatchMarkers[index]].filter((value): value is string => Boolean(value)));
+      });
+      const find = (index: number): number => parent[index] === index ? index : (parent[index] = find(parent[index]!));
+      const join = (left: number, right: number) => {
+        const leftRoot = find(left);
+        const rightRoot = find(right);
+        if (leftRoot === rightRoot) return true;
+        const leftStrong = strongMarkers[leftRoot]!;
+        const rightStrong = strongMarkers[rightRoot]!;
+        if (leftStrong.size > 0 && rightStrong.size > 0 && ![...leftStrong].some((key) => rightStrong.has(key))) return false;
+        parent[rightRoot] = leftRoot;
+        for (const marker of rightStrong) leftStrong.add(marker);
+        return true;
+      };
+      for (let left = 0; left < partition.length; left += 1) {
+        const leftItem = partition[left]!;
+        const leftTime = Date.parse(leftItem.row.occurred_at);
+        const leftMarkers = threadMarkers(leftItem.row);
+        const leftStrong = new Set([leftMarkers.rootId, leftMarkers.sessionId, leftMarkers.threadId].filter(Boolean));
+        const leftKeys = new Set(explicitMessageKeys(leftItem.row));
+        for (let right = left + 1; right < partition.length; right += 1) {
+          const rightItem = partition[right]!;
+          const sameStoredBatch = Boolean(storedBatchMarkers[left] && storedBatchMarkers[left] === storedBatchMarkers[right]);
+          if (!sameStoredBatch && leftItem.threadId && rightItem.threadId && leftItem.threadId !== rightItem.threadId) continue;
+          const rightTime = Date.parse(rightItem.row.occurred_at);
+          const gap = Math.abs((Number.isFinite(leftTime) ? leftTime : 0) - (Number.isFinite(rightTime) ? rightTime : 0));
+          const rightMarkers = threadMarkers(rightItem.row);
+          const rightStrong = new Set([rightMarkers.rootId, rightMarkers.sessionId, rightMarkers.threadId].filter(Boolean));
+          const rightKeys = explicitMessageKeys(rightItem.row);
+          const explicitlyLinked = sameStoredBatch || rightKeys.some((key) => leftKeys.has(key));
+          const explicitConflict = leftStrong.size > 0 && rightStrong.size > 0
+            && ![...leftStrong].some((key) => rightStrong.has(key));
+          const sameSender = leftItem.row.sender_id === rightItem.row.sender_id;
+          const leftHistoryBackfill = parseMetadata(leftItem.row.metadata_json).historyBackfill === true;
+          const rightHistoryBackfill = parseMetadata(rightItem.row.metadata_json).historyBackfill === true;
+          const explicitContinuation = looksLikeFollowUp(leftItem.row.content) || looksLikeFollowUp(rightItem.row.content);
+          const conversationalContinuation = sameSender
+            && !explicitConflict
+            && gap <= CONTINUOUS_DIALOGUE_WINDOW_MS
+            && (looksLikeConversationContinuation(leftItem.row.content) || looksLikeConversationContinuation(rightItem.row.content))
+            // Natural short turns use history rows as context, not as a new
+            // classification batch. Explicit “补充/追加” retains the old
+            // batch behavior because it is an intentional source continuation.
+            && (!leftHistoryBackfill && !rightHistoryBackfill || explicitContinuation);
+          const shortSameSenderBatch = sameSender
+            && !explicitConflict
+            && gap <= CONTINUOUS_MESSAGE_WINDOW_MS
+            && (!leftHistoryBackfill && !rightHistoryBackfill || explicitContinuation);
+          if (sameStoredBatch || (explicitlyLinked && !explicitConflict && gap <= EXPLICIT_MESSAGE_CONTEXT_WINDOW_MS)
+            || shortSameSenderBatch
+            || conversationalContinuation) join(left, right);
+        }
+      }
+      const components = new Map<number, SourceEventRow[]>();
+      partition.forEach((item, index) => {
+        const root = find(index);
+        const component = components.get(root) ?? [];
+        component.push(item.row);
+        components.set(root, component);
+      });
+      grouped.push(...[...components.values()].map((group) => group.sort(stableSourceOrder)));
+    }
+    return [...singleton, ...grouped].sort((left, right) => stableSourceOrder(left[0]!, right[0]!));
+  }
+
+  private taskPatchFromDraft(
+    task: TaskRecord,
+    draft: CandidateDraft,
+    thread?: RequirementThreadRow | null,
+    narrativeMode: 'none' | 'full' | 'safe_sparse' = 'none',
+    evidenceContent = '',
+  ) {
+    const patch: Record<string, unknown> = {};
+    if (narrativeMode === 'full' && draft.title.trim() && draft.title.trim() !== task.title) patch.title = draft.title.trim();
+    if (narrativeMode === 'full' && draft.describe.trim() && draft.describe.trim() !== task.describe) patch.describe = draft.describe.trim();
+    const timeRange = draft.analysis?.timeRange;
+    // Date parsing and date meaning are separate. A reference/ask-only date
+    // must never become a private plan; a start and a deadline update their
+    // respective fields. Old adapters without `semantic` retain the legacy
+    // two-sided range behavior for compatibility.
+    if (timeRange?.semantic !== 'reference') {
+      if (timeRange?.semantic !== 'deadline' && timeRange?.startAt && timeRange.startAt !== task.planned_start_at) {
+        patch.plannedStartAt = timeRange.startAt;
+      }
+      if (timeRange?.semantic !== 'start' && timeRange?.endAt && timeRange.endAt !== task.planned_due_at) {
+        patch.plannedDueAt = timeRange.endAt;
+      }
+    }
+    if (narrativeMode === 'full' && draft.title.trim() && draft.title.trim() !== thread?.title) patch.threadTitle = draft.title.trim();
+    if (narrativeMode === 'full' && draft.background.trim() && draft.background.trim() !== thread?.background) patch.threadBackground = draft.background.trim();
+    if (narrativeMode === 'full' && draft.validationQuestion.trim() && draft.validationQuestion.trim() !== thread?.validation_question) patch.threadValidationQuestion = draft.validationQuestion.trim();
+    if (narrativeMode === 'full' && draft.describe.trim() && draft.describe.trim() !== thread?.describe) patch.threadDescribe = draft.describe.trim();
+    if (narrativeMode === 'safe_sparse') {
+      const updates: CandidateNarrativeUpdates = draft.analysis?.narrativeUpdates ?? {};
+      const safeValue = (
+        current: string,
+        update: CandidateNarrativeUpdates[keyof CandidateNarrativeUpdates],
+        field: NarrativeReplacementField,
+        maxLength: number,
+        allowAppend: boolean,
+      ) => {
+        if (!update || update.confidence < AUTO_UPDATE_CONFIDENCE || !['fact', 'document'].includes(update.basis)) return undefined;
+        const value = update.value.trim();
+        if (!value || value.length > maxLength) return undefined;
+        if (update.mode === 'replace') {
+          if (!hasExplicitNarrativeReplacement(evidenceContent, field)) return undefined;
+          return value !== current ? value : undefined;
+        }
+        if (!allowAppend) return undefined;
+        const appended = appendNarrativeValue(current, value);
+        return appended !== current && appended.length <= maxLength ? appended : undefined;
+      };
+      const taskTitle = safeValue(task.title, updates.taskTitle, 'title', 160, false);
+      const taskDescribe = safeValue(task.describe, updates.taskDescribe, 'describe', 2_000, true);
+      const threadTitle = thread ? safeValue(thread.title, updates.threadTitle, 'title', 160, false) : undefined;
+      const threadBackground = thread ? safeValue(thread.background, updates.threadBackground, 'background', 2_000, true) : undefined;
+      const threadValidationQuestion = thread ? safeValue(thread.validation_question, updates.threadValidationQuestion, 'validationQuestion', 1_000, true) : undefined;
+      const threadDescribe = thread ? safeValue(thread.describe, updates.threadDescribe, 'describe', 2_000, true) : undefined;
+      if (taskTitle !== undefined) patch.title = taskTitle;
+      if (taskDescribe !== undefined) patch.describe = taskDescribe;
+      if (threadTitle !== undefined) patch.threadTitle = threadTitle;
+      if (threadBackground !== undefined) patch.threadBackground = threadBackground;
+      if (threadValidationQuestion !== undefined) patch.threadValidationQuestion = threadValidationQuestion;
+      if (threadDescribe !== undefined) patch.threadDescribe = threadDescribe;
+    }
+    if (draft.analysis?.prioritySuggestion && draft.analysis.prioritySuggestion !== task.risk) patch.risk = draft.analysis.prioritySuggestion;
+    if (draft.analysis?.note?.trim()) patch.note = draft.analysis.note.trim();
+    if (draft.analysis?.statusSuggestion && draft.analysis.statusSuggestion !== task.status) patch.status = draft.analysis.statusSuggestion;
+    if (draft.analysis?.nextStepSuggestion?.trim() && draft.analysis.nextStepSuggestion.trim() !== task.next_step) patch.nextStep = draft.analysis.nextStepSuggestion.trim();
+    if (draft.analysis?.waitingReasonSuggestion !== undefined
+      && draft.analysis.waitingReasonSuggestion !== null
+      && draft.analysis.waitingReasonSuggestion !== task.waiting_reason) patch.waitingReason = draft.analysis.waitingReasonSuggestion;
+    return patch;
+  }
+
+  private createTaskUpdateProposal(input: {
+    task: TaskRecord;
+    threadId: string | null;
+    sourceEventId: string | null;
+    demandUnitId: string | null;
+    candidateRevisionId: string | null;
+    threadRevisionId: string | null;
+    baseThreadVersion: number | null;
+    patch: Record<string, unknown>;
+    reason: string;
+    evidence: unknown;
+    provider?: string;
+    model?: string;
+    promptVersion?: string;
+    origin: 'follow_up' | 'owner_association' | 'reprocess';
+    associationConfidence: number | null;
+    updateConfidence: number | null;
+    usedFallback: boolean;
+    idempotencyKey: string;
+    createdAt?: string;
+  }) {
+    const proposalId = id('task-update');
+    const timestamp = input.createdAt ?? nowIso();
+    this.database.raw.prepare(
+      `INSERT OR IGNORE INTO task_update_proposal
+        (id, task_id, thread_id, source_event_id, demand_unit_id, candidate_revision_id, thread_revision_id, base_task_version, base_thread_version,
+         patch_json, reason, evidence_json, provider, model, prompt_version, state, origin, association_confidence, update_confidence,
+         used_fallback, decision_mode, policy_version, policy_reason, idempotency_key, created_at, decided_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'awaiting_approval', ?, ?, ?, ?, 'pending', ?, ?, ?, ?, NULL)`,
+    ).run(
+      proposalId,
+      input.task.id,
+      input.threadId,
+      input.sourceEventId,
+      input.demandUnitId,
+      input.candidateRevisionId,
+      input.threadRevisionId,
+      input.task.version,
+      input.baseThreadVersion,
+      JSON.stringify(input.patch),
+      input.reason,
+      JSON.stringify(input.evidence),
+      input.provider ?? this.adapters.classifier.provider,
+      input.model ?? this.adapters.classifier.model,
+      input.promptVersion ?? this.adapters.classifier.promptVersion,
+      input.origin,
+      input.associationConfidence,
+      input.updateConfidence,
+      input.usedFallback ? 1 : 0,
+      AUTO_UPDATE_POLICY_VERSION,
+      '等待自动维护策略判断。',
+      input.idempotencyKey,
+      timestamp,
+    );
+    return this.database.raw.prepare('SELECT * FROM task_update_proposal WHERE idempotency_key = ?')
+      .get(input.idempotencyKey) as unknown as TaskUpdateProposalRow;
+  }
+
+  private ensureRequirementThread(
+    sourceRow: SourceEventRow,
+    draft: CandidateDraft,
+    classification: ClassificationResult,
+    candidateRevisionId?: string | null,
+    batchRows: SourceEventRow[] = [sourceRow],
+    classificationContext: ThreadClassificationContext = { candidates: [], candidateSetHash: '', candidateSetComplete: true },
+  ) {
+    const markers = threadMarkers(sourceRow);
+    const orderedBatch = [...batchRows].sort(stableSourceOrder);
+    const participants = [...new Set(orderedBatch.flatMap((source) => threadParticipants(source)))];
+    const batchRevisionEntries = orderedBatch.map((source) => ({ id: source.id, revision: sourceRevision(source) }));
+    const revisionHash = orderedBatch.length === 1
+      ? batchRevisionEntries[0]!.revision
+      : createHash('sha256').update(JSON.stringify(batchRevisionEntries)).digest('hex');
+    const revisionKeyFor = (threadId: string) => `thread-revision:${threadId}:${sourceRow.id}:${revisionHash}`;
+    const candidateRevisionDemandUnitId = candidateRevisionId
+      ? (this.database.raw.prepare('SELECT demand_unit_id FROM candidate_revision WHERE id = ?').get(candidateRevisionId) as { demand_unit_id: string | null } | undefined)?.demand_unit_id ?? null
+      : null;
+    let baseThreadVersion = 0;
+    let thread = markers.threadId
+      ? (this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(markers.threadId) as RequirementThreadRow | undefined)
+      : undefined;
+    let relationType = 'primary';
+    let confidence = 1;
+    let evidence: string[] = ['首次来源建立需求线程。'];
+    let associationCandidates: string[] = [];
+    let threadBeforeUpdate: RequirementThreadRow | null = null;
+    let proposalId: string | null = null;
+
+    const internalThreadId = metadataText(parseMetadata(sourceRow.metadata_json), 'internalRequirementThreadId');
+    if (!thread && internalThreadId) {
+      thread = this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(internalThreadId) as RequirementThreadRow | undefined;
+      if (thread) {
+        relationType = 'batch_context';
+        confidence = 1;
+        evidence = ['同一批连续消息中已有来源已明确关联该需求线程。'];
+      }
+    }
+
+    if (!thread && markers.rootId) {
+      thread = this.database.raw.prepare(
+        `SELECT requirement_thread.* FROM requirement_thread
+          JOIN requirement_thread_source ON requirement_thread_source.thread_id = requirement_thread.id
+          JOIN source_event ON source_event.id = requirement_thread_source.source_event_id
+          WHERE requirement_thread_source.root_id = ? OR source_event.external_id = ?
+          ORDER BY requirement_thread.updated_at DESC LIMIT 1`,
+      ).get(markers.rootId, markers.rootId) as RequirementThreadRow | undefined;
+      if (thread) {
+        relationType = 'reply_root';
+        confidence = 1;
+        evidence = ['飞书回复链 root_id 与已有需求线程一致。'];
+      }
+    }
+
+    if (!thread && markers.parentId) {
+      thread = this.database.raw.prepare(
+        `SELECT requirement_thread.* FROM requirement_thread
+         JOIN requirement_thread_source ON requirement_thread_source.thread_id = requirement_thread.id
+         JOIN source_event ON source_event.id = requirement_thread_source.source_event_id
+         WHERE source_event.id = ? OR source_event.external_id = ?
+         ORDER BY requirement_thread.updated_at DESC LIMIT 1`,
+      ).get(markers.parentId, markers.parentId) as RequirementThreadRow | undefined;
+      if (thread) {
+        relationType = 'reply_parent';
+        confidence = 1;
+        evidence = ['飞书回复链 parent_id 与已有需求来源一致。'];
+      }
+    }
+
+    if (!thread && markers.sessionId) {
+      thread = this.database.raw.prepare(
+        `SELECT requirement_thread.* FROM requirement_thread
+         JOIN requirement_thread_source ON requirement_thread_source.thread_id = requirement_thread.id
+         WHERE requirement_thread_source.session_id = ?
+         ORDER BY requirement_thread.updated_at DESC LIMIT 1`,
+      ).get(markers.sessionId) as unknown as RequirementThreadRow | undefined;
+      if (thread) {
+        relationType = 'session';
+        confidence = 0.9;
+        evidence = ['来源 session_id 与已有需求线程一致。'];
+      }
+    }
+
+    if (!thread) {
+      const cutoff = new Date(new Date(sourceRow.occurred_at).getTime() - 72 * 60 * 60 * 1000).toISOString();
+      const ceiling = new Date(new Date(sourceRow.occurred_at).getTime() + 72 * 60 * 60 * 1000).toISOString();
+      const participantPlaceholders = participants.map(() => '?').join(',');
+      const participantMatch = participantPlaceholders
+        ? ` OR EXISTS (SELECT 1 FROM json_each(requirement_thread.participant_ids_json) WHERE value IN (${participantPlaceholders}))`
+        : '';
+      const candidates = this.database.raw.prepare(
+        `SELECT DISTINCT requirement_thread.* FROM requirement_thread
+         JOIN requirement_thread_source ON requirement_thread_source.thread_id = requirement_thread.id
+         JOIN source_event ON source_event.id = requirement_thread_source.source_event_id
+         WHERE requirement_thread.status <> 'closed'
+           AND source_event.conversation_id = ?
+           AND (source_event.sender_id = ?${participantMatch})
+           AND requirement_thread.last_activity_at >= ?
+           AND requirement_thread.last_activity_at <= ?
+         ORDER BY requirement_thread.last_activity_at DESC`,
+      ).all(sourceRow.conversation_id, sourceRow.sender_id, ...participants, cutoff, ceiling) as unknown as RequirementThreadRow[];
+      // A validated model association is the only semantic route.  Conversation
+      // proximity, sender overlap and continuation wording are candidate
+      // evidence only; they must never become an automatic thread decision.
+      const semantic = this.semanticThreadAssociation(classification, classificationContext);
+      if (semantic.thread) {
+        thread = semantic.thread;
+        relationType = 'semantic_unique';
+        confidence = semantic.confidence;
+        evidence = semantic.evidence;
+      }
+      if (!thread && (classification.threadAssociation?.targetThreadId || looksLikeConversationContinuation(sourceRow.content) || classification.relatedTaskHint)) {
+        associationCandidates = [...new Set([...semantic.pendingThreadIds, ...candidates.map((candidate) => candidate.id)])];
+        evidence = semantic.evidence;
+      }
+      if (!thread && !associationCandidates.length && candidates.length > 1 && looksLikeConversationContinuation(sourceRow.content)) {
+        associationCandidates = candidates.map((candidate) => candidate.id);
+        evidence = ['同一会话和参与人存在多个近期需求线程，系统没有自动合并，等待主人确认。'];
+      }
+    }
+
+    if (!thread) {
+      const threadId = id('thread');
+      const timestamp = nowIso();
+      this.database.raw.prepare(
+        `INSERT INTO requirement_thread
+          (id, status, title, background, validation_question, describe, analysis_json, conversation_id,
+           participant_ids_json, ambiguity_json, active_task_id, primary_source_event_id, primary_reason,
+           primary_confidence, version, last_activity_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 1, ?, ?, ?)`,
+      ).run(
+        threadId,
+        associationCandidates.length ? 'needs_confirmation' : 'open',
+        draft.title,
+        draft.background,
+        draft.validationQuestion,
+        draft.describe,
+        JSON.stringify({ ...(draft.analysis ?? {}), associationCandidates }),
+        sourceRow.conversation_id,
+        JSON.stringify(participants),
+        JSON.stringify(associationCandidates),
+        sourceRow.id,
+        draft.analysis?.ownerAction?.required
+          ? `系统识别到主人需要推进：${draft.analysis.ownerAction.summary}`
+          : '当前只有一条候选来源，暂作为主体，等待主人确认。',
+        draft.analysis?.ownerAction?.confidence ?? draft.confidence,
+        sourceRow.occurred_at,
+        timestamp,
+        timestamp,
+      );
+      thread = this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(threadId) as unknown as RequirementThreadRow;
+    } else {
+      threadBeforeUpdate = { ...thread };
+      const key = revisionKeyFor(thread.id);
+      const existingRevision = this.database.raw.prepare('SELECT id FROM requirement_thread_revision WHERE idempotency_key = ?').get(key);
+      if (existingRevision) {
+        const existingProposal = this.database.raw.prepare(
+          'SELECT id FROM task_update_proposal WHERE thread_id = ? AND source_event_id = ? ORDER BY created_at DESC LIMIT 1',
+        ).get(thread.id, sourceRow.id) as { id: string } | undefined;
+        return { thread, proposalId: existingProposal?.id ?? null };
+      }
+      const timestamp = nowIso();
+      const baseVersion = thread.version;
+      baseThreadVersion = baseVersion;
+      const mergedParticipants = [...new Set([
+        ...parseJsonValue<string[]>(thread.participant_ids_json, []),
+        ...participants,
+      ])];
+      // Keep the confirmed thread snapshot immutable. The model output is
+      // stored below as a proposed revision and is applied only after the
+      // automatic safety gate or the owner accepts the corresponding task update proposal.
+      this.database.raw.prepare(
+        `UPDATE requirement_thread
+         SET last_activity_at = CASE
+               WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ?
+               ELSE last_activity_at
+             END,
+             participant_ids_json = ?,
+             updated_at = ?
+          WHERE id = ? AND version = ?`,
+      ).run(sourceRow.occurred_at, sourceRow.occurred_at, JSON.stringify(mergedParticipants), timestamp, thread.id, baseVersion);
+    }
+
+    const timestamp = nowIso();
+    if (candidateRevisionDemandUnitId) {
+      this.database.raw.prepare(
+        `INSERT OR IGNORE INTO requirement_thread_unit
+          (thread_id, demand_unit_id, relation_type, confidence, evidence_json, created_at)
+         VALUES (?, ?, 'primary', 1, ?, ?)`,
+      ).run(thread.id, candidateRevisionDemandUnitId, JSON.stringify(['候选修订已绑定到需求线程。']), timestamp);
+    }
+    const threadDemandUnitId = candidateRevisionDemandUnitId ?? this.uniqueThreadDemandUnitId(thread.id);
+    for (const batchSource of orderedBatch) {
+      const sourceMarkers = threadMarkers(batchSource);
+      const sourceParticipants = threadParticipants(batchSource);
+      this.database.raw.prepare(
+        `INSERT INTO requirement_thread_source
+          (thread_id, source_event_id, demand_unit_id, relation_type, confidence, evidence_json, root_id, parent_id, session_id,
+           conversation_id, participant_ids_json, source_revision, source_role, role_reason, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(thread_id, source_event_id) DO UPDATE SET
+           relation_type = excluded.relation_type,
+           confidence = excluded.confidence,
+           evidence_json = excluded.evidence_json,
+           root_id = excluded.root_id,
+           parent_id = excluded.parent_id,
+           session_id = excluded.session_id,
+           conversation_id = excluded.conversation_id,
+           participant_ids_json = excluded.participant_ids_json,
+           source_revision = excluded.source_revision,
+           source_role = excluded.source_role,
+           role_reason = excluded.role_reason`,
+      ).run(
+        thread.id,
+        batchSource.id,
+        threadDemandUnitId,
+        batchSource.id === sourceRow.id ? relationType : 'batch_continuation',
+        confidence,
+        JSON.stringify(batchSource.id === sourceRow.id ? evidence : ['同一发送人、同一会话的连续消息被合并为一次需求判断。']),
+        sourceMarkers.rootId,
+        sourceMarkers.parentId,
+        sourceMarkers.sessionId,
+        batchSource.conversation_id,
+        JSON.stringify(sourceParticipants),
+        sourceRevision(batchSource),
+        batchSource.id === sourceRow.id && draft.analysis?.ownerAction?.required ? 'owner_delivery' : 'unknown',
+        batchSource.id === sourceRow.id && draft.analysis?.ownerAction?.required
+          ? draft.analysis.ownerAction.summary
+          : '',
+        timestamp,
+      );
+    }
+
+    const threadRevisionId = id('thread-revision');
+    this.database.raw.prepare(
+      `INSERT OR IGNORE INTO requirement_thread_revision
+        (id, thread_id, source_event_id, demand_unit_id, base_thread_version, patch_json, evidence_json, state, idempotency_key, created_at, decided_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, NULL)`,
+    ).run(
+      threadRevisionId,
+      thread.id,
+      sourceRow.id,
+      threadDemandUnitId,
+      baseThreadVersion,
+      // Keep the model output for audit, but a normal follow-up may only apply
+      // narrative fields that survive the sparse server-side evidence gate.
+      JSON.stringify(threadRevisionPatchFromDraft(draft, true)),
+      JSON.stringify([...evidence, ...(draft.analysis?.recognitionEvidence ?? [])]),
+      revisionKeyFor(thread.id),
+      timestamp,
+    );
+    if (thread.active_task_id) {
+      const task = this.getTask(thread.active_task_id);
+      if (task) {
+        for (const batchSource of orderedBatch) {
+          this.linkTaskSource(task.id, batchSource.id, 'thread_update', timestamp, threadDemandUnitId);
+        }
+        const patch = this.taskPatchFromDraft(task, draft, threadBeforeUpdate ?? thread, 'safe_sparse', orderedBatch.map((row) => row.content).join('\n'));
+        if (Object.keys(patch).length) {
+          const proposalKey = `task-update:${task.id}:${sourceRow.id}:${revisionHash}`;
+          proposalId = this.createTaskUpdateProposal({
+            task,
+            threadId: thread.id,
+            sourceEventId: sourceRow.id,
+            demandUnitId: candidateRevisionId
+              ? (this.database.raw.prepare('SELECT demand_unit_id FROM candidate_revision WHERE id = ?').get(candidateRevisionId) as { demand_unit_id: string | null } | undefined)?.demand_unit_id ?? null
+              : null,
+            candidateRevisionId: candidateRevisionId
+              && (this.database.raw.prepare('SELECT state FROM candidate_revision WHERE id = ?').get(candidateRevisionId) as { state: string } | undefined)?.state === 'proposed'
+              ? candidateRevisionId
+              : null,
+            threadRevisionId,
+            baseThreadVersion,
+            patch,
+            reason: '后续来源被判断为同一需求的补充。',
+            evidence: {
+              sourceEventId: sourceRow.id,
+              relationType,
+              confidence,
+              evidence,
+              recognitionEvidence: draft.analysis?.recognitionEvidence ?? [],
+              analysis: draft.analysis ?? {},
+            },
+            origin: 'follow_up',
+            associationConfidence: confidence,
+            updateConfidence: draft.analysis?.updateConfidence ?? null,
+            usedFallback: classification.usedFallback,
+            idempotencyKey: proposalKey,
+            createdAt: timestamp,
+          }).id;
+          this.database.raw.prepare("UPDATE requirement_thread SET status = 'needs_confirmation', updated_at = ? WHERE id = ?").run(timestamp, thread.id);
+        } else {
+          this.database.raw.prepare("UPDATE requirement_thread_revision SET state = 'rejected', decided_at = ? WHERE id = ? AND state = 'proposed'")
+            .run(timestamp, threadRevisionId);
+          if (candidateRevisionId) {
+            this.database.raw.prepare("UPDATE candidate_revision SET state = 'superseded' WHERE id = ? AND state = 'proposed'")
+              .run(candidateRevisionId);
+          }
+        }
+      }
+    }
+    return {
+      thread: this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(thread.id) as unknown as RequirementThreadRow,
+      proposalId,
+    };
+  }
+
+  private linkRuntimeJobSources(jobId: string, sourceEventIds: string[]) {
+    const timestamp = nowIso();
+    const insert = this.database.raw.prepare(
+      'INSERT OR IGNORE INTO job_source_link (job_id, source_event_id, created_at) VALUES (?, ?, ?)',
+    );
+    for (const sourceEventId of [...new Set(sourceEventIds)]) insert.run(jobId, sourceEventId, timestamp);
+  }
+
+  private sourceFailureRecords(source: Pick<SourceEventRow, 'metadata_json'>) {
+    const metadata = parseMetadata(source.metadata_json) as SourceFailureMetadata;
+    if (!Array.isArray(metadata.failure_inbox)) return [];
+    return metadata.failure_inbox.flatMap((item) => {
+      const parsed = sourceFailureRecordSchema.safeParse(item);
+      return parsed.success ? [parsed.data] : [];
+    });
+  }
+
+  /**
+   * Validate the durable relation behind one failure record or one retry job.
+   * The source's current revision is deliberately not part of this fence:
+   * an older, but internally consistent record is allowed to remain visible
+   * as stale.  The original Runtime payload revision is the authoritative
+   * relation fence for retry ownership.
+   */
+  private sourceFailureRelation(input: {
+    sourceEventId: string;
+    record?: SourceFailureRecord;
+    expectedJobId?: string;
+    expectedSourceRevision?: string;
+  }): SourceFailureRelation | null {
+    const jobId = input.record?.job_id ?? input.expectedJobId;
+    if (!jobId) return null;
+    const job = this.runtime.get(jobId);
+    if (!job || !['classify_source', 'classify_source_batch'].includes(job.job_type)) return null;
+
+    const payload = parseMetadata(job.payload_json);
+    const payloadRevision = typeof payload.sourceRevision === 'string' && /^[a-f0-9]{64}$/u.test(payload.sourceRevision)
+      ? payload.sourceRevision
+      : null;
+    const rawPayloadSourceEventIds = payload.sourceEventIds;
+    if (!Array.isArray(rawPayloadSourceEventIds)
+      || !rawPayloadSourceEventIds.every((value) => typeof value === 'string' && Boolean(value))) {
+      return null;
+    }
+    const payloadSourceEventIds = rawPayloadSourceEventIds;
+    const sourceEventIds = input.record?.source_event_ids ?? payloadSourceEventIds;
+    const uniqueSourceEventIds = [...new Set(sourceEventIds)];
+    if (!payloadRevision
+      || !sourceEventIds.length
+      || uniqueSourceEventIds.length !== sourceEventIds.length
+      || !uniqueSourceEventIds.includes(input.sourceEventId)
+      || payloadSourceEventIds.length !== uniqueSourceEventIds.length
+      || new Set(payloadSourceEventIds).size !== payloadSourceEventIds.length
+      || payloadSourceEventIds.some((value) => !uniqueSourceEventIds.includes(value))) {
+      return null;
+    }
+
+    if (input.record) {
+      if (input.record.id !== sourceFailureId(input.sourceEventId, input.record.source_revision)
+        || input.record.job_id !== job.id
+        || input.record.source_revision !== payloadRevision) {
+        return null;
+      }
+    }
+    if (input.expectedJobId && input.expectedJobId !== job.id) return null;
+    if (input.expectedSourceRevision && input.expectedSourceRevision !== payloadRevision) return null;
+
+    const sourcePlaceholders = uniqueSourceEventIds.map(() => '?').join(',');
+    const sourceRows = this.database.raw.prepare(
+      `SELECT id FROM source_event WHERE id IN (${sourcePlaceholders})`,
+    ).all(...uniqueSourceEventIds) as Array<{ id: string }>;
+    if (sourceRows.length !== uniqueSourceEventIds.length) return null;
+
+    const linkedRows = this.database.raw.prepare(
+      'SELECT source_event_id FROM job_source_link WHERE job_id = ? ORDER BY source_event_id ASC',
+    ).all(job.id) as Array<{ source_event_id: string }>;
+    const linkedSourceEventIds = linkedRows.map((row) => row.source_event_id);
+    if (linkedSourceEventIds.length !== uniqueSourceEventIds.length
+      || new Set(linkedSourceEventIds).size !== linkedSourceEventIds.length
+      || linkedSourceEventIds.some((value) => !uniqueSourceEventIds.includes(value))) {
+      return null;
+    }
+    if (!job.source_event_id || !uniqueSourceEventIds.includes(job.source_event_id)) return null;
+
+    return {
+      job,
+      sourceEventIds: uniqueSourceEventIds,
+      sourceRevision: payloadRevision,
+    };
+  }
+
+  private currentSourceFailureRevision(sourceEventIds: string[]) {
+    const ids = [...new Set(sourceEventIds)].filter(Boolean);
+    if (!ids.length) return null;
+    const rows = this.database.raw.prepare(
+      `SELECT * FROM source_event WHERE id IN (${ids.map(() => '?').join(',')})`,
+    ).all(...ids) as SourceEventRow[];
+    if (rows.length !== ids.length) return null;
+    const ordered = rows.sort(stableSourceOrder);
+    const contextsBySource = new Map(ordered.map((row) => [row.id, this.feishuDocumentContext.list(row.id)]));
+    const base = ordered.length === 1
+      ? combinedClassificationRevision(ordered[0]!, contextsBySource.get(ordered[0]!.id) ?? [])
+      : combinedBatchClassificationRevision(ordered, contextsBySource);
+    const confirmed = this.classificationRevisionContext(ordered).revision;
+    return confirmed ? createHash('sha256').update(`${base.revision}:${confirmed}`).digest('hex') : base.revision;
+  }
+
+  private sourceFailureAudit(record: SourceFailureRecord, action: string, sourceEventId: string) {
+    const timestamp = nowIso();
+    this.database.raw.prepare(
+      `INSERT OR IGNORE INTO correction_event
+        (id, idempotency_key, task_id, candidate_id, source_event_id, ai_decision_id, correction_type,
+         before_json, after_json, note, visibility, operation, created_at)
+       VALUES (?, ?, NULL, NULL, ?, NULL, ?, ?, ?, ?, 'private', ?, ?)`,
+    ).run(
+      id('source-failure-audit'),
+      `source-failure:${record.id}:${action}:${record.last_failed_at}:${record.status}`,
+      sourceEventId,
+      'source_failure',
+      JSON.stringify({ status: 'previous' }),
+      JSON.stringify({ status: record.status, errorCode: record.error_code, stage: record.stage }),
+      '失败来源状态变更；仅保留脱敏状态和稳定错误码。',
+      action,
+      timestamp,
+    );
+  }
+
+  private recordSourceFailure(input: {
+    sourceEventIds: string[];
+    sourceRevision: string;
+    jobId: string;
+    status: 'retrying' | 'open';
+    errorCode?: string | null;
+    error?: unknown;
+  }) {
+    const ids = input.sourceEventIds;
+    if (!Array.isArray(ids)
+      || !ids.length
+      || !ids.every((value) => typeof value === 'string' && Boolean(value))
+      || new Set(ids).size !== ids.length) return false;
+    const relation = this.sourceFailureRelation({
+      sourceEventId: ids[0]!,
+      expectedJobId: input.jobId,
+      expectedSourceRevision: input.sourceRevision,
+    });
+    if (!relation
+      || relation.sourceEventIds.length !== ids.length
+      || !relation.sourceEventIds.every((sourceEventId) => ids.includes(sourceEventId))) return false;
+    const timestamp = nowIso();
+    const job = relation.job;
+    this.database.transaction(() => {
+      for (const sourceEventId of ids) {
+        const source = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(sourceEventId) as SourceEventRow | undefined;
+        if (!source) throw new Error('失败来源关系在写入前已经失效。');
+        const metadata = parseMetadata(source.metadata_json) as SourceFailureMetadata;
+        const records = this.sourceFailureRecords(source).filter((record) => this.sourceFailureRelation({
+          sourceEventId: source.id,
+          record,
+        }));
+        const existing = records.find((item) => item.source_revision === input.sourceRevision);
+        const attempts = job?.attempts ?? existing?.attempts ?? 0;
+        if (existing && input.status === 'retrying' && existing.status === 'retrying' && existing.job_id === input.jobId && attempts <= existing.attempts) continue;
+        const errorCode = stableSourceFailureCode(input.errorCode ?? existing?.error_code, input.error);
+        const errorMessage = sourceFailureMessage(errorCode);
+        const nextStatus = existing?.status === 'ignored' ? 'ignored' as const : input.status;
+        const next: SourceFailureRecord = {
+          id: existing?.id ?? sourceFailureId(sourceEventId, input.sourceRevision),
+          source_revision: input.sourceRevision,
+          source_event_ids: ids,
+          job_id: input.jobId,
+          stage: 'classification',
+          error_code: errorCode,
+          error_message: errorMessage,
+          status: nextStatus,
+          retryable: nextStatus === 'open' || nextStatus === 'retrying',
+          attempts,
+          max_attempts: job?.max_attempts ?? existing?.max_attempts ?? 3,
+          first_failed_at: existing?.first_failed_at ?? timestamp,
+          last_failed_at: timestamp,
+          next_retry_at: nextStatus === 'retrying' ? job?.available_at ?? timestamp : null,
+          resolved_at: null,
+          ignored_at: nextStatus === 'ignored' ? existing?.ignored_at ?? timestamp : null,
+          updated_at: timestamp,
+        };
+        metadata.failure_inbox = [...records.filter((item) => item.id !== next.id), next];
+        this.database.raw.prepare('UPDATE source_event SET metadata_json = ? WHERE id = ?').run(JSON.stringify(metadata), sourceEventId);
+        this.sourceFailureAudit(next, input.status === 'retrying' ? 'retry_waiting' : 'failed', sourceEventId);
+      }
+    });
+    return true;
+  }
+
+  private resolveSourceFailure(sourceEventIds: string[], sourceRevision: string, jobId: string) {
+    const ids = [...new Set(sourceEventIds)].filter(Boolean);
+    if (!ids.length) return;
+    const timestamp = nowIso();
+    this.database.transaction(() => {
+      for (const sourceEventId of ids) {
+        const source = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(sourceEventId) as SourceEventRow | undefined;
+        if (!source) continue;
+        const metadata = parseMetadata(source.metadata_json) as SourceFailureMetadata;
+        const records = this.sourceFailureRecords(source).filter((record) => this.sourceFailureRelation({
+          sourceEventId: source.id,
+          record,
+        }));
+        const existing = records.find((item) => item.source_revision === sourceRevision && (item.job_id === jobId || item.source_event_ids.includes(sourceEventId)));
+        if (!existing || existing.status === 'ignored' || existing.status === 'resolved') continue;
+        const next = { ...existing, job_id: jobId, status: 'resolved' as const, retryable: false, next_retry_at: null, resolved_at: timestamp, updated_at: timestamp };
+        metadata.failure_inbox = [...records.filter((item) => item.id !== existing.id), next];
+        this.database.raw.prepare('UPDATE source_event SET metadata_json = ? WHERE id = ?').run(JSON.stringify(metadata), sourceEventId);
+        this.sourceFailureAudit(next, 'resolved', sourceEventId);
+      }
+    });
+  }
+
+  private sourceFailureView(source: SourceEventRow, record: SourceFailureRecord, relation?: SourceFailureRelation) {
+    const job = relation?.job ?? this.runtime.get(record.job_id);
+    const errorCode = stableSourceFailureCode(record.error_code);
+    const currentRevision = this.currentSourceFailureRevision(record.source_event_ids.length ? record.source_event_ids : [source.id]);
+    const stale = record.status !== 'ignored' && record.status !== 'resolved' && Boolean(currentRevision && currentRevision !== record.source_revision);
+    let status: SourceFailureStatus = stale ? 'stale' : record.status;
+    if (!stale && record.status === 'retrying' && job?.status === 'completed') status = 'resolved';
+    if (!stale && record.status === 'retrying' && job && !['queued', 'running'].includes(job.status)) status = 'open';
+    return {
+      id: record.id,
+      source_event_id: source.id,
+      source_type: source.source_type,
+      occurred_at: source.occurred_at,
+      stage: record.stage,
+      error_code: errorCode,
+      error_message: sourceFailureMessage(errorCode),
+      status,
+      retryable: status === 'open' || status === 'retrying',
+      stale,
+      attempts: job?.attempts ?? record.attempts,
+      max_attempts: job?.max_attempts ?? record.max_attempts,
+      job_status: job?.status ?? null,
+      next_retry_at: job && ['queued', 'running'].includes(job.status) ? job.available_at : record.next_retry_at,
+      first_failed_at: record.first_failed_at,
+      last_failed_at: record.last_failed_at,
+      resolved_at: record.resolved_at,
+      ignored_at: record.ignored_at,
+      updated_at: record.updated_at,
+    };
+  }
+
+  private findSourceFailure(failureId: string) {
+    const rows = this.database.raw.prepare('SELECT * FROM source_event ORDER BY occurred_at DESC, id DESC').all() as SourceEventRow[];
+    for (const source of rows) {
+      for (const record of this.sourceFailureRecords(source)) {
+        if (record.id !== failureId) continue;
+        const relation = this.sourceFailureRelation({ sourceEventId: source.id, record });
+        if (relation) return { source, record, relation };
+      }
+    }
+    return null;
+  }
+
+  listSourceFailures(status: 'active' | 'all' | SourceFailureStatus = 'active') {
+    const rows = this.database.raw.prepare('SELECT * FROM source_event ORDER BY occurred_at DESC, id DESC').all() as SourceEventRow[];
+    const items = rows.flatMap((source) => this.sourceFailureRecords(source).flatMap((record) => {
+      const relation = this.sourceFailureRelation({ sourceEventId: source.id, record });
+      return relation ? [this.sourceFailureView(source, record, relation)] : [];
+    }));
+    const filtered = status === 'active'
+      ? items.filter((item) => item.status === 'open' || item.status === 'retrying' || item.status === 'stale')
+      : status === 'all' ? items : items.filter((item) => item.status === status);
+    return { items: filtered };
+  }
+
+  retrySourceFailure(failureId: string, expectedVersion?: number) {
+    const found = this.findSourceFailure(failureId);
+    if (!found) throw new Error('失败来源不存在。');
+    const sourceIds = found.relation?.sourceEventIds ?? [found.source.id];
+    const candidateRows = this.database.raw.prepare(
+      `SELECT id, version FROM candidate_request
+       WHERE source_event_id IN (${sourceIds.map(() => '?').join(',')})
+       ORDER BY id`,
+    ).all(...sourceIds) as Array<{ id: string; version: number }>;
+    if (candidateRows.length > 0 && expectedVersion === undefined) throw new CandidateVersionRequiredError();
+    if (candidateRows.length > 0 && (candidateRows.length !== 1 || candidateRows[0]!.version !== expectedVersion)) {
+      throw new CandidateVersionConflictError();
+    }
+    const view = this.sourceFailureView(found.source, found.record, found.relation);
+    if (view.status === 'ignored') throw new Error('失败来源已归档，不能继续重试。');
+    if (view.status === 'resolved') return { ...view, status: 'resolved' as const, message: '这个来源已经恢复成功，无需重复重试。' };
+    if (view.status === 'stale') throw new Error('来源内容或背景已经变化，这条失败记录已陈旧，请等待新的分类结果。');
+    const result = this.retrySourceClassification(
+      found.source.id,
+      found.record.source_revision,
+      found.record.job_id,
+      candidateRows.length === 1 ? { candidateId: candidateRows[0]!.id, expectedVersion: expectedVersion! } : undefined,
+    );
+    return { ...this.sourceFailureView(found.source, found.record, found.relation), ...result };
+  }
+
+  ignoreSourceFailure(failureId: string) {
+    const found = this.findSourceFailure(failureId);
+    if (!found) throw new Error('失败来源不存在。');
+    const current = this.sourceFailureView(found.source, found.record, found.relation);
+    if (current.status === 'resolved') throw new Error('已经恢复成功的来源不能归档。');
+    const timestamp = nowIso();
+    const metadata = parseMetadata(found.source.metadata_json) as SourceFailureMetadata;
+    const records = this.sourceFailureRecords(found.source);
+    const next = {
+      ...found.record,
+      status: 'ignored' as const,
+      retryable: false,
+      next_retry_at: null,
+      resolved_at: null,
+      ignored_at: timestamp,
+      updated_at: timestamp,
+    };
+    metadata.failure_inbox = [...records.filter((item) => item.id !== found.record.id), next];
+    const updated = this.database.raw.prepare('UPDATE source_event SET metadata_json = ? WHERE id = ? AND metadata_json = ?')
+      .run(JSON.stringify(metadata), found.source.id, found.source.metadata_json);
+    if (updated.changes !== 1) throw new Error('失败来源状态已经变化，请刷新后重试。');
+    this.sourceFailureAudit(next, 'ignored', found.source.id);
+    return { ...this.sourceFailureView({ ...found.source, metadata_json: JSON.stringify(metadata) }, next, found.relation), message: '失败来源已归档，来源和审计记录仍保留。' };
+  }
+
+  private updateClassificationRecoveryState(jobId: string, status: 'queued' | 'failed', error: string | null) {
+    const processingState = status === 'failed' ? 'failed_visible' : 'retry_waiting';
+    this.database.transaction(() => {
+      // Recovery can cover a batch job.  Read every row's revision inside the
+      // same write transaction and fence each write independently so one stale
+      // candidate cannot make the rest of the batch appear successful.
+      const candidates = this.database.raw.prepare(
+        `SELECT id, version
+           FROM candidate_request
+          WHERE processing_job_id = ?
+            AND processing_state IN ('organizing','retry_waiting','failed_visible')
+          ORDER BY id`,
+      ).all(jobId) as Array<{ id: string; version: number }>;
+      const updatedAt = nowIso();
+      for (const candidate of candidates) {
+        const updated = this.database.raw.prepare(
+          `UPDATE candidate_request
+              SET processing_state = ?, processing_job_id = ?, processing_error = ?, updated_at = ?, version = version + 1
+            WHERE id = ?
+              AND processing_job_id = ?
+              AND processing_state IN ('organizing','retry_waiting','failed_visible')
+              AND version = ?`,
+        ).run(
+          processingState,
+          jobId,
+          error ? redactDiagnosticText(error, 300) : null,
+          updatedAt,
+          candidate.id,
+          jobId,
+          candidate.version,
+        );
+        if (updated.changes !== 1) throw new CandidateVersionConflictError();
+      }
+    });
+  }
+
+  private recordRuntimeClassificationFailure(jobId: string, failed: RuntimeJobRow | null, error: unknown, errorCode?: string) {
+    if (!failed || (failed.status !== 'queued' && failed.status !== 'failed')) return;
+    if (failed.job_type !== 'classify_source' && failed.job_type !== 'classify_source_batch') return;
+    const payload = parseMetadata(failed.payload_json);
+    const sourceEventIds = Array.isArray(payload.sourceEventIds)
+      ? payload.sourceEventIds.filter((value): value is string => typeof value === 'string')
+      : typeof payload.sourceEventId === 'string' ? [payload.sourceEventId] : [];
+    const sourceRevision = typeof payload.sourceRevision === 'string' ? payload.sourceRevision : null;
+    if (!sourceRevision || !sourceEventIds.length) return;
+    this.recordSourceFailure({
+      sourceEventIds,
+      sourceRevision,
+      jobId,
+      status: failed.status === 'queued' ? 'retrying' : 'open',
+      errorCode: stableSourceFailureCode(errorCode, error),
+      error,
+    });
+  }
+
+  private classificationDeferredForCooldown(
+    source: SourceEventRow,
+    jobId: string,
+    deduplicated: boolean,
+    sourceEventIds?: string[],
+  ): ClassificationPersistResult {
+    const job = this.runtime.get(jobId);
+    const payload = parseMetadata(job?.payload_json);
+    const ids = sourceEventIds?.length
+      ? sourceEventIds
+      : Array.isArray(payload.sourceEventIds)
+        ? payload.sourceEventIds.filter((value): value is string => typeof value === 'string' && Boolean(value))
+        : [source.id];
+    const candidates = this.getCandidatesForSources(ids);
+    return {
+      deduplicated,
+      sourceEventId: source.id,
+      sourceEventIds: ids,
+      sourceRevision: typeof payload.sourceRevision === 'string' ? payload.sourceRevision : undefined,
+      candidate: candidates[0] ?? null,
+      candidates,
+      classificationDeferred: true,
+      errorCode: 'MODEL_RATE_LIMITED',
+      recoveryReason: '模型服务正在冷却，来源已保留，等待安全重试。',
+    };
+  }
+
+  private classificationIds(result: ClassificationPersistResult) {
+    const base = classificationResultIds(result);
+    const candidates = result.candidates ?? (result.candidate ? [result.candidate] : []);
+    const threadIds = new Set(base.threadIds ?? []);
+    for (const candidate of candidates) {
+      const thread = this.threadForCandidate(candidate);
+      if (thread) threadIds.add(thread.id);
+    }
+    return {
+      candidateIds: base.candidateIds ?? [],
+      demandUnitIds: base.demandUnitIds ?? [],
+      threadIds: [...threadIds],
+    };
+  }
+
+  private classificationResultWithIds(result: ClassificationPersistResult): ClassificationPersistResult {
+    return { ...result, ...this.classificationIds(result) };
+  }
+
+  private classificationRuntimeSummary(result: ClassificationPersistResult, context: Record<string, unknown>) {
+    const ids = this.classificationIds(result);
+    return {
+      ...context,
+      candidateId: result.candidate?.id ?? ids.candidateIds[0] ?? null,
+      ...ids,
+    };
+  }
+
+  private settleClassificationRuntimeJob(
+    jobId: string,
+    leaseOwner: string,
+    result: ClassificationPersistResult,
+    completedResult: Record<string, unknown>,
+  ) {
+    const persistedJob = this.runtime.get(jobId);
+    const persistedPayload = parseMetadata(persistedJob?.payload_json);
+    const sourceRevision = result.sourceRevision
+      ?? (typeof persistedPayload.sourceRevision === 'string' ? persistedPayload.sourceRevision : undefined);
+    const sourceEventIds = result.sourceEventIds
+      ?? (Array.isArray(persistedPayload.sourceEventIds)
+        ? persistedPayload.sourceEventIds.filter((value): value is string => typeof value === 'string')
+        : [result.sourceEventId]);
+    if (result.classificationDeferred) {
+      // Preserve the association stage's explicit terminal disposition even
+      // when a legacy/custom adapter omitted metadata. Without this fence,
+      // runtime.fail() would classify the generic recovery message as a
+      // retryable error and reopen a known 401/403 outcome.
+      const retry: RetryFailureMetadata | null = result.metadata?.retry
+        ?? (result.deferredRetryable === false
+          ? {
+              category: 'non_retryable',
+              providerKey: this.adapters.classifier.provider,
+              cooldownKey: this.adapters.classifier.provider,
+              retryable: false,
+              retryAt: null,
+              retryAfterMs: null,
+              status: null,
+              code: 'association_non_retryable',
+            }
+          : null);
+      const failed = this.runtime.fail(jobId, new Error(result.recoveryReason || 'AI 整理暂未完成。'), {
+        leaseOwner,
+        retry,
+        retryable: result.deferredRetryable === false ? false : undefined,
+      });
+      if (failed?.status === 'queued' || failed?.status === 'failed') {
+        const recorded = sourceRevision ? this.recordSourceFailure({
+            sourceEventIds,
+            sourceRevision,
+            jobId,
+            status: failed.status === 'queued' ? 'retrying' : 'open',
+            errorCode: result.errorCode,
+            error: result.recoveryReason,
+          }) : false;
+        if (recorded) this.updateClassificationRecoveryState(jobId, failed.status, failed.last_error);
+      }
+      return failed;
+    }
+    const completed = this.runtime.complete(jobId, this.classificationRuntimeSummary(result, completedResult), leaseOwner);
+    if (completed && sourceRevision) {
+      this.resolveSourceFailure(sourceEventIds, sourceRevision, jobId);
+    }
+    return completed;
+  }
+
+  private async classifyCapturedSource(
+    sourceRow: SourceEventRow,
+    guidance: string | undefined,
+    deduplicated: boolean,
+    staleAttempts = 0,
+    retryFailed = false,
+    operationContext?: OperationContext,
+  ): Promise<ClassificationPersistResult> {
+    // Create the durable intent before any network-backed document refresh.
+    // The cached context revision distinguishes document callbacks; the
+    // effective refreshed revision is fenced again inside the job.
+    const contexts = this.feishuDocumentContext.list(sourceRow.id);
+    const baseClassificationRevision = combinedClassificationRevision(sourceRow, contexts).revision;
+    const confirmedContextRevision = this.classificationRevisionContext(this.classificationRowsForSource(sourceRow)).revision;
+    const classificationRevision = confirmedContextRevision
+      ? createHash('sha256').update(`${baseClassificationRevision}:${confirmedContextRevision}`).digest('hex')
+      : baseClassificationRevision;
+    const queuedOwnerTargets = this.isTrustedOwnerSource(sourceRow)
+      ? this.captureOwnerDecisionTargets(sourceRow)
+      : null;
+    const initialContext = this.classificationRevisionContext(this.classificationRowsForSource(sourceRow));
+    const candidateFence = this.candidateRuntimeFenceForSources(
+      [sourceRow.id],
+      initialContext.candidateMerge.candidates.map((candidate) => candidate.candidateId),
+    );
+    const runtimeJob = this.runtime.begin({
+      jobType: 'classify_source',
+      payload: {
+        sourceEventId: sourceRow.id,
+        sourceEventIds: [sourceRow.id],
+        sourceRevision: classificationRevision,
+        sourceRevisionCanonical: classificationRevision,
+        guidance: guidance?.slice(0, 2_000) ?? null,
+        ...(queuedOwnerTargets ? { ownerTargetSnapshots: queuedOwnerTargets } : {}),
+        candidateFence: candidateFence.length ? candidateFence : null,
+        ...(operationContext ? { observability: operationContext } : {}),
+      },
+      idempotencyKey: `classify:${sourceRow.id}:${classificationRevision}:${guidanceRevision(guidance)}:${this.adapters.classifier.promptVersion}`,
+      sourceEventId: sourceRow.id,
+      traceId: operationContext?.trace_id ?? null,
+      wakeRetry: retryFailed && deduplicated,
+      leaseMs: this.runtimeLeaseMs(),
+    });
+    this.linkRuntimeJobSources(runtimeJob.id, [sourceRow.id]);
+    if (!runtimeJob.acquired) {
+      const existingCandidates = this.getCandidatesForSource(sourceRow.id);
+      return this.classificationResultWithIds({ deduplicated: true, sourceEventId: sourceRow.id, candidate: existingCandidates[0] ?? null, candidates: existingCandidates });
+    }
+    try {
+      const leaseOwner = runtimeJob.lease_owner;
+      if (!leaseOwner) throw new Error('Runtime 工作项未取得有效租约。');
+      const result = await this.classifyCapturedSourceInternal(sourceRow, guidance, deduplicated, staleAttempts, runtimeJob.id, leaseOwner, [sourceRow], operationContext);
+       this.settleClassificationRuntimeJob(runtimeJob.id, leaseOwner, result, { sourceEventId: sourceRow.id });
+       return this.classificationResultWithIds(result);
+    } catch (error) {
+      const retry = classifyRetryFailure(error, this.adapters.classifier.provider);
+      const failed = this.runtime.fail(runtimeJob.id, error, {
+        leaseOwner: runtimeJob.lease_owner ?? undefined,
+        retry,
+      });
+      this.extendProviderCooldown(retry, failed);
+      if (!(error instanceof OwnerTargetSnapshotPersistenceError)) {
+        this.recordRuntimeClassificationFailure(
+          runtimeJob.id,
+          failed,
+          error,
+          error instanceof RuntimeCooldownDeferredError ? 'MODEL_RATE_LIMITED' : undefined,
+        );
+      }
+      if (error instanceof RuntimeCooldownDeferredError) {
+        return this.classificationDeferredForCooldown(sourceRow, runtimeJob.id, deduplicated);
+      }
+      throw error;
+    }
+  }
+
+  private async classifyCapturedSourceBatch(
+    rows: SourceEventRow[],
+    guidance: string | undefined,
+    retryFailed = false,
+    operationContext?: OperationContext,
+  ): Promise<ClassificationPersistResult> {
+    const ordered = [...rows].sort(stableSourceOrder);
+    const primary = ordered[0];
+    if (!primary) throw new Error('连续消息批次不能为空。');
+    if (ordered.length === 1) return this.classifyCapturedSource(primary, guidance, true, 0, retryFailed, operationContext);
+
+    // Persist the batch job before refreshing any linked documents. A process
+    // crash or provider error during refresh therefore remains recoverable.
+    const contextsBySource = new Map<string, SourceDocumentContext[]>();
+    for (const row of ordered) contextsBySource.set(row.id, this.feishuDocumentContext.list(row.id));
+    const baseClassificationRevision = combinedBatchClassificationRevision(ordered, contextsBySource).revision;
+    const confirmedContextRevision = this.classificationRevisionContext(ordered).revision;
+    const classificationRevision = confirmedContextRevision
+      ? createHash('sha256').update(`${baseClassificationRevision}:${confirmedContextRevision}`).digest('hex')
+      : baseClassificationRevision;
+    const sourceIds = ordered.map((row) => row.id);
+    const batchHash = createHash('sha256').update(JSON.stringify(sourceIds)).digest('hex');
+    const queuedOwnerSource = ordered.every((row) => this.isTrustedOwnerSource(row)) ? ordered.at(-1) ?? null : null;
+    const queuedOwnerTargets = queuedOwnerSource ? this.captureOwnerDecisionTargets(queuedOwnerSource) : null;
+    const initialContext = this.classificationRevisionContext(ordered);
+    const candidateFence = this.candidateRuntimeFenceForSources(
+      sourceIds,
+      initialContext.candidateMerge.candidates.map((candidate) => candidate.candidateId),
+    );
+    const runtimeJob = this.runtime.begin({
+      jobType: 'classify_source_batch',
+      payload: {
+        sourceEventIds: sourceIds,
+        sourceRevision: classificationRevision,
+        sourceRevisionCanonical: classificationRevision,
+        guidance: guidance?.slice(0, 2_000) ?? null,
+        ...(queuedOwnerTargets ? { ownerTargetSnapshots: queuedOwnerTargets } : {}),
+        candidateFence: candidateFence.length ? candidateFence : null,
+        ...(operationContext ? { observability: operationContext } : {}),
+      },
+      idempotencyKey: `classify-batch:${batchHash}:${classificationRevision}:${guidanceRevision(guidance)}:${this.adapters.classifier.promptVersion}`,
+      sourceEventId: primary.id,
+      traceId: operationContext?.trace_id ?? null,
+      wakeRetry: retryFailed,
+      leaseMs: this.runtimeLeaseMs(),
+    });
+    this.linkRuntimeJobSources(runtimeJob.id, sourceIds);
+    if (!runtimeJob.acquired) {
+      const existingCandidates = this.getCandidatesForSources(sourceIds);
+      return this.classificationResultWithIds({ deduplicated: true, sourceEventId: primary.id, candidate: existingCandidates[0] ?? null, candidates: existingCandidates });
+    }
+    try {
+      const leaseOwner = runtimeJob.lease_owner;
+      if (!leaseOwner) throw new Error('Runtime 连续消息工作项未取得有效租约。');
+      const result = await this.classifyCapturedSourceInternal(primary, guidance, true, 0, runtimeJob.id, leaseOwner, ordered, operationContext);
+       this.settleClassificationRuntimeJob(runtimeJob.id, leaseOwner, result, { sourceEventIds: sourceIds });
+       return this.classificationResultWithIds(result);
+    } catch (error) {
+      const retry = classifyRetryFailure(error, this.adapters.classifier.provider);
+      const failed = this.runtime.fail(runtimeJob.id, error, {
+        leaseOwner: runtimeJob.lease_owner ?? undefined,
+        retry,
+      });
+      this.extendProviderCooldown(retry, failed);
+      if (!(error instanceof OwnerTargetSnapshotPersistenceError)) {
+        this.recordRuntimeClassificationFailure(
+          runtimeJob.id,
+          failed,
+          error,
+          error instanceof RuntimeCooldownDeferredError ? 'MODEL_RATE_LIMITED' : undefined,
+        );
+      }
+      if (error instanceof RuntimeCooldownDeferredError) {
+        return this.classificationDeferredForCooldown(primary, runtimeJob.id, false, sourceIds);
+      }
+      throw error;
+    }
+  }
+
+  private assertRuntimeActive(runtimeJobId?: string, leaseOwner?: string) {
+    if (!runtimeJobId) return;
+    const job = this.runtime.get(runtimeJobId);
+    if (!job || !leaseOwner || !this.runtime.assertLease(runtimeJobId, leaseOwner)) {
+      throw new Error('Runtime 工作项已取消或租约已失效。');
+    }
+  }
+
+  private async classifyCapturedSourceInternal(
+    sourceRow: SourceEventRow,
+    guidance: string | undefined,
+    deduplicated: boolean,
+    staleAttempts = 0,
+    runtimeJobId?: string,
+    leaseOwner?: string,
+    batchRows: SourceEventRow[] = [sourceRow],
+    operationContext?: OperationContext,
+  ): Promise<ClassificationPersistResult> {
+    this.assertRuntimeActive(runtimeJobId, leaseOwner);
+    const orderedRows = [...batchRows].sort(stableSourceOrder);
+    const ownerSourceAtStart = orderedRows.length > 0 && orderedRows.every((row) => this.isTrustedOwnerSource(row))
+      ? orderedRows.at(-1) ?? null
+      : null;
+    const storedOwnerTargets = this.runtimeOwnerDecisionTargets(runtimeJobId);
+    const ownerTargetsAtStart = storedOwnerTargets ?? (ownerSourceAtStart
+      ? this.captureOwnerDecisionTargets(ownerSourceAtStart, Boolean(runtimeJobId))
+      : null);
+    const ownerTargetSnapshotRetry = Boolean(runtimeJobId && (this.runtime.get(runtimeJobId)?.attempts ?? 0) > 1);
+    // A newly captured fallback is persisted for legacy jobs before any
+    // provider/context work, but only a snapshot that was already durable
+    // when this attempt began may fence completion-time target selection.
+    // This preserves explicit legacy recovery while preventing malformed or
+    // unknown persisted data from silently triggering a rescan.
+    // The target set used after provider/context work must be the same set
+    // captured at this attempt's start.  A legacy job has no durable snapshot
+    // until the fenced payload UPDATE below succeeds, but the successfully
+    // persisted local value is already authoritative for this in-flight
+    // attempt.  Direct callers without a Runtime job still need that same
+    // call-start fence; otherwise completion can rescan candidates created or
+    // retired while the provider was running.
+    let ownerTargetsForProcess = storedOwnerTargets ?? (runtimeJobId ? null : ownerTargetsAtStart);
+    if (runtimeJobId && !storedOwnerTargets && ownerTargetsAtStart) {
+      if (!leaseOwner) throw new Error('Runtime 主人判断工作项未取得有效租约。');
+      this.persistRuntimeOwnerDecisionTargets(runtimeJobId, leaseOwner, ownerTargetsAtStart);
+      ownerTargetsForProcess = ownerTargetsAtStart;
+    }
+    const sourceEventIds = orderedRows.map((row) => row.id);
+    const runtimePayload = runtimeJobId ? parseMetadata(this.runtime.get(runtimeJobId)?.payload_json) : null;
+    const hasCandidateFence = Boolean(runtimeJobId && runtimePayload && Object.prototype.hasOwnProperty.call(runtimePayload, 'candidateFence'));
+    const runtimeCandidateFence = runtimeJobId && runtimePayload ? this.parseCandidateRuntimeFence(runtimePayload.candidateFence) : null;
+    if (runtimeJobId && (!runtimePayload || !hasCandidateFence)) throw new CandidateVersionConflictError();
+    const storedContextCheckpoint = runtimeJobId
+      ? this.runtime.checkpoints(runtimeJobId).reverse().find((checkpoint) => {
+          if (checkpoint.step !== 'document_context_refreshed') return false;
+          const state = parseJsonValue<unknown>(String(checkpoint.state_json), null);
+          const currentContextsBySource = new Map(sourceEventIds.map((sourceEventId) => [sourceEventId, this.feishuDocumentContext.list(sourceEventId)]));
+          const currentBaseRevision = sourceEventIds.length === 1
+            ? combinedClassificationRevision(orderedRows[0]!, currentContextsBySource.get(sourceEventIds[0]!) ?? [])
+            : combinedBatchClassificationRevision(orderedRows, currentContextsBySource);
+          return matchesDocumentContextCheckpoint(state, {
+            sourceEventIds,
+            sourceRevision: currentBaseRevision.sourceHash,
+            contextFingerprint: currentBaseRevision.contextHash,
+            continuationRevision: this.classificationRevisionContext(orderedRows).revision,
+            contextCount: [...currentContextsBySource.values()].reduce((total, contexts) => total + contexts.length, 0),
+          });
+        })
+      : null;
+    const contextsBySource = storedContextCheckpoint
+      ? new Map(sourceEventIds.map((sourceEventId) => [sourceEventId, this.feishuDocumentContext.list(sourceEventId)]))
+      : await this.runtime.executeTool({
+          jobId: runtimeJobId ?? null,
+          toolName: 'source.read',
+          toolInput: { sourceEventIds },
+          leaseOwner,
+          run: async (_attempt, signal) => {
+            if (signal.aborted) throw signal.reason ?? new Error('Runtime 来源读取已取消。');
+            const refreshed = new Map<string, SourceDocumentContext[]>();
+            for (const row of orderedRows) {
+              refreshed.set(row.id, await this.feishuDocumentContext.refresh(row.id, row.content));
+            }
+            this.assertRuntimeActive(runtimeJobId, leaseOwner);
+            return refreshed;
+          },
+          auditResult: (value, attempts) => ({ sourceEventIds, contextCount: [...value.values()].reduce((total, item) => total + item.length, 0), attempts }),
+        });
+    this.assertRuntimeActive(runtimeJobId, leaseOwner);
+    const contexts = [...contextsBySource.values()].flat();
+    if (runtimeJobId && !storedContextCheckpoint) {
+      const contextBaseRevision = sourceEventIds.length === 1
+        ? combinedClassificationRevision(orderedRows[0]!, contextsBySource.get(sourceEventIds[0]!) ?? [])
+        : combinedBatchClassificationRevision(orderedRows, contextsBySource);
+      this.runtime.checkpoint(runtimeJobId, 'document_context_refreshed', {
+        sourceEventIds,
+        contextCount: contexts.length,
+        sourceRevision: contextBaseRevision.sourceHash,
+        contextFingerprint: contextBaseRevision.contextHash,
+        continuationRevision: this.classificationRevisionContext(orderedRows).revision,
+      }, leaseOwner);
+    }
+    const confirmedContext = this.classificationRevisionContext(orderedRows);
+    const linkedThreadIds = [...new Set(orderedRows.map((row) => this.sourceThreadId(row.id)).filter((value): value is string => Boolean(value)))];
+    // Confirmed context is only model input. Do not pre-bind the aggregate row
+    // to that thread here, otherwise an explicit reply/root/session marker is
+    // downgraded to generic batch_context before the association gate runs.
+    const aggregateRow = aggregateClassificationSource(orderedRows, sourceRow, linkedThreadIds.length === 1 ? linkedThreadIds[0] : null);
+    const source = this.sourceWithConfirmedContext(
+      this.sourceRowToEvent(aggregateRow, contexts),
+      confirmedContext.strong,
+      confirmedContext.association,
+      confirmedContext.candidateMerge,
+    );
+    const contextRows = this.readConversationContextRows(orderedRows);
+    source.classificationSources = orderedRows.map((row, index) => ({
+      sourceKey: `s${index + 1}`,
+      senderName: row.sender_name,
+      content: row.content,
+      occurredAt: row.occurred_at,
+    }));
+    source.conversationContext = contextRows.map((row, index) => ({
+      sourceKey: `ctx${index + 1}`,
+      senderName: row.sender_name,
+      content: row.content,
+      occurredAt: row.occurred_at,
+      contextOnly: true as const,
+    }));
+    const startedAt = Date.now();
+    const baseRevision = orderedRows.length === 1
+      ? combinedClassificationRevision(sourceRow, contexts)
+      : combinedBatchClassificationRevision(orderedRows, contextsBySource);
+    const sourceHash = baseRevision.sourceHash;
+    const contextHash = baseRevision.contextHash;
+    const revision = confirmedContext.revision
+      ? createHash('sha256').update(`${baseRevision.revision}:${confirmedContext.revision}`).digest('hex')
+      : baseRevision.revision;
+    if (orderedRows.every((row) => parseMetadata(row.metadata_json).classificationRevision === revision)) {
+      // The business transaction may have committed immediately before a
+      // process crash. Re-dispatch persisted pending proposals idempotently so
+      // automatic maintenance cannot be stranded between commit and dispatch.
+      this.dispatchPendingProposalsForSources(orderedRows.map((row) => row.id), runtimeJobId ?? null, leaseOwner ?? null);
+      // Classification and the owner state-machine action are separate durable
+      // boundaries. If the process stopped after stamping the classification
+      // revision but before creating owner_decision, replay the persisted
+      // structured owner intent instead of treating the source as complete.
+      const ownerSource = [...orderedRows].reverse().find((row) => this.isTrustedOwnerSource(row));
+      const storedIntents = ownerSource ? this.storedOwnerIntents(ownerSource.id) : [];
+      if (ownerSource && storedIntents.length) {
+        await this.processOwnerIntent(ownerSource, {
+          outcome: 'valid',
+          isDataRequest: false,
+          draft: null,
+          reason: '从已持久化的分类结果恢复主人判断。',
+          relatedTaskHint: null,
+          ownerIntent: storedIntents[0] ?? null,
+          ownerIntents: storedIntents,
+          importantDates: [],
+          deliverables: [],
+          commitments: [],
+          usedFallback: false,
+          metadata: { fallbackMode: 'llm', structuredMode: 'json_schema' },
+        }, revision, this.readConversationContextRows(orderedRows), ownerTargetsForProcess, ownerTargetSnapshotRetry, operationContext);
+      }
+      const existingCandidates = this.getCandidatesForSources(orderedRows.map((row) => row.id));
+      return {
+        deduplicated,
+        sourceEventId: sourceRow.id,
+        candidate: existingCandidates[0] ?? null,
+        candidates: existingCandidates,
+        ...this.classificationIds({ deduplicated, sourceEventId: sourceRow.id, candidate: existingCandidates[0] ?? null, candidates: existingCandidates }),
+      };
+    }
+    const resumedClassification = runtimeJobId
+      ? this.runtime.checkpoints(runtimeJobId)
+        .reverse()
+        .filter((checkpoint) => checkpoint.step === 'classification_provider_completed')
+        .map((checkpoint) => parseReusableClassificationCheckpoint(parseJsonValue<unknown>(String(checkpoint.state_json), null), sourceEventIds, revision))
+        .find((value): value is ClassificationResult => Boolean(value)) ?? null
+      : null;
+    const adapterClassification = resumedClassification ?? await this.runtime.executeTool<ClassificationResult>({
+      jobId: runtimeJobId ?? null,
+      toolName: 'task.propose_update',
+      toolInput: { sourceEventIds: orderedRows.map((row) => row.id), revision, operationContext: operationContext ?? null },
+      cooldownKey: this.adapters.classifier.provider,
+      leaseOwner,
+      run: async (_attempt, signal) => {
+        if (signal.aborted) throw signal.reason ?? new Error('Runtime 模型判断已取消。');
+        const aggregateMetadata = parseMetadata(aggregateRow.metadata_json);
+        const calendarRule = orderedRows.length === 1 && aggregateRow.source_type === 'calendar'
+          ? classifyCalendarSource(source)
+          : null;
+        const value = aggregateMetadata.deleted
+          ? {
+              outcome: 'rule_final' as const,
+              isDataRequest: false,
+              draft: null,
+              reason: '来源消息已撤回或删除，不进入需求判断。',
+              relatedTaskHint: null,
+              threadAssociation: null,
+              importantDates: [],
+              deliverables: [],
+              commitments: [],
+              usedFallback: true,
+              metadata: { fallbackMode: 'rule_fallback' as const, inputCharCount: source.content.length },
+            }
+          : calendarRule
+            ? {
+                outcome: 'rule_final' as const,
+                isDataRequest: calendarRule.route === 'candidate_review',
+                draft: calendarClassificationDraft(source, calendarRule),
+                reason: calendarRule.route === 'calendar_fact'
+                  ? '普通日历事件保留为时间事实，不自动生成候选。'
+                  : calendarRule.route === 'owner_confirmation'
+                    ? '日历事件存在行动迹象，但责任或交付边界不完整，等待系统主人确认。'
+                    : '日历事件明确包含系统主人责任、动作和交付物或截止点，进入待确认候选。',
+                relatedTaskHint: null,
+                importantDates: [],
+                deliverables: calendarRule.evidenceFields.deliverableOrDeadline ? [calendarRule.evidenceFields.deliverableOrDeadline] : [],
+                commitments: calendarRule.evidenceFields.ownerResponsibility ? [calendarRule.evidenceFields.ownerResponsibility] : [],
+                usedFallback: true,
+                metadata: { fallbackMode: 'rule_fallback' as const, inputCharCount: source.content.length, calendarClassification: calendarRule },
+              }
+            : await this.adapters.classifier.classify(source, guidance, {
+              signal,
+              operationContext,
+              retryCooldownGuard: runtimeJobId && leaseOwner
+                ? () => this.runtime.assertLease(runtimeJobId, leaseOwner)
+                : undefined,
+            });
+        if (value.draft?.analysis) value.draft.analysis.threadAssociation = value.threadAssociation ?? null;
+        this.assertRuntimeActive(runtimeJobId, leaseOwner);
+        return value;
+      },
+      checkpoint: {
+        step: 'classification_provider_completed',
+        state: (value) => ({
+          sourceEventIds: orderedRows.map((row) => row.id),
+          revision,
+          reusable: !value.deferred && ['valid', 'repaired', 'rule_final'].includes(value.outcome ?? ''),
+          // The adapter result is untrusted.  Apply the same authoritative
+          // projection before Runtime writes its durable checkpoint; raw
+          // provider output must never enter crash-recovery state.
+          classification: enforceUntrustedClassificationBoundary(source, value),
+        }),
+      },
+      auditResult: (value, attempts) => {
+        const safe = enforceUntrustedClassificationBoundary(source, value);
+        return {
+          sourceEventIds: orderedRows.map((row) => row.id),
+          isDataRequest: safe.isDataRequest,
+          boundaryRejected: safe.metadata?.boundaryRejected === true,
+          attempts,
+        };
+      },
+    });
+    // SEC-02: every classifier adapter is an untrusted boundary. Re-apply
+    // identity, source-key, candidate-set and text guards before any service
+    // branch can persist a proposal or process owner intent.
+    const rawClassification = enforceUntrustedClassificationBoundary(source, adapterClassification);
+    // Owner-authored turns are a separate state-machine input.  The model is
+    // allowed to describe the owner's intent, but it must never be able to
+    // create an ordinary candidate by accidentally returning is_data_request
+    // or units for the same message.  Keep a draft-embedded owner intent when
+    // a custom provider supplied it there, then suppress all candidate fields
+    // at the service boundary.
+    const ownerOnly = orderedRows.length > 0
+      && orderedRows.every((row) => this.isTrustedOwnerSource(row));
+    const ownerIntent = rawClassification.ownerIntent ?? rawClassification.draft?.analysis?.ownerIntent ?? null;
+    const classification: ClassificationResult = ownerOnly
+      ? {
+          ...rawClassification,
+          isDataRequest: false,
+          draft: null,
+          units: undefined,
+          ownerIntent,
+        }
+      : rawClassification;
+    const rawMessageAction = classification.messageAction;
+    const nonOwnerAction = !ownerOnly && (rawMessageAction?.action === 'owner_action' || rawMessageAction?.action === 'decline_or_delegate');
+    const normalizedClassification: ClassificationResult = nonOwnerAction
+      ? {
+          ...classification,
+          messageAction: {
+            action: 'uncertain',
+            confidence: 0,
+            evidence: rawMessageAction?.evidence ?? [],
+            reason: '模型把非主人消息误判成主人动作，已转为待确认，不自动修改任何需求。',
+          },
+        }
+      : classification;
+    this.assertRuntimeActive(runtimeJobId, leaseOwner);
+    const rawMessageActionName = normalizedClassification.messageAction?.action ?? null;
+    const boundaryRejected = normalizedClassification.metadata?.boundaryRejected === true;
+    const suppressFallbackCandidate = normalizedClassification.usedFallback
+      && rawMessageActionName !== null
+      && rawMessageActionName !== 'new_demand';
+    const draft = boundaryRejected || suppressFallbackCandidate ? null : normalizedClassification.draft;
+    const classificationOutcome = normalizedClassification.outcome
+      ?? (normalizedClassification.usedFallback
+        ? (normalizedClassification.isDataRequest ? 'rule_provisional' : 'recoverable_error')
+        : 'valid');
+    const classificationFinal = ['valid', 'repaired', 'rule_final'].includes(classificationOutcome);
+    const associationDeferred = normalizedClassification.deferred?.kind === 'association';
+    const classificationDeferred = associationDeferred || !classificationFinal;
+
+    // The action stage is still useful diagnostic evidence, but an association
+    // stage is required before any candidate/task/thread/audit/notification or
+    // outbox mutation. Return a durable retry disposition without entering a
+    // persistence path that could manufacture an unowned target.
+    if (associationDeferred) {
+      this.assertRuntimeActive(runtimeJobId, leaseOwner);
+      return {
+        deduplicated,
+        sourceEventId: sourceRow.id,
+        sourceEventIds: orderedRows.map((row) => row.id),
+        sourceRevision: revision,
+        candidate: null,
+        candidates: [],
+        classificationDeferred: true,
+        deferredRetryable: normalizedClassification.deferred?.retryable,
+        errorCode: 'ASSOCIATION_UNAVAILABLE',
+        recoveryReason: '需求关联阶段暂不可用，已保留核心消息动作并等待 Runtime 重试。',
+        metadata: normalizedClassification.metadata,
+      };
+    }
+
+    // The thread-centric path is intentionally gated to a successful live
+    // model decision.  Rule fallback and legacy adapters must remain on the
+    // existing recovery/candidate path; otherwise a failed semantic judgment
+    // could be mistaken for a confirmed context-only update.
+    const messageAction = normalizedClassification.messageAction?.action ?? null;
+    const ordinaryThreadActions = new Set<MessageAction>(['update_existing', 'context_only', 'uncertain']);
+    const useThreadCentricAction = this.adapters.classifier.kind === 'live'
+      && !ownerOnly
+      && classificationFinal
+      && !normalizedClassification.usedFallback
+      && !boundaryRejected
+      && messageAction !== null
+      && ordinaryThreadActions.has(messageAction);
+    if (useThreadCentricAction) {
+      let semanticResult: ClassificationPersistResult;
+      try {
+        semanticResult = await this.persistThreadCentricAction({
+          sourceRow,
+          orderedRows,
+          classification: normalizedClassification,
+          contextsBySource,
+          sourceHash,
+          contextHash,
+          revision,
+          contextRows,
+          deduplicated,
+          // Owner turns are fenced by the durable owner target snapshot;
+          // their candidate may be retired while the provider is in flight
+          // and must still settle as stale instead of failing the whole job.
+          candidateFence: ownerOnly ? undefined : runtimeCandidateFence ?? undefined,
+          runtimeJobId,
+          leaseOwner,
+        });
+      } catch (error) {
+        if (!(error instanceof ClassificationRevisionChangedError)) throw error;
+        if (staleAttempts >= 3) throw new Error('来源在语义判断期间持续更新，请稍后重试。');
+        const stalePrimary = error.rows.find((row) => row.id === sourceRow.id) ?? error.rows[0]!;
+        return this.classifyCapturedSourceInternal(stalePrimary, guidance, deduplicated, staleAttempts + 1, runtimeJobId, leaseOwner, error.rows, operationContext);
+      }
+      if (runtimeJobId) {
+        this.runtime.checkpoint(runtimeJobId, 'classification_persisted', this.classificationRuntimeSummary(semanticResult, {
+          sourceEventIds: orderedRows.map((row) => row.id),
+          messageAction,
+        }), leaseOwner);
+      }
+      const ownerSource = [...orderedRows].reverse().find((row) => this.isTrustedOwnerSource(row));
+      if (ownerSource) await this.processOwnerIntent(ownerSource, classification, revision, contextRows, ownerTargetsForProcess, ownerTargetSnapshotRetry, operationContext);
+      this.dispatchPendingProposalsForSources(orderedRows.map((row) => row.id), runtimeJobId ?? null, leaseOwner ?? null);
+      this.assertRuntimeActive(runtimeJobId, leaseOwner);
+      return this.classificationResultWithIds(semanticResult);
+    }
+
+    // A structured response may explicitly contain more than one independent
+    // demand. Persist those units as separate durable candidates before the
+    // legacy single-candidate path can flatten them. Provisional/recoverable
+    // responses stay on the old Runtime retry path and are never marked done.
+    // Keep the legacy single-unit path for one-unit responses so existing
+    // thread association, merge and task-update safety gates remain active.
+    // The dedicated persistence path is only for an actual decomposition.
+    if (!suppressFallbackCandidate && classificationFinal && Array.isArray(normalizedClassification.units) && normalizedClassification.units.length > 1) {
+      let multiResult: ClassificationPersistResult;
+      try {
+        multiResult = this.persistMultiUnitClassification({
+          sourceRow,
+          orderedRows,
+          classification,
+          contextsBySource,
+          sourceHash,
+          contextHash,
+          revision,
+          deduplicated,
+          candidateFence: runtimeCandidateFence ?? undefined,
+          runtimeJobId,
+          leaseOwner,
+        });
+      } catch (error) {
+        if (!(error instanceof ClassificationRevisionChangedError)) throw error;
+        if (staleAttempts >= 3) throw new Error('来源在多需求判断期间持续更新，请稍后重试。');
+        const stalePrimary = error.rows.find((row) => row.id === sourceRow.id) ?? error.rows[0]!;
+        return this.classifyCapturedSourceInternal(stalePrimary, guidance, deduplicated, staleAttempts + 1, runtimeJobId, leaseOwner, error.rows, operationContext);
+      }
+      if (runtimeJobId) {
+        this.runtime.checkpoint(runtimeJobId, 'classification_persisted', this.classificationRuntimeSummary(multiResult, {
+          sourceEventIds: orderedRows.map((row) => row.id),
+        }), leaseOwner);
+      }
+      if (!classificationDeferred) {
+        const ownerSource = [...orderedRows].reverse().find((row) => this.isTrustedOwnerSource(row));
+        if (ownerSource) {
+          await this.processOwnerIntent(ownerSource, classification, revision, contextRows, ownerTargetsForProcess, ownerTargetSnapshotRetry, operationContext);
+        }
+      }
+      this.dispatchPendingProposalsForSources(orderedRows.map((row) => row.id), runtimeJobId ?? null, leaseOwner ?? null);
+      return this.classificationResultWithIds(multiResult);
+    }
+
+    let decisionCreated = false;
+    let candidateId: string | null = null;
+    let candidateRevisionId: string | null = null;
+    let staleSources: SourceEventRow[] | undefined;
+    let linkedTaskId: string | null = null;
+    let createdProposalId: string | null = null;
+    let recoveredCandidate = false;
+    this.database.transaction(() => {
+      const placeholders = orderedRows.map(() => '?').join(',');
+      const currentRows = (this.database.raw.prepare(`SELECT * FROM source_event WHERE id IN (${placeholders})`).all(...orderedRows.map((row) => row.id)) as SourceEventRow[]).sort(stableSourceOrder);
+      if (currentRows.length !== orderedRows.length) throw new Error('待判断的来源记录已经不存在。');
+      const currentContextsBySource = new Map(currentRows.map((row) => [row.id, this.feishuDocumentContext.list(row.id)]));
+      const currentBaseRevision = currentRows.length === 1
+        ? combinedClassificationRevision(currentRows[0]!, currentContextsBySource.get(currentRows[0]!.id) ?? [])
+        : combinedBatchClassificationRevision(currentRows, currentContextsBySource);
+      const currentClassificationContext = this.classificationRevisionContext(currentRows);
+      const currentConfirmedContextRevision = currentClassificationContext.revision;
+      const currentRevision = currentConfirmedContextRevision
+        ? createHash('sha256').update(`${currentBaseRevision.revision}:${currentConfirmedContextRevision}`).digest('hex')
+        : currentBaseRevision.revision;
+      if (currentRevision !== revision) {
+        staleSources = currentRows;
+        return;
+      }
+      // Owner target retirement is an expected concurrent transition.  The
+      // owner snapshot/target matcher handles it fail-closed; do not let the
+      // generic DATA-03 candidate fence strand the owner decision before it
+      // can become stale.
+      if (runtimeCandidateFence && !ownerOnly) this.assertCandidateRuntimeFence(sourceEventIds, runtimeCandidateFence);
+      const existingCandidates = this.getCandidatesForSource(sourceRow.id);
+      const existingCandidate = existingCandidates.length === 1
+        ? existingCandidates[0]
+        : existingCandidates.length > 1
+          ? (() => { throw new Error('同一来源对应多个需求单元，不能在兼容路径中随机选择候选。'); })()
+          : undefined;
+      if (currentRows.every((row) => parseMetadata(row.metadata_json).classificationRevision === revision)) {
+        candidateId = existingCandidate?.id ?? null;
+        return;
+      }
+      const decisionId = id('ai');
+      this.database.raw.prepare(
+        `INSERT INTO ai_decision_log
+          (id, source_event_id, source_revision, candidate_id, provider, model, prompt_version, is_data_request, confidence, reason, output_json, used_fallback, http_status, provider_request_id, attempts, structured_mode, input_hash, input_char_count, fallback_mode, latency_ms, created_at)
+         VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        decisionId,
+        sourceRow.id,
+        revision,
+        this.adapters.classifier.provider,
+        this.adapters.classifier.model,
+        this.adapters.classifier.promptVersion,
+        classification.isDataRequest ? 1 : 0,
+        draft?.confidence ?? null,
+        classification.reason,
+        JSON.stringify({
+          outcome: classificationOutcome,
+          title: draft?.title ?? null,
+          proposerPresent: Boolean(draft?.proposerName),
+          backgroundPresent: Boolean(draft?.background),
+          describePresent: Boolean(draft?.describe),
+          relatedTaskHint: classification.relatedTaskHint,
+          threadAssociation: classification.threadAssociation ? {
+            targetThreadId: classification.threadAssociation.targetThreadId,
+            targetTaskId: classification.threadAssociation.targetTaskId,
+            confidence: classification.threadAssociation.confidence,
+            candidateSetHash: classification.threadAssociation.candidateSetHash,
+            candidateSetComplete: classification.threadAssociation.candidateSetComplete,
+            scoreCount: classification.threadAssociation.scores.length,
+            evidence: classification.threadAssociation.evidence,
+            reason: classification.threadAssociation.reason,
+          } : null,
+          candidateMerge: classification.candidateMerge ? {
+            targetCandidateId: classification.candidateMerge.targetCandidateId,
+            targetThreadId: classification.candidateMerge.targetThreadId,
+            sameRequirement: classification.candidateMerge.sameRequirement,
+            confidence: classification.candidateMerge.confidence,
+            primary: classification.candidateMerge.primary,
+            primaryConfidence: classification.candidateMerge.primaryConfidence,
+            currentRole: classification.candidateMerge.currentRole,
+            targetRole: classification.candidateMerge.targetRole,
+            candidateSetHash: classification.candidateMerge.candidateSetHash,
+            candidateSetComplete: classification.candidateMerge.candidateSetComplete,
+            scoreCount: classification.candidateMerge.scores.length,
+            evidence: classification.candidateMerge.evidence,
+            reason: classification.candidateMerge.reason,
+          } : null,
+          ownerAction: draft?.analysis?.ownerAction ?? null,
+          ownerIntent: classification.ownerIntent ?? draft?.analysis?.ownerIntent ?? null,
+          ownerIntents: classification.ownerIntents ?? [],
+          importantDatesCount: classification.importantDates.length,
+          deliverablesCount: classification.deliverables.length,
+          commitmentsCount: classification.commitments.length,
+          calendarClassification: classification.metadata?.calendarClassification ?? null,
+          validationIssues: classification.metadata?.validationIssues ?? [],
+          sourceCount: orderedRows.length,
+          sourceRevision: sourceHash,
+          contextRevision: contextHash,
+        }),
+        classification.usedFallback ? 1 : 0,
+        classification.metadata?.httpStatus ?? null,
+        classification.metadata?.requestId ?? null,
+        classification.metadata?.attempts ?? null,
+        classification.metadata?.structuredMode ?? null,
+        classification.metadata?.inputHash ?? null,
+        classification.metadata?.inputCharCount ?? null,
+        classification.metadata?.fallbackMode ?? (classification.usedFallback ? 'rule_fallback' : 'llm'),
+        Date.now() - startedAt,
+        nowIso(),
+      );
+      decisionCreated = true;
+      this.bindAiDecisionRevisions(decisionId, orderedRows);
+      if (existingCandidate?.demand_unit_id) {
+        this.database.raw.prepare(
+          'UPDATE source_demand_unit SET ai_decision_id = ?, updated_at = ? WHERE id = ? AND (ai_decision_id IS NULL OR ai_decision_id = ?)',
+        ).run(decisionId, nowIso(), existingCandidate.demand_unit_id, decisionId);
+      }
+      if (draft) {
+        const analysisJson = candidateAnalysisJson(draft.analysis, contexts, sourceHash, contextHash);
+        const wasRecovering = Boolean(existingCandidate && ['organizing', 'retry_waiting', 'failed_visible'].includes(existingCandidate.processing_state));
+        const nextProcessingState = classificationDeferred ? 'retry_waiting' : wasRecovering ? 'recovered' : 'ready';
+        const recoveredAt = !classificationDeferred && wasRecovering ? nowIso() : existingCandidate?.recovered_at ?? null;
+        recoveredCandidate = !classificationDeferred && wasRecovering;
+        if (existingCandidate?.deleted_at) {
+          candidateId = existingCandidate.id;
+        } else if (existingCandidate && !existingCandidate.accepted_task_id) {
+          candidateId = existingCandidate.id;
+          const updatedExistingCandidate = this.database.raw.prepare(
+            `UPDATE candidate_request
+             SET title = ?, proposer_name = ?, background = ?, validation_question = ?, describe = ?, analysis_json = ?, confidence = ?,
+                 processing_state = ?, processing_job_id = ?, processing_error = ?, recovered_at = ?, updated_at = ?, version = version + 1
+             WHERE id = ? AND version = ?`,
+          ).run(
+            draft.title, draft.proposerName, draft.background, draft.validationQuestion, draft.describe, analysisJson, draft.confidence,
+            nextProcessingState, classificationDeferred ? runtimeJobId ?? null : null,
+            classificationDeferred ? classification.reason.slice(0, 300) : null, recoveredAt, nowIso(), candidateId, existingCandidate.version,
+          );
+          if (updatedExistingCandidate.changes !== 1) throw new CandidateVersionConflictError();
+        } else if (existingCandidate) {
+          candidateId = existingCandidate.id;
+          if (classificationDeferred) {
+            const updatedExistingCandidate = this.database.raw.prepare(
+              `UPDATE candidate_request SET processing_state = 'retry_waiting', processing_job_id = ?, processing_error = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?`,
+            ).run(runtimeJobId ?? null, classification.reason.slice(0, 300), nowIso(), candidateId, existingCandidate.version);
+            if (updatedExistingCandidate.changes !== 1) throw new CandidateVersionConflictError();
+          }
+        } else {
+          candidateId = id('cand');
+          this.database.raw.prepare(
+            `INSERT INTO candidate_request
+              (id, source_event_id, title, proposer_name, background, validation_question, describe, analysis_json, confidence,
+               state, snoozed_until, accepted_task_id, processing_state, processing_job_id, processing_error, context_state, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, ?, 'complete', ?, ?)`,
+          ).run(
+            candidateId, sourceRow.id, draft.title, draft.proposerName, draft.background, draft.validationQuestion, draft.describe,
+            analysisJson, draft.confidence, nextProcessingState, classificationDeferred ? runtimeJobId ?? null : null,
+            classificationDeferred ? classification.reason.slice(0, 300) : null, sourceRow.captured_at, nowIso(),
+          );
+        }
+      } else if (classificationDeferred && existingCandidate) {
+        candidateId = existingCandidate.id;
+        const updatedExistingCandidate = this.database.raw.prepare(
+          `UPDATE candidate_request SET processing_state = 'retry_waiting', processing_job_id = ?, processing_error = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?`,
+        ).run(runtimeJobId ?? null, classification.reason.slice(0, 300), nowIso(), candidateId, existingCandidate.version);
+        if (updatedExistingCandidate.changes !== 1) throw new CandidateVersionConflictError();
+      } else if (existingCandidate && !existingCandidate.accepted_task_id) {
+        candidateId = existingCandidate.id;
+        const ignoredAt = nowIso();
+        const ignored = this.database.raw.prepare("UPDATE candidate_request SET state = 'ignored', updated_at = ?, version = version + 1 WHERE id = ? AND version = ? AND state <> 'accepted'")
+          .run(ignoredAt, candidateId, existingCandidate.version);
+        if (ignored.changes === 1) {
+          const ignoredCandidate = this.getCandidate(candidateId);
+          if (!ignoredCandidate) throw new Error('候选移出活动范围后无法读取退休事实。');
+          this.recordCandidateIgnoredRetirement(ignoredCandidate, ignoredAt, existingCandidate.state);
+          this.staleOwnerDecisionsForRetiredTargets({ candidateIds: [candidateId] });
+        }
+        if (ignored.changes === 1) this.closeUnassignedThreadForCandidate(existingCandidate, ignoredAt);
+      } else if (existingCandidate) {
+        candidateId = existingCandidate.id;
+      }
+      if (candidateId) {
+        const decisionCandidate = this.getCandidate(candidateId);
+        this.database.raw.prepare('UPDATE ai_decision_log SET candidate_id = ?, demand_unit_id = ? WHERE id = ?')
+          .run(candidateId, decisionCandidate?.demand_unit_id ?? null, decisionId);
+      }
+      if (classificationFinal && draft && candidateId && !existingCandidate?.deleted_at) {
+        const revisionState = existingCandidate?.accepted_task_id ? 'proposed' : 'current';
+        if (revisionState === 'current') {
+          this.database.raw.prepare("UPDATE candidate_revision SET state = 'superseded' WHERE candidate_id = ? AND state = 'current'")
+            .run(candidateId);
+        }
+        const revisionCandidate = candidateId ? this.getCandidate(candidateId) : undefined;
+        const revisionDemandUnitId = revisionCandidate
+          ? this.ensureCandidateDemandUnitRecord(revisionCandidate, nowIso())
+          : null;
+        this.database.raw.prepare('UPDATE ai_decision_log SET demand_unit_id = ? WHERE id = ?')
+          .run(revisionDemandUnitId, decisionId);
+        if (revisionDemandUnitId) {
+          this.database.raw.prepare(
+            'UPDATE source_demand_unit SET ai_decision_id = ?, updated_at = ? WHERE id = ? AND (ai_decision_id IS NULL OR ai_decision_id = ?)',
+          ).run(decisionId, nowIso(), revisionDemandUnitId, decisionId);
+          const sourceLink = this.database.raw.prepare(
+            `INSERT INTO source_demand_unit_source
+              (demand_unit_id, source_event_id, source_key, source_role, sequence, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(demand_unit_id, source_event_id) DO UPDATE SET
+               source_key = excluded.source_key,
+               source_role = excluded.source_role,
+               sequence = excluded.sequence`,
+          );
+          orderedRows.forEach((row, index) => sourceLink.run(
+            revisionDemandUnitId,
+            row.id,
+            `s${index + 1}`,
+            row.id === sourceRow.id ? 'anchor' : 'evidence',
+            index,
+            nowIso(),
+          ));
+        }
+        candidateRevisionId = id('candidate-revision');
+        this.database.raw.prepare(
+          `INSERT INTO candidate_revision
+            (id, candidate_id, source_event_id, demand_unit_id, ai_decision_id, source_revision, title, proposer_name, background,
+             validation_question, describe, analysis_json, confidence, evidence_json, provider, model, prompt_version, state, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          candidateRevisionId,
+          candidateId,
+          sourceRow.id,
+          revisionDemandUnitId,
+          decisionId,
+          revision,
+          draft.title,
+          draft.proposerName,
+          draft.background,
+          draft.validationQuestion,
+          draft.describe,
+          candidateAnalysisJson(draft.analysis, contexts, sourceHash, contextHash),
+          draft.confidence,
+          JSON.stringify(draft.analysis?.recognitionEvidence ?? []),
+          this.adapters.classifier.provider,
+          this.adapters.classifier.model,
+          this.adapters.classifier.promptVersion,
+           revisionState,
+           nowIso(),
+         );
+        this.database.raw.prepare('UPDATE candidate_revision SET demand_unit_id = ? WHERE id = ?')
+          .run(revisionDemandUnitId, candidateRevisionId);
+      }
+      if (classificationFinal && draft && !parseMetadata(aggregateRow.metadata_json).deleted && !existingCandidate?.deleted_at) {
+        const threadResult = this.ensureRequirementThread(aggregateRow, draft, classification, candidateRevisionId, orderedRows, currentClassificationContext.association);
+        let thread = threadResult.thread;
+        const revisionCandidate = candidateId ? this.getCandidate(candidateId) : undefined;
+        const revisionDemandUnitId = revisionCandidate?.demand_unit_id ?? null;
+        if (revisionDemandUnitId) {
+          this.database.raw.prepare(
+            `INSERT OR IGNORE INTO requirement_thread_unit
+              (thread_id, demand_unit_id, relation_type, confidence, evidence_json, created_at)
+             VALUES (?, ?, 'primary', 1, ?, ?)`,
+          ).run(thread.id, revisionDemandUnitId, JSON.stringify(['分类结果已绑定到需求线程。']), nowIso());
+        }
+        createdProposalId = threadResult.proposalId;
+        if (!thread.active_task_id && candidateId && !existingCandidate?.accepted_task_id) {
+          const currentCandidate = this.getCandidate(candidateId);
+          const merge = this.candidateMergeResolution(classification, currentClassificationContext.candidateMerge, currentCandidate);
+          if (currentCandidate && merge.targetCandidate && merge.targetThread && merge.decision) {
+            if (merge.automatic) {
+              const applied = this.applyCandidateMerge({
+                currentCandidate,
+                currentThread: thread,
+                targetCandidate: merge.targetCandidate,
+                targetThread: merge.targetThread,
+                decision: merge.decision,
+                actor: 'ai',
+                reason: `${merge.reason} ${merge.decision.reason}`.trim(),
+              });
+              thread = applied.thread;
+              this.database.raw.prepare(
+                `UPDATE notification SET archived_at = COALESCE(archived_at, ?)
+                 WHERE candidate_id IN (?, ?) AND candidate_id <> ?`,
+              ).run(nowIso(), currentCandidate.id, merge.targetCandidate.id, applied.primaryCandidate.id);
+              candidateId = applied.primaryCandidate.id;
+            } else if (merge.decision.sameRequirement && merge.decision.targetCandidateId) {
+              const analysis = parseMetadata(currentCandidate.analysis_json);
+              const suggestionUpdatedAt = nowIso();
+              const targetRoot = this.candidateGroupRoot(merge.targetCandidate);
+              const nextCurrentCandidate = {
+                ...currentCandidate,
+                version: currentCandidate.version + 1,
+                updated_at: suggestionUpdatedAt,
+              };
+              const nextCurrentGroupVersionHash = candidateGroupVersionHash(
+                this.candidateGroupRows(currentCandidate.id).map((member) => member.id === currentCandidate.id ? nextCurrentCandidate : member),
+              );
+              analysis.candidateMergeSuggestion = {
+                suggestionVersion: 1,
+                suggestionId: id('candidate-merge-suggestion'),
+                currentCandidateId: currentCandidate.id,
+                currentRootCandidateId: currentCandidate.id,
+                currentThreadId: thread.id,
+                currentThreadVersion: thread.version,
+                currentSnapshotRevision: candidateSnapshotRevision({ ...currentCandidate, updated_at: suggestionUpdatedAt }, thread),
+                currentGroupMemberIds: this.candidateGroupRows(currentCandidate.id).map((candidate) => candidate.id).sort(),
+                currentGroupVersionHash: nextCurrentGroupVersionHash,
+                targetCandidateId: merge.decision.targetCandidateId,
+                targetRootCandidateId: targetRoot.id,
+                targetThreadId: merge.decision.targetThreadId,
+                targetThreadVersion: merge.targetThread.version,
+                targetSnapshotRevision: candidateSnapshotRevision(targetRoot, merge.targetThread),
+                targetGroupMemberIds: this.candidateGroupRows(targetRoot.id).map((candidate) => candidate.id).sort(),
+                targetGroupVersionHash: candidateGroupVersionHash(this.candidateGroupRows(targetRoot.id)),
+                confidence: merge.decision.confidence,
+                primary: merge.decision.primary,
+                primaryConfidence: merge.decision.primaryConfidence,
+                currentRole: merge.decision.currentRole,
+                targetRole: merge.decision.targetRole,
+                reason: merge.decision.reason,
+                evidence: merge.decision.evidence,
+                candidateSetHash: merge.decision.candidateSetHash,
+              };
+              const suggestionUpdate = this.database.raw.prepare('UPDATE candidate_request SET analysis_json = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?')
+                .run(JSON.stringify(analysis), suggestionUpdatedAt, currentCandidate.id, currentCandidate.version);
+              if (suggestionUpdate.changes !== 1) throw new CandidateVersionConflictError();
+            }
+          }
+        }
+        if (thread.active_task_id && candidateId) {
+          const relation = this.database.raw.prepare(
+            'SELECT relation_type, confidence FROM requirement_thread_source WHERE thread_id = ? AND source_event_id = ?',
+          ).get(thread.id, sourceRow.id) as { relation_type: string; confidence: number | null } | undefined;
+          // Once the server has selected an existing active thread, keep the
+          // source and candidate attached to that task even when the relation
+          // is too weak for automatic field changes. The lower confidence is
+          // still enforced by proposalAutomationDecision, so the patch stays
+          // pending for the owner instead of being auto-applied.
+          if (relation) {
+            linkedTaskId = thread.active_task_id;
+            const currentCandidate = this.getCandidate(candidateId);
+            if (!currentCandidate) throw new Error('候选需求不存在。');
+            if (currentCandidate.accepted_task_id && currentCandidate.accepted_task_id !== linkedTaskId) {
+              throw new CandidateVersionConflictError();
+            }
+            if (!currentCandidate.accepted_task_id) {
+              const acceptedCandidate = this.database.raw.prepare(
+                "UPDATE candidate_request SET state = 'accepted', accepted_task_id = ?, snoozed_until = NULL, updated_at = ?, version = version + 1 WHERE id = ? AND version = ? AND accepted_task_id IS NULL",
+              ).run(linkedTaskId, nowIso(), currentCandidate.id, currentCandidate.version);
+              if (acceptedCandidate.changes !== 1) throw new CandidateVersionConflictError();
+            }
+            const associationDemandUnitId = this.linkTaskSource(
+              linkedTaskId,
+              sourceRow.id,
+              'thread_update',
+              nowIso(),
+              currentCandidate.demand_unit_id ?? null,
+            );
+            if (relation?.relation_type === 'semantic_unique') {
+              this.database.raw.prepare(
+                `INSERT INTO task_event
+                  (id, task_id, event_type, actor_type, visibility, summary, source_event_id, demand_unit_id, before_json, after_json, occurred_at, recorded_at, version)
+                 VALUES (?, ?, 'source_auto_associated', 'ai', 'private', ?, ?, ?, ?, ?, ?, ?, ?)`,
+              ).run(
+                id('evt'), linkedTaskId, 'AI 将一条高置信后续来源自动关联到当前任务。', sourceRow.id, associationDemandUnitId,
+                JSON.stringify({ linked: false }), JSON.stringify({ linked: true, relationType: 'semantic_unique', confidence: relation.confidence }),
+                sourceRow.occurred_at, nowIso(), this.getTask(linkedTaskId)?.version ?? 1,
+              );
+            }
+          }
+        }
+      }
+      const notificationTaskId = existingCandidate?.deleted_at ? null : existingCandidate?.accepted_task_id ?? linkedTaskId;
+      if (notificationTaskId && (createdProposalId || existingCandidate?.accepted_task_id || linkedTaskId)) {
+        this.database.raw.prepare(
+          `INSERT OR IGNORE INTO notification
+            (id, task_id, task_event_id, candidate_id, notification_type, dedupe_key, reason, read_at, snoozed_until, archived_at, created_at)
+           VALUES (?, ?, NULL, ?, 'immediate', ?, ?, NULL, NULL, NULL, ?)`,
+        ).run(
+          id('notice'),
+          notificationTaskId,
+          candidateId,
+          `candidate:${candidateId}:source:${revision}`,
+          createdProposalId
+            ? '正式任务收到后续来源或原始来源发生更新；符合安全门的内部修改会自动应用，其他修改保留待确认。'
+            : '后续来源已关联到正式任务或原始来源发生更新；当前没有可应用的任务字段修改，请复核来源或文档背景。',
+          nowIso(),
+        );
+      } else if (!notificationTaskId && draft && candidateId && !existingCandidate?.deleted_at) {
+        this.database.raw.prepare(
+          `INSERT OR IGNORE INTO notification
+            (id, task_id, task_event_id, candidate_id, notification_type, dedupe_key, reason, read_at, snoozed_until, archived_at, created_at)
+           VALUES (?, NULL, NULL, ?, 'immediate', ?, ?, NULL, NULL, NULL, ?)`,
+        ).run(
+          id('notice'), candidateId, `candidate:${candidateId}:source:${revision}:${classificationOutcome}`,
+          classificationDeferred
+            ? '消息已保存，AI 正在继续整理这条明确需求。'
+            : source.ownerMentioned ? '群聊中有人 @你并提出了可能的数据需求。' : '发现一条新的候选数据需求。',
+          nowIso(),
+        );
+      }
+      if (classificationFinal) {
+        for (const current of currentRows) {
+          const currentMetadata = parseMetadata(current.metadata_json);
+          if (classification.metadata?.calendarClassification) {
+            currentMetadata.calendarClassification = classification.metadata.calendarClassification;
+          }
+          currentMetadata.classificationRevision = revision;
+          if (currentRows.length > 1) currentMetadata.classificationBatchSourceIds = currentRows.map((row) => row.id);
+          else delete currentMetadata.classificationBatchSourceIds;
+          this.database.raw.prepare('UPDATE source_event SET metadata_json = ? WHERE id = ?').run(JSON.stringify(currentMetadata), current.id);
+        }
+      }
+      this.assertRuntimeActive(runtimeJobId, leaseOwner);
+    });
+    if (staleSources) {
+      if (staleAttempts >= 3) throw new Error('来源在判断期间持续更新，请稍后重试。');
+      const stalePrimary = staleSources.find((row) => row.id === sourceRow.id) ?? staleSources[0]!;
+      return this.classifyCapturedSourceInternal(stalePrimary, guidance, deduplicated, staleAttempts + 1, runtimeJobId, leaseOwner, staleSources, operationContext);
+    }
+    if (classificationDeferred) {
+      if (runtimeJobId) {
+        this.runtime.checkpoint(runtimeJobId, 'classification_retry_waiting', {
+          sourceEventIds: orderedRows.map((row) => row.id),
+          candidateId,
+          outcome: classificationOutcome,
+        }, leaseOwner);
+      }
+      this.log('ai', 'warn', 'classifier.retry_waiting', classification.reason, {
+        sourceEventId: sourceRow.id,
+        sourceCount: orderedRows.length,
+        candidateId,
+        outcome: classificationOutcome,
+        errorCode: classification.errorCode,
+      });
+      return this.classificationResultWithIds({
+        deduplicated,
+        sourceEventId: sourceRow.id,
+        sourceEventIds: orderedRows.map((row) => row.id),
+        sourceRevision: revision,
+        errorCode: stableSourceFailureCode(classification.errorCode),
+        candidate: candidateId ? this.getCandidate(candidateId) : null,
+        classificationDeferred: true,
+        recoveryReason: classification.reason,
+        metadata: classification.metadata,
+      });
+    }
+    if (recoveredCandidate && runtimeJobId) {
+      this.runtime.checkpoint(runtimeJobId, 'classification_recovered', { sourceEventIds: orderedRows.map((row) => row.id), candidateId }, leaseOwner);
+    }
+    if (!classificationDeferred) {
+      const ownerSource = [...orderedRows].reverse().find((row) => this.isTrustedOwnerSource(row));
+      if (ownerSource) {
+        await this.processOwnerIntent(ownerSource, classification, revision, contextRows, ownerTargetsForProcess, ownerTargetSnapshotRetry, operationContext);
+      }
+    }
+    if (createdProposalId) this.dispatchTaskUpdateProposal(createdProposalId, runtimeJobId ?? null, leaseOwner ?? null);
+    else this.dispatchPendingProposalsForSources(orderedRows.map((row) => row.id), runtimeJobId ?? null, leaseOwner ?? null);
+    if (linkedTaskId) this.projectTaskMemory(linkedTaskId);
+    this.assertRuntimeActive(runtimeJobId, leaseOwner);
+    // A follow-up source can be linked to an accepted task, but its model
+    // changes remain pending unless the automatic safety gate accepts them. Do not
+    // refresh the task-memory projection from an unapproved draft.
+    const finalResult = this.classificationResultWithIds({
+      deduplicated,
+      sourceEventId: sourceRow.id,
+      sourceEventIds: orderedRows.map((row) => row.id),
+      sourceRevision: revision,
+      candidate: candidateId ? this.getCandidate(candidateId) : null,
+    });
+    if (runtimeJobId) this.runtime.checkpoint(runtimeJobId, 'classification_persisted', this.classificationRuntimeSummary(finalResult, {
+      sourceEventIds: orderedRows.map((row) => row.id),
+    }), leaseOwner);
+    if (decisionCreated) {
+      this.log('ai', classification.usedFallback ? 'warn' : 'info', 'classifier.completed', classification.reason, {
+        sourceEventId: sourceRow.id,
+        sourceCount: orderedRows.length,
+        isDataRequest: classification.isDataRequest,
+        usedFallback: classification.usedFallback,
+        errorCode: classification.errorCode,
+        latencyMs: Date.now() - startedAt,
+      });
+    }
+    return finalResult;
+  }
+
+  private sourceRowToEvent(sourceRow: SourceEventRow, documentContexts: SourceDocumentContext[] = []): NormalizedSourceEvent {
+    return {
+      externalId: sourceRow.external_id,
+      sourceType: sourceRow.source_type,
+      conversationId: sourceRow.conversation_id,
+      senderId: sourceRow.sender_id,
+      senderName: sourceRow.sender_name,
+      content: sourceRow.content,
+      occurredAt: sourceRow.occurred_at,
+      ownerMentioned: Boolean(sourceRow.owner_mentioned),
+      sourceUrl: sourceRow.source_url ?? undefined,
+      completeness: sourceRow.completeness,
+      discoveryReason: sourceRow.discovery_reason,
+      metadata: parseMetadata(sourceRow.metadata_json),
+      documentContexts,
+    };
+  }
+
+  listCandidates(state?: CandidateState, deletedState: CandidateDeletedState = 'active') {
+    const select = `SELECT candidate_request.*,
+      source_event.source_type,
+      source_event.owner_mentioned,
+      source_event.completeness AS source_completeness,
+      source_event.discovery_reason,
+      source_event.source_url,
+      source_event.content AS source_content,
+      ai_decision_log.reason AS ai_reason,
+      ai_decision_log.provider AS ai_provider,
+      ai_decision_log.model AS ai_model,
+      ai_decision_log.prompt_version
+      FROM candidate_request
+      JOIN source_event ON source_event.id = candidate_request.source_event_id
+      LEFT JOIN source_demand_unit ON source_demand_unit.id = candidate_request.demand_unit_id
+      LEFT JOIN ai_decision_log ON ai_decision_log.id = (
+        SELECT latest.id FROM ai_decision_log AS latest
+        WHERE (candidate_request.demand_unit_id IS NOT NULL AND latest.demand_unit_id = candidate_request.demand_unit_id)
+           OR (candidate_request.demand_unit_id IS NULL AND latest.demand_unit_id IS NULL AND latest.source_event_id = source_event.id)
+        ORDER BY latest.created_at DESC, latest.rowid DESC LIMIT 1
+      )`;
+    const clauses: string[] = [];
+    const args: string[] = [];
+    if (state) {
+      clauses.push('candidate_request.state = ?');
+      args.push(state);
+    }
+    if (deletedState === 'active') clauses.push('candidate_request.deleted_at IS NULL');
+    if (deletedState === 'only') clauses.push('candidate_request.deleted_at IS NOT NULL');
+    clauses.push("(candidate_request.demand_unit_id IS NULL OR source_demand_unit.state <> 'superseded' OR candidate_request.accepted_task_id IS NOT NULL)");
+    clauses.push('candidate_request.merged_into_candidate_id IS NULL');
+    clauses.push("NOT (candidate_request.title = 'AI 整理待重试' AND candidate_request.confidence = 0 AND candidate_request.background = '' AND candidate_request.validation_question = '' AND candidate_request.describe = '')");
+    const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '';
+    const rows = this.database.raw
+      .prepare(`${select}${where} ORDER BY candidate_request.created_at DESC`)
+      .all(...args) as Array<CandidateRow & Record<string, unknown>>;
+    return rows.map((row) => ({
+      ...row,
+      analysis: parseMetadata(row.analysis_json),
+      thread_association: this.candidateThreadAssociation(row),
+      merge_group: this.candidateMergeGroupView(row),
+    }));
+  }
+
+  listCandidatesPublic(state?: CandidateState, deletedState: CandidateDeletedState = 'active') {
+    return this.listCandidates(state, deletedState)
+      .map((row) => this.minimalCandidateView(row as CandidateRow & Record<string, unknown>));
+  }
+
+  private sourceContentsByIds(sourceIds: Iterable<string>) {
+    const ids = [...new Set([...sourceIds].filter((value): value is string => typeof value === 'string' && Boolean(value)))];
+    if (!ids.length) return [];
+    const placeholders = ids.map(() => '?').join(',');
+    return (this.database.raw.prepare(`SELECT content FROM source_event WHERE id IN (${placeholders}) ORDER BY occurred_at ASC, id ASC`)
+      .all(...ids) as Array<{ content: string | null }>)
+      .map((row) => typeof row.content === 'string' ? row.content : '')
+      .filter(Boolean);
+  }
+
+  private addDemandUnitSourceIds(sourceIds: Set<string>, demandUnitId: string | null | undefined) {
+    if (!demandUnitId) return;
+    const rows = this.database.raw.prepare(
+      'SELECT source_event_id FROM source_demand_unit_source WHERE demand_unit_id = ? ORDER BY sequence ASC, source_event_id ASC',
+    ).all(demandUnitId) as Array<{ source_event_id: string }>;
+    for (const row of rows) sourceIds.add(row.source_event_id);
+  }
+
+  private addThreadSourceIds(sourceIds: Set<string>, threadId: string | null | undefined) {
+    if (!threadId) return;
+    const rows = this.database.raw.prepare(
+      `SELECT source_event_id FROM requirement_thread_source WHERE thread_id = ?
+       UNION
+       SELECT source_demand_unit_source.source_event_id
+       FROM requirement_thread_unit
+       JOIN source_demand_unit_source ON source_demand_unit_source.demand_unit_id = requirement_thread_unit.demand_unit_id
+       WHERE requirement_thread_unit.thread_id = ?`,
+    ).all(threadId, threadId) as Array<{ source_event_id: string }>;
+    for (const row of rows) sourceIds.add(row.source_event_id);
+  }
+
+  private addTaskSourceIds(sourceIds: Set<string>, taskId: string | null | undefined) {
+    if (!taskId) return;
+    const rows = this.database.raw.prepare(
+      `SELECT source_event_id FROM task_source_link WHERE task_id = ?
+       UNION
+       SELECT source_event_id FROM task_event WHERE task_id = ? AND source_event_id IS NOT NULL
+       UNION
+       SELECT source_event_id FROM task_update_proposal WHERE task_id = ? AND source_event_id IS NOT NULL
+       UNION
+       SELECT source_demand_unit_source.source_event_id
+       FROM candidate_request
+       JOIN source_demand_unit_source ON source_demand_unit_source.demand_unit_id = candidate_request.demand_unit_id
+       WHERE candidate_request.accepted_task_id = ?`,
+    ).all(taskId, taskId, taskId, taskId) as Array<{ source_event_id: string }>;
+    for (const row of rows) sourceIds.add(row.source_event_id);
+    const task = this.getTask(taskId);
+    if (task?.thread_id) this.addThreadSourceIds(sourceIds, task.thread_id);
+  }
+
+  private expandDemandUnitSourceClosure(sourceIds: Set<string>) {
+    for (let pass = 0; pass < 32; pass += 1) {
+      const before = sourceIds.size;
+      const ids = [...sourceIds];
+      if (!ids.length) return;
+      const sourcePlaceholders = ids.map(() => '?').join(',');
+      const units = this.database.raw.prepare(
+        `SELECT DISTINCT demand_unit_id
+         FROM source_demand_unit_source
+         WHERE source_event_id IN (${sourcePlaceholders})`,
+      ).all(...ids) as Array<{ demand_unit_id: string }>;
+      const unitIds = [...new Set(units.map((row) => row.demand_unit_id).filter(Boolean))];
+      if (unitIds.length) {
+        const unitPlaceholders = unitIds.map(() => '?').join(',');
+        const relatedSources = this.database.raw.prepare(
+          `SELECT DISTINCT source_event_id
+           FROM source_demand_unit_source
+           WHERE demand_unit_id IN (${unitPlaceholders})`,
+        ).all(...unitIds) as Array<{ source_event_id: string }>;
+        for (const row of relatedSources) sourceIds.add(row.source_event_id);
+      }
+      if (sourceIds.size === before) return;
+    }
+  }
+
+  private sourceContentsForCandidateView(row: CandidateRow & Record<string, unknown>) {
+    const sourceIds = new Set<string>();
+    const addCandidate = (candidateId: string | null | undefined) => {
+      if (!candidateId) return;
+      const candidate = this.getCandidate(candidateId);
+      if (!candidate) return;
+      sourceIds.add(candidate.source_event_id);
+      this.addDemandUnitSourceIds(sourceIds, candidate.demand_unit_id);
+      this.addTaskSourceIds(sourceIds, candidate.accepted_task_id);
+      const thread = this.threadForCandidate(candidate);
+      if (thread) {
+        this.addThreadSourceIds(sourceIds, thread.id);
+        this.addTaskSourceIds(sourceIds, thread.active_task_id);
+      }
+    };
+    addCandidate(row.id);
+    const merge = this.candidateMergeGroupView(row);
+    if (merge) {
+      this.addThreadSourceIds(sourceIds, merge.threadId);
+      for (const source of merge.sources) {
+        sourceIds.add(source.sourceEventId);
+        addCandidate(source.candidateId);
+      }
+      addCandidate(merge.suggestion?.targetCandidateId);
+    }
+    const association = this.candidateThreadAssociation(row);
+    if (association) {
+      this.addThreadSourceIds(sourceIds, association.threadId);
+      for (const option of association.options) {
+        this.addThreadSourceIds(sourceIds, option.id);
+        this.addTaskSourceIds(sourceIds, option.activeTaskId);
+      }
+    }
+    this.expandDemandUnitSourceClosure(sourceIds);
+    return this.sourceContentsByIds(sourceIds);
+  }
+
+  private sourceContentsForTask(taskId: string, extraSourceIds: Iterable<string> = []) {
+    const sourceIds = new Set<string>(extraSourceIds);
+    this.addTaskSourceIds(sourceIds, taskId);
+    this.expandDemandUnitSourceClosure(sourceIds);
+    return this.sourceContentsByIds(sourceIds);
+  }
+
+  private minimalCandidateView(row: CandidateRow & Record<string, unknown>) {
+    const sourceContents = this.sourceContentsForCandidateView(row);
+    const association = this.candidateThreadAssociation(row);
+    const merge = this.candidateMergeGroupView(row);
+    const safeMerge = merge ? {
+      threadId: merge.threadId,
+      threadVersion: merge.threadVersion,
+      groupVersionHash: merge.groupVersionHash,
+      mutationVersionHash: merge.mutationVersionHash,
+      sourceCount: merge.sourceCount,
+      candidateCount: merge.candidateCount,
+      primaryCandidateId: merge.primaryCandidateId,
+      primaryTitle: safeCandidateNarrative(merge.primaryTitle, sourceContents, '候选主体摘要已保留；来源正文默认隐藏。', 160),
+      primaryReason: '当前候选主体已建立受控归并视图。',
+      primaryConfidence: merge.primaryConfidence,
+      suggestion: merge.suggestion ? {
+        suggestionId: merge.suggestion.suggestionId,
+        targetCandidateId: merge.suggestion.targetCandidateId,
+        targetThreadId: merge.suggestion.targetThreadId,
+        confidence: merge.suggestion.confidence,
+        primary: merge.suggestion.primary,
+        primaryConfidence: merge.suggestion.primaryConfidence,
+        currentRole: merge.suggestion.currentRole,
+        targetRole: merge.suggestion.targetRole,
+        reason: '候选归并建议已保留，需主人确认；来源正文默认隐藏。',
+        evidence: [],
+        target: merge.suggestion.target ? {
+          candidateId: merge.suggestion.target.candidateId,
+          title: safeCandidateNarrative(merge.suggestion.target.title, sourceContents, '目标候选摘要已保留；来源正文默认隐藏。', 160),
+        } : null,
+      } : null,
+      sources: merge.sources.map((source) => ({
+        sourceScope: sourceScope(row.id, source.sourceEventId),
+        version: source.version,
+        sourceType: source.sourceType,
+        occurredAt: source.occurredAt,
+        relationType: source.relationType,
+        confidence: source.confidence,
+        role: source.role,
+        candidateId: source.candidateId,
+        title: safeCandidateNarrative(source.title, sourceContents, '来源摘要已保留；正文默认隐藏。', 160),
+        isPrimary: source.isPrimary,
+      })),
+    } : null;
+    return minimalCandidateDtoSchema.parse({
+      id: row.id,
+      version: row.version,
+      title: safeCandidateNarrative(row.title, sourceContents, '候选标题已生成；来源正文默认隐藏。', 160),
+      // Sender identity is source/provider metadata, not a safe derived
+      // summary. Keep the public candidate DTO on a fixed role label; the
+      // owner-controlled verification path is the only place that can expose
+      // bounded source content.
+      proposer_name: '需求方',
+      background: safeCandidateNarrative(row.background, sourceContents, '来源背景已保留，需主人主动核验。', 2_000),
+      validation_question: safeCandidateNarrative(row.validation_question, sourceContents, '希望验证的问题已保留，需主人主动核验。', 1_000),
+      describe: safeCandidateNarrative(row.describe, sourceContents, 'AI 摘要已生成；来源正文默认隐藏。', 2_000),
+      confidence: row.confidence,
+      state: row.state,
+      snoozed_until: row.snoozed_until,
+      accepted_task_id: row.accepted_task_id,
+      deleted_at: row.deleted_at,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      source_type: row.source_type,
+      owner_mentioned: row.owner_mentioned,
+      source_completeness: row.source_completeness,
+      discovery_reason: '来源已保存，可由系统主人主动核验。',
+      source_scope: sourceScope(row.id, row.source_event_id),
+      processing_state: row.processing_state,
+      processing_error: row.processing_error ? '来源整理失败，等待安全重试。' : null,
+      context_state: row.context_state,
+      context_reason: row.context_reason
+        ? safeCandidateNarrative(row.context_reason, sourceContents, '来源上下文完整性需主人核验。', 300)
+        : null,
+      recovered_at: row.recovered_at,
+      analysis: minimalCandidateAnalysis(parseMetadata(row.analysis_json), sourceContents),
+      thread_association: association ? {
+        threadId: association.threadId,
+        status: association.status,
+        requiresConfirmation: association.requiresConfirmation,
+        options: association.options.map((option) => ({
+          id: option.id,
+          title: safeCandidateNarrative(option.title, sourceContents, '候选线程摘要已保留；来源正文默认隐藏。', 160),
+          describe: safeCandidateNarrative(option.describe, sourceContents, '候选线程摘要已保留；来源正文默认隐藏。', 2_000),
+          status: option.status,
+          activeTaskId: option.activeTaskId,
+          activeTaskTitle: option.activeTaskTitle
+            ? safeCandidateNarrative(option.activeTaskTitle, sourceContents, '已有任务摘要已保留；来源正文默认隐藏。', 160)
+            : null,
+          lastActivityAt: option.lastActivityAt,
+        })),
+      } : null,
+      merge_group: safeMerge,
+    });
+  }
+
+  listPendingOwnerActions(limit = 20) {
+    const rows = this.database.raw.prepare(
+      `SELECT owner_decision.id, owner_decision.action, owner_decision.state,
+              owner_decision.candidate_id, owner_decision.task_id,
+              owner_decision.confidence, owner_decision.schedule_text,
+              owner_decision.created_at
+       FROM owner_decision
+       LEFT JOIN candidate_request ON candidate_request.id = owner_decision.candidate_id
+       LEFT JOIN task ON task.id = owner_decision.task_id
+       WHERE owner_decision.state IN ('review','failed')
+         AND owner_decision.action <> 'uncertain'
+         AND owner_decision.rowid = (
+           SELECT latest.rowid FROM owner_decision AS latest
+           WHERE latest.source_event_id = owner_decision.source_event_id
+           ORDER BY latest.created_at DESC, latest.rowid DESC LIMIT 1
+         )
+         AND (owner_decision.candidate_id IS NULL
+              OR (candidate_request.deleted_at IS NULL
+                  AND (candidate_request.state IN ('pending','snoozed')
+                       OR (candidate_request.state = 'accepted' AND owner_decision.task_id IS NOT NULL))))
+         AND (owner_decision.task_id IS NULL OR (task.deleted_at IS NULL AND task.record_state = 'active'))
+         AND NOT (owner_decision.action = 'request_context'
+                  AND owner_decision.task_id IS NULL
+                  AND candidate_request.state IN ('pending','snoozed'))
+       ORDER BY owner_decision.created_at DESC
+       LIMIT ?`,
+    ).all(Math.max(1, Math.min(limit, 50))) as Array<{
+      id: string;
+      action: OwnerIntentDecision['action'];
+      state: 'review' | 'failed';
+      candidate_id: string | null;
+      task_id: string | null;
+      confidence: number;
+      schedule_text: string | null;
+      created_at: string;
+    }>;
+    return rows.map((row) => ({
+      id: row.id,
+      action: row.action,
+      state: row.state,
+      candidateId: row.candidate_id,
+      taskId: row.task_id,
+      confidence: row.confidence,
+      scheduleText: row.schedule_text,
+      createdAt: row.created_at,
+      message: row.state === 'failed'
+        ? '主人动作已经识别，但执行没有完成；来源和判断均已保留，可继续重试。'
+        : row.candidate_id
+          ? '主人动作已经识别，但未通过自动执行安全检查，等待主人确认。'
+          : '主人动作已经识别，但尚未安全关联到唯一候选，因此没有执行。',
+    }));
+  }
+
+  listPendingOwnerActionsPublic(limit = 20) {
+    return this.listPendingOwnerActions(limit).map(({ scheduleText, ...action }) => ({
+      ...action,
+      scheduleDetected: Boolean(scheduleText?.trim()),
+    }));
+  }
+
+  private candidateMergeGroupView(candidate: CandidateRow) {
+    const thread = this.threadForCandidate(candidate);
+    if (!thread) return null;
+    let sources = this.database.raw.prepare(
+      `SELECT source_event.id AS source_event_id, source_event.external_id, source_event.source_type,
+              source_event.sender_name, source_event.content, source_event.occurred_at,
+               COALESCE(requirement_thread_source.relation_type, requirement_thread_unit.relation_type) AS relation_type,
+               COALESCE(requirement_thread_source.confidence, requirement_thread_unit.confidence) AS confidence,
+               COALESCE(requirement_thread_source.source_role, 'unknown') AS source_role,
+               COALESCE(requirement_thread_source.role_reason, '') AS role_reason,
+               candidate_request.id AS candidate_id, candidate_request.title AS candidate_title,
+               candidate_request.merged_into_candidate_id,
+               candidate_request.demand_unit_id
+        FROM requirement_thread_unit
+        JOIN candidate_request ON candidate_request.demand_unit_id = requirement_thread_unit.demand_unit_id
+        JOIN source_demand_unit_source ON source_demand_unit_source.demand_unit_id = requirement_thread_unit.demand_unit_id
+        JOIN source_event ON source_event.id = source_demand_unit_source.source_event_id
+        LEFT JOIN requirement_thread_source
+          ON requirement_thread_source.thread_id = requirement_thread_unit.thread_id
+         AND requirement_thread_source.source_event_id = source_event.id
+        WHERE requirement_thread_unit.thread_id = ?
+        ORDER BY source_event.occurred_at ASC, source_event.id ASC, candidate_request.id ASC`,
+    ).all(thread.id) as Array<{
+      source_event_id: string;
+      external_id: string;
+      source_type: string;
+      sender_name: string;
+      content: string;
+      occurred_at: string;
+      relation_type: string;
+      confidence: number | null;
+      source_role: string;
+      role_reason: string;
+      candidate_id: string | null;
+      candidate_title: string | null;
+      merged_into_candidate_id: string | null;
+      demand_unit_id: string | null;
+    }>;
+    if (!sources.length) {
+      sources = this.database.raw.prepare(
+        `SELECT source_event.id AS source_event_id, source_event.external_id, source_event.source_type,
+                source_event.sender_name, source_event.content, source_event.occurred_at,
+                requirement_thread_source.relation_type, requirement_thread_source.confidence,
+                requirement_thread_source.source_role, requirement_thread_source.role_reason,
+                candidate_request.id AS candidate_id, candidate_request.title AS candidate_title,
+                candidate_request.merged_into_candidate_id, candidate_request.demand_unit_id
+         FROM requirement_thread_source
+         JOIN source_event ON source_event.id = requirement_thread_source.source_event_id
+         LEFT JOIN candidate_request ON candidate_request.source_event_id = source_event.id
+         WHERE requirement_thread_source.thread_id = ?
+         ORDER BY source_event.occurred_at ASC, source_event.id ASC`,
+      ).all(thread.id) as typeof sources;
+    }
+    const activeCandidateSources = sources.filter((source) => source.candidate_id);
+    const primaryCandidate = activeCandidateSources.find((source) => source.source_event_id === thread.primary_source_event_id)
+      ?? activeCandidateSources.find((source) => source.candidate_id === candidate.id)
+      ?? null;
+    const suggestionValue = parseMetadata(candidate.analysis_json).candidateMergeSuggestion;
+    const suggestionRecord = suggestionValue && typeof suggestionValue === 'object'
+      ? suggestionValue as Record<string, unknown>
+      : null;
+    const suggestionTargetId = typeof suggestionRecord?.targetCandidateId === 'string' ? suggestionRecord.targetCandidateId : null;
+    const suggestionTarget = suggestionTargetId ? this.getCandidate(suggestionTargetId) : null;
+    const suggestionTargetThread = suggestionTarget ? this.threadForCandidate(suggestionTarget) : null;
+    const suggestion = suggestionTarget && suggestionTargetThread && suggestionRecord
+      && this.candidateMergeSuggestionMatches(suggestionRecord, candidate, thread, suggestionTarget, suggestionTargetThread)
+      ? suggestionRecord
+      : null;
+    const suggestionTargetView = suggestionTarget && suggestion ? {
+      candidateId: suggestionTarget.id,
+      version: suggestionTarget.version,
+      title: suggestionTarget.title,
+      proposerName: suggestionTarget.proposer_name,
+      occurredAt: (this.database.raw.prepare('SELECT occurred_at FROM source_event WHERE id = ?').get(suggestionTarget.source_event_id) as { occurred_at?: string } | undefined)?.occurred_at ?? null,
+    } : null;
+    const groupRows = this.candidateGroupRows(this.candidateGroupRoot(candidate).id);
+    const mutationVersionHash = suggestionTarget
+      ? candidatePairVersionHash(candidate, suggestionTarget)
+      : candidateGroupVersionHash(groupRows);
+    return {
+      threadId: thread.id,
+      threadVersion: thread.version,
+      groupVersionHash: candidateGroupVersionHash(groupRows),
+      mutationVersionHash,
+      sourceCount: sources.length,
+      candidateCount: activeCandidateSources.length,
+      primaryCandidateId: primaryCandidate?.candidate_id ?? candidate.id,
+      primarySourceEventId: thread.primary_source_event_id ?? candidate.source_event_id,
+      primaryTitle: primaryCandidate?.candidate_title ?? candidate.title,
+      primaryReason: thread.primary_reason || '当前候选暂作为主体，等待主人确认。',
+      primaryConfidence: thread.primary_confidence,
+      suggestion: suggestion ? {
+        suggestionId: suggestion.suggestionId as string,
+        targetCandidateId: suggestionTarget!.id,
+        targetThreadId: suggestionTargetThread!.id,
+        confidence: typeof suggestion.confidence === 'number' ? suggestion.confidence : null,
+        primary: suggestion.primary === 'current' || suggestion.primary === 'target' ? suggestion.primary : null,
+        primaryConfidence: typeof suggestion.primaryConfidence === 'number' ? suggestion.primaryConfidence : null,
+        currentRole: typeof suggestion.currentRole === 'string' ? suggestion.currentRole : null,
+        targetRole: typeof suggestion.targetRole === 'string' ? suggestion.targetRole : null,
+        reason: typeof suggestion.reason === 'string' ? suggestion.reason : '',
+        evidence: Array.isArray(suggestion.evidence) ? suggestion.evidence.filter((value): value is string => typeof value === 'string') : [],
+        candidateSetHash: typeof suggestion.candidateSetHash === 'string' ? suggestion.candidateSetHash : '',
+        target: suggestionTargetView,
+      } : null,
+      sources: sources.map((source) => ({
+        sourceEventId: source.source_event_id,
+        version: source.candidate_id ? (this.getCandidate(source.candidate_id)?.version ?? 1) : 1,
+        externalId: source.external_id,
+        sourceType: source.source_type,
+        senderName: projectUntrustedSenderName(source.sender_name),
+        content: source.content,
+        occurredAt: source.occurred_at,
+        relationType: source.relation_type,
+        confidence: source.confidence,
+        role: source.source_role || 'unknown',
+        roleReason: source.role_reason || '',
+        candidateId: source.candidate_id,
+        demandUnitId: source.demand_unit_id,
+        title: source.candidate_title,
+        isPrimary: source.source_event_id === (thread.primary_source_event_id ?? candidate.source_event_id),
+      })),
+    };
+  }
+
+  getCandidate(candidateId: string) {
+    return (this.database.raw.prepare('SELECT * FROM candidate_request WHERE id = ?').get(candidateId) as CandidateRow) ?? null;
+  }
+
+  candidateVersionDto(candidateId: string) {
+    const candidate = this.getCandidate(candidateId);
+    return candidate ? {
+      id: candidate.id,
+      version: candidate.version,
+      state: candidate.state,
+      processing_state: candidate.processing_state,
+      deleted_at: candidate.deleted_at,
+      accepted_task_id: candidate.accepted_task_id,
+      updated_at: candidate.updated_at,
+    } : null;
+  }
+
+  /** Return the same canonical candidate projection used by the inbox after a mutation. */
+  candidateCanonicalDto(candidateId: string) {
+    return this.listCandidates(undefined, 'all').find((candidate) => candidate.id === candidateId)
+      ?? this.candidateVersionDto(candidateId);
+  }
+
+  /** Replace candidate mutation payloads with canonical candidate/group state before they reach clients. */
+  candidateMutationCanonical(payload: unknown) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payload;
+    const result = { ...(payload as Record<string, unknown>) };
+    for (const key of ['candidate', 'splitCandidate', 'remainingCandidate', 'targetCandidate']) {
+      const value = result[key];
+      if (!value || typeof value !== 'object' || typeof (value as { id?: unknown }).id !== 'string') continue;
+      result[key] = this.candidateCanonicalDto((value as { id: string }).id);
+    }
+    return result;
+  }
+
+  candidateVersionFenceForSource(sourceEventId: string, expectedVersion: number) {
+    const candidates = this.getCandidatesForSources([sourceEventId]);
+    if (candidates.length !== 1) return null;
+    return { candidateId: candidates[0]!.id, expectedVersion };
+  }
+
+  candidateVersionDtoForSource(sourceEventId: string) {
+    const candidates = this.getCandidatesForSources([sourceEventId]);
+    return candidates.length === 1 ? this.candidateVersionDto(candidates[0]!.id) : null;
+  }
+
+  private candidateGroupRoot(candidate: CandidateRow) {
+    if (!candidate.merged_into_candidate_id) return candidate;
+    const root = this.getCandidate(candidate.merged_into_candidate_id);
+    if (!root || root.merged_into_candidate_id) throw new Error('候选归并关系已损坏，请先刷新或导出诊断。');
+    return root;
+  }
+
+  private clearCandidateMergeSuggestion(candidateIds: string[], timestamp = nowIso()) {
+    for (const candidateId of candidateIds) {
+      const candidate = this.getCandidate(candidateId);
+      if (!candidate) continue;
+      const analysis = parseMetadata(candidate.analysis_json);
+      if (!Object.prototype.hasOwnProperty.call(analysis, 'candidateMergeSuggestion')) continue;
+      delete analysis.candidateMergeSuggestion;
+      const updated = this.database.raw.prepare('UPDATE candidate_request SET analysis_json = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?')
+        .run(JSON.stringify(analysis), timestamp, candidateId, candidate.version);
+      if (updated.changes !== 1) throw new CandidateVersionConflictError();
+    }
+  }
+
+  private assertCandidateActive(candidate: CandidateRow) {
+    if (candidate.deleted_at) throw new Error('回收站中的候选只能恢复，不能继续操作。');
+  }
+
+  private assertCandidateVersion(candidate: CandidateRow, expectedVersion?: number) {
+    if (typeof expectedVersion !== 'number' || !Number.isInteger(expectedVersion) || expectedVersion <= 0 || expectedVersion !== candidate.version) {
+      throw new CandidateVersionConflictError();
+    }
+  }
+
+  private assertCandidateGroupSnapshot(expectedGroup: CandidateRow[], actualGroup: CandidateRow[], expectedGroupVersionHash?: string) {
+    const sameSnapshot = expectedGroup.length === actualGroup.length
+      && expectedGroup.every((expected, index) => {
+        const actual = actualGroup[index];
+        if (!actual) return false;
+        return actual.id === expected.id
+          && actual.version === expected.version
+          && actual.updated_at === expected.updated_at
+          && actual.merged_into_candidate_id === expected.merged_into_candidate_id
+          && actual.accepted_task_id === expected.accepted_task_id
+          && actual.deleted_at === expected.deleted_at;
+      });
+    if (!sameSnapshot || (expectedGroup.length > 1 && candidateGroupVersionHash(actualGroup) !== expectedGroupVersionHash)) {
+      throw new CandidateVersionConflictError();
+    }
+  }
+
+  private updateCandidateGroupDeletedStateInTransaction(
+    groupSnapshot: CandidateRow[],
+    rootCandidateId: string,
+    timestamp: string,
+    deletedAt: string | null,
+  ) {
+    const restoring = deletedAt === null;
+    for (const member of groupSnapshot) {
+      const isRoot = member.id === rootCandidateId;
+      const relationPredicate = isRoot
+        ? 'merged_into_candidate_id IS NULL'
+        : 'merged_into_candidate_id = ?';
+      const query = restoring
+        ? `UPDATE candidate_request
+           SET deleted_at = NULL, updated_at = ?, version = version + 1
+           WHERE id = ? AND ${relationPredicate} AND accepted_task_id IS NULL
+             AND version = ? AND deleted_at IS NOT NULL`
+        : `UPDATE candidate_request
+           SET deleted_at = ?, updated_at = ?, version = version + 1
+           WHERE id = ? AND ${relationPredicate} AND accepted_task_id IS NULL
+             AND version = ? AND deleted_at IS NULL`;
+      const params = isRoot
+        ? (restoring ? [timestamp, member.id, member.version] : [deletedAt, timestamp, member.id, member.version])
+        : (restoring ? [timestamp, member.id, rootCandidateId, member.version] : [deletedAt, timestamp, member.id, rootCandidateId, member.version]);
+      const updated = this.database.raw.prepare(query).run(...params);
+      if (updated.changes !== 1) throw new CandidateVersionConflictError();
+    }
+    const candidateIds = groupSnapshot.map((member) => member.id);
+    this.database.raw.prepare(
+      `UPDATE notification
+       SET archived_at = COALESCE(archived_at, ?)
+       WHERE candidate_id IN (${candidateIds.map(() => '?').join(',')})`,
+    ).run(timestamp, ...candidateIds);
+  }
+
+  private deleteLinkedCandidatesInTransaction(taskId: string, timestamp: string) {
+    const linked = this.database.raw.prepare(
+      'SELECT id, version FROM candidate_request WHERE accepted_task_id = ? AND deleted_at IS NULL ORDER BY id',
+    ).all(taskId) as Array<{ id: string; version: number }>;
+    for (const candidate of linked) {
+      const updated = this.database.raw.prepare(
+        'UPDATE candidate_request SET deleted_at = ?, updated_at = ?, version = version + 1 WHERE id = ? AND accepted_task_id = ? AND version = ? AND deleted_at IS NULL',
+      ).run(timestamp, timestamp, candidate.id, taskId, candidate.version);
+      if (updated.changes !== 1) throw new CandidateVersionConflictError();
+    }
+    this.staleOwnerDecisionsForRetiredTargets({ taskId });
+    this.database.raw.prepare(
+      'UPDATE notification SET archived_at = COALESCE(archived_at, ?) WHERE candidate_id IN (SELECT id FROM candidate_request WHERE accepted_task_id = ?)',
+    ).run(timestamp, taskId);
+  }
+
+  private restoreLinkedCandidatesInTransaction(taskId: string, timestamp: string) {
+    const linked = this.database.raw.prepare(
+      'SELECT id, version FROM candidate_request WHERE accepted_task_id = ? AND deleted_at IS NOT NULL ORDER BY id',
+    ).all(taskId) as Array<{ id: string; version: number }>;
+    for (const candidate of linked) {
+      const updated = this.database.raw.prepare(
+        'UPDATE candidate_request SET deleted_at = NULL, updated_at = ?, version = version + 1 WHERE id = ? AND accepted_task_id = ? AND version = ? AND deleted_at IS NOT NULL',
+      ).run(timestamp, candidate.id, taskId, candidate.version);
+      if (updated.changes !== 1) throw new CandidateVersionConflictError();
+    }
+  }
+
+  /**
+   * M1 keeps approval/outbox rows as audit facts, but a task lifecycle change
+   * must make every still-open draft terminal in the same SQLite transaction.
+   * The database enum remains backward compatible; the public DTO exposes the
+   * draft-only `rejected`/`obsolete` state instead of implying delivery.
+   */
+  private terminateTaskDraftsInTransaction(taskId: string, timestamp: string) {
+    this.database.raw.prepare(
+      "UPDATE approval SET status = 'rejected', decided_at = COALESCE(decided_at, ?) WHERE task_id = ? AND status = 'awaiting_approval'",
+    ).run(timestamp, taskId);
+    this.database.raw.prepare(
+      "UPDATE outbox SET status = 'failed' WHERE approval_id IN (SELECT id FROM approval WHERE task_id = ?) AND status IN ('awaiting_approval', 'ready')",
+    ).run(taskId);
+  }
+
+  private deleteTaskInTransaction(task: TaskRecord, timestamp: string) {
+    const nextVersion = task.version + 1;
+    const updated = this.database.raw
+      .prepare('UPDATE task SET deleted_at = ?, updated_at = ?, version = ? WHERE id = ? AND version = ? AND deleted_at IS NULL')
+      .run(timestamp, timestamp, nextVersion, task.id, task.version);
+    if (updated.changes !== 1) throw new Error('任务已被其他操作更新，请刷新后重试。');
+
+    this.database.raw.prepare("UPDATE notification SET archived_at = COALESCE(archived_at, ?) WHERE task_id = ?").run(timestamp, task.id);
+    this.database.raw.prepare("UPDATE reminder SET state = 'cancelled' WHERE task_id = ? AND state <> 'cancelled'").run(task.id);
+    this.terminateTaskDraftsInTransaction(task.id, timestamp);
+    this.database.raw.prepare(
+      `INSERT INTO task_event
+        (id, task_id, event_type, actor_type, visibility, summary, source_event_id, before_json, after_json, occurred_at, recorded_at, version)
+       VALUES (?, ?, 'task_deleted', 'user', 'private', ?, NULL, ?, ?, ?, ?, ?)`,
+    ).run(
+      id('evt'), task.id,
+      '系统主人将任务和对应的已接受候选一起移到回收站；来源、参考路径和审计历史继续保留。',
+      JSON.stringify(taskAuditSnapshot(task)),
+      JSON.stringify({ ...taskAuditSnapshot(task), deleted_at: timestamp, version: nextVersion }),
+      timestamp, timestamp, nextVersion,
+    );
+  }
+
+  private restoreTaskInTransaction(task: TaskRecord, timestamp: string) {
+    const nextVersion = task.version + 1;
+    const updated = this.database.raw
+      .prepare('UPDATE task SET deleted_at = NULL, updated_at = ?, version = ? WHERE id = ? AND version = ? AND deleted_at IS NOT NULL')
+      .run(timestamp, nextVersion, task.id, task.version);
+    if (updated.changes !== 1) throw new Error('任务已被其他操作更新，请刷新后重试。');
+    this.database.raw.prepare(
+      `INSERT INTO task_event
+        (id, task_id, event_type, actor_type, visibility, summary, source_event_id, before_json, after_json, occurred_at, recorded_at, version)
+       VALUES (?, ?, 'task_restored', 'user', 'private', ?, NULL, ?, ?, ?, ?, ?)`,
+    ).run(
+      id('evt'), task.id,
+      '系统主人从回收站恢复了任务和对应的已接受候选；此前作废的对外草稿不会自动恢复。',
+      JSON.stringify(taskAuditSnapshot(task)),
+      JSON.stringify({ ...taskAuditSnapshot(task), deleted_at: null, version: nextVersion }),
+      timestamp, timestamp, nextVersion,
+    );
+  }
+
+  deleteCandidate(candidateId: string, expectedVersion: number, expectedGroupVersionHash?: string) {
+    const requested = this.getCandidate(candidateId);
+    if (!requested) throw new Error('候选需求不存在。');
+    const candidate = this.candidateGroupRoot(requested);
+    const group = this.candidateGroupRows(candidate.id);
+    if (group.length > 1 && candidateGroupVersionHash(group) !== expectedGroupVersionHash) throw new CandidateVersionConflictError();
+    this.assertCandidateVersion(requested, expectedVersion);
+    const linkedTask = candidate.accepted_task_id ? this.getTask(candidate.accepted_task_id) : null;
+    const timestamp = nowIso();
+    const deleted = this.database.transaction(() => {
+      const currentRequested = this.getCandidate(candidateId);
+      if (!currentRequested) throw new Error('候选需求不存在。');
+      const current = this.candidateGroupRoot(currentRequested);
+      const currentGroup = this.candidateGroupRows(current.id);
+      if (current.id !== candidate.id) throw new CandidateVersionConflictError();
+      this.assertCandidateGroupSnapshot(group, currentGroup, expectedGroupVersionHash);
+      this.assertCandidateVersion(currentRequested, expectedVersion);
+      const allDeleted = currentGroup.every((member) => Boolean(member.deleted_at));
+      const allActive = currentGroup.every((member) => !member.deleted_at);
+      if (!allDeleted && !allActive) throw new CandidateVersionConflictError();
+      const currentLinkedTask = current.accepted_task_id ? this.getTask(current.accepted_task_id) : null;
+      if (currentLinkedTask && currentLinkedTask.record_state === 'active') {
+        if (!currentLinkedTask.deleted_at) this.deleteTaskInTransaction(currentLinkedTask, timestamp);
+        this.deleteLinkedCandidatesInTransaction(currentLinkedTask.id, timestamp);
+      } else if (allDeleted) {
+        return current;
+      } else {
+        this.updateCandidateGroupDeletedStateInTransaction(currentGroup, current.id, timestamp, timestamp);
+        this.staleOwnerDecisionsForRetiredTargets({ candidateIds: currentGroup.map((item) => item.id) });
+        this.closeUnassignedThreadForCandidate({ ...current, deleted_at: timestamp }, timestamp);
+      }
+      return this.getCandidate(current.id);
+    });
+    if (linkedTask?.record_state === 'active') this.projectTaskMemory(linkedTask.id);
+    this.log('runtime', 'info', 'candidate.deleted', '系统主人将候选移入回收站。', { candidateId, acceptedTaskId: candidate.accepted_task_id });
+    return deleted;
+  }
+
+  restoreCandidate(candidateId: string, expectedVersion: number, expectedGroupVersionHash?: string) {
+    const requested = this.getCandidate(candidateId);
+    if (!requested) throw new Error('候选需求不存在。');
+    const candidate = this.candidateGroupRoot(requested);
+    const group = this.candidateGroupRows(candidate.id);
+    if (group.length > 1 && candidateGroupVersionHash(group) !== expectedGroupVersionHash) throw new CandidateVersionConflictError();
+    this.assertCandidateVersion(requested, expectedVersion);
+    const linkedTask = candidate.accepted_task_id ? this.getTask(candidate.accepted_task_id) : null;
+    const timestamp = nowIso();
+    const restored = this.database.transaction(() => {
+      const currentRequested = this.getCandidate(candidateId);
+      if (!currentRequested) throw new Error('候选需求不存在。');
+      const current = this.candidateGroupRoot(currentRequested);
+      const currentGroup = this.candidateGroupRows(current.id);
+      if (current.id !== candidate.id) throw new CandidateVersionConflictError();
+      this.assertCandidateGroupSnapshot(group, currentGroup, expectedGroupVersionHash);
+      this.assertCandidateVersion(currentRequested, expectedVersion);
+      const allDeleted = currentGroup.every((member) => Boolean(member.deleted_at));
+      const allActive = currentGroup.every((member) => !member.deleted_at);
+      if (!allDeleted && !allActive) throw new CandidateVersionConflictError();
+      const currentLinkedTask = current.accepted_task_id ? this.getTask(current.accepted_task_id) : null;
+      if (currentLinkedTask && currentLinkedTask.record_state === 'active') {
+        if (currentLinkedTask.deleted_at) this.restoreTaskInTransaction(currentLinkedTask, timestamp);
+        this.restoreLinkedCandidatesInTransaction(currentLinkedTask.id, timestamp);
+      } else if (allActive) {
+        return current;
+      } else {
+        this.updateCandidateGroupDeletedStateInTransaction(currentGroup, current.id, timestamp, null);
+      }
+      return this.getCandidate(current.id);
+    });
+    if (linkedTask?.record_state === 'active') this.projectTaskMemory(linkedTask.id);
+    this.log('runtime', 'info', 'candidate.restored', '系统主人从回收站恢复候选。', { candidateId, acceptedTaskId: candidate.accepted_task_id });
+    return restored;
+  }
+
+  confirmCandidateMerge(candidateId: string, targetCandidateId: string, primaryCandidateId: string, suggestionId: string, expectedThreadVersion: number, expectedVersion: number, expectedTargetVersion: number, expectedGroupVersionHash: string) {
+    return this.database.transaction(() => {
+      const currentRequested = this.getCandidate(candidateId);
+      const targetRequested = this.getCandidate(targetCandidateId);
+      if (!currentRequested || !targetRequested) throw new Error('候选需求不存在。');
+      this.assertCandidateVersion(currentRequested, expectedVersion);
+      this.assertCandidateVersion(targetRequested, expectedTargetVersion);
+      if (candidatePairVersionHash(currentRequested, targetRequested) !== expectedGroupVersionHash) throw new CandidateVersionConflictError();
+      const analysis = parseMetadata(currentRequested.analysis_json);
+      const suggestion = analysis.candidateMergeSuggestion;
+      if (!suggestion || typeof suggestion !== 'object') throw new Error('当前候选没有可确认的归并建议。');
+      const suggestionRecord = suggestion as Record<string, unknown>;
+      if (suggestionRecord.suggestionId !== suggestionId) throw new Error('归并建议已经更新，请刷新后重新判断。');
+       const currentThread = this.threadForCandidate(currentRequested);
+       const targetThread = this.threadForCandidate(targetRequested);
+      if (currentThread?.version !== expectedThreadVersion) throw new Error('候选需求已经变化，请刷新后重新确认。');
+      if (!currentThread || !targetThread
+        || !this.candidateMergeSuggestionMatches(suggestionRecord, currentRequested, currentThread, targetRequested, targetThread)) {
+        throw new Error('归并建议生成后候选或需求线程已经变化，请刷新后重新判断。');
+      }
+      const current = currentRequested;
+      const target = targetRequested;
+      if (current.id === target.id) throw new Error('归并建议目标无效，请刷新后重试。');
+      if (primaryCandidateId !== current.id && primaryCandidateId !== target.id) throw new Error('主体必须是本次归并的两个候选之一。');
+      const currentRole = typeof suggestionRecord.currentRole === 'string' ? suggestionRecord.currentRole : 'unknown';
+      const targetRole = typeof suggestionRecord.targetRole === 'string' ? suggestionRecord.targetRole : 'unknown';
+      const allowedRoles = new Set(['owner_delivery', 'background', 'constraint', 'process_question', 'unknown']);
+      const decision: CandidateMergeDecision = {
+        targetCandidateId: target.id,
+        targetThreadId: targetThread.id,
+        sameRequirement: true,
+        confidence: typeof suggestionRecord.confidence === 'number' ? suggestionRecord.confidence : 1,
+        scores: [],
+        primary: primaryCandidateId === current.id ? 'current' : 'target',
+        primaryConfidence: 1,
+        currentRole: allowedRoles.has(currentRole) ? currentRole as CandidateMergeDecision['currentRole'] : 'unknown',
+        targetRole: allowedRoles.has(targetRole) ? targetRole as CandidateMergeDecision['targetRole'] : 'unknown',
+        reason: typeof suggestionRecord.reason === 'string' ? suggestionRecord.reason : '系统主人确认两条候选属于同一需求。',
+        evidence: Array.isArray(suggestionRecord.evidence) ? suggestionRecord.evidence.filter((value): value is string => typeof value === 'string') : [],
+        candidateSetHash: typeof suggestionRecord.candidateSetHash === 'string' ? suggestionRecord.candidateSetHash : `owner:${current.id}:${target.id}`,
+        candidateSetComplete: true,
+      };
+      if (decision.primary === 'current') decision.currentRole = 'owner_delivery';
+      else decision.targetRole = 'owner_delivery';
+      const applied = this.applyCandidateMerge({
+        currentCandidate: current,
+        currentThread,
+        targetCandidate: target,
+        targetThread,
+        decision,
+        actor: 'user',
+        reason: `系统主人确认两条消息属于同一需求，并选择“${this.getCandidate(primaryCandidateId)?.title ?? '当前候选'}”作为主体。`,
+      });
+      this.clearCandidateMergeSuggestion(this.candidateGroupRows(applied.primaryCandidate.id).map((candidate) => candidate.id));
+      return { candidate: this.getCandidate(applied.primaryCandidate.id), mergeGroup: this.candidateMergeGroupView(applied.primaryCandidate) };
+    });
+  }
+
+  rejectCandidateMerge(candidateId: string, targetCandidateId: string, suggestionId: string, expectedVersion: number, expectedTargetVersion: number, expectedGroupVersionHash: string) {
+    return this.database.transaction(() => {
+      const candidate = this.getCandidate(candidateId);
+      const target = this.getCandidate(targetCandidateId);
+      if (!candidate || !target) throw new Error('候选需求不存在。');
+      this.assertCandidateVersion(candidate, expectedVersion);
+      this.assertCandidateVersion(target, expectedTargetVersion);
+      if (candidatePairVersionHash(candidate, target) !== expectedGroupVersionHash) throw new CandidateVersionConflictError();
+      const analysis = parseMetadata(candidate.analysis_json);
+      const suggestion = analysis.candidateMergeSuggestion;
+      if (!suggestion || typeof suggestion !== 'object') throw new Error('当前候选没有可否决的归并建议。');
+      const suggestionRecord = suggestion as Record<string, unknown>;
+      if (suggestionRecord.suggestionId !== suggestionId) throw new Error('归并建议已经更新，请刷新后重新判断。');
+       const candidateThread = this.threadForCandidate(candidate);
+       const targetThread = this.threadForCandidate(target);
+      if (!candidateThread || !targetThread
+        || !this.candidateMergeSuggestionMatches(suggestionRecord, candidate, candidateThread, target, targetThread)) {
+        throw new Error('归并建议生成后候选或需求线程已经变化，请刷新后重新判断。');
+      }
+      const timestamp = nowIso();
+      this.recordCandidateMergeExclusion(candidate, target, '系统主人明确确认这两项需要分别推进。', timestamp);
+      delete analysis.candidateMergeSuggestion;
+      const rejectedUpdate = this.database.raw.prepare('UPDATE candidate_request SET analysis_json = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?')
+        .run(JSON.stringify(analysis), timestamp, candidate.id, candidate.version);
+      if (rejectedUpdate.changes !== 1) throw new CandidateVersionConflictError();
+      this.database.raw.prepare(
+        `INSERT INTO correction_event
+          (id, idempotency_key, task_id, candidate_id, source_event_id, demand_unit_id, correction_type,
+           before_json, after_json, note, visibility, operation, created_at)
+          VALUES (?, ?, NULL, ?, ?, ?, 'candidate_merge_rejected', ?, ?, ?, 'private', 'apply', ?)`,
+      ).run(
+        id('correction'),
+        `candidate-merge-rejected:${candidate.id}:${target.id}:${candidate.updated_at}`,
+        candidate.id,
+        candidate.source_event_id,
+        candidate.demand_unit_id,
+        JSON.stringify({ targetCandidateId: target.id, suggestion: suggestionRecord }),
+        JSON.stringify({ targetCandidateId: null, separateCandidates: true }),
+        '系统主人确认这两条候选需要分别推进。',
+        timestamp,
+      );
+      this.log('runtime', 'info', 'candidate.merge_rejected', '系统主人确认两条候选不是同一需求。', {
+        candidateId: candidate.id,
+        targetCandidateId: target.id,
+      });
+      return { candidate: this.getCandidate(candidate.id), targetCandidate: this.getCandidate(target.id), separateCandidates: true };
+    });
+  }
+
+  setCandidateMergePrimary(candidateId: string, primaryCandidateId: string, expectedVersion: number, expectedGroupVersionHash: string, expectedThreadVersion: number) {
+    return this.database.transaction(() => {
+      const requested = this.getCandidate(candidateId);
+      const selected = this.getCandidate(primaryCandidateId);
+      if (!requested || !selected) throw new Error('候选需求不存在。');
+      this.assertCandidateVersion(requested, expectedVersion);
+      const root = this.candidateGroupRoot(requested);
+      const selectedRoot = this.candidateGroupRoot(selected);
+      if (selectedRoot.id !== root.id) throw new Error('所选主体不属于当前候选组。');
+      const members = this.candidateGroupRows(root.id);
+      if (members.length > 1 && candidateGroupVersionHash(members) !== expectedGroupVersionHash) throw new CandidateVersionConflictError();
+      if (members.length < 2) throw new Error('当前候选没有已归并的其他来源。');
+      if (members.some((member) => member.deleted_at || member.accepted_task_id || member.state === 'accepted')) {
+        throw new Error('候选组已经被接受或移入回收站，不能更换主体。');
+      }
+      if (!members.some((member) => member.id === selected.id)) throw new Error('所选主体不属于当前候选组。');
+      const thread = this.threadForCandidate(root);
+      if (!thread || thread.active_task_id || thread.status === 'closed') throw new Error('候选线程已经变化，不能更换主体。');
+      if (thread.version !== expectedThreadVersion) throw new CandidateVersionConflictError();
+      if (selected.id === root.id) return { candidate: root, mergeGroup: this.candidateMergeGroupView(root) };
+      const timestamp = nowIso();
+      for (const member of members) {
+        if (member.id === selected.id) {
+          const updated = this.database.raw.prepare('UPDATE candidate_request SET merged_into_candidate_id = NULL, merged_at = NULL, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?')
+            .run(timestamp, member.id, member.version);
+          if (updated.changes !== 1) throw new CandidateVersionConflictError();
+        } else {
+          const updated = this.database.raw.prepare('UPDATE candidate_request SET merged_into_candidate_id = ?, merged_at = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?')
+            .run(selected.id, timestamp, timestamp, member.id, member.version);
+          if (updated.changes !== 1) throw new CandidateVersionConflictError();
+          this.database.raw.prepare('UPDATE notification SET archived_at = COALESCE(archived_at, ?) WHERE candidate_id = ?')
+            .run(timestamp, member.id);
+        }
+      }
+      this.database.raw.prepare(
+        `UPDATE requirement_thread_source
+         SET source_role = CASE WHEN source_event_id = ? THEN 'owner_delivery'
+                                WHEN source_event_id = ? AND source_role = 'owner_delivery' THEN 'unknown'
+                                ELSE source_role END,
+             role_reason = CASE WHEN source_event_id = ? THEN ? ELSE role_reason END
+         WHERE thread_id = ?`,
+      ).run(selected.source_event_id, root.source_event_id, selected.source_event_id, '系统主人明确选择这条来源作为需要推进的主体任务。', thread.id);
+      const threadUpdate = this.database.raw.prepare(
+        `UPDATE requirement_thread
+         SET title = ?, background = ?, validation_question = ?, describe = ?, analysis_json = ?,
+             primary_source_event_id = ?, primary_reason = ?, primary_confidence = 1,
+             version = version + 1, updated_at = ?
+         WHERE id = ? AND active_task_id IS NULL AND version = ?`,
+      ).run(
+        selected.title,
+        selected.background,
+        selected.validation_question,
+        selected.describe,
+        selected.analysis_json,
+        selected.source_event_id,
+        `系统主人将“${selected.title}”设为本需求的主体任务。`,
+        timestamp,
+        thread.id,
+        expectedThreadVersion,
+      );
+      if (threadUpdate.changes !== 1) throw new CandidateVersionConflictError();
+      this.database.raw.prepare(
+        `INSERT INTO correction_event
+          (id, idempotency_key, task_id, candidate_id, source_event_id, demand_unit_id, correction_type,
+           before_json, after_json, note, visibility, operation, created_at)
+          VALUES (?, ?, NULL, ?, ?, ?, 'candidate_primary_changed', ?, ?, ?, 'private', 'apply', ?)`,
+      ).run(
+        id('correction'),
+        `candidate-primary:${root.id}:${selected.id}:${thread.version}`,
+        selected.id,
+        selected.source_event_id,
+        selected.demand_unit_id,
+        JSON.stringify({ primaryCandidateId: root.id, primarySourceEventId: thread.primary_source_event_id }),
+        JSON.stringify({ primaryCandidateId: selected.id, primarySourceEventId: selected.source_event_id }),
+        '系统主人更换了归并候选的主体任务。',
+        timestamp,
+      );
+      this.database.raw.prepare(
+        `INSERT OR IGNORE INTO notification
+          (id, task_id, task_event_id, candidate_id, notification_type, dedupe_key, reason, read_at, snoozed_until, archived_at, created_at)
+         VALUES (?, NULL, NULL, ?, 'immediate', ?, ?, NULL, NULL, NULL, ?)`,
+      ).run(
+        id('notice'),
+        selected.id,
+        `candidate-primary:${thread.id}:${selected.id}:${thread.version}`,
+        '系统主人更换了归并需求的主体任务。',
+        timestamp,
+      );
+      this.clearCandidateMergeSuggestion(members.map((member) => member.id), timestamp);
+      const refreshed = this.getCandidate(selected.id)!;
+      return { candidate: refreshed, mergeGroup: this.candidateMergeGroupView(refreshed) };
+    });
+  }
+
+  splitCandidateMerge(candidateId: string, expectedVersion: number, expectedGroupVersionHash: string, expectedThreadVersion: number) {
+    return this.database.transaction(() => {
+      const selected = this.getCandidate(candidateId);
+      if (!selected) throw new Error('候选需求不存在。');
+      this.assertCandidateVersion(selected, expectedVersion);
+      const root = this.candidateGroupRoot(selected);
+      const members = this.candidateGroupRows(root.id);
+      if (members.length > 1 && candidateGroupVersionHash(members) !== expectedGroupVersionHash) throw new CandidateVersionConflictError();
+      if (members.length < 2) throw new Error('当前候选没有可拆分的归并来源。');
+      if (members.some((member) => member.deleted_at || member.accepted_task_id || member.state === 'accepted')) {
+        throw new Error('候选组已经被接受或移入回收站，不能拆分。');
+      }
+      const thread = this.threadForCandidate(root);
+      if (!thread || thread.active_task_id || thread.status === 'closed') throw new Error('候选线程已经变化，不能拆分。');
+      if (thread.version !== expectedThreadVersion) throw new CandidateVersionConflictError();
+      const source = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(selected.source_event_id) as SourceEventRow | undefined;
+      if (!source) throw new Error('候选来源与需求线程关系不完整。');
+      const selectedSources = this.sourceRowsForDemandUnit(selected.demand_unit_id, source);
+      const directRelations = selectedSources.map((selectedSource) => ({
+        source: selectedSource,
+        relation: this.database.raw.prepare(
+          'SELECT * FROM requirement_thread_source WHERE thread_id = ? AND source_event_id = ?',
+        ).get(thread.id, selectedSource.id) as (RequirementThreadSourceRow & {
+          session_id: string | null;
+          conversation_id: string | null;
+          participant_ids_json: string;
+          source_revision: string | null;
+          source_role: string;
+          role_reason: string;
+        }) | undefined,
+      }));
+      const selectedRelation = directRelations.find((item) => item.source.id === selected.source_event_id)?.relation
+        ?? directRelations.find((item) => item.relation)?.relation;
+      if (!selectedRelation) throw new Error('候选主来源与需求线程关系不完整。');
+      // Older continuous-message batches only stored a thread relation for the
+      // anchor message.  The demand-unit mapping is authoritative for the
+      // remaining batch rows, so inherit the anchor relation while splitting.
+      const selectedRelations = directRelations.map((item) => ({
+        source: item.source,
+        relation: item.relation ?? selectedRelation,
+      }));
+      const splitLastActivity = selectedSources.reduce(
+        (latest, selectedSource) => latest.localeCompare(selectedSource.occurred_at) >= 0 ? latest : selectedSource.occurred_at,
+        source.occurred_at,
+      );
+      const splitParticipants = [...new Set(selectedRelations.flatMap((item) => parseJsonValue<string[]>(item.relation.participant_ids_json, [])))];
+      const remaining = members.filter((member) => member.id !== selected.id);
+      const remainingUnitIds = this.demandUnitIdsForCandidates(remaining);
+      const remainingRoot = remaining.find((member) => member.id === root.id) ?? remaining[0]!;
+      const timestamp = nowIso();
+      for (const member of remaining) {
+        if (member.id === remainingRoot.id) {
+          const updated = this.database.raw.prepare('UPDATE candidate_request SET merged_into_candidate_id = NULL, merged_at = NULL, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?')
+            .run(timestamp, member.id, member.version);
+          if (updated.changes !== 1) throw new CandidateVersionConflictError();
+        } else {
+          const updated = this.database.raw.prepare('UPDATE candidate_request SET merged_into_candidate_id = ?, merged_at = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?')
+            .run(remainingRoot.id, timestamp, timestamp, member.id, member.version);
+          if (updated.changes !== 1) throw new CandidateVersionConflictError();
+        }
+      }
+      const selectedUpdated = this.database.raw.prepare('UPDATE candidate_request SET merged_into_candidate_id = NULL, merged_at = NULL, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?')
+        .run(timestamp, selected.id, selected.version);
+      if (selectedUpdated.changes !== 1) throw new CandidateVersionConflictError();
+      const splitThreadId = id('thread');
+      this.database.raw.prepare(
+        `INSERT INTO requirement_thread
+          (id, status, title, background, validation_question, describe, analysis_json, conversation_id,
+           participant_ids_json, ambiguity_json, active_task_id, primary_source_event_id, primary_reason,
+           primary_confidence, version, last_activity_at, created_at, updated_at)
+         VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, '[]', NULL, ?, ?, 1, 1, ?, ?, ?)`,
+      ).run(
+        splitThreadId,
+        selected.title,
+        selected.background,
+        selected.validation_question,
+        selected.describe,
+        selected.analysis_json,
+        selectedRelation.conversation_id ?? source.conversation_id,
+        JSON.stringify(splitParticipants),
+        selected.source_event_id,
+        `系统主人将“${selected.title}”拆分为独立候选。`,
+        splitLastActivity,
+        timestamp,
+        timestamp,
+      );
+      for (const item of selectedRelations) {
+        const isAnchor = item.source.id === selected.source_event_id;
+        this.database.raw.prepare(
+          `INSERT INTO requirement_thread_source
+            (thread_id, source_event_id, demand_unit_id, relation_type, confidence, evidence_json, root_id, parent_id, session_id,
+             conversation_id, participant_ids_json, source_revision, source_role, role_reason, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          splitThreadId,
+          item.source.id,
+          selected.demand_unit_id,
+          isAnchor ? 'owner_split' : 'owner_split_batch',
+          isAnchor ? 1 : item.relation.confidence,
+          isAnchor
+            ? JSON.stringify(['系统主人将这组连续来源从归并需求中拆分为独立候选。'])
+            : item.relation.evidence_json,
+          item.relation.root_id,
+          item.relation.parent_id,
+          item.relation.session_id,
+          item.relation.conversation_id ?? item.source.conversation_id,
+          item.relation.participant_ids_json,
+          item.relation.source_revision ?? sourceRevision(item.source),
+          isAnchor ? 'owner_delivery' : item.relation.source_role || 'unknown',
+          isAnchor ? '系统主人确认这组连续来源需要独立推进。' : item.relation.role_reason || '随连续消息批次一并拆分。',
+          item.relation.created_at,
+        );
+        const sharedWithRemainingUnit = selected.demand_unit_id
+          ? this.sourceUsedByThreadUnits(thread.id, item.source.id, remainingUnitIds)
+          : false;
+        if (!selected.demand_unit_id) {
+          // Legacy batches did not have demand units and could leave a
+          // continuation row on their original provisional thread after a
+          // candidate merge.  A split owns the whole classification batch, so
+          // remove those unassigned legacy relations as well.
+          this.database.raw.prepare(
+            `DELETE FROM requirement_thread_source
+             WHERE source_event_id = ? AND thread_id <> ?
+               AND thread_id IN (SELECT id FROM requirement_thread WHERE active_task_id IS NULL)`,
+          ).run(item.source.id, splitThreadId);
+        } else if (!sharedWithRemainingUnit) {
+          this.database.raw.prepare('DELETE FROM requirement_thread_source WHERE thread_id = ? AND source_event_id = ?')
+            .run(thread.id, item.source.id);
+        }
+        const metadata = parseMetadata(item.source.metadata_json);
+        if (sharedWithRemainingUnit) delete metadata.internalRequirementThreadId;
+        else metadata.internalRequirementThreadId = splitThreadId;
+        this.database.raw.prepare('UPDATE source_event SET metadata_json = ? WHERE id = ?')
+          .run(JSON.stringify(metadata), item.source.id);
+      }
+      if (selected.demand_unit_id) {
+        this.moveDemandUnitsToThread([selected.demand_unit_id], thread.id, splitThreadId, timestamp);
+        this.database.raw.prepare(
+          `UPDATE requirement_thread_unit SET relation_type = 'primary', confidence = 1, evidence_json = ?
+           WHERE thread_id = ? AND demand_unit_id = ?`,
+        ).run(JSON.stringify(['系统主人将该需求单元拆分为独立候选。']), splitThreadId, selected.demand_unit_id);
+      }
+      const remainingRelations = this.database.raw.prepare(
+        `SELECT source_event.occurred_at, requirement_thread_source.participant_ids_json
+         FROM requirement_thread_source JOIN source_event ON source_event.id = requirement_thread_source.source_event_id
+         WHERE requirement_thread_source.thread_id = ?`,
+      ).all(thread.id) as Array<{ occurred_at: string; participant_ids_json: string }>;
+      const remainingActivity = remainingRelations.reduce<string | null>((latest, row) => (
+        !latest || row.occurred_at > latest ? row.occurred_at : latest
+      ), null);
+      const remainingParticipants = [...new Set(remainingRelations.flatMap((row) => (
+        parseJsonValue<string[]>(row.participant_ids_json, [])
+      )).filter(Boolean))];
+      const remainingThreadUpdate = this.database.raw.prepare(
+        `UPDATE requirement_thread
+         SET title = ?, background = ?, validation_question = ?, describe = ?, analysis_json = ?,
+             primary_source_event_id = ?, primary_reason = ?, primary_confidence = 1,
+             participant_ids_json = ?, last_activity_at = ?, version = version + 1, updated_at = ?
+         WHERE id = ? AND active_task_id IS NULL AND version = ?`,
+      ).run(
+        remainingRoot.title,
+        remainingRoot.background,
+        remainingRoot.validation_question,
+        remainingRoot.describe,
+        remainingRoot.analysis_json,
+        remainingRoot.source_event_id,
+        `系统主人拆出一条独立候选后，将“${remainingRoot.title}”保留为主体。`,
+        JSON.stringify(remainingParticipants),
+        remainingActivity,
+        timestamp,
+        thread.id,
+        expectedThreadVersion,
+      );
+      if (remainingThreadUpdate.changes !== 1) throw new CandidateVersionConflictError();
+      const splitSourceIds = selectedSources.map((selectedSource) => selectedSource.id);
+      const splitPlaceholders = splitSourceIds.map(() => '?').join(',');
+      this.database.raw.prepare(
+        `UPDATE requirement_thread_revision SET state = 'stale', decided_at = ?
+         WHERE thread_id = ? AND source_event_id IN (${splitPlaceholders}) AND state = 'proposed'`,
+      ).run(timestamp, thread.id, ...splitSourceIds);
+      this.database.raw.prepare(
+        `INSERT INTO correction_event
+          (id, idempotency_key, task_id, candidate_id, source_event_id, demand_unit_id, correction_type,
+           before_json, after_json, note, visibility, operation, created_at)
+          VALUES (?, ?, NULL, ?, ?, ?, 'candidate_split', ?, ?, ?, 'private', 'apply', ?)`,
+      ).run(
+        id('correction'),
+        `candidate-split:${root.id}:${selected.id}:${thread.version}`,
+        selected.id,
+        selected.source_event_id,
+        selected.demand_unit_id,
+        JSON.stringify({ threadId: thread.id, primaryCandidateId: root.id, memberIds: members.map((member) => member.id), sourceEventIds: splitSourceIds }),
+        JSON.stringify({ splitThreadId, splitCandidateId: selected.id, splitSourceEventIds: splitSourceIds, remainingThreadId: thread.id, remainingPrimaryCandidateId: remainingRoot.id }),
+        selectedSources.length > 1 ? '系统主人把误归并需求单元的多条来源拆成独立候选。' : '系统主人把误归并的需求单元拆成独立候选。',
+        timestamp,
+      );
+      this.clearCandidateMergeSuggestion(members.map((member) => member.id), timestamp);
+      this.database.raw.prepare(
+        `INSERT OR IGNORE INTO notification
+          (id, task_id, task_event_id, candidate_id, notification_type, dedupe_key, reason, read_at, snoozed_until, archived_at, created_at)
+         VALUES (?, NULL, NULL, ?, 'immediate', ?, ?, NULL, NULL, NULL, ?)`,
+      ).run(
+        id('notice'),
+        selected.id,
+        `candidate-split:${selected.id}:${splitThreadId}`,
+        selectedSources.length > 1 ? `${selectedSources.length} 条需求证据已由主人拆分为独立候选。` : '一个需求单元已由主人拆分为独立候选。',
+        timestamp,
+      );
+      return {
+        splitCandidate: this.getCandidate(selected.id),
+        remainingCandidate: this.getCandidate(remainingRoot.id),
+        splitGroup: this.candidateMergeGroupView(this.getCandidate(selected.id)!),
+        remainingGroup: this.candidateMergeGroupView(this.getCandidate(remainingRoot.id)!),
+      };
+    });
+  }
+
+  private threadForSource(sourceEventId: string) {
+    const rows = this.database.raw.prepare(
+      `SELECT DISTINCT requirement_thread.* FROM requirement_thread
+       JOIN requirement_thread_source ON requirement_thread_source.thread_id = requirement_thread.id
+       WHERE requirement_thread_source.source_event_id = ?
+       ORDER BY requirement_thread.updated_at DESC, requirement_thread.id ASC`,
+    ).all(sourceEventId) as unknown as RequirementThreadRow[];
+    return rows.length === 1 ? rows[0] : undefined;
+  }
+
+  private candidateThreadAssociation(candidate: CandidateRow) {
+    const thread = this.threadForCandidate(candidate);
+    if (!thread) return null;
+    const ambiguity = parseJsonValue<string[]>(thread.ambiguity_json, []).filter((value) => typeof value === 'string');
+    const options = ambiguity.flatMap((threadId) => {
+      const option = this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(threadId) as unknown as RequirementThreadRow | undefined;
+      if (!option || option.status === 'closed') return [];
+      const task = option.active_task_id ? this.getTask(option.active_task_id) : null;
+      return [{
+        id: option.id,
+        title: option.title,
+        describe: option.describe,
+        status: option.status,
+        version: option.version,
+        activeTaskId: task?.id ?? null,
+        activeTaskTitle: task?.title ?? null,
+        lastActivityAt: option.last_activity_at,
+      }];
+    });
+    return {
+      threadId: thread.id,
+      threadVersion: thread.version,
+      status: thread.status,
+      requiresConfirmation: thread.status === 'needs_confirmation' && options.length > 0,
+      options,
+    };
+  }
+
+  resolveCandidateThreadAssociation(
+    candidateId: string,
+    targetThreadId: string | null,
+    expectedVersion: number,
+    expectedThreadVersion: number,
+    expectedTargetThreadVersion?: number,
+  ) {
+    let proposalToDispatch: string | null = null;
+    const result = this.database.transaction(() => {
+      const candidate = this.getCandidate(candidateId);
+      if (!candidate) throw new Error('候选需求不存在。');
+      this.assertCandidateVersion(candidate, expectedVersion);
+      this.assertCandidateActive(candidate);
+      if (candidate.accepted_task_id || candidate.state === 'accepted') throw new Error('该候选已经关联正式任务。');
+      const sourceRow = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(candidate.source_event_id) as SourceEventRow | undefined;
+      if (!sourceRow) throw new Error('候选的来源消息不存在。');
+      const batchRows = this.sourceRowsForDemandUnit(candidate.demand_unit_id, sourceRow);
+      const provisional = this.threadForCandidate(candidate);
+      if (!provisional) throw new Error('该候选还没有需求线程。');
+      if (provisional.version !== expectedThreadVersion) {
+        throw new CandidateVersionConflictError();
+      }
+      const options = parseJsonValue<string[]>(provisional.ambiguity_json, []).filter((value) => typeof value === 'string');
+      if (provisional.status !== 'needs_confirmation' || !options.length) throw new Error('该候选不需要确认需求归属。');
+      const timestamp = nowIso();
+
+      if (targetThreadId === null) {
+        const analysis = parseMetadata(provisional.analysis_json);
+        analysis.associationCandidates = [];
+        const reopenedThread = this.database.raw.prepare(
+          "UPDATE requirement_thread SET status = 'open', ambiguity_json = '[]', analysis_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?",
+        ).run(JSON.stringify(analysis), timestamp, provisional.id, provisional.version);
+        if (reopenedThread.changes !== 1) throw new Error('需求线程已被其他操作更新，请刷新后重试。');
+        const updatedCandidate = this.database.raw.prepare(
+          'UPDATE candidate_request SET updated_at = ?, version = version + 1 WHERE id = ? AND version = ?',
+        ).run(timestamp, candidate.id, candidate.version);
+        if (updatedCandidate.changes !== 1) throw new CandidateVersionConflictError();
+        for (const batchRow of batchRows) {
+          this.database.raw.prepare(
+            "UPDATE requirement_thread_source SET relation_type = 'owner_confirmed_new', confidence = 1, evidence_json = ? WHERE thread_id = ? AND source_event_id = ?",
+          ).run(JSON.stringify(['系统主人确认这是一项新的独立需求。']), provisional.id, batchRow.id);
+        }
+        this.database.raw.prepare(
+          "UPDATE requirement_thread_revision SET state = 'accepted', decided_at = ? WHERE thread_id = ? AND source_event_id = ? AND state = 'proposed'",
+        ).run(timestamp, provisional.id, candidate.source_event_id);
+        return { candidate: this.getCandidate(candidateId), task: null, proposal: null, threadId: provisional.id, projectTaskId: null as string | null };
+      }
+
+      if (!options.includes(targetThreadId)) throw new Error('所选需求线程不在本次待确认范围内。');
+      const target = this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(targetThreadId) as unknown as RequirementThreadRow | undefined;
+      if (!target || target.status === 'closed') throw new Error('所选需求线程已经关闭或不存在。');
+      if (typeof expectedTargetThreadVersion !== 'number') throw new CandidateVersionRequiredError();
+      if (target.version !== expectedTargetThreadVersion) {
+        throw new CandidateVersionConflictError();
+      }
+      for (const batchRow of batchRows) {
+        const relation = this.database.raw.prepare(
+          'SELECT * FROM requirement_thread_source WHERE thread_id = ? AND source_event_id = ?',
+        ).get(provisional.id, batchRow.id) as (RequirementThreadSourceRow & {
+          session_id: string | null;
+          conversation_id: string | null;
+          participant_ids_json: string;
+          source_revision: string | null;
+        }) | undefined;
+        if (!relation) throw new Error('当前需求单元与临时线程的关联不完整。');
+        this.database.raw.prepare(
+          `INSERT INTO requirement_thread_source
+            (thread_id, source_event_id, demand_unit_id, relation_type, confidence, evidence_json, root_id, parent_id, session_id,
+             conversation_id, participant_ids_json, source_revision, created_at)
+           VALUES (?, ?, ?, 'owner_confirmed', 1, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(thread_id, source_event_id) DO UPDATE SET
+             relation_type = 'owner_confirmed', confidence = 1, evidence_json = excluded.evidence_json,
+             root_id = excluded.root_id, parent_id = excluded.parent_id, session_id = excluded.session_id,
+             conversation_id = excluded.conversation_id, participant_ids_json = excluded.participant_ids_json,
+             source_revision = excluded.source_revision`,
+        ).run(
+          target.id,
+          batchRow.id,
+          candidate.demand_unit_id,
+          JSON.stringify(['系统主人从多个候选线程中明确选择了这一项。']),
+          relation.root_id,
+          relation.parent_id,
+          relation.session_id,
+          relation.conversation_id ?? batchRow.conversation_id,
+          relation.participant_ids_json,
+          relation.source_revision ?? sourceRevision(batchRow),
+          timestamp,
+        );
+        if (!this.sourceUsedByOtherThreadUnit(provisional.id, batchRow.id, candidate.demand_unit_id ? [candidate.demand_unit_id] : [])) {
+          this.database.raw.prepare('DELETE FROM requirement_thread_source WHERE thread_id = ? AND source_event_id = ?')
+            .run(provisional.id, batchRow.id);
+        }
+      }
+      if (candidate.demand_unit_id) this.moveDemandUnitsToThread([candidate.demand_unit_id], provisional.id, target.id, timestamp);
+      const provisionalUnits = this.database.raw.prepare('SELECT COUNT(*) AS count FROM requirement_thread_unit WHERE thread_id = ?')
+        .get(provisional.id) as { count: number };
+      if (provisionalUnits.count === 0) {
+        const closedThread = this.database.raw.prepare(
+          "UPDATE requirement_thread SET status = 'closed', ambiguity_json = '[]', version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND active_task_id IS NULL",
+        ).run(timestamp, provisional.id, provisional.version);
+        if (closedThread.changes !== 1) throw new Error('临时需求线程已被其他操作更新，请刷新后重试。');
+      }
+      this.database.raw.prepare(
+        "UPDATE requirement_thread_revision SET state = 'stale', decided_at = ? WHERE thread_id = ? AND source_event_id = ? AND state = 'proposed'",
+      ).run(timestamp, provisional.id, candidate.source_event_id);
+      const targetUpdated = this.database.raw.prepare(
+        `UPDATE requirement_thread SET
+           last_activity_at = CASE WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ? ELSE last_activity_at END,
+           version = version + 1,
+           updated_at = ? WHERE id = ? AND version = ?`,
+      ).run(sourceRow.occurred_at, sourceRow.occurred_at, timestamp, target.id, target.version);
+      if (targetUpdated.changes !== 1) throw new Error('目标需求线程已被其他操作更新，请刷新后重试。');
+
+      const currentRevision = this.database.raw.prepare(
+        "SELECT * FROM candidate_revision WHERE candidate_id = ? AND state = 'current' ORDER BY created_at DESC, rowid DESC LIMIT 1",
+      ).get(candidate.id) as {
+        id: string;
+        ai_decision_id: string | null;
+        source_revision: string;
+        provider: string;
+        model: string;
+        prompt_version: string;
+        evidence_json: string;
+      } | undefined;
+      const currentDecision = currentRevision?.ai_decision_id
+        ? this.database.raw.prepare('SELECT used_fallback FROM ai_decision_log WHERE id = ?').get(currentRevision.ai_decision_id) as { used_fallback: number } | undefined
+        : undefined;
+      const activeTask = target.active_task_id ? this.getTask(target.active_task_id) : null;
+      let proposalId: string | null = null;
+      if (activeTask) {
+        const draft: CandidateDraft = {
+          title: candidate.title,
+          proposerName: candidate.proposer_name,
+          background: candidate.background,
+          validationQuestion: candidate.validation_question,
+          describe: candidate.describe,
+          confidence: candidate.confidence,
+          analysis: parseMetadata(candidate.analysis_json) as CandidateDraft['analysis'],
+        };
+        const patch = this.taskPatchFromDraft(activeTask, draft, target, 'full');
+        const accepted = this.database.raw.prepare(
+          "UPDATE candidate_request SET state = 'accepted', accepted_task_id = ?, snoozed_until = NULL, updated_at = ?, version = version + 1 WHERE id = ? AND version = ? AND accepted_task_id IS NULL",
+        ).run(activeTask.id, timestamp, candidate.id, candidate.version);
+        if (accepted.changes !== 1) throw new CandidateVersionConflictError();
+        for (const batchRow of batchRows) {
+          this.linkTaskSource(activeTask.id, batchRow.id, 'thread_update', timestamp, candidate.demand_unit_id);
+        }
+
+        if (Object.keys(patch).length) {
+          const threadRevisionId = id('thread-revision');
+          const revisionMarker = currentRevision?.source_revision ?? sourceRevision(sourceRow);
+          const revisionKey = `thread-owner-association:${target.id}:${candidate.source_event_id}:${revisionMarker}`;
+          this.database.raw.prepare(
+            `INSERT OR IGNORE INTO requirement_thread_revision
+              (id, thread_id, source_event_id, demand_unit_id, base_thread_version, patch_json, evidence_json, state, idempotency_key, created_at, decided_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, NULL)`,
+          ).run(
+            threadRevisionId,
+            target.id,
+            candidate.source_event_id,
+            candidate.demand_unit_id,
+            target.version,
+            JSON.stringify({ title: candidate.title, background: candidate.background, validationQuestion: candidate.validation_question, describe: candidate.describe, analysis: parseMetadata(candidate.analysis_json) }),
+            currentRevision?.evidence_json ?? '[]',
+            revisionKey,
+            timestamp,
+          );
+          const storedThreadRevision = this.database.raw.prepare('SELECT id FROM requirement_thread_revision WHERE idempotency_key = ?').get(revisionKey) as { id: string };
+          const proposalKey = `task-update-owner-association:${activeTask.id}:${candidate.source_event_id}:${revisionMarker}`;
+          const storedProposal = this.createTaskUpdateProposal({
+            task: activeTask,
+            threadId: target.id,
+            sourceEventId: candidate.source_event_id,
+            demandUnitId: candidate.demand_unit_id,
+            candidateRevisionId: null,
+            threadRevisionId: storedThreadRevision.id,
+            baseThreadVersion: target.version,
+            patch,
+            reason: '系统主人确认这条消息属于已有需求；字段变化进入统一自动维护安全门禁。',
+            evidence: {
+              sourceEventId: candidate.source_event_id,
+              relationType: 'owner_confirmed',
+              confidence: 1,
+              analysis: draft.analysis ?? {},
+            },
+            provider: currentRevision?.provider,
+            model: currentRevision?.model,
+            promptVersion: currentRevision?.prompt_version,
+            origin: 'owner_association',
+            associationConfidence: 1,
+            updateConfidence: draft.analysis?.updateConfidence ?? null,
+            usedFallback: Boolean(currentDecision?.used_fallback),
+            idempotencyKey: proposalKey,
+            createdAt: timestamp,
+          });
+          proposalId = storedProposal.id;
+          proposalToDispatch = storedProposal.id;
+          this.database.raw.prepare("UPDATE requirement_thread SET status = 'needs_confirmation', updated_at = ? WHERE id = ?").run(timestamp, target.id);
+        }
+      }
+
+      return {
+        candidate: this.getCandidate(candidateId),
+        task: activeTask,
+        proposal: proposalId ? this.getTaskUpdateProposal(proposalId) : null,
+        threadId: target.id,
+        projectTaskId: activeTask?.id ?? null,
+      };
+    });
+    if (proposalToDispatch) this.dispatchTaskUpdateProposal(proposalToDispatch, null, null);
+    if (result.projectTaskId) this.projectTaskMemory(result.projectTaskId);
+    const { projectTaskId: _projectTaskId, ...view } = result;
+    return view;
+  }
+
+  private closeUnassignedThreadForCandidate(candidate: CandidateRow, timestamp = nowIso()) {
+     const thread = this.threadForCandidate(candidate);
+    if (!thread || thread.active_task_id) return;
+    const remaining = this.database.raw.prepare(
+      `SELECT COUNT(DISTINCT candidate_request.id) AS count
+       FROM requirement_thread_unit
+       JOIN candidate_request ON candidate_request.demand_unit_id = requirement_thread_unit.demand_unit_id
+       WHERE requirement_thread_unit.thread_id = ?
+         AND candidate_request.id <> ?
+          AND candidate_request.state IN ('pending','snoozed','accepted')
+          AND candidate_request.deleted_at IS NULL`,
+    ).get(thread.id, candidate.id) as { count: number };
+    if (remaining.count > 0) return;
+    this.database.raw.prepare(
+      "UPDATE requirement_thread SET status = 'closed', updated_at = ? WHERE id = ? AND active_task_id IS NULL",
+    ).run(timestamp, thread.id);
+    this.database.raw.prepare(
+      "UPDATE requirement_thread_revision SET state = 'rejected', decided_at = ? WHERE thread_id = ? AND state = 'proposed'",
+    ).run(timestamp, thread.id);
+  }
+
+  listThreads(status?: RequirementThreadRecord['status']) {
+    const rows = status
+      ? this.database.raw.prepare('SELECT * FROM requirement_thread WHERE status = ? ORDER BY last_activity_at DESC, updated_at DESC').all(status) as unknown as RequirementThreadRow[]
+      : this.database.raw.prepare('SELECT * FROM requirement_thread ORDER BY last_activity_at DESC, updated_at DESC').all() as unknown as RequirementThreadRow[];
+    return rows.map((row) => ({ ...row, analysis: parseMetadata(row.analysis_json) }));
+  }
+
+  getThreadDetail(threadId: string) {
+    const thread = this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(threadId) as unknown as RequirementThreadRow | undefined;
+    if (!thread) return null;
+    const sources = this.database.raw.prepare(
+      `SELECT source_event.*, requirement_thread_source.relation_type, requirement_thread_source.confidence,
+              requirement_thread_source.evidence_json, requirement_thread_source.root_id, requirement_thread_source.parent_id
+       FROM source_event JOIN requirement_thread_source ON requirement_thread_source.source_event_id = source_event.id
+       WHERE requirement_thread_source.thread_id = ? ORDER BY source_event.occurred_at ASC`,
+    ).all(threadId);
+    const revisions = this.database.raw.prepare('SELECT * FROM requirement_thread_revision WHERE thread_id = ? ORDER BY created_at DESC').all(threadId) as Array<{
+      id: string;
+      thread_id: string;
+      source_event_id: string | null;
+      base_thread_version: number;
+      patch_json: string;
+      evidence_json: string;
+      state: string;
+      created_at: string;
+      decided_at: string | null;
+    }>;
+    const proposals = this.database.raw.prepare('SELECT * FROM task_update_proposal WHERE thread_id = ? ORDER BY created_at DESC').all(threadId) as unknown as TaskUpdateProposalRow[];
+    const task = thread.active_task_id ? this.getTask(thread.active_task_id) : null;
+    return {
+      id: thread.id,
+      status: thread.status,
+      title: thread.title,
+      background: thread.background,
+      validation_question: thread.validation_question,
+      describe: thread.describe,
+      conversation_id: thread.conversation_id,
+      active_task_id: thread.active_task_id,
+      version: thread.version,
+      last_activity_at: thread.last_activity_at,
+      created_at: thread.created_at,
+      updated_at: thread.updated_at,
+      analysis: parseMetadata(thread.analysis_json),
+      ambiguity: parseJsonValue<unknown[]>(thread.ambiguity_json, []),
+      sources: sources.map((source) => {
+        const row = source as Record<string, unknown>;
+        return minimalSourceDtoSchema.parse({
+          source_scope: sourceScope(`thread:${thread.id}`, String(row.id)),
+          source_type: row.source_type,
+          completeness: row.completeness,
+          occurred_at: row.occurred_at,
+          summary_available: false,
+        });
+      }),
+      revisions: revisions.map((revision) => ({
+        id: revision.id,
+        thread_id: revision.thread_id,
+        base_thread_version: revision.base_thread_version,
+        state: revision.state,
+        created_at: revision.created_at,
+        decided_at: revision.decided_at,
+      })),
+      proposals: proposals.map((proposal) => this.taskUpdateProposalView(proposal)),
+      task,
+    };
+  }
+
+  private threadSourceIds(threadId: string, taskId: string | null | undefined, proposals: readonly TaskUpdateProposalRow[]) {
+    const sourceIds = new Set<string>();
+    const rows = this.database.raw.prepare(
+      'SELECT source_event_id FROM requirement_thread_source WHERE thread_id = ?',
+    ).all(threadId) as Array<{ source_event_id: string }>;
+    for (const row of rows) sourceIds.add(row.source_event_id);
+    for (const proposal of proposals) {
+      if (proposal.source_event_id) sourceIds.add(proposal.source_event_id);
+    }
+    this.addTaskSourceIds(sourceIds, taskId);
+    this.expandDemandUnitSourceClosure(sourceIds);
+    return sourceIds;
+  }
+
+  private publicThreadSummary(thread: RequirementThreadRow) {
+    const sourceContents = this.sourceContentsByIds(this.threadSourceIds(thread.id, thread.active_task_id, []));
+    return requirementThreadDtoSchema.parse({
+      id: thread.id,
+      status: thread.status,
+      title: safeCandidateNarrative(thread.title, sourceContents, '需求线程标题已生成；来源正文默认隐藏。', 160),
+      background: safeCandidateNarrative(thread.background, sourceContents, '需求线程背景已保留，需主人主动核验。', 2_000),
+      validation_question: safeCandidateNarrative(thread.validation_question, sourceContents, '需求线程验证问题已保留，需主人主动核验。', 1_000),
+      describe: safeCandidateNarrative(thread.describe, sourceContents, '需求线程摘要已生成；来源正文默认隐藏。', 2_000),
+      version: thread.version,
+      last_activity_at: thread.last_activity_at,
+      ambiguity: [],
+    });
+  }
+
+  listThreadsPublic(status?: RequirementThreadRecord['status']) {
+    const rows = status
+      ? this.database.raw.prepare('SELECT * FROM requirement_thread WHERE status = ? ORDER BY last_activity_at DESC, updated_at DESC').all(status) as unknown as RequirementThreadRow[]
+      : this.database.raw.prepare('SELECT * FROM requirement_thread ORDER BY last_activity_at DESC, updated_at DESC').all() as unknown as RequirementThreadRow[];
+    return rows.map((thread) => this.publicThreadSummary(thread));
+  }
+
+  publicThreadDetail(threadId: string) {
+    const thread = this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(threadId) as unknown as RequirementThreadRow | undefined;
+    if (!thread) return null;
+    const sources = this.database.raw.prepare(
+      `SELECT source_event.*, requirement_thread_source.relation_type, requirement_thread_source.confidence,
+              requirement_thread_source.evidence_json, requirement_thread_source.root_id, requirement_thread_source.parent_id
+       FROM source_event JOIN requirement_thread_source ON requirement_thread_source.source_event_id = source_event.id
+       WHERE requirement_thread_source.thread_id = ? ORDER BY source_event.occurred_at ASC`,
+    ).all(threadId) as Array<Record<string, unknown>>;
+    const revisions = this.database.raw.prepare('SELECT * FROM requirement_thread_revision WHERE thread_id = ? ORDER BY created_at DESC').all(threadId) as Array<{
+      id: string;
+      thread_id: string;
+      base_thread_version: number;
+      state: string;
+      created_at: string;
+      decided_at: string | null;
+    }>;
+    const proposals = this.database.raw.prepare('SELECT * FROM task_update_proposal WHERE thread_id = ? ORDER BY created_at DESC').all(threadId) as unknown as TaskUpdateProposalRow[];
+    const sourceContents = this.sourceContentsByIds(this.threadSourceIds(threadId, thread.active_task_id, proposals));
+    const publicThread = requirementThreadDtoSchema.parse({
+      id: thread.id,
+      status: thread.status,
+      title: safeCandidateNarrative(thread.title, sourceContents, '需求线程标题已生成；来源正文默认隐藏。', 160),
+      background: safeCandidateNarrative(thread.background, sourceContents, '需求线程背景已保留，需主人主动核验。', 2_000),
+      validation_question: safeCandidateNarrative(thread.validation_question, sourceContents, '需求线程验证问题已保留，需主人主动核验。', 1_000),
+      describe: safeCandidateNarrative(thread.describe, sourceContents, '需求线程摘要已生成；来源正文默认隐藏。', 2_000),
+      version: thread.version,
+      last_activity_at: thread.last_activity_at,
+      ambiguity: [],
+    });
+    return threadDetailDtoSchema.parse({
+      ...publicThread,
+      active_task_id: thread.active_task_id,
+      created_at: thread.created_at,
+      updated_at: thread.updated_at,
+      sources: sources.map((source) => minimalSourceDtoSchema.parse({
+        source_scope: sourceScope(`thread:${thread.id}`, String(source.id)),
+        source_type: source.source_type,
+        completeness: source.completeness,
+        occurred_at: source.occurred_at,
+        summary_available: false,
+      })),
+      revisions: revisions.map((revision) => threadRevisionDtoSchema.parse({
+        id: revision.id,
+        thread_id: revision.thread_id,
+        base_thread_version: revision.base_thread_version,
+        state: revision.state,
+        created_at: revision.created_at,
+        decided_at: revision.decided_at,
+      })),
+      proposals: proposals.map((proposal) => taskUpdateProposalDtoSchema.parse(this.taskUpdateProposalView(proposal, {
+        public: true,
+        sourceContents,
+      }))),
+      task: thread.active_task_id ? this.publicTask(thread.active_task_id) : null,
+    });
+  }
+
+  listTaskUpdateProposals(state?: TaskUpdateProposalRecord['state']) {
+    return this.taskUpdateProposalRows(state).map((row) => this.taskUpdateProposalView(row));
+  }
+
+  listTaskUpdateProposalsPublic(state?: TaskUpdateProposalRecord['state']) {
+    return this.taskUpdateProposalRows(state)
+      .map((row) => taskUpdateProposalDtoSchema.parse(this.taskUpdateProposalView(row, {
+        public: true,
+        sourceContents: this.sourceContentsForTask(row.task_id, row.source_event_id ? [row.source_event_id] : []),
+      })));
+  }
+
+  private taskUpdateProposalRows(state?: TaskUpdateProposalRecord['state']) {
+    return state
+      ? this.database.raw.prepare('SELECT * FROM task_update_proposal WHERE state = ? ORDER BY created_at DESC').all(state) as unknown as TaskUpdateProposalRow[]
+      : this.database.raw.prepare('SELECT * FROM task_update_proposal ORDER BY created_at DESC').all() as unknown as TaskUpdateProposalRow[];
+  }
+
+  getTaskUpdateProposal(proposalId: string) {
+    const row = this.database.raw.prepare('SELECT * FROM task_update_proposal WHERE id = ?').get(proposalId) as TaskUpdateProposalRow | undefined;
+    if (!row) return null;
+    return { ...this.taskUpdateProposalView(row), task: this.getTask(row.task_id) };
+  }
+
+  private runtimeJobView(job: RuntimeJobRow) {
+    return {
+      id: job.id,
+      job_type: job.job_type,
+      status: job.status,
+      attempts: job.attempts,
+      max_attempts: job.max_attempts,
+      retryable: job.retryable,
+      available_at: job.available_at,
+      // Runtime errors may contain provider diagnostics or source fragments.
+      // The owner can use the status/attempt counters by default; detailed
+      // diagnostics stay behind the controlled local diagnostic flow.
+      last_error: job.last_error ? '运行失败；详细诊断已脱敏保留。' : null,
+      created_at: job.created_at,
+      updated_at: job.updated_at,
+    };
+  }
+
+  listRuntimeJobs(limit = 100) {
+    return { items: this.runtime.list(limit).map((job) => this.runtimeJobView(job)) };
+  }
+
+  getRuntimeJob(jobId: string) {
+    const job = this.runtime.get(jobId);
+    if (!job) return null;
+    const checkpoints = this.runtime.checkpoints(jobId) as Array<{ step: string; created_at: string }>;
+    const toolCalls = this.runtime.toolCalls(jobId) as Array<{
+      tool_name: string;
+      policy: string;
+      status: string;
+      error: string | null;
+      started_at: string;
+      finished_at: string | null;
+    }>;
+    return {
+      ...this.runtimeJobView(job),
+      checkpoints: checkpoints.map((checkpoint) => ({ step: checkpoint.step, created_at: checkpoint.created_at })),
+      toolCalls: toolCalls.map((call) => ({
+        tool_name: call.tool_name,
+        policy: call.policy,
+        status: call.status,
+        error: call.error,
+        started_at: call.started_at,
+        finished_at: call.finished_at,
+      })),
+    };
+  }
+
+  runtimeToolPolicies() {
+    return this.runtime.tools.list();
+  }
+
+  cancelRuntimeJob(jobId: string) {
+    const job = this.runtime.cancel(jobId);
+    if (!job) throw new Error('Runtime 工作项不存在。');
+    return this.runtimeJobView(job);
+  }
+
+  retryRuntimeJob(jobId: string) {
+    const current = this.runtime.get(jobId);
+    if (!current) throw new Error('Runtime 工作项不存在。');
+    if (current.job_type !== 'classify_source' && current.job_type !== 'classify_source_batch' && current.job_type !== 'reprocess_candidate' && current.job_type !== 'owner_decision') {
+      throw new Error('这个 Runtime 工作项没有安全的自动重试处理器。');
+    }
+    if (current.job_type === 'owner_decision') {
+      const payload = parseMetadata(current.payload_json);
+      const sourceEventId = typeof payload.sourceEventId === 'string' ? payload.sourceEventId : current.source_event_id;
+      const sourceRevisionValue = typeof payload.sourceRevision === 'string' ? payload.sourceRevision : null;
+      const decision = sourceEventId && sourceRevisionValue ? this.ownerDecisionRow(sourceEventId, sourceRevisionValue) : null;
+      if (!decision) throw new Error('主人判断工作项关联的记录不存在。');
+      if (decision.state === 'stale' || decision.state === 'review' || decision.state === 'applied' || decision.state === 'noop') {
+        throw new Error('这个主人判断已经进入待确认或终态，不能重复自动重试。');
+      }
+    }
+    return this.runtimeJobView(this.runtime.retry(jobId));
+  }
+
+  /**
+   * Retry classification through a source id, keeping Runtime job ids
+   * internal to the service. Batch jobs are resolved through job_source_link.
+   */
+  retrySourceClassification(
+    sourceEventId: string,
+    expectedSourceRevision?: string,
+    expectedJobId?: string,
+    candidateFence?: { candidateId: string; expectedVersion: number },
+  ) {
+    const source = this.database.raw.prepare('SELECT id FROM source_event WHERE id = ?').get(sourceEventId) as { id: string } | undefined;
+    if (!source) throw new Error('来源消息不存在。');
+
+    const expectedRelation = expectedJobId
+      ? this.sourceFailureRelation({ sourceEventId, expectedJobId, expectedSourceRevision })
+      : null;
+    if (expectedJobId && !expectedRelation) throw new Error('失败来源不存在。');
+    const expectedSourceIds = expectedRelation?.sourceEventIds ?? [sourceEventId];
+    if (expectedSourceRevision) {
+      const currentRevision = this.currentSourceFailureRevision(expectedSourceIds);
+      if (currentRevision && currentRevision !== expectedSourceRevision) {
+        throw new Error('来源内容或背景已经变化，这条失败记录已陈旧，请等待新的分类结果。');
+      }
+    }
+
+    const linkedJob = (expectedRelation?.job ?? this.database.raw.prepare(
+      `SELECT job.*
+       FROM job
+       LEFT JOIN job_source_link ON job_source_link.job_id = job.id
+       WHERE (job_source_link.source_event_id = ? OR job.source_event_id = ?)
+         AND job.job_type IN ('classify_source', 'classify_source_batch')
+       ORDER BY job.updated_at DESC, job.created_at DESC
+       LIMIT 1`,
+      ).get(sourceEventId, sourceEventId)) as unknown as RuntimeJobRow | undefined;
+    if (!linkedJob) throw new Error('这个来源没有可恢复的 AI 整理工作项。');
+    const linkedRelation = expectedRelation ?? this.sourceFailureRelation({ sourceEventId, expectedJobId: linkedJob.id });
+    if (!linkedRelation) throw new Error('这个来源没有可恢复的 AI 整理工作项。');
+
+    const candidateRows = this.database.raw.prepare(
+      `SELECT id, version
+         FROM candidate_request
+        WHERE (source_event_id IN (SELECT source_event_id FROM job_source_link WHERE job_id = ?) OR source_event_id = ?)
+          AND (? IS NULL OR id = ?)
+        ORDER BY id`,
+    ).all(
+      linkedJob.id,
+      sourceEventId,
+      candidateFence?.candidateId ?? null,
+      candidateFence?.candidateId ?? null,
+    ) as Array<{ id: string; version: number }>;
+    if (candidateRows.length > 0 && !candidateFence) throw new CandidateVersionRequiredError();
+    if (candidateFence && (candidateRows.length !== 1 || candidateRows[0]!.version !== candidateFence.expectedVersion)) {
+      throw new CandidateVersionConflictError();
+    }
+
+    if (linkedJob.status === 'completed') {
+      return { sourceEventId, status: 'completed' as const, message: '这个来源已经完成整理，无需重复重试。' };
+    }
+    if (linkedJob.status === 'running') {
+      return { sourceEventId, status: 'processing' as const, message: 'AI 正在整理这个来源，请稍候。' };
+    }
+    if (linkedJob.status === 'waiting_approval') {
+      throw new Error('这个来源的结果正在等待主人确认，不能按分类失败重试。');
+    }
+
+    if (linkedJob.status === 'queued') {
+      this.runtime.wakeRetry(linkedJob.id);
+    } else if (linkedJob.status === 'failed' || linkedJob.status === 'cancelled') {
+      try {
+        this.runtime.retry(linkedJob.id);
+      } catch (error) {
+        const current = this.runtime.get(linkedJob.id);
+        if (!current || !['queued', 'running'].includes(current.status)) throw error;
+        return { sourceEventId, status: current.status === 'running' ? 'processing' as const : 'queued' as const, message: current.status === 'running' ? 'AI 正在整理这个来源，请稍候。' : '已加入 AI 自动重试队列。' };
+      }
+    } else {
+      throw new Error('这个来源当前没有可安全重试的 AI 整理状态。');
+    }
+
+    const recorded = this.recordSourceFailure({
+      sourceEventIds: linkedRelation.sourceEventIds,
+      sourceRevision: linkedRelation.sourceRevision,
+      jobId: linkedJob.id,
+      status: 'retrying',
+    });
+    if (!recorded) throw new Error('失败来源关系已经变化，请刷新后重试。');
+
+    this.database.transaction(() => {
+      const updatedAt = nowIso();
+      for (const candidate of candidateRows) {
+        const updated = this.database.raw.prepare(
+          `UPDATE candidate_request
+              SET processing_state = 'retry_waiting',
+                  processing_job_id = ?,
+                  processing_error = NULL,
+                  recovered_at = NULL,
+                  updated_at = ?,
+                  version = version + 1
+            WHERE id = ? AND version = ?`,
+        ).run(linkedJob.id, updatedAt, candidate.id, candidate.version);
+        if (updated.changes !== 1) throw new CandidateVersionConflictError();
+      }
+    });
+
+    return { sourceEventId, status: 'queued' as const, message: '已加入 AI 自动重试队列。' };
+  }
+
+  retryCandidateSourceClassification(candidateId: string, sourceScopeValue: string, expectedVersion: number) {
+    const candidate = this.getCandidate(candidateId);
+    if (!candidate) throw new Error('候选需求不存在。');
+    this.assertCandidateVersion(candidate, expectedVersion);
+    const relation = this.resolveCandidateSourceScope(candidateId, sourceScopeValue);
+    if (!relation) return null;
+    const result = this.retrySourceClassification(relation.sourceEventId, undefined, undefined, {
+      candidateId,
+      expectedVersion: expectedVersion ?? candidate.version,
+    });
+    return result;
+  }
+
+  actOnCandidate(
+    candidateId: string,
+    action: 'accept' | 'snooze' | 'ignore',
+    snoozedUntil: string | undefined,
+    expectedVersion: number,
+    expectedGroupVersionHash?: string,
+  ) {
+    const result = this.database.transaction(() => {
+      // Re-read inside BEGIN IMMEDIATE so two stale UI requests cannot each
+      // create a different task from the same candidate.
+      const requested = this.getCandidate(candidateId);
+      if (!requested) throw new Error('候选需求不存在。');
+      const candidate = this.candidateGroupRoot(requested);
+      const group = this.candidateGroupRows(candidate.id);
+      this.assertCandidateVersion(candidate, expectedVersion);
+      if (group.length > 1 && candidateGroupVersionHash(group) !== expectedGroupVersionHash) {
+        throw new CandidateVersionConflictError();
+      }
+      this.assertCandidateActive(candidate);
+      if (candidate.state === 'accepted' && action !== 'accept') {
+        throw new Error('已接受的候选已经绑定正式任务，不能再暂存或忽略。');
+      }
+      if (candidate.state === 'accepted' && candidate.accepted_task_id) {
+        const task = this.getTask(candidate.accepted_task_id);
+        if (!task) throw new Error('候选关联的正式任务不存在。');
+        return { candidate, task, linkedExistingTask: true, projectTaskId: null as string | null };
+      }
+
+      const timestamp = nowIso();
+      if (action === 'snooze') {
+        const until = snoozedUntil ?? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+        for (const member of group) {
+          const updated = this.database.raw.prepare(
+            "UPDATE candidate_request SET state = 'snoozed', snoozed_until = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ? AND state <> 'accepted' AND accepted_task_id IS NULL",
+          ).run(until, timestamp, member.id, member.version);
+          if (updated.changes !== 1) throw new CandidateVersionConflictError();
+        }
+        return { candidate: this.getCandidate(candidate.id), task: null, linkedExistingTask: false, projectTaskId: null as string | null };
+      }
+
+      if (action === 'ignore') {
+        for (const member of group) {
+          const updated = this.database.raw.prepare(
+            "UPDATE candidate_request SET state = 'ignored', snoozed_until = NULL, updated_at = ?, version = version + 1 WHERE id = ? AND version = ? AND state <> 'accepted' AND accepted_task_id IS NULL",
+          ).run(timestamp, member.id, member.version);
+          if (updated.changes !== 1) throw new CandidateVersionConflictError();
+        }
+        for (const item of group) this.recordCandidateIgnoredRetirement(item, timestamp);
+        this.staleOwnerDecisionsForRetiredTargets({ candidateIds: group.map((item) => item.id) });
+        this.closeUnassignedThreadForCandidate(candidate, timestamp);
+        return { candidate: this.getCandidate(candidate.id), task: null, linkedExistingTask: false, projectTaskId: null as string | null };
+      }
+
+       const existingThread = this.threadForCandidate(candidate);
+      const candidateDemandUnitId = candidate.demand_unit_id ?? this.ensureCandidateDemandUnitRecord(candidate, timestamp);
+      const candidateSourceMatchesUnit = Boolean(this.database.raw.prepare(
+        `SELECT 1 FROM source_demand_unit_source
+         WHERE demand_unit_id = ? AND source_event_id = ?`,
+      ).get(candidateDemandUnitId, candidate.source_event_id));
+      if (action === 'accept' && existingThread && parseJsonValue<string[]>(existingThread.ambiguity_json, []).length > 0) {
+        throw new Error('请先确认这条候选属于哪个需求线程，再接受为正式任务。');
+      }
+      if (existingThread?.active_task_id) {
+        const existingTask = this.getTask(existingThread.active_task_id);
+        if (!existingTask) throw new Error('需求线程关联的正式任务不存在。');
+        for (const member of group) {
+          const accepted = this.database.raw.prepare(
+            "UPDATE candidate_request SET state = 'accepted', accepted_task_id = ?, snoozed_until = NULL, updated_at = ?, version = version + 1 WHERE id = ? AND version = ? AND state <> 'accepted' AND accepted_task_id IS NULL",
+          ).run(existingTask.id, timestamp, member.id, member.version);
+          if (accepted.changes !== 1) throw new CandidateVersionConflictError();
+        }
+        const threadSources = this.database.raw.prepare(
+          'SELECT source_event_id, demand_unit_id FROM requirement_thread_source WHERE thread_id = ?',
+        ).all(existingThread.id) as Array<{ source_event_id: string; demand_unit_id: string | null }>;
+        for (const source of threadSources) {
+          this.linkTaskSource(
+            existingTask.id,
+            source.source_event_id,
+            'thread_update',
+            timestamp,
+            source.demand_unit_id ?? this.uniqueThreadDemandUnitId(existingThread.id),
+          );
+        }
+        return { candidate: this.getCandidate(candidate.id), task: existingTask, linkedExistingTask: true, projectTaskId: existingTask.id };
+      }
+
+      const taskId = id('task');
+      this.database.raw.prepare(
+        `INSERT INTO task
+          (id, title, proposer_name, describe, status, schedule_at, next_step, risk, waiting_reason, version, completed_at, archived_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'unplanned', NULL, ?, 'medium', NULL, 1, NULL, NULL, ?, ?)`,
+      ).run(
+        taskId,
+        candidate.title,
+        candidate.proposer_name,
+        candidate.describe,
+        '确认需求边界、关键问题和可用数据源。',
+        timestamp,
+        timestamp,
+      );
+      const originDemandUnitId = this.linkTaskSource(
+        taskId,
+        candidate.source_event_id,
+        'origin',
+        timestamp,
+        candidateSourceMatchesUnit ? candidateDemandUnitId : null,
+      );
+      if (existingThread) {
+        const threadSources = this.database.raw.prepare(
+          'SELECT source_event_id, demand_unit_id FROM requirement_thread_source WHERE thread_id = ?',
+        ).all(existingThread.id) as Array<{ source_event_id: string; demand_unit_id: string | null }>;
+        for (const source of threadSources) {
+          if (source.source_event_id === candidate.source_event_id) continue;
+          this.linkTaskSource(
+            taskId,
+            source.source_event_id,
+            'thread_update',
+            timestamp,
+            source.demand_unit_id ?? this.uniqueThreadDemandUnitId(existingThread.id),
+          );
+        }
+      }
+      this.database.raw.prepare(
+        `INSERT INTO task_event
+          (id, task_id, event_type, actor_type, visibility, summary, source_event_id, demand_unit_id, before_json, after_json, occurred_at, recorded_at, version)
+         VALUES (?, ?, 'task_created', 'user', 'private', ?, ?, ?, NULL, ?, ?, ?, 1)`,
+      ).run(
+        id('evt'),
+        taskId,
+        '系统主人接受候选，建立正式任务。',
+        candidate.source_event_id,
+        originDemandUnitId,
+        JSON.stringify({ status: 'unplanned' }),
+        timestamp,
+        timestamp,
+      );
+      if (existingThread) {
+        this.database.raw.prepare('UPDATE task SET thread_id = ? WHERE id = ?').run(existingThread.id, taskId);
+        const linked = this.database.raw.prepare(
+          `UPDATE requirement_thread
+           SET active_task_id = ?, status = 'open', version = version + 1, updated_at = ?
+           WHERE id = ? AND active_task_id IS NULL`,
+        ).run(taskId, timestamp, existingThread.id);
+        if (linked.changes !== 1) throw new Error('需求线程已经绑定其他任务，请刷新后重试。');
+        this.database.raw.prepare(
+          "UPDATE requirement_thread_revision SET state = 'accepted', decided_at = ? WHERE thread_id = ? AND source_event_id = ? AND state = 'proposed'",
+        ).run(timestamp, existingThread.id, candidate.source_event_id);
+      }
+      for (const member of group) {
+        const accepted = this.database.raw.prepare(
+          "UPDATE candidate_request SET state = 'accepted', accepted_task_id = ?, snoozed_until = NULL, updated_at = ?, version = version + 1 WHERE id = ? AND version = ? AND state <> 'accepted' AND accepted_task_id IS NULL",
+        ).run(taskId, timestamp, member.id, member.version);
+        if (accepted.changes !== 1) throw new CandidateVersionConflictError();
+      }
+      return { candidate: this.getCandidate(candidate.id), task: this.getTask(taskId), linkedExistingTask: false, projectTaskId: taskId };
+    });
+    if (result.projectTaskId) this.projectTaskMemory(result.projectTaskId);
+    const { projectTaskId: _projectTaskId, ...view } = result;
+    return view;
+  }
+
+  listTasks(
+    status?: TaskStatus,
+    recordState: 'active' | 'invalidated' | 'all' = 'active',
+    deletedState: 'active' | 'only' | 'all' = 'active',
+  ) {
+    const stateClause = recordState === 'all' ? '' : ' AND record_state = ?';
+    const stateArgs = recordState === 'all' ? [] : [recordState];
+    const deletedClause = deletedState === 'all' ? '' : deletedState === 'only' ? ' AND deleted_at IS NOT NULL' : ' AND deleted_at IS NULL';
+    const scheduleOrder = 'COALESCE(planned_start_at, planned_due_at, schedule_at)';
+    if (status) {
+      const rows = this.database.raw
+        .prepare(`SELECT * FROM task WHERE status = ?${stateClause}${deletedClause} ORDER BY ${scheduleOrder} IS NULL, ${scheduleOrder}, updated_at DESC`)
+        .all(status, ...stateArgs) as unknown as TaskRecord[];
+      return rows.map((task) => normalizeTaskRecord(task)!);
+    }
+    const rows = this.database.raw
+      .prepare(`SELECT * FROM task WHERE 1 = 1${stateClause}${deletedClause} ORDER BY deleted_at IS NOT NULL, record_state = 'invalidated', status = 'archived', ${scheduleOrder} IS NULL, ${scheduleOrder}, updated_at DESC`)
+      .all(...stateArgs) as unknown as TaskRecord[];
+    return rows.map((task) => normalizeTaskRecord(task)!);
+  }
+
+  listTasksPublic(
+    status?: TaskStatus,
+    recordState: 'active' | 'invalidated' | 'all' = 'active',
+    deletedState: 'active' | 'only' | 'all' = 'active',
+  ) {
+    return this.listTasks(status, recordState, deletedState)
+      .map((task) => this.publicTask(task.id))
+      .filter((task): task is NonNullable<typeof task> => task !== null);
+  }
+
+  getTask(taskId: string) {
+    return normalizeTaskRecord(this.database.raw.prepare('SELECT * FROM task WHERE id = ?').get(taskId) as TaskRecord | undefined);
+  }
+
+  publicCandidate(candidateId: string) {
+    const row = this.listCandidates(undefined, 'all').find((candidate) => candidate.id === candidateId);
+    return row ? this.minimalCandidateView(row as CandidateRow & Record<string, unknown>) : null;
+  }
+
+  publicTask(taskId: string | null | undefined) {
+    if (!taskId) return null;
+    const detail = this.getTaskDetail(taskId);
+    if (!detail) return null;
+    return taskDtoSchema.parse({
+      id: detail.id,
+      title: detail.title,
+      proposer_name: detail.proposer_name,
+      describe: detail.describe,
+      status: detail.status,
+      schedule_at: safePublicTimestamp(detail.schedule_at),
+      planned_start_at: safePublicTimestamp(detail.planned_start_at),
+      planned_due_at: safePublicTimestamp(detail.planned_due_at),
+      next_step: detail.next_step,
+      risk: detail.risk,
+      waiting_reason: detail.waiting_reason,
+      version: detail.version,
+      completed_at: safePublicTimestamp(detail.completed_at),
+      archived_at: safePublicTimestamp(detail.archived_at),
+      deleted_at: safePublicTimestamp(detail.deleted_at),
+      record_state: detail.record_state,
+      merged_into_task_id: detail.merged_into_task_id,
+      auto_update_paused: detail.auto_update_paused,
+      created_at: detail.created_at,
+      updated_at: detail.updated_at,
+    });
+  }
+
+  publicMergeGroup(candidateId: string) {
+    const candidate = this.getCandidate(candidateId);
+    if (!candidate) return null;
+    return this.publicCandidate(candidateId)?.merge_group ?? null;
+  }
+
+  publicTaskUpdateProposal(proposalId: string | null | undefined) {
+    if (!proposalId) return null;
+    const row = this.database.raw.prepare('SELECT * FROM task_update_proposal WHERE id = ?').get(proposalId) as TaskUpdateProposalRow | undefined;
+    return row ? taskUpdateProposalDtoSchema.parse(this.taskUpdateProposalView(row, {
+      public: true,
+      sourceContents: this.sourceContentsForTask(row.task_id, row.source_event_id ? [row.source_event_id] : []),
+    })) : null;
+  }
+
+  private taskUpdateProposalView(proposal: TaskUpdateProposalRow, options: { public?: boolean; sourceContents?: readonly string[] } = {}) {
+    const patch = parseTaskUpdatePatch(proposal.patch_json);
+    const evidence = parseJsonValue<unknown>(proposal.evidence_json, []);
+    const beforeSnapshot = parseJsonValue<TaskUpdateProposalSnapshot | null>(proposal.before_snapshot_json, null);
+    const afterSnapshot = parseJsonValue<TaskUpdateProposalSnapshot | null>(proposal.after_snapshot_json, null);
+    const task = this.getTask(proposal.task_id);
+    const thread = proposal.thread_id
+      ? this.database.raw.prepare('SELECT version FROM requirement_thread WHERE id = ?').get(proposal.thread_id) as { version: number } | undefined
+      : undefined;
+    const source = proposal.source_event_id
+      ? this.database.raw.prepare('SELECT id, source_type, occurred_at, content FROM source_event WHERE id = ?')
+          .get(proposal.source_event_id) as { id: string; source_type: string; occurred_at: string; content: string } | undefined
+      : undefined;
+    const candidateRevision = proposal.candidate_revision_id
+      ? this.database.raw.prepare('SELECT candidate_id FROM candidate_revision WHERE id = ?').get(proposal.candidate_revision_id) as { candidate_id: string } | undefined
+      : undefined;
+    const candidate = candidateRevision
+      ? this.database.raw.prepare('SELECT * FROM candidate_request WHERE id = ?').get(candidateRevision.candidate_id) as CandidateRow | undefined
+      : undefined;
+    let cannotRevertReason: string | null = null;
+    if (proposal.decision_mode !== 'auto') cannotRevertReason = '只有 AI 自动应用的更新可以一键撤销。';
+    else if (proposal.reverted_at) cannotRevertReason = '这次自动更新已经撤销。';
+    else if (proposal.state !== 'approved' || proposal.applied_task_version === null) cannotRevertReason = '这次自动更新尚未完整应用。';
+    else if (!task || task.version !== proposal.applied_task_version) cannotRevertReason = '任务已有后续修改，不能覆盖新内容。';
+    else if (proposal.thread_id && (!thread || proposal.applied_thread_version === null || thread.version !== proposal.applied_thread_version)) {
+      cannotRevertReason = '需求线程已有后续修改，不能覆盖新内容。';
+    } else if (proposal.candidate_revision_id && !candidateRevision) {
+      cannotRevertReason = '候选修订已不存在，不能安全撤销。';
+    } else if (proposal.candidate_revision_id && !afterSnapshot?.candidate) {
+      cannotRevertReason = '自动更新缺少候选应用后快照，不能安全撤销。';
+    } else if (proposal.candidate_revision_id && !candidateSnapshotsEqual(afterSnapshot!.candidate, candidateFullAuditSnapshot(candidate))) {
+      cannotRevertReason = '候选摘要已有后续人工修改，不能覆盖新内容。';
+    }
+    const sourceContents = options.sourceContents ?? (source?.content ? [source.content] : []);
+    const safeNarrative = (value: unknown, fallback: string, maxLength: number) => options.public
+      ? safeCandidateNarrative(value, sourceContents, fallback, maxLength)
+      : value;
+    const safeProposalValue = (value: unknown, key: string) => {
+      if (key === 'plannedStartAt' || key === 'plannedDueAt') {
+        return value === null ? null : safePublicTimestamp(typeof value === 'string' ? value : null);
+      }
+      if (key === 'status' || key === 'risk') return value;
+      if (typeof value !== 'string') return value;
+      const maxLength = key.toLowerCase().includes('title') ? 160 : key.toLowerCase().includes('describe') || key.toLowerCase().includes('background') ? 2_000 : 1_000;
+      return safeNarrative(value, '提案字段已保留；来源正文默认隐藏。', maxLength);
+    };
+    const safePatch = Object.fromEntries(Object.entries(patch).map(([key, value]) => [key, safeProposalValue(value, key)]));
+    const valueBefore = (key: string) => {
+      const taskBefore = objectValue(beforeSnapshot?.task);
+      const threadBefore = objectValue(beforeSnapshot?.thread);
+      const map: Record<string, unknown> = {
+        title: taskBefore.title,
+        describe: taskBefore.describe,
+        status: taskBefore.status,
+        plannedStartAt: taskBefore.planned_start_at,
+        plannedDueAt: taskBefore.planned_due_at,
+        nextStep: taskBefore.next_step,
+        risk: taskBefore.risk,
+        waitingReason: taskBefore.waiting_reason,
+        threadTitle: threadBefore.title,
+        threadBackground: threadBefore.background,
+        threadValidationQuestion: threadBefore.validation_question,
+        threadDescribe: threadBefore.describe,
+        note: null,
+      };
+      return safeProposalValue(map[key] ?? null, key);
+    };
+    return {
+      id: proposal.id,
+      task_id: proposal.task_id,
+      thread_id: proposal.thread_id,
+      candidate_revision_id: proposal.candidate_revision_id,
+      thread_revision_id: proposal.thread_revision_id,
+      base_task_version: proposal.base_task_version,
+      base_thread_version: proposal.base_thread_version,
+      patch: safePatch,
+      changes: Object.entries(safePatch)
+        .filter(([, value]) => value !== undefined)
+        .map(([field, after]) => ({ field, before: valueBefore(field), after })),
+      reason: safeNarrative(proposal.reason, '受控任务更新提案已生成；具体来源需主人主动核验。', 500),
+      // Evidence is intentionally represented by the bounded patch and
+      // fixed policy text below; model/provider fields never leave the
+      // server-side audit record in the default task DTO.
+      evidence: Array.isArray(evidence) ? ['已保留受控证据，原文需主人主动核验。'] : [],
+      state: proposal.state,
+      origin: proposal.origin,
+      association_confidence: proposal.association_confidence,
+      update_confidence: proposal.update_confidence,
+      used_fallback: Boolean(proposal.used_fallback),
+      decision_mode: proposal.decision_mode,
+      policy_version: options.public
+        ? proposal.policy_version === AUTO_UPDATE_POLICY_VERSION ? AUTO_UPDATE_POLICY_VERSION : 'unknown'
+        : proposal.policy_version,
+      policy_reason: options.public ? '服务端策略门禁已记录。' : proposal.policy_reason,
+      applied_task_version: proposal.applied_task_version,
+      applied_thread_version: proposal.applied_thread_version,
+      task_event_id: proposal.applied_task_event_id,
+      reverted_at: proposal.reverted_at,
+      reverted_task_event_id: proposal.reverted_task_event_id,
+      can_revert: cannotRevertReason === null,
+      cannot_revert_reason: cannotRevertReason,
+      source: source ? {
+        scope: sourceScope(proposal.task_id, source.id),
+        source_type: source.source_type,
+        occurred_at: source.occurred_at,
+      } : null,
+      created_at: proposal.created_at,
+      decided_at: proposal.decided_at,
+    };
+  }
+
+  resolveCandidateSourceScope(candidateId: string, scope: string) {
+    const candidate = this.getCandidate(candidateId);
+    if (!candidate) return null;
+    const source = this.database.raw.prepare(
+      `SELECT source_event.id, candidate_request.demand_unit_id
+       FROM candidate_request JOIN source_event ON source_event.id = candidate_request.source_event_id
+       WHERE candidate_request.id = ?`,
+    ).get(candidateId) as { id: string; demand_unit_id: string | null } | undefined;
+    if (!source || sourceScope(candidateId, source.id) !== scope) return null;
+    return { sourceEventId: source.id, demandUnitId: source.demand_unit_id };
+  }
+
+  resolveTaskSourceScope(taskId: string, scope: string) {
+    const task = this.getTask(taskId);
+    if (!task || task.record_state !== 'active' || task.deleted_at) return null;
+    const rows = this.database.raw.prepare(
+      `SELECT source_event.id, COALESCE(task_source_link.demand_unit_id, candidate_request.demand_unit_id) AS demand_unit_id
+       FROM task_source_link
+       JOIN source_event ON source_event.id = task_source_link.source_event_id
+       LEFT JOIN candidate_request ON candidate_request.accepted_task_id = task_source_link.task_id
+         AND candidate_request.source_event_id = task_source_link.source_event_id
+       WHERE task_source_link.task_id = ?
+       UNION
+       SELECT source_event.id, candidate_request.demand_unit_id
+       FROM candidate_request
+       JOIN source_demand_unit_source ON source_demand_unit_source.demand_unit_id = candidate_request.demand_unit_id
+       JOIN source_event ON source_event.id = source_demand_unit_source.source_event_id
+       WHERE candidate_request.accepted_task_id = ?`,
+    ).all(taskId, taskId) as Array<{ id: string; demand_unit_id: string | null }>;
+    const row = rows.find((item) => sourceScope(taskId, item.id) === scope);
+    return row ? { sourceEventId: row.id, demandUnitId: row.demand_unit_id } : null;
+  }
+
+  verifyTaskSource(taskId: string, scope: string, confirmed: unknown): SourceVerificationDto {
+    sourceVerificationRequestSchema.parse({ confirmed });
+    const relation = this.resolveTaskSourceScope(taskId, scope);
+    if (!relation) throw new Error('来源核验范围无效。');
+    const source = this.database.raw.prepare(
+      'SELECT source_type, completeness, occurred_at, content, metadata_json, captured_at FROM source_event WHERE id = ?',
+    ).get(relation.sourceEventId) as {
+      source_type: 'bot_dm' | 'owner_dm' | 'group' | 'calendar' | 'meeting' | 'manual';
+      completeness: 'complete' | 'partial' | 'limited';
+      occurred_at: string;
+      content: string | null;
+      metadata_json: string | null;
+      captured_at: string;
+    } | undefined;
+    if (!source) throw new Error('来源核验范围无效。');
+    return this.database.transaction(() => {
+      let metadata: Record<string, unknown> = {};
+      let metadataCorrupt = false;
+      try {
+        const parsed = JSON.parse(source.metadata_json ?? '');
+        if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') metadataCorrupt = true;
+        else metadata = parsed as Record<string, unknown>;
+      } catch {
+        metadataCorrupt = true;
+      }
+      const withdrawn = metadata.deleted === true || metadata.withdrawn === true || metadata.recalled === true;
+      const permissionDenied = metadata.permissionDenied === true || metadata.accessStatus === 'restricted' || metadata.status === 'unauthorized';
+      const contentCorrupt = metadataCorrupt || (source.content !== null && typeof source.content !== 'string');
+      const hasContent = typeof source.content === 'string' && Boolean(source.content.trim());
+      const reason = metadataCorrupt
+        ? 'snapshot_content_corrupt'
+        : withdrawn
+          ? 'snapshot_marked_revoked'
+          : permissionDenied
+            ? 'snapshot_permission_unavailable'
+            : hasContent
+              ? 'available'
+              : 'snapshot_content_missing';
+      const status = reason === 'available' ? 'local_snapshot_verified' : 'local_snapshot_unavailable';
+      const providerStatusByMetadata: Record<string, SourceVerificationDto['provider_status']> = {
+        authorized: 'last_known_authorized',
+        permission_denied: 'last_known_permission_denied',
+        revoked: 'last_known_revoked',
+        unavailable: 'last_known_unavailable',
+      };
+      const lastKnownProviderStatus = typeof metadata.lastKnownProviderStatus === 'string'
+        ? providerStatusByMetadata[metadata.lastKnownProviderStatus] ?? 'unknown'
+        : 'unknown';
+      const lastKnownProviderStatusAt = typeof metadata.lastKnownProviderStatusAt === 'string'
+        && Number.isFinite(Date.parse(metadata.lastKnownProviderStatusAt))
+        && lastKnownProviderStatus !== 'unknown'
+        ? metadata.lastKnownProviderStatusAt
+        : null;
+      const providerStatus = lastKnownProviderStatusAt ? lastKnownProviderStatus : 'unknown';
+      const excerpt = status === 'local_snapshot_verified' ? redactDiagnosticText(sourceExcerpt(source.content!), 280) : null;
+      const message = status === 'local_snapshot_verified'
+        ? '已核验本地保存的来源快照片段；不代表当前 provider 权限或撤回状态。'
+        : reason === 'snapshot_marked_revoked'
+          ? '本地保存的来源快照标记为已撤回或删除；未执行实时 provider 核验，当前状态未知。'
+          : reason === 'snapshot_permission_unavailable'
+            ? '本地保存的来源快照标记为权限不可用；未执行实时 provider 核验，当前状态未知。'
+            : reason === 'snapshot_content_corrupt'
+              ? '本地保存的来源快照内容损坏；未执行实时 provider 核验，当前状态未知。'
+              : '本地保存的来源快照没有可用正文；未执行实时 provider 核验，当前状态未知。';
+      const result = sourceVerificationDtoSchema.parse({
+        scope,
+        status,
+        reason,
+        provider_status: providerStatus,
+        provider_status_at: lastKnownProviderStatusAt,
+        snapshot_captured_at: source.captured_at,
+        source_type: source.source_type,
+        completeness: source.completeness,
+        occurred_at: source.occurred_at,
+        content_excerpt: excerpt,
+        message,
+        excerpt_redacted: true,
+        external_action: 'none',
+      });
+      this.log(
+        'security',
+        status === 'local_snapshot_verified' ? 'info' : 'warn',
+        status === 'local_snapshot_verified' ? 'source.verification.completed' : 'source.verification.failed',
+        status === 'local_snapshot_verified'
+          ? '系统主人主动核验了一项本地来源快照；只返回受控脱敏片段，不产生对外动作。'
+          : '系统主人主动核验本地来源快照未完成；只记录受控状态，不产生对外动作。',
+        {
+          relationFingerprint: createHash('sha256').update(`${taskId}:${relation.sourceEventId}`).digest('hex').slice(0, 16),
+          sourceType: source.source_type,
+          verificationStatus: status,
+          verificationReason: reason,
+          providerStatus,
+          snapshotCapturedAt: source.captured_at,
+          excerptChars: excerpt?.length ?? 0,
+          externalAction: 'none',
+        },
+      );
+      return result;
+    });
+  }
+
+  getTaskDetail(taskId: string, options: { internal?: boolean } = {}) {
+    const task = this.getTask(taskId);
+    if (!task) {
+      return null;
+    }
+    const sourceRows = this.database.raw
+      .prepare(
+        `SELECT source_event.*, candidate_request.demand_unit_id,
+                candidate_request.title AS demand_unit_title,
+                candidate_request.describe AS demand_unit_describe
+         FROM candidate_request
+         JOIN source_demand_unit_source ON source_demand_unit_source.demand_unit_id = candidate_request.demand_unit_id
+         JOIN source_event ON source_event.id = source_demand_unit_source.source_event_id
+         WHERE candidate_request.accepted_task_id = ?
+         UNION ALL
+         SELECT source_event.*, task_source_link.demand_unit_id,
+                candidate_request.title AS demand_unit_title,
+                candidate_request.describe AS demand_unit_describe
+         FROM task_source_link
+         JOIN source_event ON source_event.id = task_source_link.source_event_id
+         LEFT JOIN candidate_request
+           ON candidate_request.demand_unit_id = task_source_link.demand_unit_id
+         WHERE task_source_link.task_id = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM candidate_request
+             JOIN source_demand_unit_source ON source_demand_unit_source.demand_unit_id = candidate_request.demand_unit_id
+             WHERE candidate_request.accepted_task_id = task_source_link.task_id
+               AND source_demand_unit_source.source_event_id = task_source_link.source_event_id
+           )
+         ORDER BY occurred_at DESC`,
+      )
+      .all(taskId, taskId);
+    const sourceDtos: MinimalSourceDto[] = (sourceRows as Array<Record<string, unknown>>).map((row) => minimalSourceDtoSchema.parse({
+      source_scope: sourceScope(taskId, String(row.id)),
+      source_type: row.source_type,
+      completeness: row.completeness,
+      occurred_at: row.occurred_at,
+      summary_available: Boolean(row.demand_unit_title || row.demand_unit_describe),
+    }));
+    const events = this.database.raw
+      .prepare('SELECT * FROM task_event WHERE task_id = ? ORDER BY occurred_at DESC, recorded_at DESC')
+      .all(taskId);
+    const references = this.database.raw
+      .prepare('SELECT * FROM reference_binding WHERE task_id = ? ORDER BY created_at DESC')
+      .all(taskId);
+    const approvals = (this.database.raw
+      .prepare('SELECT id, action_type, status, created_at, decided_at FROM approval WHERE task_id = ? ORDER BY created_at DESC')
+      .all(taskId) as Array<Record<string, unknown>>).map(approvalDraftDto);
+    const outboxDrafts = (this.database.raw
+      .prepare(
+        `SELECT outbox.id, outbox.approval_id, outbox.action_type, outbox.status, outbox.created_at
+         FROM outbox
+         JOIN approval ON approval.id = outbox.approval_id
+         WHERE approval.task_id = ?
+         ORDER BY outbox.created_at DESC`,
+      )
+      .all(taskId) as Array<Record<string, unknown>>).map(outboxDraftDto);
+    const thread = task.thread_id
+      ? this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(task.thread_id) as unknown as RequirementThreadRow | undefined
+      : undefined;
+    const updateProposals = this.database.raw.prepare(
+      'SELECT * FROM task_update_proposal WHERE task_id = ? ORDER BY created_at DESC',
+    ).all(taskId) as unknown as TaskUpdateProposalRow[];
+    const runtimeJobs = this.database.raw.prepare(
+      `SELECT id, job_type, status, attempts, max_attempts, retryable, available_at, last_error, created_at, updated_at
+       FROM job
+       WHERE task_id = ? OR source_event_id IN (SELECT source_event_id FROM task_source_link WHERE task_id = ?)
+       ORDER BY updated_at DESC LIMIT 20`,
+    ).all(taskId, taskId);
+    const relatedSourceIds = [
+      ...(sourceRows as Array<Record<string, unknown>>).map((row) => typeof row.id === 'string' ? row.id : null),
+      ...(events as Array<Record<string, unknown>>).map((event) => typeof event.source_event_id === 'string' ? event.source_event_id : null),
+      ...updateProposals.map((proposal) => proposal.source_event_id),
+    ].filter((value): value is string => Boolean(value));
+    const sourceContents = this.sourceContentsForTask(taskId, relatedSourceIds);
+    const publicDetail = {
+      id: task.id,
+      title: safeCandidateNarrative(task.title, sourceContents, '任务标题已生成；来源正文默认隐藏。', 160),
+      // Do not heuristically authorize sender identity. Public task details
+      // expose only the fixed role label; internal callers retain the raw row.
+      proposer_name: options.internal ? task.proposer_name : '需求方',
+      describe: safeCandidateNarrative(task.describe, sourceContents, '任务摘要已生成；来源正文默认隐藏。', 2_000),
+      status: task.status,
+      schedule_at: safePublicTimestamp(task.schedule_at),
+      planned_start_at: safePublicTimestamp(task.planned_start_at),
+      planned_due_at: safePublicTimestamp(task.planned_due_at),
+      next_step: safeCandidateNarrative(task.next_step, sourceContents, '下一步已记录；来源正文默认隐藏。', 1_000),
+      risk: task.risk,
+      waiting_reason: task.waiting_reason === null
+        ? null
+        : safeCandidateNarrative(task.waiting_reason, sourceContents, '等待原因已记录；来源正文默认隐藏。', 1_000),
+      version: task.version,
+      completed_at: safePublicTimestamp(task.completed_at),
+      archived_at: safePublicTimestamp(task.archived_at),
+      deleted_at: safePublicTimestamp(task.deleted_at),
+      record_state: task.record_state,
+      merged_into_task_id: task.merged_into_task_id,
+      auto_update_paused: task.auto_update_paused,
+      created_at: task.created_at,
+      updated_at: task.updated_at,
+      sources: options.internal ? sourceRows : sourceDtos,
+      events: options.internal ? events : (events as Array<Record<string, unknown>>).map((event) => ({
+        id: event.id,
+        event_type: event.event_type,
+        actor_type: event.actor_type,
+        visibility: event.visibility,
+        summary: safeCandidateNarrative(event.summary, sourceContents, '任务事件摘要已保留；来源正文默认隐藏。', 500),
+        occurred_at: event.occurred_at,
+        recorded_at: event.recorded_at,
+        version: event.version,
+      })),
+      // A reference path can reveal the owner's filesystem layout. Keep the
+      // binding usable for remove/inspect actions without returning the path.
+      references: options.internal ? references : (references as Array<Record<string, unknown>>).map((reference) => ({
+        id: reference.id,
+        label: safeCandidateNarrative(reference.label, sourceContents, '受控参考已保留；具体内容需主人主动核验。', 200),
+        access_mode: reference.access_mode,
+        created_at: reference.created_at,
+        path_bound: true,
+      })),
+      approvals: options.internal ? approvals : (approvals as Array<Record<string, unknown>>).map((approval) => ({
+        id: approval.id,
+        action_type: approval.action_type,
+        status: approval.status,
+        created_at: approval.created_at,
+        decided_at: approval.decided_at,
+      })),
+      thread: thread ? {
+        id: thread.id,
+        status: thread.status,
+        title: safeCandidateNarrative(thread.title, sourceContents, '线程摘要已保留；来源正文默认隐藏。', 160),
+        background: safeCandidateNarrative(thread.background, sourceContents, '线程背景已保留；来源正文默认隐藏。', 2_000),
+        validation_question: safeCandidateNarrative(thread.validation_question, sourceContents, '线程验证问题已保留；来源正文默认隐藏。', 1_000),
+        describe: safeCandidateNarrative(thread.describe, sourceContents, '线程摘要已生成；来源正文默认隐藏。', 2_000),
+        version: thread.version,
+        last_activity_at: thread.last_activity_at,
+        ambiguity: [],
+      } : null,
+      update_proposals: updateProposals.map((proposal) => this.taskUpdateProposalView(proposal, {
+        public: !options.internal,
+        sourceContents,
+      })),
+      auto_updates: updateProposals
+        .filter((proposal) => proposal.decision_mode === 'auto' || proposal.decision_mode === 'reverted')
+        .map((proposal) => this.taskUpdateProposalView(proposal, {
+          public: !options.internal,
+          sourceContents,
+        })),
+      memory_projection: this.getMemoryProjectionView(taskId),
+      runtime_jobs: options.internal ? runtimeJobs : (runtimeJobs as RuntimeJobRow[]).map((job) => this.runtimeJobView(job)),
+    };
+    return options.internal ? publicDetail : taskDetailDtoSchema.parse(publicDetail);
+  }
+
+  /**
+   * Read the complete source → demand unit → candidate/thread/task graph and
+   * every related AI/owner/audit record. The ID sets grow monotonically until
+   * a fixpoint; a hard cap prevents an accidental pathological graph from
+   * becoming an unbounded read.
+   */
+  getAuditChain(filters: {
+    sourceEventId?: string;
+    demandUnitId?: string;
+    candidateId?: string;
+    threadId?: string;
+    taskId?: string;
+  }): AuditChainDto {
+    const MAX_AUDIT_FIXPOINT_PASSES = 32;
+    for (const value of Object.values(filters)) {
+      if (value !== undefined && !AUDIT_INTERNAL_ID_PATTERN.test(value)) {
+        throw new Error('审计链 ID 格式无效。');
+      }
+    }
+    const sourceIds = new Set<string>(filters.sourceEventId ? [filters.sourceEventId] : []);
+    const demandUnitIds = new Set<string>(filters.demandUnitId ? [filters.demandUnitId] : []);
+    const candidateIds = new Set<string>(filters.candidateId ? [filters.candidateId] : []);
+    const threadIds = new Set<string>(filters.threadId ? [filters.threadId] : []);
+    const taskIds = new Set<string>(filters.taskId ? [filters.taskId] : []);
+    const inSql = (values: Set<string>) => values.size ? [...values].map(() => '?').join(',') : "''";
+    const addRows = (target: Set<string>, rows: Array<{ id: string | null | undefined }>) => {
+      rows.forEach((row) => { if (row.id) target.add(row.id); });
+    };
+    const ids = (sql: string, args: string[]) => this.database.raw.prepare(sql).all(...args) as Array<{ id: string }>;
+
+    let reachedFixpoint = false;
+    for (let pass = 0; pass < MAX_AUDIT_FIXPOINT_PASSES; pass += 1) {
+      const sizesBefore = [sourceIds.size, demandUnitIds.size, candidateIds.size, threadIds.size, taskIds.size];
+      if (sourceIds.size) {
+        const values = inSql(sourceIds);
+        addRows(demandUnitIds, ids(`SELECT DISTINCT demand_unit_id AS id FROM source_demand_unit_source WHERE source_event_id IN (${values})`, [...sourceIds]));
+        addRows(demandUnitIds, ids(`SELECT DISTINCT demand_unit_id AS id FROM requirement_thread_source WHERE source_event_id IN (${values}) AND demand_unit_id IS NOT NULL`, [...sourceIds]));
+        addRows(demandUnitIds, ids(`SELECT DISTINCT demand_unit_id AS id FROM task_source_link WHERE source_event_id IN (${values}) AND demand_unit_id IS NOT NULL`, [...sourceIds]));
+        addRows(candidateIds, ids(`SELECT DISTINCT id FROM candidate_request WHERE source_event_id IN (${values})`, [...sourceIds]));
+        addRows(threadIds, ids(`SELECT DISTINCT thread_id AS id FROM requirement_thread_source WHERE source_event_id IN (${values})`, [...sourceIds]));
+        addRows(taskIds, ids(`SELECT DISTINCT task_id AS id FROM task_source_link WHERE source_event_id IN (${values})`, [...sourceIds]));
+      }
+      if (demandUnitIds.size) {
+        const values = inSql(demandUnitIds);
+        addRows(sourceIds, ids(`SELECT DISTINCT source_event_id AS id FROM source_demand_unit_source WHERE demand_unit_id IN (${values})`, [...demandUnitIds]));
+        addRows(candidateIds, ids(`SELECT DISTINCT id FROM candidate_request WHERE demand_unit_id IN (${values})`, [...demandUnitIds]));
+        addRows(threadIds, ids(`SELECT DISTINCT thread_id AS id FROM requirement_thread_unit WHERE demand_unit_id IN (${values})`, [...demandUnitIds]));
+        addRows(threadIds, ids(`SELECT DISTINCT thread_id AS id FROM requirement_thread_source WHERE demand_unit_id IN (${values})`, [...demandUnitIds]));
+        addRows(taskIds, ids(`SELECT DISTINCT task_id AS id FROM task_source_link WHERE demand_unit_id IN (${values})`, [...demandUnitIds]));
+      }
+      if (candidateIds.size) {
+        const values = inSql(candidateIds);
+        addRows(sourceIds, ids(`SELECT DISTINCT source_event_id AS id FROM candidate_request WHERE id IN (${values})`, [...candidateIds]));
+        addRows(demandUnitIds, ids(`SELECT DISTINCT demand_unit_id AS id FROM candidate_request WHERE id IN (${values}) AND demand_unit_id IS NOT NULL`, [...candidateIds]));
+        addRows(taskIds, ids(`SELECT DISTINCT accepted_task_id AS id FROM candidate_request WHERE id IN (${values}) AND accepted_task_id IS NOT NULL`, [...candidateIds]));
+        addRows(threadIds, ids(`SELECT DISTINCT requirement_thread_unit.thread_id AS id FROM requirement_thread_unit JOIN candidate_request ON candidate_request.demand_unit_id = requirement_thread_unit.demand_unit_id WHERE candidate_request.id IN (${values})`, [...candidateIds]));
+      }
+      if (threadIds.size) {
+        const values = inSql(threadIds);
+        addRows(sourceIds, ids(`SELECT DISTINCT source_event_id AS id FROM requirement_thread_source WHERE thread_id IN (${values})`, [...threadIds]));
+        addRows(demandUnitIds, ids(`SELECT DISTINCT demand_unit_id AS id FROM requirement_thread_unit WHERE thread_id IN (${values})`, [...threadIds]));
+        addRows(demandUnitIds, ids(`SELECT DISTINCT demand_unit_id AS id FROM requirement_thread_source WHERE thread_id IN (${values}) AND demand_unit_id IS NOT NULL`, [...threadIds]));
+        addRows(taskIds, ids(`SELECT DISTINCT id FROM task WHERE thread_id IN (${values})`, [...threadIds]));
+      }
+      if (taskIds.size) {
+        const values = inSql(taskIds);
+        addRows(sourceIds, ids(`SELECT DISTINCT source_event_id AS id FROM task_source_link WHERE task_id IN (${values})`, [...taskIds]));
+        addRows(demandUnitIds, ids(`SELECT DISTINCT demand_unit_id AS id FROM task_source_link WHERE task_id IN (${values}) AND demand_unit_id IS NOT NULL`, [...taskIds]));
+        addRows(threadIds, ids(`SELECT DISTINCT thread_id AS id FROM task WHERE id IN (${values}) AND thread_id IS NOT NULL`, [...taskIds]));
+        addRows(candidateIds, ids(`SELECT DISTINCT id FROM candidate_request WHERE accepted_task_id IN (${values})`, [...taskIds]));
+      }
+      const sizesAfter = [sourceIds.size, demandUnitIds.size, candidateIds.size, threadIds.size, taskIds.size];
+      if (sizesAfter.every((size, index) => size === sizesBefore[index])) {
+        reachedFixpoint = true;
+        break;
+      }
+    }
+    if (!reachedFixpoint) {
+      throw new Error('审计链关联超过安全上限，已拒绝返回。');
+    }
+
+    const selectIds = <T>(sql: string, values: Set<string>) => {
+      if (!values.size) return [] as T[];
+      return this.database.raw.prepare(sql).all(...values) as T[];
+    };
+    const selectWithArgs = <T>(sql: string, args: string[]) => {
+      if (!args.length) return [] as T[];
+      return this.database.raw.prepare(sql).all(...args) as T[];
+    };
+    const sources = selectIds<{
+      id: string; source_type: string; owner_mentioned: number; completeness: string;
+      occurred_at: string; captured_at: string;
+    }>(`SELECT id, source_type, owner_mentioned, completeness, occurred_at, captured_at
+        FROM source_event WHERE id IN (${inSql(sourceIds)}) ORDER BY occurred_at ASC, id ASC`, sourceIds);
+    const demandUnits = selectIds<{
+      id: string; anchor_source_event_id: string; unit_kind: string; state: string; classification_revision: string | null;
+      ai_decision_id: string | null; created_at: string; updated_at: string;
+    }>(`SELECT id, anchor_source_event_id, unit_kind, state, classification_revision, ai_decision_id, created_at, updated_at
+        FROM source_demand_unit WHERE id IN (${inSql(demandUnitIds)}) ORDER BY created_at ASC, id ASC`, demandUnitIds);
+    const candidates = selectIds<{
+      id: string; source_event_id: string; demand_unit_id: string | null;
+      confidence: number; state: string; accepted_task_id: string | null; merged_into_candidate_id: string | null;
+      merged_at: string | null; deleted_at: string | null; created_at: string; updated_at: string;
+    }>(`SELECT id, source_event_id, demand_unit_id, confidence, state,
+              accepted_task_id, merged_into_candidate_id, merged_at, deleted_at, created_at, updated_at
+        FROM candidate_request WHERE id IN (${inSql(candidateIds)}) ORDER BY created_at ASC, id ASC`, candidateIds);
+    const threads = selectIds<{
+      id: string; status: string; active_task_id: string | null; primary_source_event_id: string | null;
+      version: number; last_activity_at: string | null; created_at: string; updated_at: string;
+    }>(`SELECT id, status, active_task_id, primary_source_event_id, version, last_activity_at, created_at, updated_at
+        FROM requirement_thread WHERE id IN (${inSql(threadIds)}) ORDER BY created_at ASC, id ASC`, threadIds);
+    const tasks = selectIds<{
+      id: string; status: string; schedule_at: string | null; planned_start_at: string | null;
+      planned_due_at: string | null; risk: string; version: number; thread_id: string | null;
+      record_state: string; created_at: string; updated_at: string;
+    }>(`SELECT id, status, schedule_at, planned_start_at, planned_due_at, risk, version,
+              thread_id, record_state, created_at, updated_at
+        FROM task WHERE id IN (${inSql(taskIds)}) ORDER BY created_at ASC, id ASC`, taskIds);
+    const sourceDemandUnits = selectWithArgs<{
+      demand_unit_id: string; source_event_id: string; source_role: string; sequence: number; created_at: string;
+    }>(`SELECT demand_unit_id, source_event_id, source_role, sequence, created_at
+        FROM source_demand_unit_source
+        WHERE demand_unit_id IN (${inSql(demandUnitIds)}) OR source_event_id IN (${inSql(sourceIds)})
+        ORDER BY sequence ASC, created_at ASC`, [...demandUnitIds, ...sourceIds]);
+    const threadUnits = selectWithArgs<{
+      thread_id: string; demand_unit_id: string; relation_type: string; confidence: number | null; created_at: string;
+    }>(`SELECT thread_id, demand_unit_id, relation_type, confidence, created_at
+        FROM requirement_thread_unit
+        WHERE thread_id IN (${inSql(threadIds)}) OR demand_unit_id IN (${inSql(demandUnitIds)})
+        ORDER BY created_at ASC`, [...threadIds, ...demandUnitIds]);
+    const threadSources = selectWithArgs<{
+      thread_id: string; source_event_id: string; demand_unit_id: string | null; relation_type: string;
+      confidence: number | null; source_revision: string | null; source_role: string; created_at: string;
+    }>(`SELECT thread_id, source_event_id, demand_unit_id, relation_type, confidence, source_revision, source_role, created_at
+        FROM requirement_thread_source
+        WHERE thread_id IN (${inSql(threadIds)}) OR source_event_id IN (${inSql(sourceIds)})
+        ORDER BY created_at ASC`, [...threadIds, ...sourceIds]);
+    const taskSourceLinks = selectWithArgs<{
+      task_id: string; source_event_id: string; demand_unit_id: string | null; relation_type: string; created_at: string;
+    }>(`SELECT task_id, source_event_id, demand_unit_id, relation_type, created_at
+        FROM task_source_link
+        WHERE task_id IN (${inSql(taskIds)}) OR source_event_id IN (${inSql(sourceIds)}) OR demand_unit_id IN (${inSql(demandUnitIds)})
+        ORDER BY created_at ASC`, [...taskIds, ...sourceIds, ...demandUnitIds]);
+    const aiDecisionClauses: string[] = [];
+    const aiDecisionArgs: string[] = [];
+    if (sourceIds.size) { aiDecisionClauses.push(`source_event_id IN (${inSql(sourceIds)})`); aiDecisionArgs.push(...sourceIds); }
+    if (demandUnitIds.size) { aiDecisionClauses.push(`demand_unit_id IN (${inSql(demandUnitIds)})`); aiDecisionArgs.push(...demandUnitIds); }
+    if (candidateIds.size) { aiDecisionClauses.push(`candidate_id IN (${inSql(candidateIds)})`); aiDecisionArgs.push(...candidateIds); }
+    const aiDecisions = aiDecisionClauses.length
+      ? this.database.raw.prepare(`SELECT id, source_event_id, source_revision, demand_unit_id, candidate_id,
+              confidence, used_fallback, http_status, attempts, structured_mode, input_hash,
+              input_char_count, fallback_mode, latency_ms, created_at
+           FROM ai_decision_log WHERE ${aiDecisionClauses.join(' OR ')} ORDER BY created_at ASC, id ASC`).all(...aiDecisionArgs)
+      : [];
+    const ownerClauses: string[] = [];
+    const ownerArgs: string[] = [];
+    if (sourceIds.size) { ownerClauses.push(`source_event_id IN (${inSql(sourceIds)})`); ownerArgs.push(...sourceIds); }
+    if (demandUnitIds.size) { ownerClauses.push(`demand_unit_id IN (${inSql(demandUnitIds)})`); ownerArgs.push(...demandUnitIds); }
+    if (candidateIds.size) { ownerClauses.push(`candidate_id IN (${inSql(candidateIds)})`); ownerArgs.push(...candidateIds); }
+    if (threadIds.size) { ownerClauses.push(`thread_id IN (${inSql(threadIds)})`); ownerArgs.push(...threadIds); }
+    if (taskIds.size) { ownerClauses.push(`task_id IN (${inSql(taskIds)})`); ownerArgs.push(...taskIds); }
+    const ownerDecisions = ownerClauses.length
+      ? this.database.raw.prepare(`SELECT id, source_event_id, source_revision, demand_unit_id, candidate_id, thread_id, task_id,
+              action, disposition, confidence, state, applied_task_version,
+              applied_thread_version, created_at, applied_at
+           FROM owner_decision WHERE ${ownerClauses.join(' OR ')} ORDER BY created_at ASC, id ASC`).all(...ownerArgs)
+      : [];
+    const eventClauses: string[] = [];
+    const eventArgs: string[] = [];
+    if (sourceIds.size) { eventClauses.push(`source_event_id IN (${inSql(sourceIds)})`); eventArgs.push(...sourceIds); }
+    if (demandUnitIds.size) { eventClauses.push(`demand_unit_id IN (${inSql(demandUnitIds)})`); eventArgs.push(...demandUnitIds); }
+    if (taskIds.size) { eventClauses.push(`task_id IN (${inSql(taskIds)})`); eventArgs.push(...taskIds); }
+    const taskEvents = eventClauses.length
+      ? this.database.raw.prepare(`SELECT id, task_id, event_type, actor_type, visibility, source_event_id, demand_unit_id,
+              occurred_at, recorded_at, version
+           FROM task_event WHERE ${eventClauses.join(' OR ')} ORDER BY occurred_at ASC, recorded_at ASC, id ASC`).all(...eventArgs) as Array<{
+             id: string; task_id: string; event_type: string; actor_type: string; visibility: string;
+             source_event_id: string | null; demand_unit_id: string | null; occurred_at: string; recorded_at: string; version: number;
+           }>
+      : [] as Array<{
+          id: string; task_id: string; event_type: string; actor_type: string; visibility: string;
+          source_event_id: string | null; demand_unit_id: string | null; occurred_at: string; recorded_at: string; version: number;
+        }>;
+    const correctionClauses: string[] = [];
+    const correctionArgs: string[] = [];
+    if (sourceIds.size) { correctionClauses.push(`source_event_id IN (${inSql(sourceIds)})`); correctionArgs.push(...sourceIds); }
+    if (demandUnitIds.size) { correctionClauses.push(`demand_unit_id IN (${inSql(demandUnitIds)})`); correctionArgs.push(...demandUnitIds); }
+    if (candidateIds.size) { correctionClauses.push(`candidate_id IN (${inSql(candidateIds)})`); correctionArgs.push(...candidateIds); }
+    if (taskIds.size) { correctionClauses.push(`task_id IN (${inSql(taskIds)})`); correctionArgs.push(...taskIds); }
+    const corrections = correctionClauses.length
+      ? this.database.raw.prepare(`SELECT id, task_id, candidate_id, source_event_id, demand_unit_id, correction_type,
+              visibility, operation, created_at
+           FROM correction_event WHERE ${correctionClauses.join(' OR ')} ORDER BY created_at ASC, id ASC`).all(...correctionArgs)
+      : [];
+    const gapClauses: string[] = [];
+    const gapArgs: string[] = [];
+    if (sourceIds.size) { gapClauses.push(`source_event_id IN (${inSql(sourceIds)})`); gapArgs.push(...sourceIds); }
+    if (demandUnitIds.size) { gapClauses.push(`demand_unit_id IN (${inSql(demandUnitIds)})`); gapArgs.push(...demandUnitIds); }
+    if (candidateIds.size) { gapClauses.push(`candidate_id IN (${inSql(candidateIds)})`); gapArgs.push(...candidateIds); }
+    if (threadIds.size) { gapClauses.push(`thread_id IN (${inSql(threadIds)})`); gapArgs.push(...threadIds); }
+    if (taskIds.size) { gapClauses.push(`task_id IN (${inSql(taskIds)})`); gapArgs.push(...taskIds); }
+    const integrityGaps = gapClauses.length
+      ? this.database.raw.prepare(`SELECT id, source_event_id, demand_unit_id, candidate_id, thread_id, task_id,
+              record_table, reason, status, correction_event_id, created_at, updated_at
+           FROM data_integrity_gap WHERE ${gapClauses.join(' OR ')} ORDER BY created_at ASC, id ASC`).all(...gapArgs)
+      : [];
+    return {
+      filters: {
+        source_event_id: auditOptionalId(filters.sourceEventId),
+        demand_unit_id: auditOptionalId(filters.demandUnitId),
+        candidate_id: auditOptionalId(filters.candidateId),
+        thread_id: auditOptionalId(filters.threadId),
+        task_id: auditOptionalId(filters.taskId),
+      },
+      sources: sources.map((row) => ({
+        id: auditRequiredId(row.id),
+        source_type: auditEnum(row.source_type, AUDIT_SOURCE_TYPES),
+        owner_mentioned: Boolean(row.owner_mentioned),
+        completeness: auditEnum(row.completeness, AUDIT_COMPLETENESS),
+        occurred_at: row.occurred_at,
+        captured_at: row.captured_at,
+      })),
+      demand_units: demandUnits.map((row) => ({
+        id: auditRequiredId(row.id),
+        anchor_source_event_id: auditRequiredId(row.anchor_source_event_id),
+        unit_kind: auditEnum(row.unit_kind, AUDIT_UNIT_KINDS),
+        state: auditEnum(row.state, AUDIT_DEMAND_STATES),
+        classification_revision: auditHash(row.classification_revision),
+        ai_decision_id: auditOptionalId(row.ai_decision_id),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      })),
+      candidates: candidates.map((row) => ({
+        id: auditRequiredId(row.id),
+        source_event_id: auditRequiredId(row.source_event_id),
+        demand_unit_id: auditOptionalId(row.demand_unit_id),
+        confidence: row.confidence,
+        state: auditEnum(row.state, AUDIT_CANDIDATE_STATES),
+        accepted_task_id: auditOptionalId(row.accepted_task_id),
+        merged_into_candidate_id: auditOptionalId(row.merged_into_candidate_id),
+        merged_at: row.merged_at,
+        deleted_at: row.deleted_at,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      })),
+      threads: threads.map((row) => ({
+        id: auditRequiredId(row.id),
+        status: auditEnum(row.status, AUDIT_THREAD_STATES),
+        active_task_id: auditOptionalId(row.active_task_id),
+        primary_source_event_id: auditOptionalId(row.primary_source_event_id),
+        version: row.version,
+        last_activity_at: row.last_activity_at,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      })),
+      tasks: tasks.map((row) => ({
+        id: auditRequiredId(row.id),
+        status: auditEnum(row.status, AUDIT_TASK_STATUSES),
+        schedule_at: row.schedule_at,
+        planned_start_at: row.planned_start_at,
+        planned_due_at: row.planned_due_at,
+        risk: auditEnum(row.risk, AUDIT_RISK_LEVELS),
+        version: row.version,
+        thread_id: auditOptionalId(row.thread_id),
+        record_state: auditEnum(row.record_state, AUDIT_RECORD_STATES),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      })),
+      source_demand_units: sourceDemandUnits.map((row) => ({
+        demand_unit_id: auditRequiredId(row.demand_unit_id),
+        source_event_id: auditRequiredId(row.source_event_id),
+        source_role: auditEnum(row.source_role, AUDIT_SOURCE_ROLES),
+        sequence: row.sequence,
+        created_at: row.created_at,
+      })),
+      thread_units: threadUnits.map((row) => ({
+        thread_id: auditRequiredId(row.thread_id),
+        demand_unit_id: auditRequiredId(row.demand_unit_id),
+        relation_type: auditEnum(row.relation_type, AUDIT_RELATION_TYPES),
+        confidence: row.confidence,
+        created_at: row.created_at,
+      })),
+      thread_sources: threadSources.map((row) => ({
+        thread_id: auditRequiredId(row.thread_id),
+        source_event_id: auditRequiredId(row.source_event_id),
+        demand_unit_id: auditOptionalId(row.demand_unit_id),
+        relation_type: auditEnum(row.relation_type, AUDIT_RELATION_TYPES),
+        confidence: row.confidence,
+        source_revision: auditHash(row.source_revision),
+        source_role: auditEnum(row.source_role, AUDIT_SOURCE_ROLES),
+        created_at: row.created_at,
+      })),
+      task_source_links: taskSourceLinks.map((row) => ({
+        task_id: auditRequiredId(row.task_id),
+        source_event_id: auditRequiredId(row.source_event_id),
+        demand_unit_id: auditOptionalId(row.demand_unit_id),
+        relation_type: auditEnum(row.relation_type, AUDIT_RELATION_TYPES),
+        created_at: row.created_at,
+      })),
+      ai_decisions: (aiDecisions as Array<{
+        id: string; source_event_id: string; source_revision: string | null; demand_unit_id: string | null;
+        candidate_id: string | null; confidence: number; used_fallback: number; http_status: number | null;
+        attempts: number; structured_mode: string; input_hash: string | null; input_char_count: number;
+        fallback_mode: string; latency_ms: number | null; created_at: string;
+      }>).map((row) => ({
+        id: auditRequiredId(row.id),
+        source_event_id: auditRequiredId(row.source_event_id),
+        source_revision: auditHash(row.source_revision),
+        demand_unit_id: auditOptionalId(row.demand_unit_id),
+        candidate_id: auditOptionalId(row.candidate_id),
+        confidence: row.confidence,
+        used_fallback: Boolean(row.used_fallback),
+        http_status: row.http_status,
+        attempts: row.attempts,
+        structured_mode: auditEnum(row.structured_mode, ['json_object', 'tool_call', 'text'] as const),
+        input_hash: auditHash(row.input_hash),
+        input_char_count: row.input_char_count,
+        fallback_mode: auditEnum(row.fallback_mode, ['llm', 'rule_mock', 'none'] as const),
+        latency_ms: row.latency_ms,
+        created_at: row.created_at,
+      })),
+      owner_decisions: (ownerDecisions as Array<{
+        id: string; source_event_id: string; source_revision: string; demand_unit_id: string | null;
+        candidate_id: string | null; thread_id: string | null; task_id: string | null; action: string;
+        disposition: string; confidence: number; state: string; applied_task_version: number | null;
+        applied_thread_version: number | null; created_at: string; applied_at: string | null;
+      }>).map((row) => ({
+        id: auditRequiredId(row.id),
+        source_event_id: auditRequiredId(row.source_event_id),
+        source_revision: auditHash(row.source_revision),
+        demand_unit_id: auditOptionalId(row.demand_unit_id),
+        candidate_id: auditOptionalId(row.candidate_id),
+        thread_id: auditOptionalId(row.thread_id),
+        task_id: auditOptionalId(row.task_id),
+        action: auditEnum(row.action, ['continue', 'confirm_schedule', 'request_context', 'decline', 'delegate', 'uncertain'] as const),
+        disposition: auditEnum(row.disposition, ['apply_task_patch', 'accept_candidate', 'decline_candidate', 'delegate_candidate', 'review', 'noop'] as const),
+        confidence: row.confidence,
+        state: auditEnum(row.state, ['queued', 'running', 'applied', 'review', 'failed', 'stale', 'noop'] as const),
+        applied_task_version: row.applied_task_version,
+        applied_thread_version: row.applied_thread_version,
+        created_at: row.created_at,
+        applied_at: row.applied_at,
+      })),
+      task_events: taskEvents.map((row) => ({
+        id: auditRequiredId(row.id),
+        task_id: auditRequiredId(row.task_id),
+        event_type: auditEnum(row.event_type, AUDIT_EVENT_TYPES),
+        actor_type: auditEnum(row.actor_type, AUDIT_ACTOR_TYPES),
+        visibility: auditEnum(row.visibility, AUDIT_VISIBILITIES),
+        source_event_id: auditOptionalId(row.source_event_id),
+        demand_unit_id: auditOptionalId(row.demand_unit_id),
+        occurred_at: row.occurred_at,
+        recorded_at: row.recorded_at,
+        version: row.version,
+      })),
+      corrections: (corrections as Array<{
+        id: string; task_id: string | null; candidate_id: string | null; source_event_id: string | null;
+        demand_unit_id: string | null; correction_type: string; visibility: string; operation: string; created_at: string;
+      }>).map((row) => ({
+        id: auditRequiredId(row.id),
+        task_id: auditOptionalId(row.task_id),
+        candidate_id: auditOptionalId(row.candidate_id),
+        source_event_id: auditOptionalId(row.source_event_id),
+        demand_unit_id: auditOptionalId(row.demand_unit_id),
+        correction_type: auditEnum(row.correction_type, AUDIT_CORRECTION_TYPES),
+        visibility: auditEnum(row.visibility, AUDIT_VISIBILITIES),
+        operation: auditEnum(row.operation, AUDIT_OPERATIONS),
+        created_at: row.created_at,
+      })),
+      integrity_gaps: (integrityGaps as Array<{
+        id: string; source_event_id: string | null; demand_unit_id: string | null; candidate_id: string | null;
+        thread_id: string | null; task_id: string | null; record_table: string; reason: string; status: string;
+        correction_event_id: string | null; created_at: string; updated_at: string;
+      }>).map((row) => ({
+        id: auditRequiredId(row.id),
+        source_event_id: auditOptionalId(row.source_event_id),
+        demand_unit_id: auditOptionalId(row.demand_unit_id),
+        candidate_id: auditOptionalId(row.candidate_id),
+        thread_id: auditOptionalId(row.thread_id),
+        task_id: auditOptionalId(row.task_id),
+        record_kind: auditEnum(row.record_table, AUDIT_RECORD_KINDS),
+        gap_code: auditEnum(row.reason, AUDIT_GAP_CODES),
+        status: auditEnum(row.status, AUDIT_GAP_STATUSES),
+        correction_event_id: auditOptionalId(row.correction_event_id),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      })),
+    };
+  }
+
+  getMemoryProjection(taskId: string) {
+    return (this.database.raw.prepare('SELECT * FROM memory_projection WHERE task_id = ?').get(taskId) as MemoryProjectionRecord | undefined) ?? null;
+  }
+
+  getMemoryProjectionView(taskId: string) {
+    const projection = this.getMemoryProjection(taskId);
+    if (!projection) return null;
+    return {
+      task_id: projection.task_id,
+      projection_version: projection.projection_version,
+      // The persisted projection path includes a title-derived slug and can
+      // therefore repeat source text. The renderer only needs a stable label;
+      // Electron resolves the real directory from task_id server-side.
+      relative_path: `tasks/${projection.task_id}`,
+      state: projection.state,
+      last_error: publicMemoryProjectionError(projection.last_error),
+      last_projected_at: projection.last_projected_at,
+      updated_at: projection.updated_at,
+    };
+  }
+
+  resolveTaskMemoryDirectory(taskId: string) {
+    const projection = this.getMemoryProjection(taskId);
+    if (!projection) throw new Error('任务记忆投影不存在，请先重新生成。');
+    if (projection.state !== 'ready') throw new Error('任务记忆尚未就绪，请先重新生成。');
+    const configuredRoot = this.assertTaskMemoryRootSafe(resolve(this.config.taskMemoryRoot));
+    if (!this.samePath(projection.root_path, configuredRoot)) {
+      throw new Error('任务记忆保存位置已经变化，请先重新生成。');
+    }
+    const directory = this.assertProjectionPathSafe(configuredRoot, projection.relative_path);
+    if (!existsSync(directory) || !lstatSync(directory).isDirectory()) {
+      throw new Error('任务记忆目录已不存在，请先重新生成。');
+    }
+    return directory;
+  }
+
+  private atomicMemoryWrite(path: string, content: string) {
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    writeFileSync(temporary, content, 'utf8');
+    renameSync(temporary, path);
+  }
+
+  private pathWithin(childPath: string, parentPath: string) {
+    const child = resolve(childPath);
+    const parent = resolve(parentPath);
+    const left = process.platform === 'win32' ? child.toLowerCase() : child;
+    const right = process.platform === 'win32' ? parent.toLowerCase() : parent;
+    return left === right || left.startsWith(right + sep);
+  }
+
+  private samePath(leftPath: string, rightPath: string) {
+    const left = resolve(leftPath);
+    const right = resolve(rightPath);
+    return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
+  }
+
+  private assertTaskMemoryRootSafe(rootPath: string) {
+    const root = resolve(rootPath);
+    const rootAnchor = dirname(root) === root ? root : dirname(root);
+    let current = root;
+    const existingAncestors: string[] = [];
+    while (true) {
+      if (existsSync(current)) existingAncestors.push(current);
+      const parent = dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+    for (const ancestor of existingAncestors) {
+      const stat = lstatSync(ancestor);
+      const real = realpathSync(ancestor);
+      if (stat.isSymbolicLink() || !this.samePath(real, ancestor)) {
+        throw new Error('任务记忆根目录及其父目录不能经过符号链接或 junction。');
+      }
+    }
+    const existingRootBase = existingAncestors[0] ?? rootAnchor;
+    const rootRealBase = existsSync(existingRootBase) ? realpathSync(existingRootBase) : existingRootBase;
+    const projectedRootReal = resolve(rootRealBase, relative(existingRootBase, root));
+    for (const allowed of this.config.workspace.allowedPaths) {
+      const allowedPath = resolve(allowed);
+      let allowedComparable = allowedPath;
+      if (existsSync(allowedPath)) {
+        const allowedStat = lstatSync(allowedPath);
+        const allowedReal = realpathSync(allowedPath);
+        if (allowedStat.isSymbolicLink() || !this.samePath(allowedReal, allowedPath)) {
+          throw new Error('实际工作目录授权不能经过符号链接或 junction。');
+        }
+        allowedComparable = allowedReal;
+      }
+      if (this.pathWithin(projectedRootReal, allowedComparable) || this.pathWithin(allowedComparable, projectedRootReal)) {
+        throw new Error('任务记忆目录不能位于实际工作目录或其父目录内；请单独选择系统自有目录。');
+      }
+    }
+    return root;
+  }
+
+  private assertProjectionPathSafe(rootPath: string, relativePath: string) {
+    if (isAbsolute(relativePath) || relativePath.split(/[\\/]+/u).some((part) => part === '..')) {
+      throw new Error('任务记忆投影路径必须是根目录内的相对路径。');
+    }
+    const directory = resolve(rootPath, relativePath);
+    if (!this.pathWithin(directory, rootPath)) throw new Error('任务记忆投影路径越过了根目录边界。');
+    let current = resolve(rootPath);
+    for (const part of relativePath.split(/[\\/]+/u).filter(Boolean)) {
+      current = join(current, part);
+      if (existsSync(current)) {
+        const stat = lstatSync(current);
+        if (stat.isSymbolicLink() || !this.samePath(realpathSync(current), current)) {
+          throw new Error('任务记忆投影路径不能经过符号链接或 junction。');
+        }
+      }
+    }
+    return directory;
+  }
+
+  private normalizeManagedProjectionFile(relativeFile: string) {
+    const normalized = relativeFile.replaceAll('\\', '/').replace(/^\.\//u, '');
+    if (!normalized || isAbsolute(normalized) || normalized.split('/').some((part) => !part || part === '..')) {
+      throw new Error('任务记忆托管文件清单包含无效路径，已停止清理。');
+    }
+    return normalized;
+  }
+
+  private assertManagedProjectionFileSafe(directory: string, relativeFile: string) {
+    const normalized = this.normalizeManagedProjectionFile(relativeFile);
+    const parts = normalized.split('/');
+    const filePath = resolve(directory, ...parts);
+    if (!this.pathWithin(filePath, directory) || filePath === resolve(directory)) {
+      throw new Error('任务记忆托管文件越过了任务目录边界。');
+    }
+    let current = resolve(directory);
+    for (const part of parts.slice(0, -1)) {
+      current = join(current, part);
+      if (existsSync(current)) {
+        const stat = lstatSync(current);
+        if (stat.isSymbolicLink() || !this.samePath(realpathSync(current), current)) {
+          throw new Error('任务记忆托管文件路径不能经过符号链接或 junction。');
+        }
+      }
+    }
+    if (existsSync(filePath) && lstatSync(filePath).isSymbolicLink()) {
+      throw new Error('任务记忆托管文件不能是符号链接。');
+    }
+    if (existsSync(filePath) && !this.samePath(realpathSync(filePath), filePath)) {
+      throw new Error('任务记忆托管文件不能是 junction 或其他 reparse point。');
+    }
+    return { normalized, filePath };
+  }
+
+  private cleanManagedProjectionFiles(directory: string, managedFiles: string[]) {
+    let removed = 0;
+    for (const item of [...new Set(managedFiles)]) {
+      if (typeof item !== 'string') continue;
+      const { filePath } = this.assertManagedProjectionFileSafe(directory, item);
+      if (!existsSync(filePath)) continue;
+      const stat = lstatSync(filePath);
+      if (!stat.isFile()) throw new Error('任务记忆托管清单指向了目录，已停止清理以保护未知文件。');
+      rmSync(filePath, { force: true });
+      removed += 1;
+    }
+    return removed;
+  }
+
+  private recoverLegacyManagedProjectionFiles(directory: string, projection: MemoryProjectionRecord | null) {
+    if (!projection || projection.state !== 'ready' || !projection.checksum || !projection.last_projected_at) return [] as string[];
+    const index = this.assertManagedProjectionFileSafe(directory, 'updates/index.json');
+    if (!existsSync(index.filePath) || !lstatSync(index.filePath).isFile()) return [] as string[];
+    try {
+      const legacy = JSON.parse(readFileSync(index.filePath, 'utf8')) as {
+        taskEvents?: Array<{ id?: unknown }>;
+        confirmedRevisions?: Array<{ proposalId?: unknown }>;
+      };
+      if (!Array.isArray(legacy.taskEvents) || !Array.isArray(legacy.confirmedRevisions)) return [] as string[];
+      const files = [
+        'task.json',
+        'brief.md',
+        'sources.md',
+        'artifacts.json',
+        'updates/index.json',
+        ...legacy.taskEvents.flatMap((event) => typeof event?.id === 'string' && event.id ? [`updates/${safeSlug(event.id)}.md`] : []),
+        ...legacy.confirmedRevisions.flatMap((revision) => typeof revision?.proposalId === 'string' && revision.proposalId ? [`updates/proposal-${safeSlug(revision.proposalId)}.md`] : []),
+      ];
+      return [...new Set(files.map((file) => this.normalizeManagedProjectionFile(file)))];
+    } catch {
+      return [] as string[];
+    }
+  }
+
+  private memorySafeReferencePath(referencePath: string) {
+    const normalized = referencePath.replaceAll('\\', '/');
+    if (normalized.startsWith('workspace://')) {
+      const suffix = normalized.slice('workspace://'.length).replace(/^\/+/, '');
+      return `workspace/${suffix || 'root'}`;
+    }
+    if (isAbsolute(referencePath)) {
+      const allowed = this.config.workspace.allowedPaths.find((item) => this.pathWithin(referencePath, item));
+      if (!allowed) return 'workspace/<authorized-path-unavailable>';
+      const suffix = relative(resolve(allowed), resolve(referencePath)).replaceAll('\\', '/');
+      return `workspace/${suffix || 'root'}`;
+    }
+    if (normalized.split('/').some((part) => part === '..')) return 'workspace/<invalid-relative-path>';
+    return `workspace/${normalized.replace(/^\/+/, '') || 'root'}`;
+  }
+
+  /**
+   * The task-memory directory is a rebuildable, system-owned projection.
+   * It never becomes the source of truth and never writes to reference paths.
+   */
+  projectTaskMemory(taskId: string) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error('任务不存在。');
+    const rootPath = resolve(this.config.taskMemoryRoot);
+    const timestamp = nowIso();
+    const existing = this.getMemoryProjection(taskId);
+    // Keep the first directory stable when a title changes so an update cannot
+    // leave multiple stale task folders behind.
+    const relativePath = existing?.relative_path ?? join('tasks', `${task.id}-${safeSlug(task.title)}`);
+    if (!existing) {
+      this.database.raw.prepare(
+        `INSERT INTO memory_projection
+          (id, task_id, projection_version, root_path, relative_path, state, checksum, last_error, last_projected_at, created_at, updated_at)
+         VALUES (?, ?, 0, ?, ?, 'pending', NULL, NULL, NULL, ?, ?)`,
+      ).run(id('memory'), taskId, rootPath, relativePath, timestamp, timestamp);
+    } else {
+      this.database.raw.prepare("UPDATE memory_projection SET state = 'pending', last_error = NULL, updated_at = ? WHERE task_id = ?").run(timestamp, taskId);
+    }
+
+    const memoryTool = this.runtime.authorizeTool(null, 'memory.project', { taskId }, true);
+    try {
+      if (!memoryTool.allowed) throw new Error(`Runtime 禁止任务记忆投影：${memoryTool.reason}`);
+      this.assertTaskMemoryRootSafe(rootPath);
+      const detail = this.getTaskDetail(taskId, { internal: true })!;
+      const lastSource = detail.sources[detail.sources.length - 1] as { id?: unknown } | undefined;
+      const lastSourceId = typeof lastSource?.id === 'string' ? lastSource.id : '';
+      const thread = task.thread_id
+        ? this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(task.thread_id) as unknown as RequirementThreadRow | undefined
+        : this.threadForSource(lastSourceId);
+      const directory = this.assertProjectionPathSafe(rootPath, relativePath);
+      const taskJson = JSON.stringify({
+        task,
+        threadId: thread?.id ?? null,
+        sourceIds: detail.sources.map((source: Record<string, unknown>) => String(source.external_id ?? source.id ?? '')),
+        projectionVersion: task.version,
+        generatedAt: timestamp,
+      }, null, 2);
+      const brief = [
+        `# ${task.title}`,
+        '',
+        `- 任务 ID：${task.id}`,
+        `- 提出人：${task.proposer_name}`,
+        `- 状态：${task.status}`,
+        `- 风险：${task.risk}`,
+        `- 我的计划开始：${task.planned_start_at ?? '未知'}`,
+        `- 我的计划完成：${task.planned_due_at ?? '未知'}`,
+        '',
+        '## Describe',
+        '',
+        task.describe || '未知',
+        '',
+        '## 当前下一步',
+        '',
+        task.next_step || '未知',
+        '',
+        '## 线程背景',
+        '',
+        thread && typeof thread.background === 'string' ? thread.background || '未知' : '未知',
+        '',
+        '## 投影边界',
+        '',
+        '只包含主人已确认的正式任务与线程状态；待确认提案不会写入任务记忆目录。',
+        '',
+      ].join('\n');
+      const sources = [
+        '# 来源索引',
+        '',
+        ...detail.sources.map((source: Record<string, unknown>) => {
+          const sourceContent = typeof source.content === 'string' ? source.content : '';
+          const sourceHash = createHash('sha256').update(sourceContent).digest('hex');
+          return [
+            `## ${String(source.occurred_at ?? '未知时间')} · ${String(source.sender_name ?? '未知发送人')}`,
+            `- 来源类型：${String(source.source_type ?? '未知')}`,
+            `- 来源链接：${String(source.source_url ?? '无')}`,
+            `- 来源标识哈希：${createHash('sha256').update(String(source.external_id ?? '')).digest('hex').slice(0, 16) || '未知'}`,
+            `- 正文哈希：${sourceHash}`,
+            `- 正文长度：${sourceContent.length}`,
+            '',
+          ].join('\n');
+        }),
+      ].join('\n');
+      const updates = detail.events.map((event: Record<string, unknown>) => ({
+        id: String(event.id),
+        eventType: String(event.event_type),
+        summary: String(event.summary),
+        version: Number(event.version),
+        occurredAt: String(event.occurred_at),
+      }));
+      const approvedProposals = this.database.raw.prepare(
+        "SELECT * FROM task_update_proposal WHERE task_id = ? AND state = 'approved' AND reverted_at IS NULL ORDER BY decided_at ASC, created_at ASC",
+      ).all(taskId) as unknown as TaskUpdateProposalRow[];
+      const confirmedRevisions = approvedProposals.map((proposal) => ({
+        proposalId: proposal.id,
+        candidateRevisionId: proposal.candidate_revision_id,
+        threadRevisionId: proposal.thread_revision_id,
+        baseTaskVersion: proposal.base_task_version,
+        baseThreadVersion: proposal.base_thread_version,
+        patch: parseMetadata(proposal.patch_json),
+        evidence: parseJsonValue<unknown>(proposal.evidence_json, []),
+        provider: proposal.provider,
+        model: proposal.model,
+        promptVersion: proposal.prompt_version,
+        createdAt: proposal.created_at,
+        decidedAt: proposal.decided_at,
+      }));
+      const artifacts = JSON.stringify({
+        references: detail.references.map((reference: Record<string, unknown>) => {
+          const snapshot = this.database.raw.prepare(
+            'SELECT state, entry_count, truncated, entries_json, error, inspected_at FROM reference_snapshot WHERE reference_binding_id = ? ORDER BY inspected_at DESC LIMIT 1',
+          ).get(String(reference.id ?? '')) as { state?: string; entry_count?: number; truncated?: number; entries_json?: string; error?: string | null; inspected_at?: string } | undefined;
+          const entries = parseJsonValue<unknown[]>(snapshot?.entries_json, []).filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === 'object' && !Array.isArray(entry)))
+            .map((entry) => ({
+              relativePath: typeof entry.relativePath === 'string' ? entry.relativePath.replaceAll('\\', '/') : '未知',
+              type: typeof entry.type === 'string' ? entry.type : '未知',
+              size: typeof entry.size === 'number' ? entry.size : null,
+              modifiedAt: typeof entry.modifiedAt === 'string' ? entry.modifiedAt : null,
+            }));
+          return {
+            label: reference.label,
+            referencePath: this.memorySafeReferencePath(String(reference.reference_path ?? '')),
+            accessMode: reference.access_mode,
+            snapshot: snapshot ? {
+              state: snapshot.state ?? 'unknown',
+              entryCount: snapshot.entry_count ?? entries.length,
+              truncated: Boolean(snapshot.truncated),
+              inspectedAt: snapshot.inspected_at ?? null,
+              error: snapshot.error ? String(snapshot.error).slice(0, 160) : null,
+              entries,
+            } : null,
+          };
+        }),
+        note: '实际工作目录只读；此文件不复制或修改工作文件。',
+      }, null, 2);
+      const managedFiles = [
+        'task.json',
+        'brief.md',
+        'sources.md',
+        'artifacts.json',
+        'updates/index.json',
+        ...updates.map((update) => `updates/${safeSlug(update.id)}.md`),
+        ...confirmedRevisions.map((revision) => `updates/proposal-${safeSlug(revision.proposalId)}.md`),
+      ].map((item) => this.normalizeManagedProjectionFile(item));
+      const storedManagedFiles = parseJsonValue<unknown[]>(existing?.managed_files_json, [])
+        .filter((item): item is string => typeof item === 'string');
+      const previousManagedFiles = storedManagedFiles.length
+        ? storedManagedFiles
+        : this.recoverLegacyManagedProjectionFiles(directory, existing);
+      const cleanupManifest = [...new Set([...previousManagedFiles, ...managedFiles])];
+      this.database.raw.prepare('UPDATE memory_projection SET managed_files_json = ?, updated_at = ? WHERE task_id = ?')
+        .run(JSON.stringify(cleanupManifest), timestamp, taskId);
+      mkdirSync(directory, { recursive: true });
+      this.cleanManagedProjectionFiles(directory, previousManagedFiles);
+      const updatesDirectory = join(directory, 'updates');
+      if (existsSync(updatesDirectory) && lstatSync(updatesDirectory).isSymbolicLink()) {
+        throw new Error('任务记忆 updates 目录不能是符号链接或 junction。');
+      }
+      mkdirSync(updatesDirectory, { recursive: true });
+      this.atomicMemoryWrite(join(directory, 'task.json'), taskJson);
+      this.atomicMemoryWrite(join(directory, 'brief.md'), brief);
+      this.atomicMemoryWrite(join(directory, 'sources.md'), sources);
+      this.atomicMemoryWrite(join(directory, 'artifacts.json'), artifacts);
+      this.atomicMemoryWrite(join(directory, 'updates', 'index.json'), JSON.stringify({ taskEvents: updates, confirmedRevisions }, null, 2));
+      for (const update of updates) {
+        this.atomicMemoryWrite(join(directory, 'updates', `${safeSlug(update.id)}.md`), `# ${update.eventType}\n\n${update.summary}\n\n- 版本：${update.version}\n- 时间：${update.occurredAt}\n`);
+      }
+      for (const revision of confirmedRevisions) {
+        const patchJson = JSON.stringify(revision.patch, null, 2);
+        const evidenceJson = JSON.stringify(revision.evidence, null, 2);
+        this.atomicMemoryWrite(
+          join(directory, 'updates', `proposal-${safeSlug(revision.proposalId)}.md`),
+          `# 已确认更新 ${revision.proposalId}\n\n- 候选修订：${revision.candidateRevisionId ?? '无'}\n- 线程修订：${revision.threadRevisionId ?? '无'}\n- 基于任务版本：v${revision.baseTaskVersion}\n- 基于线程版本：${revision.baseThreadVersion === null ? '无' : `v${revision.baseThreadVersion}`}\n- 模型：${revision.provider || '本地规则'}${revision.model ? ` / ${revision.model}` : ''}\n- 确认时间：${revision.decidedAt ?? '未知'}\n\n## Patch\n\n\`\`\`json\n${patchJson}\n\`\`\`\n\n## 证据\n\n\`\`\`json\n${evidenceJson}\n\`\`\`\n`,
+        );
+      }
+      const checksum = createHash('sha256').update(`${taskJson}\n${brief}\n${sources}\n${artifacts}\n${JSON.stringify(updates)}\n${JSON.stringify(confirmedRevisions)}`).digest('hex');
+      this.database.raw.prepare(
+        `UPDATE memory_projection
+         SET projection_version = ?, root_path = ?, relative_path = ?, state = 'ready', checksum = ?, last_error = NULL,
+             managed_files_json = ?, last_projected_at = ?, updated_at = ?
+         WHERE task_id = ?`,
+      ).run(task.version, rootPath, relativePath, checksum, JSON.stringify(managedFiles), timestamp, timestamp, taskId);
+      this.runtime.completeToolCall(memoryTool.callId, { taskId, projectionVersion: task.version });
+    } catch (error) {
+      this.runtime.failToolCall(memoryTool.callId, error);
+      const message = sanitizeRuntimeError(error, 300);
+      this.database.raw.prepare("UPDATE memory_projection SET state = 'error', last_error = ?, updated_at = ? WHERE task_id = ?").run(message, timestamp, taskId);
+      this.log('runtime', 'error', 'memory.projection_failed', '任务记忆投影失败，正式任务保留并等待重试。', { taskId, error: message });
+    }
+    return this.getMemoryProjection(taskId);
+  }
+
+  rebuildTaskMemory(taskId: string) {
+    const projection = this.projectTaskMemory(taskId);
+    this.log(
+      'runtime',
+      projection?.state === 'ready' ? 'info' : 'warn',
+      'memory.rebuilt',
+      projection?.state === 'ready' ? '已清理系统托管的旧文件并重建任务记忆。' : '任务记忆清理重建未完成。',
+      { taskId, state: projection?.state ?? 'missing' },
+    );
+    return this.getMemoryProjectionView(taskId);
+  }
+
+  private resolveTaskPatch(task: TaskRecord, patch: TaskPatch) {
+    const next = {
+      title: patch.title ?? task.title,
+      describe: patch.describe ?? task.describe,
+      status: patch.status ?? task.status,
+      scheduleAt: patch.scheduleAt === undefined ? task.schedule_at : patch.scheduleAt,
+      plannedStartAt: patch.plannedStartAt === undefined ? task.planned_start_at : patch.plannedStartAt,
+      plannedDueAt: patch.plannedDueAt === undefined
+        ? (patch.scheduleAt === undefined ? task.planned_due_at : patch.scheduleAt)
+        : patch.plannedDueAt,
+      nextStep: patch.nextStep ?? task.next_step,
+      risk: patch.risk ?? task.risk,
+      waitingReason: patch.waitingReason === undefined ? task.waiting_reason : patch.waitingReason,
+    };
+    assertShanghaiCalendarPlanRange(next.plannedStartAt, next.plannedDueAt);
+    return next;
+  }
+
+  private applyTaskPatch(
+    task: TaskRecord,
+    patch: TaskPatch,
+    options: {
+      actorType?: string;
+      visibility?: 'private' | 'awaiting_approval' | 'external';
+      eventType?: string;
+      taskEventId?: string;
+      summary?: string;
+      sourceEventId?: string | null;
+      demandUnitId?: string | null;
+      afterTransaction?: (timestamp: string, nextVersion: number, taskEventId: string) => void;
+    } = {},
+  ) {
+    if (task.record_state === 'invalidated') throw new Error('无效记录只能查看和纠错，不能继续修改任务。');
+    if (task.deleted_at) throw new Error('回收站中的任务只能恢复或查看，不能继续修改。');
+    if (patch.expectedVersion !== undefined && patch.expectedVersion !== task.version) throw new Error('任务已被其他操作更新，请刷新后重试。');
+    const next = this.resolveTaskPatch(task, patch);
+    const timestamp = nowIso();
+    const nextVersion = task.version + 1;
+    const completedAt = next.status === 'completed' ? task.completed_at ?? timestamp : next.status === 'archived' ? task.completed_at : null;
+    const archivedAt = next.status === 'archived' ? task.archived_at ?? timestamp : null;
+    const taskEventId = options.taskEventId ?? id('evt');
+    const summary = options.summary ?? (patch.plannedStartAt !== undefined || patch.plannedDueAt !== undefined || patch.scheduleAt !== undefined
+      ? '系统主人更新了我的计划时间。'
+      : '系统主人更新了任务信息。');
+    this.database.transaction(() => {
+      const result = this.database.raw.prepare(
+        `UPDATE task SET title = ?, describe = ?, status = ?, schedule_at = ?, planned_start_at = ?, planned_due_at = ?, next_step = ?, risk = ?, waiting_reason = ?,
+           version = ?, completed_at = ?, archived_at = ?, updated_at = ?
+         WHERE id = ? AND version = ?`,
+      ).run(
+        next.title,
+        next.describe,
+        next.status,
+        next.plannedDueAt,
+        next.plannedStartAt,
+        next.plannedDueAt,
+        next.nextStep,
+        next.risk,
+        next.waitingReason,
+        nextVersion,
+        completedAt,
+        archivedAt,
+        timestamp,
+        task.id,
+        task.version,
+      );
+      if (result.changes !== 1) throw new Error('任务已被其他操作更新，请刷新后重试。');
+      this.database.raw.prepare(
+        `INSERT INTO task_event
+          (id, task_id, event_type, actor_type, visibility, summary, source_event_id, demand_unit_id, before_json, after_json, occurred_at, recorded_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        taskEventId,
+        task.id,
+        options.eventType ?? 'task_updated',
+        options.actorType ?? 'user',
+        options.visibility ?? 'private',
+        summary,
+        options.sourceEventId ?? null,
+        options.demandUnitId ?? (options.sourceEventId ? this.uniqueSourceDemandUnitId(options.sourceEventId) : null),
+        JSON.stringify(taskAuditSnapshot(task)),
+        JSON.stringify({ ...taskAuditSnapshot(task), ...next, version: nextVersion, updated_at: timestamp }),
+        timestamp,
+        timestamp,
+        nextVersion,
+      );
+      options.afterTransaction?.(timestamp, nextVersion, taskEventId);
+    });
+    this.projectTaskMemory(task.id);
+    return this.getTaskDetail(task.id);
+  }
+
+  updateTask(taskId: string, patch: TaskPatch) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error('任务不存在。');
+    return this.applyTaskPatch(task, patch);
+  }
+
+  private refreshThreadProposalStatus(threadId: string, timestamp: string) {
+    const pending = this.database.raw.prepare(
+      "SELECT COUNT(*) AS count FROM task_update_proposal WHERE thread_id = ? AND state = 'awaiting_approval'",
+    ).get(threadId) as { count: number };
+    this.database.raw.prepare(
+      `UPDATE requirement_thread
+       SET status = ?, updated_at = ?
+       WHERE id = ? AND status <> 'closed'`,
+    ).run(pending.count > 0 ? 'needs_confirmation' : 'open', timestamp, threadId);
+  }
+
+  private markTaskUpdateProposalStale(proposal: TaskUpdateProposalRow) {
+    const timestamp = nowIso();
+    this.database.transaction(() => {
+      const updated = this.database.raw.prepare(
+        "UPDATE task_update_proposal SET state = 'stale', decided_at = ? WHERE id = ? AND state = 'awaiting_approval'",
+      ).run(timestamp, proposal.id);
+      if (updated.changes !== 1) return;
+      if (proposal.thread_revision_id) {
+        this.database.raw.prepare("UPDATE requirement_thread_revision SET state = 'stale', decided_at = ? WHERE id = ? AND state = 'proposed'")
+          .run(timestamp, proposal.thread_revision_id);
+      }
+      if (proposal.candidate_revision_id) {
+        this.database.raw.prepare("UPDATE candidate_revision SET state = 'superseded' WHERE id = ? AND state = 'proposed'")
+          .run(proposal.candidate_revision_id);
+      }
+      if (proposal.thread_id) this.refreshThreadProposalStatus(proposal.thread_id, timestamp);
+    });
+  }
+
+  private markSupersededTaskProposalsStale(taskId: string, approvedProposalId: string, nextTaskVersion: number, timestamp: string) {
+    const siblings = this.database.raw.prepare(
+      `SELECT * FROM task_update_proposal
+       WHERE task_id = ? AND id <> ? AND state = 'awaiting_approval' AND base_task_version < ?`,
+    ).all(taskId, approvedProposalId, nextTaskVersion) as unknown as TaskUpdateProposalRow[];
+    const affectedThreadIds = new Set<string>();
+    for (const sibling of siblings) {
+      const updated = this.database.raw.prepare(
+        "UPDATE task_update_proposal SET state = 'stale', decided_at = ? WHERE id = ? AND state = 'awaiting_approval'",
+      ).run(timestamp, sibling.id);
+      if (updated.changes !== 1) continue;
+      if (sibling.thread_revision_id) {
+        this.database.raw.prepare("UPDATE requirement_thread_revision SET state = 'stale', decided_at = ? WHERE id = ? AND state = 'proposed'")
+          .run(timestamp, sibling.thread_revision_id);
+      }
+      if (sibling.candidate_revision_id) {
+        this.database.raw.prepare("UPDATE candidate_revision SET state = 'superseded' WHERE id = ? AND state = 'proposed'")
+          .run(sibling.candidate_revision_id);
+      }
+      if (sibling.thread_id) affectedThreadIds.add(sibling.thread_id);
+    }
+    for (const threadId of affectedThreadIds) this.refreshThreadProposalStatus(threadId, timestamp);
+  }
+
+  private proposalAutomationDecision(proposal: TaskUpdateProposalRow, task: TaskRecord, patch: TaskPatch) {
+    if (this.automationPolicy().mode !== 'auto') return { apply: false, reason: '全局当前为仅建议模式。' };
+    if (task.auto_update_paused) return { apply: false, reason: '这项任务已暂停 AI 自动维护。' };
+    if (task.record_state === 'invalidated' || task.deleted_at) return { apply: false, reason: '无效或回收站任务不能自动更新。' };
+    if (proposal.used_fallback) return { apply: false, reason: '本次使用了规则降级，不能自动写入。' };
+    if ((proposal.association_confidence ?? 0) < AUTO_ASSOCIATION_CONFIDENCE) return { apply: false, reason: '需求归属置信度不足。' };
+    if ((proposal.update_confidence ?? 0) < AUTO_UPDATE_CONFIDENCE) return { apply: false, reason: '字段修改置信度不足。' };
+    const candidateAnalysis = proposal.candidate_revision_id
+      ? this.database.raw.prepare('SELECT analysis_json FROM candidate_revision WHERE id = ?').get(proposal.candidate_revision_id) as { analysis_json: string } | undefined
+      : undefined;
+    const proposalEvidence = parseMetadata(proposal.evidence_json);
+    const analysis = candidateAnalysis
+      ? parseMetadata(candidateAnalysis.analysis_json)
+      : objectValue(proposalEvidence.analysis);
+    const linkedDocuments = Array.isArray(analysis.linkedDocuments)
+      ? analysis.linkedDocuments.filter((document): document is { freshness?: unknown } => Boolean(document && typeof document === 'object' && !Array.isArray(document)))
+      : [];
+    if (linkedDocuments.some((document) => document.freshness !== 'fresh')) return { apply: false, reason: '来源包含可能过期的文档背景，不能自动写入。' };
+    if (!Object.keys(patch).length) return { apply: false, reason: '完整叙述变化需要主人确认；AI 不会用单条补充自动覆盖需求摘要。' };
+    if (proposal.origin !== 'owner_association') {
+      const evidence = proposalEvidence;
+      const relationType = typeof evidence.relationType === 'string' ? evidence.relationType : '';
+      if (!['reply_root', 'reply_parent', 'session', 'owner_confirmed', 'semantic_unique'].includes(relationType)) return { apply: false, reason: '当前关联证据仍需主人确认。' };
+    }
+    if ((patch.plannedStartAt !== undefined || patch.plannedDueAt !== undefined)) {
+      const candidate = proposal.candidate_revision_id
+        ? this.database.raw.prepare('SELECT analysis_json FROM candidate_revision WHERE id = ?').get(proposal.candidate_revision_id) as { analysis_json: string } | undefined
+        : undefined;
+      const analysis = candidate
+        ? parseMetadata(candidate.analysis_json)
+        : objectValue(proposalEvidence.analysis);
+      const timeRange = objectValue(analysis.timeRange);
+      if (timeRange.needsConfirmation === true || timeRange.status === 'inferred') return { apply: false, reason: '计划时间仍需主人确认。' };
+    }
+    if (patch.status === 'completed' || patch.status === 'archived') {
+      if ((proposal.update_confidence ?? 0) < AUTO_TERMINAL_STATUS_CONFIDENCE) {
+        return { apply: false, reason: '完成或归档需要更高置信度的明确证据。' };
+      }
+      const source = proposal.source_event_id
+        ? this.database.raw.prepare('SELECT content, metadata_json FROM source_event WHERE id = ?').get(proposal.source_event_id) as { content: string; metadata_json: string } | undefined
+        : undefined;
+      const sourceMetadata = parseMetadata(source?.metadata_json);
+      const batchSourceIds = Array.isArray(sourceMetadata.classificationBatchSourceIds)
+        ? sourceMetadata.classificationBatchSourceIds.filter((value): value is string => typeof value === 'string')
+        : [];
+      const evidenceRows = batchSourceIds.length
+        ? this.database.raw.prepare(`SELECT content FROM source_event WHERE id IN (${batchSourceIds.map(() => '?').join(',')})`).all(...batchSourceIds) as Array<{ content: string }>
+        : source ? [{ content: source.content }] : [];
+      const terminalStatus = patch.status;
+      const terminalEvidence = evidenceRows.some((row) => hasExplicitTerminalEvidence(row.content, terminalStatus));
+      if (!terminalEvidence) return { apply: false, reason: '来源正文没有明确表达完成、交付、取消或不再处理。' };
+    }
+    return { apply: true, reason: '唯一强关联、模型未降级、双重置信度及版本门槛均通过。' };
+  }
+
+  private dispatchTaskUpdateProposal(proposalId: string, runtimeJobId: string | null, leaseOwner: string | null = null) {
+    // Validate the caller's original fence before touching the proposal. A
+    // reclaimed job must never borrow the current owner's token by rereading
+    // the mutable job row here.
+    if (runtimeJobId) this.assertRuntimeActive(runtimeJobId, leaseOwner ?? undefined);
+    const proposal = this.database.raw.prepare('SELECT * FROM task_update_proposal WHERE id = ?').get(proposalId) as unknown as TaskUpdateProposalRow | undefined;
+    if (!proposal || proposal.state !== 'awaiting_approval') return null;
+    const task = this.getTask(proposal.task_id);
+    if (!task) return null;
+    const patch = parseTaskUpdatePatch(proposal.patch_json);
+    const decision = this.proposalAutomationDecision(proposal, task, patch);
+    this.database.raw.prepare(
+      'UPDATE task_update_proposal SET policy_version = ?, policy_reason = ? WHERE id = ? AND state = \'awaiting_approval\'',
+    ).run(AUTO_UPDATE_POLICY_VERSION, decision.reason, proposal.id);
+    if (!decision.apply) return this.getTaskUpdateProposal(proposal.id);
+    return this.runtime.executeToolSync({
+      jobId: runtimeJobId,
+      toolName: 'task.auto_apply_update',
+      toolInput: { proposalId: proposal.id, taskId: proposal.task_id, baseTaskVersion: proposal.base_task_version },
+      leaseOwner: runtimeJobId ? (leaseOwner ?? undefined) : undefined,
+      run: () => this.applyTaskUpdateProposal(proposal.id, 'ai'),
+      auditResult: (detail) => ({ proposalId: proposal.id, taskId: proposal.task_id, taskVersion: detail?.version ?? proposal.base_task_version }),
+    });
+  }
+
+  private dispatchPendingProposalsForSources(sourceEventIds: string[], runtimeJobId: string | null, leaseOwner: string | null = null) {
+    if (!sourceEventIds.length) return;
+    const placeholders = sourceEventIds.map(() => '?').join(',');
+    const proposals = this.database.raw.prepare(
+      `SELECT id FROM task_update_proposal
+       WHERE source_event_id IN (${placeholders}) AND state = 'awaiting_approval' AND decision_mode = 'pending'
+       ORDER BY created_at ASC`,
+    ).all(...sourceEventIds) as Array<{ id: string }>;
+    for (const proposal of proposals) this.dispatchTaskUpdateProposal(proposal.id, runtimeJobId, leaseOwner);
+  }
+
+  approveTaskUpdateProposal(proposalId: string) {
+    return this.runtime.executeToolSync({
+      jobId: null,
+      toolName: 'task.apply_update',
+      toolInput: { proposalId },
+      approved: true,
+      run: () => this.applyTaskUpdateProposal(proposalId, 'owner'),
+      auditResult: (detail) => ({ proposalId, taskVersion: detail?.version ?? null }),
+    });
+  }
+
+  private applyTaskUpdateProposal(proposalId: string, actor: ProposalApplyActor) {
+    const proposal = this.database.raw.prepare('SELECT * FROM task_update_proposal WHERE id = ?').get(proposalId) as unknown as TaskUpdateProposalRow | undefined;
+    if (!proposal) throw new Error('任务更新提案不存在。');
+    if (proposal.state === 'approved') return this.getTaskDetail(proposal.task_id);
+    if (proposal.state !== 'awaiting_approval') throw new Error('这条任务更新提案已经失效或被拒绝。');
+    const task = this.getTask(proposal.task_id);
+    if (!task) throw new Error('提案对应的任务不存在。');
+    if (task.version !== proposal.base_task_version) {
+      this.markTaskUpdateProposalStale(proposal);
+      throw new Error('任务已经发生新修改，这条更新提案已失效，请重新判断。');
+    }
+    const patch = parseTaskUpdatePatch(proposal.patch_json);
+    const thread = proposal.thread_id
+      ? this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(proposal.thread_id) as unknown as RequirementThreadRow | undefined
+      : undefined;
+    const threadRevision = proposal.thread_revision_id
+      ? this.database.raw.prepare('SELECT * FROM requirement_thread_revision WHERE id = ?').get(proposal.thread_revision_id) as { id: string; base_thread_version: number; patch_json: string; state: string } | undefined
+      : undefined;
+    if (proposal.thread_id && !thread) throw new Error('提案对应的需求线程不存在。');
+    if (proposal.thread_id && (!threadRevision || threadRevision.state !== 'proposed')) {
+      this.markTaskUpdateProposalStale(proposal);
+      throw new Error('提案对应的需求线程修订已失效，请重新判断。');
+    }
+    const candidateRevision = proposal.candidate_revision_id
+      ? this.database.raw.prepare('SELECT * FROM candidate_revision WHERE id = ?').get(proposal.candidate_revision_id) as CandidateRevisionPayloadRow | undefined
+      : undefined;
+    const candidate = candidateRevision
+      ? this.database.raw.prepare('SELECT * FROM candidate_request WHERE id = ?').get(candidateRevision.candidate_id) as CandidateRow | undefined
+      : undefined;
+    const proposalSourceCandidate = !candidate && proposal.source_event_id
+      ? this.database.raw.prepare(
+          'SELECT * FROM candidate_request WHERE source_event_id = ? AND accepted_task_id = ? ORDER BY updated_at DESC, rowid DESC LIMIT 1',
+        ).get(proposal.source_event_id, task.id) as CandidateRow | undefined
+      : undefined;
+    const previousCandidateRevisions = candidateRevision
+      ? this.database.raw.prepare("SELECT * FROM candidate_revision WHERE candidate_id = ? AND state = 'current'").all(candidateRevision.candidate_id) as CandidateRevisionPayloadRow[]
+      : [];
+    const previousCandidateRevision = previousCandidateRevisions[0];
+    if (proposal.candidate_revision_id) {
+      if (
+        !candidateRevision
+        || candidateRevision.state !== 'proposed'
+        || !candidate
+        || previousCandidateRevisions.length !== 1
+        || !previousCandidateRevision
+        || previousCandidateRevision.id === candidateRevision.id
+        || !candidateRevisionPayloadMatchesSnapshot(previousCandidateRevision, candidateFullAuditSnapshot(candidate))
+      ) {
+        this.markTaskUpdateProposalStale(proposal);
+        throw new Error('提案对应的候选修订已失效，请重新判断。');
+      }
+    }
+    const baseThreadVersion = proposal.base_thread_version ?? threadRevision?.base_thread_version ?? null;
+    if (thread && baseThreadVersion !== null && thread.version !== baseThreadVersion) {
+      this.markTaskUpdateProposalStale(proposal);
+      throw new Error('需求线程已经发生新修改，这条更新提案已失效，请重新判断。');
+    }
+    const proposedThread = threadRevision ? parseMetadata(threadRevision.patch_json) : {};
+    // A follow-up may only apply the sparse, server-gated fields shown in the
+    // proposal view. Owner approval must not smuggle in a full model rewrite.
+    const appliedThreadPatch = proposal.origin === 'follow_up' ? {} : proposedThread;
+    const taskChanged = (
+      (patch.title !== undefined && patch.title !== task.title)
+      || (patch.describe !== undefined && patch.describe !== task.describe)
+      || (patch.status !== undefined && patch.status !== task.status)
+      || (patch.plannedStartAt !== undefined && patch.plannedStartAt !== task.planned_start_at)
+      || (patch.plannedDueAt !== undefined && patch.plannedDueAt !== task.planned_due_at)
+      || (patch.nextStep !== undefined && patch.nextStep !== task.next_step)
+      || (patch.risk !== undefined && patch.risk !== task.risk)
+      || (patch.waitingReason !== undefined && patch.waitingReason !== task.waiting_reason)
+    );
+    const threadChanged = Boolean(thread && (
+      (typeof appliedThreadPatch.title === 'string' && appliedThreadPatch.title !== thread.title)
+      || (typeof appliedThreadPatch.background === 'string' && appliedThreadPatch.background !== thread.background)
+      || (typeof appliedThreadPatch.validationQuestion === 'string' && appliedThreadPatch.validationQuestion !== thread.validation_question)
+      || (typeof appliedThreadPatch.describe === 'string' && appliedThreadPatch.describe !== thread.describe)
+      || (patch.threadTitle !== undefined && patch.threadTitle !== thread.title)
+      || (patch.threadBackground !== undefined && patch.threadBackground !== thread.background)
+      || (patch.threadValidationQuestion !== undefined && patch.threadValidationQuestion !== thread.validation_question)
+      || (patch.threadDescribe !== undefined && patch.threadDescribe !== thread.describe)
+    ));
+    const noteAdded = Boolean(patch.note?.trim());
+    if (!taskChanged && !threadChanged && !noteAdded) {
+      this.markTaskUpdateProposalStale(proposal);
+      throw new Error('任务更新提案没有可应用的实际变化。');
+    }
+    patch.expectedVersion = task.version;
+    const beforeSnapshot: TaskUpdateProposalSnapshot = {
+      task: taskAuditSnapshot(task)!,
+      thread: threadAuditSnapshot(thread),
+      candidate: candidateFullAuditSnapshot(candidate),
+      previousCandidateRevisionId: previousCandidateRevision?.id ?? null,
+    };
+    return this.applyTaskPatch(task, patch, {
+        actorType: actor === 'ai' ? 'ai' : 'owner',
+        visibility: 'private',
+        eventType: actor === 'ai' ? 'task_auto_updated' : 'task_updated',
+        summary: actor === 'ai'
+          ? `AI 根据高置信度后续来源自动维护了私人任务${patch.note?.trim() ? `：${patch.note.trim().slice(0, 160)}` : '。'}`
+          : patch.note?.trim()
+            ? `系统主人确认了后续来源提出的任务更新：${patch.note.trim().slice(0, 200)}`
+            : '系统主人确认了后续来源提出的任务更新。',
+        sourceEventId: proposal.source_event_id,
+        demandUnitId: proposal.demand_unit_id,
+        afterTransaction: (timestamp, nextVersion, taskEventId) => {
+        const proposalUpdate = this.database.raw.prepare(
+          `UPDATE task_update_proposal
+           SET state = 'approved', decision_mode = ?, policy_version = ?, policy_reason = ?, applied_task_version = ?, applied_task_event_id = ?,
+               before_snapshot_json = ?, decided_at = ?
+           WHERE id = ? AND state = 'awaiting_approval'`,
+        ).run(
+          actor === 'ai' ? 'auto' : 'owner',
+          AUTO_UPDATE_POLICY_VERSION,
+          actor === 'ai' ? '通过自动维护安全门槛。' : '系统主人确认应用。',
+          nextVersion,
+          taskEventId,
+          JSON.stringify(beforeSnapshot),
+          timestamp,
+          proposal.id,
+        );
+        if (proposalUpdate.changes !== 1) throw new Error('这条任务更新提案已被其他操作处理。');
+        if (proposal.thread_id) {
+          const nextTitle = typeof appliedThreadPatch.title === 'string'
+            ? appliedThreadPatch.title
+            : patch.threadTitle === undefined ? thread?.title ?? '' : patch.threadTitle;
+          const nextBackground = typeof appliedThreadPatch.background === 'string'
+            ? appliedThreadPatch.background
+            : patch.threadBackground === undefined ? thread?.background ?? '' : patch.threadBackground;
+          const nextValidation = typeof appliedThreadPatch.validationQuestion === 'string'
+            ? appliedThreadPatch.validationQuestion
+            : patch.threadValidationQuestion === undefined ? thread?.validation_question ?? '' : patch.threadValidationQuestion;
+          const nextDescribe = typeof appliedThreadPatch.describe === 'string'
+            ? appliedThreadPatch.describe
+            : patch.threadDescribe === undefined ? thread?.describe ?? '' : patch.threadDescribe;
+          const nextAnalysis = appliedThreadPatch.analysis && typeof appliedThreadPatch.analysis === 'object' ? JSON.stringify(appliedThreadPatch.analysis) : thread?.analysis_json ?? '{}';
+          const threadUpdate = this.database.raw.prepare(
+            `UPDATE requirement_thread
+             SET title = ?, background = ?, validation_question = ?, describe = ?, analysis_json = ?,
+                 status = ?, version = version + 1, last_activity_at = COALESCE(last_activity_at, ?), updated_at = ?
+             WHERE id = ? AND version = ?`,
+          ).run(
+            nextTitle,
+            nextBackground,
+            nextValidation,
+            nextDescribe,
+            nextAnalysis,
+            'open',
+            proposal.source_event_id ? (this.database.raw.prepare('SELECT occurred_at FROM source_event WHERE id = ?').get(proposal.source_event_id) as { occurred_at?: string } | undefined)?.occurred_at ?? timestamp : timestamp,
+            timestamp,
+            proposal.thread_id,
+            baseThreadVersion ?? thread?.version ?? 1,
+          );
+          if (threadUpdate.changes !== 1) throw new Error('需求线程已被其他操作更新，请刷新后重试。');
+          this.database.raw.prepare('UPDATE task_update_proposal SET applied_thread_version = ? WHERE id = ?')
+            .run((baseThreadVersion ?? thread?.version ?? 1) + 1, proposal.id);
+          if (threadRevision) this.database.raw.prepare("UPDATE requirement_thread_revision SET state = 'accepted', decided_at = ? WHERE id = ? AND state = 'proposed'").run(timestamp, threadRevision.id);
+          this.refreshThreadProposalStatus(proposal.thread_id, timestamp);
+        }
+        if (candidateRevision) {
+          const candidateUpdate = this.database.raw.prepare(
+            `UPDATE candidate_request
+             SET title = ?, proposer_name = ?, background = ?, validation_question = ?, describe = ?, analysis_json = ?, confidence = ?, updated_at = ?, version = version + 1
+             WHERE id = ? AND version = ?`,
+          ).run(
+            candidateRevision.title,
+            candidateRevision.proposer_name,
+            candidateRevision.background,
+            candidateRevision.validation_question,
+            candidateRevision.describe,
+            candidateRevision.analysis_json,
+            candidateRevision.confidence,
+            timestamp,
+            candidateRevision.candidate_id,
+            candidate?.version ?? -1,
+          );
+          if (candidateUpdate.changes !== 1 || !previousCandidateRevision) throw new Error('提案对应的候选修订已失效，请重新判断。');
+          const supersededPreviousRevision = this.database.raw.prepare(
+            "UPDATE candidate_revision SET state = 'superseded' WHERE id = ? AND candidate_id = ? AND state = 'current'",
+          ).run(previousCandidateRevision.id, candidateRevision.candidate_id);
+          if (supersededPreviousRevision.changes !== 1) throw new Error('提案对应的候选修订已失效，请重新判断。');
+          const activatedCandidateRevision = this.database.raw.prepare(
+            "UPDATE candidate_revision SET state = 'current' WHERE id = ? AND candidate_id = ? AND state = 'proposed'",
+          ).run(candidateRevision.id, candidateRevision.candidate_id);
+          if (activatedCandidateRevision.changes !== 1) throw new Error('提案对应的候选修订已失效，请重新判断。');
+          const currentRevisions = this.database.raw.prepare(
+            "SELECT * FROM candidate_revision WHERE candidate_id = ? AND state = 'current'",
+          ).all(candidateRevision.candidate_id) as CandidateRevisionPayloadRow[];
+          const updatedCandidate = this.database.raw.prepare('SELECT * FROM candidate_request WHERE id = ?')
+            .get(candidateRevision.candidate_id) as CandidateRow | undefined;
+          if (
+            currentRevisions.length !== 1
+            || currentRevisions[0]?.id !== candidateRevision.id
+            || !candidateRevisionPayloadMatchesSnapshot(currentRevisions[0], candidateFullAuditSnapshot(updatedCandidate))
+          ) {
+            throw new Error('提案对应的候选修订已失效，请重新判断。');
+          }
+        }
+        this.markSupersededTaskProposalsStale(task.id, proposal.id, nextVersion, timestamp);
+        const afterTask = { ...taskAuditSnapshot(task), ...this.resolveTaskPatch(task, patch), version: nextVersion };
+        const afterThread = proposal.thread_id
+          ? this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(proposal.thread_id) as unknown as RequirementThreadRow | undefined
+          : undefined;
+        const afterCandidate = candidateRevision
+          ? this.database.raw.prepare('SELECT * FROM candidate_request WHERE id = ?').get(candidateRevision.candidate_id) as CandidateRow | undefined
+          : undefined;
+        this.database.raw.prepare('UPDATE task_update_proposal SET after_snapshot_json = ? WHERE id = ?')
+          .run(JSON.stringify({
+            task: afterTask,
+            thread: threadAuditSnapshot(afterThread),
+            candidate: candidateFullAuditSnapshot(afterCandidate),
+            previousCandidateRevisionId: null,
+          }), proposal.id);
+        if (actor === 'ai') {
+          const terminalStatus = patch.status === 'completed' || patch.status === 'archived';
+          const notificationCandidateId = candidateRevision?.candidate_id ?? proposalSourceCandidate?.id ?? null;
+          if (notificationCandidateId) {
+            this.database.raw.prepare(
+              `UPDATE notification
+               SET archived_at = COALESCE(archived_at, ?)
+               WHERE candidate_id = ?
+                 AND dedupe_key LIKE 'candidate:%:source:%'
+                 AND archived_at IS NULL`,
+            ).run(timestamp, notificationCandidateId);
+          }
+          this.database.raw.prepare(
+            `INSERT OR IGNORE INTO notification
+              (id, task_id, task_event_id, candidate_id, notification_type, dedupe_key, reason, read_at, snoozed_until, archived_at, created_at)
+             VALUES (?, ?, ?, ?, 'immediate', ?, ?, NULL, NULL, NULL, ?)`,
+          ).run(
+            id('notice'),
+            task.id,
+            taskEventId,
+            notificationCandidateId,
+            `auto-update:${proposal.id}`,
+            terminalStatus
+              ? `重点核对：AI 已把私人任务标为${patch.status === 'completed' ? '已完成' : '已归档'}；请检查来源证据，若不正确可立即撤销。`
+              : 'AI 已自动维护私人任务；你可以查看证据或在没有后续修改时一键撤销。',
+            timestamp,
+          );
+        }
+        },
+    });
+  }
+
+  revertAutomaticTaskUpdate(proposalId: string) {
+    const proposal = this.database.raw.prepare('SELECT * FROM task_update_proposal WHERE id = ?').get(proposalId) as unknown as TaskUpdateProposalRow | undefined;
+    if (!proposal) throw new Error('任务更新记录不存在。');
+    if (proposal.decision_mode !== 'auto' || proposal.state !== 'approved') throw new Error('只有 AI 自动应用的任务更新可以一键撤销。');
+    if (proposal.reverted_at) return this.getTaskDetail(proposal.task_id);
+    if (proposal.applied_task_version === null) throw new Error('这条自动更新缺少应用版本，不能安全撤销。');
+    const task = this.getTask(proposal.task_id);
+    if (!task) throw new Error('自动更新对应的任务不存在。');
+    if (task.version !== proposal.applied_task_version) throw new Error('任务在自动更新后已经发生新修改，不能覆盖后续内容。');
+    if (task.record_state === 'invalidated' || task.deleted_at) throw new Error('无效或回收站任务不能撤销自动更新。');
+
+    const snapshot = parseTaskUpdateSnapshot(proposal.before_snapshot_json);
+    const afterSnapshot = parseTaskUpdateSnapshot(proposal.after_snapshot_json);
+    const beforeTask = snapshot.task;
+    if (beforeTask.id !== task.id || afterSnapshot.task.id !== task.id) {
+      throw new Error(INVALID_TASK_UPDATE_SNAPSHOT_ERROR);
+    }
+    const thread = proposal.thread_id
+      ? this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(proposal.thread_id) as unknown as RequirementThreadRow | undefined
+      : undefined;
+    if (proposal.thread_id) {
+      if (
+        !thread
+        || !snapshot.thread
+        || !afterSnapshot.thread
+        || snapshot.thread.id !== proposal.thread_id
+        || afterSnapshot.thread.id !== proposal.thread_id
+        || thread.id !== proposal.thread_id
+      ) {
+        throw new Error(INVALID_TASK_UPDATE_SNAPSHOT_ERROR);
+      }
+    } else if (snapshot.thread !== null || afterSnapshot.thread !== null) {
+      throw new Error(INVALID_TASK_UPDATE_SNAPSHOT_ERROR);
+    }
+    if (proposal.thread_id && (!thread || proposal.applied_thread_version === null || thread.version !== proposal.applied_thread_version)) {
+      throw new Error('需求线程在自动更新后已经发生新修改，不能覆盖后续内容。');
+    }
+    const candidateRevision = proposal.candidate_revision_id
+      ? this.database.raw.prepare('SELECT * FROM candidate_revision WHERE id = ?').get(proposal.candidate_revision_id) as CandidateRevisionPayloadRow | undefined
+      : undefined;
+    const currentCandidate = candidateRevision
+      ? this.database.raw.prepare('SELECT * FROM candidate_request WHERE id = ?').get(candidateRevision.candidate_id) as CandidateRow | undefined
+      : undefined;
+    let previousCandidateRevision: CandidateRevisionPayloadRow | undefined;
+    if (proposal.candidate_revision_id) {
+      if (
+        !candidateRevision
+        || candidateRevision.state !== 'current'
+        || !currentCandidate
+        || !snapshot.candidate
+        || !afterSnapshot.candidate
+        || snapshot.candidate.id !== candidateRevision.candidate_id
+        || afterSnapshot.candidate.id !== candidateRevision.candidate_id
+        || currentCandidate.id !== candidateRevision.candidate_id
+        || snapshot.candidate.state !== currentCandidate.state
+        || afterSnapshot.candidate.state !== currentCandidate.state
+        || !snapshot.previousCandidateRevisionId
+        || snapshot.previousCandidateRevisionId === candidateRevision.id
+        || afterSnapshot.previousCandidateRevisionId !== null
+        || !candidateRevisionPayloadMatchesSnapshot(candidateRevision, afterSnapshot.candidate)
+      ) {
+        throw new Error(INVALID_TASK_UPDATE_SNAPSHOT_ERROR);
+      }
+      previousCandidateRevision = this.database.raw.prepare(
+        'SELECT * FROM candidate_revision WHERE id = ?',
+      ).get(snapshot.previousCandidateRevisionId) as CandidateRevisionPayloadRow | undefined;
+      if (
+        !previousCandidateRevision
+        || previousCandidateRevision.candidate_id !== candidateRevision.candidate_id
+        || previousCandidateRevision.state !== 'superseded'
+        || !candidateRevisionPayloadMatchesSnapshot(previousCandidateRevision, snapshot.candidate)
+      ) {
+        throw new Error(INVALID_TASK_UPDATE_SNAPSHOT_ERROR);
+      }
+    } else if (
+      snapshot.candidate !== null
+      || afterSnapshot.candidate !== null
+      || snapshot.previousCandidateRevisionId !== null
+      || afterSnapshot.previousCandidateRevisionId !== null
+    ) {
+      throw new Error(INVALID_TASK_UPDATE_SNAPSHOT_ERROR);
+    }
+    if (candidateRevision && !candidateSnapshotsEqual(afterSnapshot.candidate, candidateFullAuditSnapshot(currentCandidate))) {
+      throw new Error('候选摘要在自动更新后已经发生人工修改，不能覆盖后续内容。');
+    }
+    const authoritativeCandidateState = currentCandidate?.state;
+
+    assertShanghaiCalendarPlanRange(beforeTask.planned_start_at, beforeTask.planned_due_at);
+    const timestamp = nowIso();
+    const nextVersion = task.version + 1;
+    const taskEventId = id('evt');
+    this.database.transaction(() => {
+      const restored = this.database.raw.prepare(
+        `UPDATE task SET title = ?, proposer_name = ?, describe = ?, status = ?, schedule_at = ?, planned_start_at = ?, planned_due_at = ?,
+           next_step = ?, risk = ?, waiting_reason = ?, completed_at = ?, archived_at = ?, auto_update_paused = ?, version = ?, updated_at = ?
+         WHERE id = ? AND version = ? AND deleted_at IS NULL AND record_state = 'active'`,
+      ).run(
+        beforeTask.title,
+        beforeTask.proposer_name,
+        beforeTask.describe,
+        beforeTask.status,
+        beforeTask.schedule_at,
+        beforeTask.planned_start_at,
+        beforeTask.planned_due_at,
+        beforeTask.next_step,
+        beforeTask.risk,
+        beforeTask.waiting_reason,
+        beforeTask.completed_at,
+        beforeTask.archived_at,
+        beforeTask.auto_update_paused ? 1 : 0,
+        nextVersion,
+        timestamp,
+        task.id,
+        task.version,
+      );
+      if (restored.changes !== 1) throw new Error('任务已被其他操作更新，请刷新后重试。');
+
+      if (thread && snapshot?.thread) {
+        const beforeThread = snapshot.thread;
+        const restoredThread = this.database.raw.prepare(
+          `UPDATE requirement_thread
+           SET title = ?, background = ?, validation_question = ?, describe = ?, analysis_json = ?, status = ?,
+               version = version + 1, last_activity_at = ?, updated_at = ?
+           WHERE id = ? AND version = ?`,
+        ).run(
+          beforeThread.title,
+          beforeThread.background,
+          beforeThread.validation_question,
+          beforeThread.describe,
+          beforeThread.analysis_json,
+          beforeThread.status,
+          beforeThread.last_activity_at,
+          timestamp,
+          thread.id,
+          proposal.applied_thread_version,
+        );
+        if (restoredThread.changes !== 1) throw new Error('需求线程已被其他操作更新，请刷新后重试。');
+      }
+
+      if (currentCandidate && snapshot.candidate && candidateRevision) {
+        const beforeCandidate = snapshot.candidate;
+        const restoredCandidate = this.database.raw.prepare(
+          `UPDATE candidate_request
+           SET title = ?, proposer_name = ?, background = ?, validation_question = ?, describe = ?, analysis_json = ?, confidence = ?, updated_at = ?, version = version + 1
+           WHERE id = ? AND version = ?`,
+        ).run(
+          beforeCandidate.title,
+          beforeCandidate.proposer_name,
+          beforeCandidate.background,
+          beforeCandidate.validation_question,
+          beforeCandidate.describe,
+          beforeCandidate.analysis_json,
+          beforeCandidate.confidence,
+          timestamp,
+          currentCandidate.id,
+          currentCandidate.version,
+        );
+        if (restoredCandidate.changes !== 1) throw new Error(INVALID_TASK_UPDATE_SNAPSHOT_ERROR);
+        const supersededAppliedRevision = this.database.raw.prepare(
+          "UPDATE candidate_revision SET state = 'superseded' WHERE id = ? AND candidate_id = ? AND state = 'current'",
+        ).run(candidateRevision.id, currentCandidate.id);
+        if (supersededAppliedRevision.changes !== 1) throw new Error(INVALID_TASK_UPDATE_SNAPSHOT_ERROR);
+        const restoredPreviousRevision = this.database.raw.prepare(
+          "UPDATE candidate_revision SET state = 'current' WHERE id = ? AND candidate_id = ? AND state = 'superseded'",
+        ).run(previousCandidateRevision!.id, currentCandidate.id);
+        if (restoredPreviousRevision.changes !== 1) throw new Error(INVALID_TASK_UPDATE_SNAPSHOT_ERROR);
+        const restoredCurrentRevisions = this.database.raw.prepare(
+          "SELECT * FROM candidate_revision WHERE candidate_id = ? AND state = 'current'",
+        ).all(currentCandidate.id) as CandidateRevisionPayloadRow[];
+        const restoredCandidateRow = this.database.raw.prepare('SELECT * FROM candidate_request WHERE id = ?')
+          .get(currentCandidate.id) as CandidateRow | undefined;
+        if (
+          restoredCurrentRevisions.length !== 1
+          || restoredCurrentRevisions[0]?.id !== previousCandidateRevision!.id
+          || !candidateRevisionPayloadMatchesSnapshot(restoredCurrentRevisions[0], snapshot.candidate)
+          || !candidateRevisionPayloadMatchesSnapshot(restoredCurrentRevisions[0], candidateFullAuditSnapshot(restoredCandidateRow))
+          || restoredCandidateRow?.state !== authoritativeCandidateState
+        ) {
+          throw new Error(INVALID_TASK_UPDATE_SNAPSHOT_ERROR);
+        }
+      }
+
+      this.database.raw.prepare(
+        `INSERT INTO task_event
+          (id, task_id, event_type, actor_type, visibility, summary, source_event_id, demand_unit_id, before_json, after_json, occurred_at, recorded_at, version)
+         VALUES (?, ?, 'task_auto_update_reverted', 'owner', 'private', ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        taskEventId,
+        task.id,
+        '系统主人撤销了最近一次 AI 自动维护；任务内容已恢复，但版本历史继续保留。',
+        proposal.source_event_id,
+        proposal.demand_unit_id,
+        JSON.stringify(taskAuditSnapshot(task)),
+        JSON.stringify({ ...beforeTask, version: nextVersion, updated_at: timestamp }),
+        timestamp,
+        timestamp,
+        nextVersion,
+      );
+      const reverted = this.database.raw.prepare(
+        `UPDATE task_update_proposal
+         SET decision_mode = 'reverted', policy_reason = ?, reverted_at = ?, reverted_task_event_id = ?
+         WHERE id = ? AND decision_mode = 'auto' AND reverted_at IS NULL AND applied_task_version = ?`,
+      ).run('系统主人在没有后续修改覆盖时撤销了这次 AI 自动维护。', timestamp, taskEventId, proposal.id, task.version);
+      if (reverted.changes !== 1) throw new Error('这条自动更新已经被其他操作处理。');
+      this.database.raw.prepare("UPDATE notification SET archived_at = COALESCE(archived_at, ?) WHERE dedupe_key = ?")
+        .run(timestamp, `auto-update:${proposal.id}`);
+      this.database.raw.prepare(
+        `INSERT OR IGNORE INTO notification
+          (id, task_id, task_event_id, candidate_id, notification_type, dedupe_key, reason, read_at, snoozed_until, archived_at, created_at)
+         VALUES (?, ?, ?, ?, 'immediate', ?, ?, NULL, NULL, NULL, ?)`,
+      ).run(id('notice'), task.id, taskEventId, currentCandidate?.id ?? null, `auto-update-reverted:${proposal.id}`, 'AI 自动维护已撤销；任务已生成新的恢复版本。', timestamp);
+    });
+    this.projectTaskMemory(task.id);
+    return this.getTaskDetail(task.id);
+  }
+
+  rejectTaskUpdateProposal(proposalId: string) {
+    const proposal = this.database.raw.prepare('SELECT * FROM task_update_proposal WHERE id = ?').get(proposalId) as unknown as TaskUpdateProposalRow | undefined;
+    if (!proposal) throw new Error('任务更新提案不存在。');
+    if (proposal.state === 'awaiting_approval') {
+      const timestamp = nowIso();
+      this.database.transaction(() => {
+        const updated = this.database.raw.prepare("UPDATE task_update_proposal SET state = 'rejected', decided_at = ? WHERE id = ? AND state = 'awaiting_approval'").run(timestamp, proposal.id);
+        if (updated.changes !== 1) throw new Error('这条任务更新提案已被其他操作处理。');
+        if (proposal.thread_id) {
+          if (proposal.thread_revision_id) this.database.raw.prepare("UPDATE requirement_thread_revision SET state = 'rejected', decided_at = ? WHERE id = ? AND state = 'proposed'").run(timestamp, proposal.thread_revision_id);
+          this.refreshThreadProposalStatus(proposal.thread_id, timestamp);
+        }
+        if (proposal.candidate_revision_id) this.database.raw.prepare("UPDATE candidate_revision SET state = 'rejected' WHERE id = ? AND state = 'proposed'").run(proposal.candidate_revision_id);
+      });
+    }
+    return this.getTaskDetail(proposal.task_id);
+  }
+
+  deleteTask(taskId: string, expectedVersion?: number) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error('任务不存在。');
+    if (task.record_state === 'invalidated') throw new Error('无效记录已经作为纠错审计保留，不能移到普通回收站。');
+    if (expectedVersion !== undefined && expectedVersion !== task.version) throw new Error('任务已被其他操作更新，请刷新后重试。');
+    if (task.deleted_at) {
+      this.database.transaction(() => this.deleteLinkedCandidatesInTransaction(taskId, nowIso()));
+      return this.getTaskDetail(taskId);
+    }
+
+    const timestamp = nowIso();
+    this.database.transaction(() => {
+      this.deleteTaskInTransaction(task, timestamp);
+      this.deleteLinkedCandidatesInTransaction(taskId, timestamp);
+    });
+    this.projectTaskMemory(taskId);
+    return this.getTaskDetail(taskId);
+  }
+
+  restoreTask(taskId: string, expectedVersion?: number) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error('任务不存在。');
+    if (task.record_state === 'invalidated') throw new Error('无效记录不能恢复为普通任务；请从纠错流程重新判断。');
+    if (expectedVersion !== undefined && expectedVersion !== task.version) throw new Error('任务已被其他操作更新，请刷新后重试。');
+    if (!task.deleted_at) {
+      this.database.transaction(() => this.restoreLinkedCandidatesInTransaction(taskId, nowIso()));
+      return this.getTaskDetail(taskId);
+    }
+
+    const timestamp = nowIso();
+    this.database.transaction(() => {
+      this.restoreTaskInTransaction(task, timestamp);
+      this.restoreLinkedCandidatesInTransaction(taskId, timestamp);
+    });
+    this.projectTaskMemory(taskId);
+    return this.getTaskDetail(taskId);
+  }
+
+  addReference(taskId: string, label: string, referencePath: string, accessMode: 'reference_only' | 'readonly' = 'reference_only') {
+    const task = this.getTask(taskId);
+    if (!task) {
+      throw new Error('任务不存在。');
+    }
+    if (task.deleted_at) throw new Error('回收站中的任务不能新增参考路径。');
+    if (isAbsolute(referencePath) && !this.isAllowedWorkspacePath(referencePath)) {
+      throw new Error('本地目录必须先通过桌面原生选择器授权，系统不会接受未授权的绝对路径。');
+    }
+    if (accessMode === 'readonly' && (!this.config.workspace.readEnabled || !isAbsolute(referencePath))) {
+      throw new Error('只读检查只允许对已授权的本地目录执行。');
+    }
+    const referenceId = id('ref');
+    this.database.raw
+      .prepare(
+        `INSERT INTO reference_binding (id, task_id, label, reference_path, access_mode, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(referenceId, taskId, label, referencePath, accessMode, nowIso());
+    this.projectTaskMemory(taskId);
+    return this.database.raw.prepare('SELECT * FROM reference_binding WHERE id = ?').get(referenceId);
+  }
+
+  removeReference(taskId: string, referenceId: string) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error('任务不存在。');
+    if (task.deleted_at) throw new Error('回收站中的任务不能修改参考路径。');
+    const reference = this.database.raw.prepare('SELECT id FROM reference_binding WHERE id = ? AND task_id = ?')
+      .get(referenceId, taskId) as { id: string } | undefined;
+    if (!reference) throw new Error('参考路径绑定不存在。');
+    const removed = this.database.raw.prepare('DELETE FROM reference_binding WHERE id = ? AND task_id = ?').run(referenceId, taskId);
+    if (removed.changes !== 1) throw new Error('参考路径绑定已经发生变化，请刷新后重试。');
+    this.log('workspace', 'info', 'reference.unbound', '已解除任务与参考路径的本地绑定；真实工作目录没有被读取、移动或删除。', { taskId, referenceId });
+    this.projectTaskMemory(taskId);
+    return this.getTaskDetail(taskId);
+  }
+
+  private isAllowedWorkspacePath(referencePath: string) {
+    const target = resolve(referencePath);
+    return this.config.workspace.allowedPaths.some((item) => {
+      const allowed = resolve(item);
+      const left = process.platform === 'win32' ? allowed.toLowerCase() : allowed;
+      const right = process.platform === 'win32' ? target.toLowerCase() : target;
+      return right === left || right.startsWith(left + sep);
+    });
+  }
+
+  requestExternalAction(taskId: string, actionType: string, payload: unknown) {
+    const task = this.getTask(taskId);
+    if (!task) {
+      throw new Error('任务不存在。');
+    }
+    if (task.record_state === 'invalidated') {
+      throw new Error('无效记录不能生成对外动作。');
+    }
+    if (task.deleted_at) {
+      throw new Error('回收站中的任务不能生成对外动作。');
+    }
+    const timestamp = nowIso();
+    const payloadJson = stableJson(payload ?? {});
+    const requestFingerprint = createHash('sha256')
+      .update(`${taskId}\n${task.version}\n${actionType}\n${payloadJson}`)
+      .digest('hex');
+    const idempotencyKey = `draft:${taskId}:${task.version}:${requestFingerprint}`;
+    const approvalId = `approval_${requestFingerprint}`;
+    const outboxId = `outbox_${requestFingerprint}`;
+    const draft = this.database.transaction(() => {
+      const existing = this.database.raw.prepare(
+        `SELECT approval.id AS approval_id, outbox.id AS outbox_id, approval.status
+         FROM outbox JOIN approval ON approval.id = outbox.approval_id
+         WHERE outbox.idempotency_key = ?`,
+      ).get(idempotencyKey) as { approval_id: string; outbox_id: string; status: string } | undefined;
+      if (existing) return existing;
+
+      // A new task version or payload is a new draft. Any previous open draft
+      // remains in the audit ledger but is no longer awaiting owner review.
+      this.terminateTaskDraftsInTransaction(taskId, timestamp);
+      this.database.raw
+        .prepare(
+          `INSERT OR IGNORE INTO approval (id, task_id, action_type, payload_json, status, created_at, decided_at)
+           VALUES (?, ?, ?, ?, 'awaiting_approval', ?, NULL)`,
+        )
+        .run(approvalId, taskId, actionType, payloadJson, timestamp);
+      this.database.raw
+        .prepare(
+          `INSERT OR IGNORE INTO outbox (id, approval_id, action_type, payload_json, status, idempotency_key, created_at, sent_at)
+           VALUES (?, ?, ?, ?, 'awaiting_approval', ?, ?, NULL)`,
+        )
+        .run(outboxId, approvalId, actionType, payloadJson, idempotencyKey, timestamp);
+      const inserted = this.database.raw.prepare(
+        `SELECT approval.id AS approval_id, outbox.id AS outbox_id, approval.status
+         FROM outbox JOIN approval ON approval.id = outbox.approval_id
+         WHERE outbox.idempotency_key = ?`,
+      ).get(idempotencyKey) as { approval_id: string; outbox_id: string; status: string } | undefined;
+      if (!inserted) throw new Error('草稿无法安全保存，请刷新后重试。');
+      return inserted;
+    });
+    return {
+      approvalId: draft.approval_id,
+      outboxId: draft.outbox_id,
+      status: draft.status,
+      state: draftOnlyApprovalState(draft.status),
+      reviewStatus: draftOnlyApprovalState(draft.status) === 'draft' ? 'pending_owner_review' : 'terminal',
+      externallySent: false,
+      sendAvailable: false,
+      adapterSentCount: this.adapters.feishu.sentCount,
+    };
+  }
+
+  rejectExternalDraft(approvalId: string) {
+    const approval = this.database.raw.prepare(
+      'SELECT id, task_id, status FROM approval WHERE id = ?',
+    ).get(approvalId) as { id: string; task_id: string | null; status: string } | undefined;
+    if (!approval || !approval.task_id) throw new Error('草稿不存在。');
+    const timestamp = nowIso();
+    this.database.transaction(() => {
+      if (approval.status === 'awaiting_approval') {
+        const updated = this.database.raw.prepare(
+          "UPDATE approval SET status = 'rejected', decided_at = COALESCE(decided_at, ?) WHERE id = ? AND status = 'awaiting_approval'",
+        ).run(timestamp, approval.id);
+        if (updated.changes !== 1) throw new Error('草稿已被其他操作处理，请刷新后重试。');
+        this.database.raw.prepare(
+          "UPDATE outbox SET status = 'failed' WHERE approval_id = ? AND status IN ('awaiting_approval', 'ready')",
+        ).run(approval.id);
+      }
+    });
+    return this.getTaskDetail(approval.task_id);
+  }
+
+  dashboard() {
+    const generatedAt = nowIso();
+    const day = shanghaiDayWindow(generatedAt);
+    const activeTaskWhere = "record_state = 'active' AND deleted_at IS NULL";
+    const todayDate = "COALESCE(planned_start_at, planned_due_at, schedule_at)";
+    const todayWhere = `status IN ('unplanned','planned','in_progress','review')
+           AND ((${todayDate} >= ? AND ${todayDate} < ?)
+                OR (planned_start_at IS NOT NULL AND planned_due_at IS NOT NULL
+                    AND planned_start_at < planned_due_at
+                    AND planned_start_at < ? AND planned_due_at > ?))`;
+    const candidateWhere = `state = 'pending' AND deleted_at IS NULL
+           AND NOT (title = 'AI 整理待重试' AND confidence = 0
+                    AND background = '' AND validation_question = '' AND describe = '')`;
+    const candidates = this.database.raw
+      .prepare(
+        `SELECT * FROM candidate_request
+         WHERE ${candidateWhere}
+         ORDER BY created_at DESC LIMIT 6`,
+      )
+      .all() as CandidateRow[];
+    const today = this.database.raw
+      .prepare(
+         `SELECT * FROM task
+         WHERE ${activeTaskWhere}
+           AND ${todayWhere}
+         ORDER BY ${todayDate}, updated_at DESC LIMIT 8`,
+      )
+      .all(day.startAt, day.endAt, day.endAt, day.startAt) as unknown as TaskRecord[];
+    const waiting = this.database.raw
+      .prepare(`SELECT * FROM task WHERE ${activeTaskWhere} AND status = 'waiting' ORDER BY ${todayDate} IS NULL, ${todayDate}, updated_at DESC LIMIT 8`)
+      .all() as unknown as TaskRecord[];
+    const publicCandidates = candidates
+      .map((candidate) => this.publicCandidate(candidate.id))
+      .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null);
+    const publicToday = today
+      .map((task) => this.publicTask(task.id))
+      .filter((task): task is NonNullable<typeof task> => task !== null);
+    const publicWaiting = waiting
+      .map((task) => this.publicTask(task.id))
+      .filter((task): task is NonNullable<typeof task> => task !== null);
+    const candidateTotal = (this.database.raw.prepare(`SELECT COUNT(*) AS count FROM candidate_request WHERE ${candidateWhere}`).get() as { count: number }).count;
+    const todayTotal = (this.database.raw.prepare(`SELECT COUNT(*) AS count FROM task WHERE ${activeTaskWhere} AND ${todayWhere}`).get(day.startAt, day.endAt, day.endAt, day.startAt) as { count: number }).count;
+    const waitingTotal = (this.database.raw.prepare(`SELECT COUNT(*) AS count FROM task WHERE ${activeTaskWhere} AND status = 'waiting'`).get() as { count: number }).count;
+    const inProgressTotal = (this.database.raw.prepare(`SELECT COUNT(*) AS count FROM task WHERE ${activeTaskWhere} AND status = 'in_progress'`).get() as { count: number }).count;
+    const overdueTotal = (this.database.raw.prepare(`SELECT COUNT(*) AS count FROM task WHERE ${activeTaskWhere} AND status IN ('planned','in_progress','review','waiting') AND COALESCE(planned_due_at, schedule_at) < ?`).get(generatedAt) as { count: number }).count;
+    const dataMode = this.adapters.feishu.kind === 'live' || this.adapters.classifier.kind === 'live' ? 'configured' : 'local_mock';
+    return {
+      candidates: publicCandidates,
+      today: publicToday,
+      waiting: publicWaiting,
+      counts: { candidates: candidateTotal, today: todayTotal, waiting: waitingTotal, inProgress: inProgressTotal, overdue: overdueTotal },
+      asOf: generatedAt,
+      todayDate: day.date,
+      timezone: SHANGHAI_TIMEZONE,
+      dataMode,
+    };
+  }
+
+  calendar() {
+    const generatedAt = nowIso();
+    const rows = this.database.raw
+      .prepare(
+        `SELECT * FROM task
+         WHERE record_state = 'active' AND deleted_at IS NULL
+           AND COALESCE(planned_start_at, planned_due_at, schedule_at) IS NOT NULL
+           AND status NOT IN ('archived')
+         ORDER BY COALESCE(planned_start_at, planned_due_at, schedule_at) ASC`,
+      )
+      .all() as unknown as TaskRecord[];
+    type CalendarTaskItem = {
+      id: string;
+      title: string;
+      status: TaskStatus;
+      next_step: string;
+      display_start_at: string | null;
+      display_due_at: string | null;
+      display_schedule_at: string | null;
+      display_anchor_at: string;
+    };
+    const days = new Map<string, CalendarTaskItem[]>();
+    let omittedCount = 0;
+    for (const row of rows) {
+      try {
+        const task = this.publicTask(row.id);
+        if (!task) {
+          omittedCount += 1;
+          continue;
+        }
+        const projection = projectShanghaiCalendarPlan(task.planned_start_at, task.planned_due_at, task.schedule_at);
+        const item: CalendarTaskItem = {
+          id: task.id,
+          title: task.title,
+          status: task.status,
+          next_step: task.next_step,
+          display_start_at: projection.displayStartAt,
+          display_due_at: projection.displayDueAt,
+          display_schedule_at: projection.displayScheduleAt,
+          display_anchor_at: projection.displayAnchorAt,
+        };
+        for (const date of projection.dayKeys) days.set(date, [...(days.get(date) ?? []), item]);
+      } catch {
+        omittedCount += 1;
+      }
+    }
+    return {
+      asOf: generatedAt,
+      timezone: SHANGHAI_TIMEZONE,
+      warning: omittedCount > 0 ? SHANGHAI_CALENDAR_OMITTED_WARNING : null,
+      omittedCount,
+      days: Array.from(days.entries())
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([date, items]) => ({ date, items })),
+    };
+  }
+
+  calendarSources(input: { route?: CalendarClassification['route']; limit?: number } = {}) {
+    const limit = Math.min(Math.max(input.limit ?? 100, 1), 500);
+    const rows = this.database.raw.prepare(
+      `SELECT occurred_at, metadata_json
+       FROM source_event
+       WHERE source_type = 'calendar'
+       ORDER BY occurred_at DESC, captured_at DESC
+       LIMIT ?`,
+    ).all(limit) as Array<{ occurred_at: string; metadata_json: string }>;
+    const boundedText = (value: unknown, max: number) => {
+      if (typeof value !== 'string') return null;
+      const safe = value.replace(/[\u0000-\u001F\u007F]/gu, ' ').replace(/\s+/gu, ' ').trim();
+      if (/(?:sk-[A-Za-z0-9]|gh[pousr]_[A-Za-z0-9]|Bearer\s+|BEGIN (?:RSA|OPENSSH|EC|PRIVATE) KEY|sourceEventId|externalId|provider[_ -]?payload|raw[_ -]?(?:json|payload|source))/iu.test(safe)) return '<redacted>';
+      return safe ? safe.slice(0, max) : null;
+    };
+    const safeEvidence = (value: unknown) => {
+      const raw = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+      const result: Record<string, string> = {};
+      for (const key of ['ownerResponsibility', 'action', 'deliverableOrDeadline', 'missingSignalCode'] as const) {
+        const item = boundedText(raw[key], 160);
+        if (item) result[key] = item;
+      }
+      const sourceReference = typeof raw.sourceReference === 'string' && /^sha256:[0-9a-f]{16}$/u.test(raw.sourceReference)
+        ? raw.sourceReference
+        : 'sha256:0000000000000000';
+      result.sourceReference = sourceReference;
+      return result;
+    };
+    return {
+      timezone: SHANGHAI_TIMEZONE,
+      items: rows.flatMap((row) => {
+        const metadata = parseMetadata(row.metadata_json);
+        const classification = metadata.calendarClassification as CalendarClassification | undefined;
+        if (!classification || (input.route && classification.route !== input.route)) return [];
+        const route = classification.route === 'calendar_fact' || classification.route === 'candidate_review' || classification.route === 'owner_confirmation'
+          ? classification.route
+          : 'calendar_fact';
+        return [{
+          title: boundedText(metadata.calendarTitle, 160) || '未命名日程',
+          startAt: boundedText(metadata.startTime, 64) || boundedText(row.occurred_at, 64),
+          endAt: boundedText(metadata.endTime, 64),
+          route,
+          sourceRetained: classification.sourceRetained === true,
+          candidateCreated: route === 'candidate_review' && classification.candidateCreated === true,
+          requiresOwnerConfirmation: route !== 'calendar_fact' && classification.requiresOwnerConfirmation === true,
+          explanationCode: typeof classification.explanationCode === 'string' && /^[a-z][a-z0-9_]{0,79}$/u.test(classification.explanationCode)
+            ? classification.explanationCode
+            : 'calendar_input_invalid',
+          evidenceFields: safeEvidence(classification.evidenceFields),
+          correctionScope: 'current_event_only',
+        }];
+      }),
+    };
+  }
+
+  listNotifications(unreadOnly = false, limit = 100) {
+    type NotificationView = {
+      id: string;
+      task_id: string | null;
+      task_event_id: string | null;
+      candidate_id: string | null;
+      notification_type: 'immediate' | 'daily';
+      dedupe_key: string | null;
+      reason: string;
+      read_at: string | null;
+      snoozed_until: string | null;
+      archived_at: string | null;
+      created_at: string;
+      task_title: string | null;
+      candidate_title: string | null;
+    };
+    const safeLimit = Math.min(Math.max(limit, 1), 500);
+    const rows = this.database.raw
+      .prepare(
+        `SELECT notification.*, candidate_request.title AS candidate_title, task.title AS task_title
+         FROM notification
+         LEFT JOIN candidate_request ON candidate_request.id = notification.candidate_id
+         LEFT JOIN task ON task.id = notification.task_id
+         WHERE (? = 0 OR notification.read_at IS NULL)
+           AND notification.archived_at IS NULL
+         ORDER BY notification.created_at DESC LIMIT ?`,
+      )
+      .all(unreadOnly ? 1 : 0, safeLimit) as NotificationView[];
+    return rows.map((row): NotificationView => ({
+      ...row,
+      task_title: row.task_id ? this.publicTask(row.task_id)?.title ?? null : null,
+      candidate_title: row.candidate_id ? this.publicCandidate(row.candidate_id)?.title ?? null : null,
+    }));
+  }
+
+  markNotificationRead(notificationId: string) {
+    const result = this.database.raw.prepare('UPDATE notification SET read_at = COALESCE(read_at, ?) WHERE id = ?').run(nowIso(), notificationId);
+    if (!result.changes) throw new Error('提醒不存在。');
+    return this.database.raw.prepare('SELECT * FROM notification WHERE id = ?').get(notificationId);
+  }
+
+  listLogs(input: { category?: string; level?: string; from?: string; to?: string; operation_id?: string; trace_id?: string; event_type?: string; limit?: number } = {}) {
+    const limit = Math.min(Math.max(input.limit ?? 100, 1), 500);
+    const from = input.from ?? null;
+    const to = input.to ?? null;
+    const rows = this.database.raw
+      .prepare(
+        `SELECT id, category, level, event_type, summary, context_json, created_at FROM app_log
+         WHERE (? IS NULL OR category = ?) AND (? IS NULL OR level = ?)
+           AND (? IS NULL OR created_at >= ?) AND (? IS NULL OR created_at <= ?)
+           AND (? IS NULL OR event_type = ?)
+           AND (? IS NULL OR context_json LIKE '%' || ? || '%')
+           AND (? IS NULL OR context_json LIKE '%' || ? || '%')
+         ORDER BY created_at DESC LIMIT ?`,
+      )
+      .all(input.category ?? null, input.category ?? null, input.level ?? null, input.level ?? null, from, from, to, to,
+        input.event_type ?? null, input.event_type ?? null,
+        input.operation_id ?? null, input.operation_id ?? null,
+        input.trace_id ?? null, input.trace_id ?? null, limit);
+    const safeRows = (rows as Array<Record<string, unknown>>).map((row) => {
+      const details = diagnosticLogDetails(row.context_json);
+      const eventType = typeof row.event_type === 'string' && diagnosticEventLabels[row.event_type]
+        ? row.event_type
+        : 'OBS_UNKNOWN_EVENT';
+      return {
+        id: diagnosticInternalId(row.id),
+        category: row.category === 'runtime' || row.category === 'integration' || row.category === 'ai' || row.category === 'workspace' ? row.category : 'unknown',
+        level: row.level === 'info' || row.level === 'warn' || row.level === 'error' ? row.level : 'unknown',
+        event_type: eventType,
+        summary: diagnosticEventLabels[eventType] ?? diagnosticEventFallback,
+        // Keep a JSON string for legacy local consumers, but only serialize
+        // the already-projected diagnostic details; raw context never crosses
+        // this boundary.
+        context_json: JSON.stringify({ details }),
+        details,
+        operation_id: details.operation_id ?? null,
+        request_id: details.request_id ?? null,
+        trace_id: details.trace_id ?? null,
+        parent_span_id: details.parent_span_id ?? null,
+        span_id: details.span_id ?? null,
+        created_at: diagnosticTimestamp(row.created_at),
+      };
+    });
+    // Provider request IDs and source relationships are intentionally not
+    // selected: the logs UI consumes only this fixed, local diagnostic DTO.
+    const decisions = (this.database.raw
+      .prepare(
+        `SELECT id, provider, model, prompt_version,
+                is_data_request, confidence, used_fallback, http_status,
+                attempts, structured_mode, input_hash, input_char_count, fallback_mode, latency_ms, created_at
+         FROM ai_decision_log
+         WHERE (? IS NULL OR created_at >= ?) AND (? IS NULL OR created_at <= ?)
+         ORDER BY created_at DESC LIMIT ?`,
+      )
+      .all(from, from, to, to, Math.min(limit, 100)) as unknown as LogDecisionRow[]).map(diagnosticDecision);
+    const health = (this.database.raw
+      .prepare(`SELECT integration, status, message, latency_ms, checked_at FROM integration_health
+        WHERE (? IS NULL OR checked_at >= ?) AND (? IS NULL OR checked_at <= ?)
+        ORDER BY checked_at DESC`)
+      .all(from, from, to, to) as Array<Record<string, unknown>>).map((row) => ({
+        ...row,
+        message: redactDiagnosticText(row.message, 300),
+      }));
+    // Idempotency keys are omitted, while free-form notes are reduced to a
+    // presence marker by diagnosticCorrection.
+    const corrections = this.database.raw
+      .prepare(
+        `SELECT id, task_id, candidate_id, correction_type, note, created_at
+         FROM correction_event
+         WHERE (? IS NULL OR created_at >= ?) AND (? IS NULL OR created_at <= ?)
+         ORDER BY created_at DESC LIMIT ?`,
+      )
+      .all(from, from, to, to, Math.min(limit, 100)) as unknown as LogCorrectionRow[];
+    return {
+      logs: safeRows,
+      decisions,
+      health,
+      corrections: corrections.map(diagnosticCorrection),
+      redactionSchemaVersion: REDACTION_SCHEMA_VERSION,
+    };
+  }
+
+  diagnostics(requestId?: string) {
+    const operationId = randomUUID();
+    const traceId = randomUUID();
+    let readiness = this.readiness();
+    let counts = { sources: 0, candidates: 0, tasks: 0, logs: 0, decisions: 0, corrections: 0 };
+    let recentErrors: unknown[] = [];
+    if (readiness.status !== 'not_ready') {
+      try {
+        counts = {
+          sources: (this.database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count,
+          candidates: (this.database.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get() as { count: number }).count,
+          tasks: (this.database.raw.prepare('SELECT COUNT(*) AS count FROM task').get() as { count: number }).count,
+          logs: (this.database.raw.prepare('SELECT COUNT(*) AS count FROM app_log').get() as { count: number }).count,
+          decisions: (this.database.raw.prepare('SELECT COUNT(*) AS count FROM ai_decision_log').get() as { count: number }).count,
+          corrections: (this.database.raw.prepare('SELECT COUNT(*) AS count FROM correction_event').get() as { count: number }).count,
+        };
+        recentErrors = (this.database.raw
+          .prepare("SELECT category, level, event_type, summary, created_at FROM app_log WHERE level = 'error' ORDER BY created_at DESC LIMIT 20")
+          .all() as Array<Record<string, unknown>>).map(diagnosticRecentError);
+      } catch {
+        readiness = { status: 'not_ready', reasons: [{ code: 'DATABASE_UNAVAILABLE', message: '本地数据库当前不可用。' }] };
+        counts = { sources: 0, candidates: 0, tasks: 0, logs: 0, decisions: 0, corrections: 0 };
+        recentErrors = [];
+      }
+    }
+    const health = this.health(requestId, readiness);
+    let recentEvents: unknown[] = [];
+    try {
+      recentEvents = this.listLogs({ limit: 50 }).logs;
+    } catch {
+      recentEvents = [];
+    }
+    return redactDiagnosticRecord({
+      diagnostic_bundle_version: 'obs-01-v1',
+      generatedAt: nowIso(),
+      operation_id: operationId,
+      request_id: requestId ?? randomUUID(),
+      trace_id: traceId,
+      health,
+      readiness,
+      release: this.releaseIdentity(),
+      counts,
+      configuration: this.configuration(),
+      recentErrors,
+      recentEvents,
+      summaries: {
+        database: { provider: this.config.database.provider, schema_version: CURRENT_SCHEMA_VERSION },
+        runtime: { failed_jobs: health.dependencies?.runner?.details?.failed_jobs ?? 0, pending_jobs: health.dependencies?.runner?.details?.pending_jobs ?? 0 },
+        integrations: health.integrations,
+        sync: { outcome: (recentEvents as Array<Record<string, unknown>>).find((event) => event.event_type === 'feishu.sync.completed')?.details && typeof ((recentEvents as Array<Record<string, unknown>>).find((event) => event.event_type === 'feishu.sync.completed')?.details) === 'object'
+          ? (((recentEvents as Array<Record<string, unknown>>).find((event) => event.event_type === 'feishu.sync.completed')?.details as Record<string, unknown>).outcome ?? null)
+          : null },
+        backoff: health.dependencies?.backoff ?? null,
+        queue: health.dependencies?.queue ?? null,
+      },
+      limits: { recent_events: 50, recent_errors: 20, max_string_length: 300 },
+      privacy: {
+        rawMessagesIncluded: false,
+        secretsIncluded: false,
+        absolutePathsIncluded: false,
+      },
+    });
+  }
+
+  cleanupLogs(retentionDays = this.config.logging.retentionDays) {
+    const safeDays = Math.min(Math.max(retentionDays, 1), 365);
+    const cutoff = new Date(Date.now() - safeDays * 24 * 60 * 60 * 1000).toISOString();
+    const result = this.database.transaction(() => {
+      const logs = this.database.raw.prepare('DELETE FROM app_log WHERE created_at < ?').run(cutoff);
+      const decisions = this.database.raw.prepare('DELETE FROM ai_decision_log WHERE created_at < ?').run(cutoff);
+      const health = this.database.raw.prepare('DELETE FROM integration_health WHERE checked_at < ?').run(cutoff);
+      return { logs: logs.changes, decisions: decisions.changes, health: health.changes };
+    });
+    this.log('runtime', 'info', 'logs.cleanup', '已按保留期限清理脱敏日志。', { retentionDays: safeDays, ...result });
+    return result;
+  }
+
+  clearLogs(includeCorrections = false) {
+    const result = this.database.transaction(() => {
+      const logs = this.database.raw.prepare('DELETE FROM app_log').run().changes;
+      const decisions = this.database.raw.prepare('DELETE FROM ai_decision_log').run().changes;
+      const health = this.database.raw.prepare('DELETE FROM integration_health').run().changes;
+      const corrections = includeCorrections ? this.database.raw.prepare('DELETE FROM correction_event').run().changes : 0;
+      return { logs, decisions, health, corrections };
+    });
+    return result;
+  }
+
+  async testIntegration(key: 'feishu' | 'llm' | 'workspace'): Promise<IntegrationCheck> {
+    const startedAt = Date.now();
+    let result: IntegrationCheck;
+    if (key === 'feishu') result = await this.adapters.feishu.testConnection();
+    else if (key === 'llm') result = await this.adapters.classifier.testConnection();
+    else {
+      const workspaceKind = (this.adapters.workspace as { kind: string }).kind;
+      result = {
+      ok: workspaceKind === 'readonly_bridge',
+      status: workspaceKind === 'readonly_bridge' ? 'ready' : 'not_configured',
+      message: workspaceKind === 'readonly_bridge' ? '只读工作区适配器可用。' : '尚未开启只读目录读取。',
+      checkedAt: nowIso(),
+      };
+    }
+    // Keep one current row per integration. State transitions are retained in
+    // the redacted app log, so the health table cannot be mistaken for an
+    // unbounded probe history.
+    const safeResult: IntegrationCheck = {
+      ok: result.ok,
+      status: result.status,
+      message: redactDiagnosticText(result.message, 300),
+      checkedAt: redactDiagnosticText(result.checkedAt, 80),
+      details: redactDiagnosticRecord(result.details ?? {}),
+    };
+    this.database.transaction(() => {
+      this.database.raw.prepare('DELETE FROM integration_health WHERE integration = ?').run(key);
+      this.database.raw
+        .prepare('INSERT INTO integration_health (id, integration, status, message, details_json, latency_ms, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(id('health'), key, safeResult.status, safeResult.message, JSON.stringify(safeResult.details ?? {}), Date.now() - startedAt, safeResult.checkedAt);
+    });
+    this.log(result.ok ? 'integration' : 'runtime', result.ok ? 'info' : 'warn', 'integration.checked', safeResult.message, {
+      integration: key,
+      status: safeResult.status,
+      latencyMs: Date.now() - startedAt,
+    });
+    return safeResult;
+  }
+
+  async feishuAuthorizationUrl(state?: string) {
+    const adapter = this.adapters.feishu as { buildAuthorizationUrl?: (state?: string) => Promise<string> };
+    if (!adapter.buildAuthorizationUrl) throw new Error('当前飞书适配器不支持 OAuth。');
+    return { url: await adapter.buildAuthorizationUrl(state) };
+  }
+
+  async completeFeishuOAuth(code: string, state?: string) {
+    const adapter = this.adapters.feishu as { exchangeCode?: (code: string, state?: string) => Promise<{ expiresAt: string }> };
+    if (!adapter.exchangeCode) throw new Error('当前飞书适配器不支持 OAuth。');
+    const resumeAfterOAuth = this.feishuStarted || this.feishuBotStarted;
+    const previousOwnerStatus = this.beginOwnerAuthorizationTransition();
+    try {
+      await this.stopFeishu();
+    } catch (error) {
+      this.restoreOwnerAuthorizationStatus(previousOwnerStatus);
+      throw error;
+    }
+    let result: { expiresAt: string };
+    try {
+      result = await adapter.exchangeCode(code, state);
+    } catch (error) {
+      this.restoreOwnerAuthorizationStatus(previousOwnerStatus);
+      if (resumeAfterOAuth) {
+        try { await this.startFeishu({ refreshOwner: false }); } catch { /* preserve the OAuth error */ }
+      }
+      const diagnostic = error instanceof FeishuAuthError ? error.diagnostic : describeFeishuAuthError(error, 'token_exchange');
+      this.log('integration', 'error', 'feishu.oauth.exchange_failed', '飞书授权码换 Token 失败。', {
+        stage: diagnostic.stage,
+        category: diagnostic.category,
+        statusCode: diagnostic.statusCode ?? undefined,
+        diagnosticCode: diagnostic.code ?? undefined,
+      });
+      throw error;
+    }
+    this.log('integration', 'info', 'feishu.oauth.completed', '飞书用户授权完成，令牌已安全保存。', { expiresAtPresent: Boolean(result.expiresAt) });
+    try {
+      const ownerInformation = await this.refreshOwnerIdentity();
+      if (resumeAfterOAuth) await this.startFeishu({ refreshOwner: false });
+      return { ok: true, tokenSaved: true, ...result, owner: ownerInformation.owner, ownerError: null };
+    } catch (error) {
+      if (resumeAfterOAuth) {
+        try { await this.startFeishu({ refreshOwner: false }); } catch { /* owner diagnostics remain authoritative */ }
+      }
+      const diagnostic = error instanceof FeishuAuthError ? error.diagnostic : describeFeishuAuthError(error, 'owner_identity');
+      this.log('integration', 'warn', 'feishu.oauth.owner_identity_failed', '飞书令牌已保存，但系统主人身份读取失败。', {
+        stage: diagnostic.stage,
+        category: diagnostic.category,
+        statusCode: diagnostic.statusCode ?? undefined,
+        diagnosticCode: diagnostic.code ?? undefined,
+      });
+      return {
+        ok: true,
+        tokenSaved: true,
+        ...result,
+        owner: null,
+        ownerError: diagnostic.message,
+        ownerDiagnostic: {
+          stage: diagnostic.stage,
+          category: diagnostic.category,
+          statusCode: diagnostic.statusCode,
+          code: diagnostic.code,
+        },
+      };
+    }
+  }
+
+  private beginOwnerAuthorizationTransition() {
+    const current = this.database.raw.prepare("SELECT oauth_status FROM owner_profile WHERE id = 'primary'").get() as { oauth_status: OwnerProfileRow['oauth_status'] } | undefined;
+    if (current) {
+      this.database.raw.prepare("UPDATE owner_profile SET oauth_status = 'unknown', last_synced_at = NULL, updated_at = ? WHERE id = 'primary'")
+        .run(nowIso());
+    }
+    return current?.oauth_status ?? null;
+  }
+
+  private restoreOwnerAuthorizationStatus(previous: OwnerProfileRow['oauth_status'] | null) {
+    if (!previous) return;
+    this.database.raw.prepare("UPDATE owner_profile SET oauth_status = ?, updated_at = ? WHERE id = 'primary' AND oauth_status = 'unknown'")
+      .run(previous, nowIso());
+  }
+
+  private assertFeishuLifecycleFence(claim?: PrivacyLifecycleClaimRow) {
+    if (claim) {
+      this.renewPrivacyLifecycleClaim(claim);
+      return;
+    }
+    this.assertNoActivePrivacyLifecycleClaim();
+  }
+
+  startFeishu(options: { refreshOwner?: boolean; syncOnce?: boolean } = {}, lifecycleClaim?: PrivacyLifecycleClaimRow) {
+    return this.queueFeishuLifecycle(async () => {
+      this.assertFeishuLifecycleFence(lifecycleClaim);
+      if (this.privacyControl().collection_status === 'stopped') {
+        return { ok: false, skipped: true, reason: 'privacy_collection_stopped' } as const;
+      }
+      const refreshOwner = options.refreshOwner !== false;
+      const adapter = this.adapters.feishu as { kind?: string; start?: (handler: (event: NormalizedSourceEvent) => Promise<unknown>) => Promise<void>; stop?: () => Promise<void> };
+      if (adapter.kind !== 'live') return { ok: false, skipped: true, reason: 'not_configured' } as const;
+      if (this.feishuStarted) {
+        if (refreshOwner) {
+          try {
+            await this.refreshOwnerIdentity();
+          } catch {
+            // Keep the running supplement listener alive; source health records
+            // explain why owner-led polling could not refresh yet.
+          }
+        }
+        const bot = await this.tryStartBotSupplement(adapter, lifecycleClaim);
+        if (options.syncOnce) await this.syncFeishuOnce();
+        return { ok: true, alreadyStarted: true, resynced: Boolean(options.syncOnce), botSupplementStarted: bot.started } as const;
+      }
+      try {
+        if (refreshOwner) {
+          try {
+            await this.refreshOwnerIdentity();
+          } catch {
+            // The bot supplement may still start without user OAuth. Owner-led
+            // sources remain explicitly marked unauthorized/error.
+          }
+        }
+        this.feishuSync?.start();
+        this.feishuOwnerSync?.start();
+        this.feishuCalendarSync?.start();
+        this.feishuMinutesSync?.start();
+        this.feishuDocumentSync?.start();
+        this.feishuStarted = true;
+        const bot = await this.tryStartBotSupplement(adapter, lifecycleClaim);
+        this.log('integration', 'info', 'feishu.listener.started', '飞书个人信息流已自动启动。', { botSupplementStarted: bot.started });
+        return { ok: true, started: true, botSupplementStarted: bot.started } as const;
+      } catch (error) {
+        await Promise.all([
+          this.feishuSync?.stop(),
+          this.feishuOwnerSync?.stop(),
+          this.feishuCalendarSync?.stop(),
+          this.feishuMinutesSync?.stop(),
+          this.feishuDocumentSync?.stop(),
+        ]);
+        if (this.feishuBotStarted) {
+          try { await adapter.stop?.(); } catch { /* best effort cleanup */ }
+        }
+        this.feishuStarted = false;
+        this.feishuBotStarted = false;
+        this.log('integration', 'error', 'feishu.listener.start_failed', '飞书个人信息流自动启动失败。', {
+          errorType: error instanceof Error ? error.name : 'unknown',
+        });
+        throw error;
+      }
+    });
+  }
+
+  stopFeishu(lifecycleClaim?: PrivacyLifecycleClaimRow) {
+    return this.queueFeishuLifecycle(async () => {
+      this.assertFeishuLifecycleFence(lifecycleClaim);
+      const adapter = this.adapters.feishu as { kind?: string; stop?: () => Promise<void> };
+      const wasStarted = this.feishuStarted || this.feishuBotStarted;
+      await Promise.all([
+        this.feishuSync?.stop(),
+        this.feishuOwnerSync?.stop(),
+        this.feishuCalendarSync?.stop(),
+        this.feishuMinutesSync?.stop(),
+        this.feishuDocumentSync?.stop(),
+      ]);
+      try {
+        if (this.feishuBotStarted) {
+          // Keep the durable claim check immediately adjacent to the provider
+          // call. A stale/reclaimed actor must not reach adapter.stop().
+          this.assertFeishuLifecycleFence(lifecycleClaim);
+          await adapter.stop?.();
+        }
+      } finally {
+        this.feishuStarted = false;
+        this.feishuBotStarted = false;
+      }
+      if (!wasStarted) return { ok: true, stopped: true, alreadyStopped: true } as const;
+      this.log('integration', 'info', 'feishu.listener.stopped', '飞书个人信息流和补充入口已停止。');
+      return { ok: true, stopped: true } as const;
+    });
+  }
+
+  private async tryStartBotSupplement(
+    adapter: { start?: (handler: (event: NormalizedSourceEvent) => Promise<unknown>) => Promise<void>; stop?: () => Promise<void> },
+    lifecycleClaim?: PrivacyLifecycleClaimRow,
+  ) {
+    if (this.feishuBotStarted) return { started: true } as const;
+    if (!adapter.start) {
+      this.markBotSupplementState('error', '当前飞书适配器不支持机器人事件监听；主人个人信息流仍继续运行。');
+      return { started: false } as const;
+    }
+    try {
+      // The final durable fence must be the last local step before the
+      // provider adapter is invoked.
+      this.assertFeishuLifecycleFence(lifecycleClaim);
+       await adapter.start((event) => this.captureFeishuBotEvent(event));
+      this.feishuBotStarted = true;
+      this.markBotSupplementState('partial', null);
+      return { started: true } as const;
+    } catch (error) {
+      try {
+        this.assertFeishuLifecycleFence(lifecycleClaim);
+        await adapter.stop?.();
+      } catch { /* preserve the start error; lifecycle claim remains durable */ }
+      const message = error instanceof Error ? error.message : '机器人补充入口启动失败。';
+      this.markBotSupplementState('error', `${message} 主人个人信息流仍继续运行。`);
+      this.log('integration', 'warn', 'feishu.bot_listener.start_failed', '机器人补充入口启动失败，主人个人信息流继续运行。', {
+        errorType: error instanceof Error ? error.name : 'unknown',
+      });
+      return { started: false } as const;
+    }
+  }
+
+  private queueFeishuLifecycle<T>(operation: () => Promise<T>) {
+    const result = this.feishuLifecycle.then(operation, operation);
+    this.feishuLifecycle = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private invokeSyncEntry<TRunner>(
+    runner: TRunner | undefined,
+    operation: (available: TRunner) => Promise<unknown> | unknown,
+  ) {
+    if (!runner) return { skipped: true, reason: 'adapter_unavailable' } as const;
+    return operation(runner);
+  }
+
+  async syncFeishuOnce(requestId?: string, traceContext: { traceId?: string | null; parentSpanId?: string | null } = {}, suppliedContext?: OperationContext) {
+    const startedAt = Date.now();
+    const operationContext = suppliedContext ?? createOperationContext({ requestId: requestId ?? randomUUID(), traceId: traceContext.traceId, parentSpanId: traceContext.parentSpanId });
+    if (this.privacyControl().collection_status === 'stopped') {
+      const sources = (['owner_messages', 'bot_supplement', 'calendar', 'minutes', 'documents'] as const)
+        .map((source) => syncSourceOutcome(source, { skipped: true, reason: 'privacy_collection_stopped' }, 0));
+      const observable = operationEnvelope({ context: operationContext, startedAt, sources, release: this.releaseIdentity() });
+      return { ...observable, ...safeSyncTotals(sources) };
+    }
+    const run = async (operation: () => Promise<unknown> | unknown) => {
+      const sourceStartedAt = Date.now();
+      try {
+        return { result: await operation(), durationMs: Date.now() - sourceStartedAt };
+      } catch (error) {
+        throw { error, durationMs: Date.now() - sourceStartedAt };
+      }
+    };
+    const settled = await Promise.allSettled([
+      run(() => this.invokeSyncEntry(this.feishuOwnerSync, (runner) => runner.runAfterCurrent(undefined, childOperationContext(operationContext)))),
+      run(() => this.invokeSyncEntry(this.feishuSync, (runner) => runner.runAfterCurrent(childOperationContext(operationContext)))),
+      run(() => this.invokeSyncEntry(this.feishuCalendarSync, (runner) => runner.runAfterCurrent(childOperationContext(operationContext)))),
+      run(() => this.invokeSyncEntry(this.feishuMinutesSync, (runner) => runner.runAfterCurrent(childOperationContext(operationContext)))),
+      run(() => this.invokeSyncEntry(this.feishuDocumentSync, (runner) => runner.runAfterCurrent({ force: true }, childOperationContext(operationContext)))),
+    ]);
+    const sourceNames = ['owner_messages', 'bot_supplement', 'calendar', 'minutes', 'documents'] as const;
+    const sources: SourceOutcome[] = settled.map((entry, index) => {
+      const source = sourceNames[index]!;
+      const rejected = entry.status === 'rejected' && entry.reason && typeof entry.reason === 'object'
+        ? entry.reason as { error?: unknown; durationMs?: number }
+        : undefined;
+      return entry.status === 'rejected'
+        ? failedSourceOutcome(source, rejected?.error, rejected?.durationMs ?? 0)
+        : syncSourceOutcome(source, entry.value.result, entry.value.durationMs);
+    });
+    const observable = operationEnvelope({ context: operationContext, startedAt, sources, release: this.releaseIdentity() });
+    const totals = safeSyncTotals(sources);
+    this.log('integration', observable.outcome === 'failure' ? 'error' : observable.outcome === 'success' ? 'info' : 'warn', 'feishu.sync.completed', '飞书同步操作已结束。', {
+      operationId: observable.operation_id,
+      requestId: observable.request_id,
+      traceId: observable.trace_id,
+      parentSpanId: observable.parent_span_id,
+      spanId: observable.span_id,
+      outcome: observable.outcome,
+      failures: totals.failures,
+      reason: sources.find((source) => source.status !== 'success')?.reason ?? null,
+      stale: sources.some((source) => source.stale),
+      nextRetryAt: sources.find((source) => source.next_retry_at)?.next_retry_at ?? null,
+      durationMs: observable.duration_ms,
+    });
+    return { ...observable, ...totals };
+  }
+
+  async syncFeishuSource(kind: OwnerSourceKind, requestId?: string, traceContext: { traceId?: string | null; parentSpanId?: string | null } = {}, suppliedContext?: OperationContext) {
+    const startedAt = Date.now();
+    const operationContext = suppliedContext ?? createOperationContext({ requestId: requestId ?? randomUUID(), traceId: traceContext.traceId, parentSpanId: traceContext.parentSpanId });
+    if (this.privacyControl().collection_status === 'stopped') {
+      const safeSource = syncSourceOutcome(kind, { skipped: true, reason: 'privacy_collection_stopped' }, 0);
+      const observable = operationEnvelope({ context: operationContext, startedAt, sources: [safeSource], release: this.releaseIdentity() });
+      return { ...observable, ...safeSyncTotals(observable.sources) };
+    }
+    const finish = (result: unknown, error?: unknown) => {
+      const durationMs = Date.now() - startedAt;
+      const safeSource = error === undefined
+        ? syncSourceOutcome(kind, result, durationMs)
+        : failedSourceOutcome(kind, error, durationMs);
+      const observable = operationEnvelope({ context: operationContext, startedAt, sources: [safeSource], release: this.releaseIdentity() });
+      const totals = safeSyncTotals(observable.sources);
+      this.log('integration', observable.outcome === 'failure' ? 'error' : observable.outcome === 'success' ? 'info' : 'warn', 'feishu.source_sync.completed', '飞书单来源同步操作已结束。', {
+        operationId: observable.operation_id,
+        requestId: observable.request_id,
+        traceId: observable.trace_id,
+        parentSpanId: observable.parent_span_id,
+        spanId: observable.span_id,
+        outcome: observable.outcome,
+        source: kind,
+        errorCode: safeSource.error_code,
+        reason: safeSource.reason,
+        stale: safeSource.stale,
+        nextRetryAt: safeSource.next_retry_at,
+        failures: totals.failures,
+        durationMs: observable.duration_ms,
+      });
+      return { ...observable, ...totals };
+    };
+    try {
+      if (kind === 'owner_dm' || kind === 'owner_mentions') {
+        return finish(await this.invokeSyncEntry(this.feishuOwnerSync, (runner) => runner.runAfterCurrent(kind, childOperationContext(operationContext))));
+      }
+      if (kind === 'bot_supplement') {
+        return finish(await this.invokeSyncEntry(this.feishuSync, (runner) => runner.runAfterCurrent(childOperationContext(operationContext))));
+      }
+      if (kind === 'calendar') {
+        return finish(await this.invokeSyncEntry(this.feishuCalendarSync, (runner) => runner.runAfterCurrent(childOperationContext(operationContext))));
+      }
+      if (kind === 'minutes') {
+        return finish(await this.invokeSyncEntry(this.feishuMinutesSync, (runner) => runner.runAfterCurrent(childOperationContext(operationContext))));
+      }
+    } catch (error) {
+      return finish(undefined, error);
+    }
+    throw new Error(`当前尚未提供“${kind}”的独立同步入口。`);
+  }
+
+  async feishuCalendar(input: Record<string, unknown> = {}) {
+    const adapter = this.adapters.feishu as { primaryCalendar?: () => Promise<unknown>; listCalendarEvents?: (input?: Record<string, unknown>) => Promise<unknown> };
+    if (!adapter.primaryCalendar || !adapter.listCalendarEvents) throw new Error('当前飞书适配器不支持日历读取。');
+    const calendar = await adapter.primaryCalendar();
+    const primary = (calendar as { calendars?: Array<{ calendar?: { calendar_id?: string } }> }).calendars?.[0]?.calendar?.calendar_id;
+    const events = await adapter.listCalendarEvents({ ...input, calendarId: input.calendarId ?? primary });
+    return { calendar, events };
+  }
+
+  async feishuChats() {
+    const adapter = this.adapters.feishu as { listChats?: () => Promise<unknown> };
+    if (!adapter.listChats) throw new Error('当前飞书适配器不支持会话读取。');
+    return { items: await adapter.listChats() };
+  }
+
+  async feishuMessagesSearch(input: Record<string, unknown> = {}) {
+    const adapter = this.adapters.feishu as { searchMessages?: (input?: Record<string, unknown>) => Promise<unknown> };
+    if (!adapter.searchMessages) throw new Error('当前飞书适配器不支持消息搜索。');
+    return adapter.searchMessages(input);
+  }
+
+  async feishuMinutesSearch(input: Record<string, unknown> = {}) {
+    const adapter = this.adapters.feishu as { searchMinutes?: (input?: Record<string, unknown>) => Promise<unknown> };
+    if (!adapter.searchMinutes) throw new Error('当前飞书适配器不支持会议纪要读取。');
+    return adapter.searchMinutes(input);
+  }
+
+  async feishuMinuteTranscript(token: string) {
+    const adapter = this.adapters.feishu as { getMinuteTranscript?: (token: string) => Promise<unknown> };
+    if (!adapter.getMinuteTranscript) throw new Error('当前飞书适配器不支持会议纪要读取。');
+    return adapter.getMinuteTranscript(token);
+  }
+
+  integrationHealth() {
+    return (this.database.raw
+      .prepare('SELECT integration, status, message, latency_ms, checked_at FROM integration_health ORDER BY integration')
+      .all() as Array<Record<string, unknown>>).map((row) => ({
+        ...row,
+        message: redactDiagnosticText(row.message, 300),
+      }));
+  }
+
+  listCorrections(limit = 100) {
+    return this.database.raw.prepare('SELECT * FROM correction_event ORDER BY created_at DESC LIMIT ?').all(Math.min(Math.max(limit, 1), 500));
+  }
+
+  listCorrectionsPublic(limit = 100) {
+    return (this.listCorrections(limit) as Array<Record<string, unknown>>).map((row) => ({
+      id: row.id,
+      candidate_id: row.candidate_id ?? null,
+      task_id: row.task_id ?? null,
+      correction_type: row.correction_type,
+      visibility: row.visibility,
+      operation: row.operation,
+      created_at: row.created_at,
+    }));
+  }
+
+  recordCorrection(input: {
+    correctionType: string;
+    candidateId?: string;
+    taskId?: string;
+    expectedCandidateVersion?: number;
+    targetTaskId?: string;
+    sourceEventId?: string;
+    demandUnitId?: string;
+    expectedTaskVersion?: number;
+    expectedTargetTaskVersion?: number;
+    idempotencyKey?: string;
+    note?: string;
+    replacementValue?: string;
+    replacementStatus?: TaskStatus;
+    replacementScheduleAt?: string | null;
+    manualContent?: string;
+    manualSenderName?: string;
+    manualOccurredAt?: string;
+  }) {
+    const candidate = input.candidateId
+      ? this.getCandidate(input.candidateId)
+      : input.correctionType === 'false_positive' && input.taskId
+        ? (this.database.raw.prepare('SELECT * FROM candidate_request WHERE accepted_task_id = ?').get(input.taskId) as CandidateRow | undefined) ?? null
+        : null;
+    if (candidate?.deleted_at) throw new Error('回收站中的候选只能恢复，不能继续纠错。');
+    if (candidate && (typeof input.expectedCandidateVersion !== 'number' || !Number.isInteger(input.expectedCandidateVersion)
+      || input.expectedCandidateVersion <= 0
+      || candidate.version !== input.expectedCandidateVersion)) {
+      throw new CandidateVersionConflictError();
+    }
+    const task = input.taskId ? this.getTask(input.taskId) : candidate?.accepted_task_id ? this.getTask(candidate.accepted_task_id) : null;
+    const targetTask = input.targetTaskId ? this.getTask(input.targetTaskId) : null;
+    if (input.correctionType !== 'missed_request' && !candidate && !task) throw new Error('纠错对象不存在。');
+    if (input.correctionType === 'false_positive') {
+      if (!candidate) throw new Error('“这不是需求”只能用于候选记录。');
+      if (candidate.state === 'ignored' && !candidate.accepted_task_id) throw new Error('该候选已经标记为不是需求。');
+      if (task?.record_state === 'invalidated') throw new Error('该正式任务已经标记为无效记录。');
+      if (task && input.expectedTaskVersion === undefined) throw new Error('标记已建立的正式任务前需要提供当前任务版本。');
+    }
+    if (input.correctionType === 'missed_request' && !input.manualContent?.trim()) {
+      throw new Error('漏掉的需求需要填写原始消息内容。');
+    }
+    if (input.correctionType === 'wrong_association' && (!task || !targetTask || task.id === targetTask.id)) {
+      throw new Error('任务关联纠错需要提供有效的目标任务。');
+    }
+    if ((input.correctionType === 'wrong_fields' || input.correctionType === 'describe_incomplete') && !input.replacementValue?.trim()) {
+      throw new Error('字段纠错需要填写正确内容。');
+    }
+    if (input.correctionType === 'status_or_schedule_wrong' && !task) {
+      throw new Error('状态或排期纠错需要指定任务。');
+    }
+    if (task && input.expectedTaskVersion !== undefined && input.expectedTaskVersion !== task.version) {
+      throw new Error('任务已被其他操作更新，请刷新后重试。');
+    }
+    if (targetTask && input.expectedTargetTaskVersion !== undefined && input.expectedTargetTaskVersion !== targetTask.version) {
+      throw new Error('目标任务已被其他操作更新，请刷新后重试。');
+    }
+    const idempotencyKey = input.idempotencyKey?.trim() || id('idem');
+    const existing = this.database.raw.prepare('SELECT * FROM correction_event WHERE idempotency_key = ?').get(idempotencyKey) as Record<string, unknown> | undefined;
+    if (existing) return { duplicate: true, correction: existing };
+    const correctionId = id('corr');
+    if (task && input.correctionType === 'status_or_schedule_wrong'
+      && input.replacementScheduleAt !== undefined
+      && input.replacementScheduleAt !== task.planned_due_at) {
+      assertShanghaiCalendarPlanRange(task.planned_start_at, input.replacementScheduleAt);
+    }
+    const before = {
+      candidate: candidateAuditSnapshot(candidate),
+      task: taskAuditSnapshot(task),
+      targetTask: taskAuditSnapshot(targetTask),
+    };
+    const timestamp = nowIso();
+    let createdCandidateId: string | null = null;
+    let createdSourceEventId: string | null = null;
+    let affectedSourceEventId = candidate?.source_event_id ?? null;
+    let afterCandidate: CandidateRow | null = candidate;
+    let afterTask: TaskRecord | null = task;
+    let afterTargetTask: TaskRecord | null = targetTask;
+    const pendingTaskSourceGapClosures: Array<{
+      gapTaskId: string;
+      resolutionTaskId: string;
+      sourceEventId: string;
+      demandUnitId: string;
+      correctionTaskId?: string;
+    }> = [];
+    const appendTaskEvent = (eventTask: TaskRecord, summary: string, beforeValue: unknown, afterValue: unknown, sourceEventId: string | null = null) => {
+      const demandUnitId = candidate?.demand_unit_id
+        ?? (sourceEventId ? this.uniqueSourceDemandUnitId(sourceEventId) : null);
+      this.database.raw.prepare(
+        `INSERT INTO task_event
+          (id, task_id, event_type, actor_type, visibility, summary, source_event_id, demand_unit_id, before_json, after_json, occurred_at, recorded_at, version)
+         VALUES (?, ?, 'correction_recorded', 'user', 'private', ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(id('evt'), eventTask.id, summary, sourceEventId, demandUnitId, JSON.stringify(beforeValue), JSON.stringify(afterValue), timestamp, timestamp, eventTask.version);
+    };
+    this.database.transaction(() => {
+      if (input.correctionType === 'missed_request') {
+        createdSourceEventId = id('src');
+        affectedSourceEventId = createdSourceEventId;
+        const occurredAt = input.manualOccurredAt ?? timestamp;
+        this.database.raw.prepare(
+          `INSERT INTO source_event (id, external_id, source_type, conversation_id, sender_id, sender_name, content, occurred_at, captured_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(createdSourceEventId, `manual-correction:${idempotencyKey}`, 'manual', 'manual-entry', 'manual-owner', input.manualSenderName ?? '人工补录', input.manualContent!, occurredAt, timestamp);
+        const draft = createManualCandidate(input.manualContent!, input.manualSenderName ?? '人工补录', occurredAt);
+        createdCandidateId = id('cand');
+        const analysisJson = JSON.stringify({ ...draft.analysis, linkedDocuments: [], sourceRevision: null, contextRevision: null });
+        this.database.raw.prepare(
+          `INSERT INTO candidate_request
+            (id, source_event_id, title, proposer_name, background, validation_question, describe, analysis_json, confidence, state, snoozed_until, accepted_task_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)`,
+        ).run(createdCandidateId, createdSourceEventId, draft.title, draft.proposerName, draft.background, draft.validationQuestion, draft.describe, analysisJson, draft.confidence, timestamp, timestamp);
+        afterCandidate = this.getCandidate(createdCandidateId);
+      }
+      if (candidate && input.correctionType === 'false_positive') {
+        const candidateUpdate = this.database.raw.prepare("UPDATE candidate_request SET state = 'ignored', updated_at = ?, version = version + 1 WHERE id = ? AND version = ?")
+          .run(timestamp, candidate.id, candidate.version);
+        if (candidateUpdate.changes !== 1) throw new CandidateVersionConflictError();
+        afterCandidate = this.getCandidate(candidate.id);
+        if (task) {
+          const result = this.database.raw.prepare(
+            "UPDATE task SET status = 'archived', record_state = 'invalidated', archived_at = COALESCE(archived_at, ?), updated_at = ?, version = version + 1 WHERE id = ? AND version = ?",
+          ).run(timestamp, timestamp, task.id, task.version);
+          if (result.changes !== 1) throw new Error('任务已被其他操作更新，请刷新后重试。');
+          afterTask = this.getTask(task.id);
+          this.terminateTaskDraftsInTransaction(task.id, timestamp);
+          appendTaskEvent(afterTask!, '系统主人确认这条记录不是需求，已将正式任务标记为无效并归档。', taskAuditSnapshot(task), taskAuditSnapshot(afterTask), candidate.source_event_id);
+        }
+        this.staleOwnerDecisionsForRetiredTargets({ candidateIds: [candidate.id], taskId: task?.id ?? null });
+      }
+      if (candidate && input.correctionType === 'wrong_fields' && input.replacementValue) {
+        const candidateUpdate = this.database.raw.prepare('UPDATE candidate_request SET proposer_name = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?')
+          .run(input.replacementValue, timestamp, candidate.id, candidate.version);
+        if (candidateUpdate.changes !== 1) throw new CandidateVersionConflictError();
+        afterCandidate = this.getCandidate(candidate.id);
+      }
+      if (task && input.correctionType === 'wrong_fields' && input.replacementValue) {
+        const result = this.database.raw.prepare('UPDATE task SET proposer_name = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?')
+          .run(input.replacementValue, timestamp, task.id, task.version);
+        if (result.changes !== 1) throw new Error('任务已被其他操作更新，请刷新后重试。');
+        afterTask = this.getTask(task.id);
+        appendTaskEvent(afterTask!, '系统主人纠正了任务提出人。', taskAuditSnapshot(task), taskAuditSnapshot(afterTask));
+      }
+      if (candidate && input.correctionType === 'describe_incomplete' && input.replacementValue) {
+        const candidateUpdate = this.database.raw.prepare('UPDATE candidate_request SET describe = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?')
+          .run(input.replacementValue, timestamp, candidate.id, candidate.version);
+        if (candidateUpdate.changes !== 1) throw new CandidateVersionConflictError();
+        afterCandidate = this.getCandidate(candidate.id);
+      }
+      if (task && input.correctionType === 'describe_incomplete' && input.replacementValue) {
+        const result = this.database.raw.prepare('UPDATE task SET describe = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?')
+          .run(input.replacementValue, timestamp, task.id, task.version);
+        if (result.changes !== 1) throw new Error('任务已被其他操作更新，请刷新后重试。');
+        afterTask = this.getTask(task.id);
+        appendTaskEvent(afterTask!, '系统主人补充了任务 describe。', taskAuditSnapshot(task), taskAuditSnapshot(afterTask));
+      }
+      if (task && input.correctionType === 'status_or_schedule_wrong') {
+        const nextStatus = input.replacementStatus ?? task.status;
+        const nextSchedule = input.replacementScheduleAt === undefined ? task.planned_due_at : input.replacementScheduleAt;
+        const nextStep = input.replacementValue ?? task.next_step;
+        if (nextStatus === task.status && nextSchedule === task.planned_due_at && nextStep === task.next_step) {
+          throw new Error('状态、排期和下一步都没有发生变化。');
+        }
+        const completedAt = nextStatus === 'completed' ? task.completed_at ?? timestamp : nextStatus === 'archived' ? task.completed_at : null;
+        const archivedAt = nextStatus === 'archived' ? task.archived_at ?? timestamp : null;
+        const result = this.database.raw.prepare(
+          'UPDATE task SET status = ?, schedule_at = ?, planned_due_at = ?, next_step = ?, completed_at = ?, archived_at = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?',
+        ).run(nextStatus, nextSchedule, nextSchedule, nextStep, completedAt, archivedAt, timestamp, task.id, task.version);
+        if (result.changes !== 1) throw new Error('任务已被其他操作更新，请刷新后重试。');
+        afterTask = this.getTask(task.id);
+        appendTaskEvent(afterTask!, '系统主人纠正了任务状态或排期。', taskAuditSnapshot(task), taskAuditSnapshot(afterTask));
+      }
+      if (task && targetTask && input.correctionType === 'wrong_association') {
+        const sourceIds = this.database.raw.prepare('SELECT source_event_id FROM task_source_link WHERE task_id = ?').all(task.id) as Array<{ source_event_id: string }>;
+        if (!sourceIds.length) throw new Error('源任务没有可移动的来源记录。');
+        const selectedSourceId = input.sourceEventId;
+        if (!selectedSourceId) throw new Error('请明确选择要纠正的来源。');
+        const matchingUnits = this.database.raw.prepare(
+          `SELECT DISTINCT candidate_request.demand_unit_id
+           FROM candidate_request
+           JOIN source_demand_unit_source ON source_demand_unit_source.demand_unit_id = candidate_request.demand_unit_id
+           WHERE candidate_request.accepted_task_id = ?
+             AND source_demand_unit_source.source_event_id = ?
+             AND candidate_request.demand_unit_id IS NOT NULL`,
+        ).all(task.id, selectedSourceId) as Array<{ demand_unit_id: string }>;
+        const selectedUnitId = input.demandUnitId ?? (matchingUnits.length === 1 ? matchingUnits[0]!.demand_unit_id : null);
+        if (!sourceIds.some((source) => source.source_event_id === selectedSourceId)) {
+          throw new Error('所选需求不属于源任务。');
+        }
+        const legacyCandidates = this.database.raw.prepare(
+          'SELECT * FROM candidate_request WHERE source_event_id = ? AND accepted_task_id = ? ORDER BY updated_at DESC',
+        ).all(selectedSourceId, task.id) as CandidateRow[];
+        if (!selectedUnitId && legacyCandidates.length !== 1) throw new Error('这条消息包含多个需求，请明确选择要纠正的具体需求。');
+        const selectedCandidate = selectedUnitId
+          ? this.database.raw.prepare('SELECT * FROM candidate_request WHERE demand_unit_id = ?').get(selectedUnitId) as CandidateRow | undefined
+          : legacyCandidates[0];
+        if (!selectedCandidate || selectedCandidate.accepted_task_id !== task.id) throw new Error('所选需求没有关联当前任务。');
+        const oldTaskSourceRows = this.database.raw.prepare(
+          'SELECT demand_unit_id FROM task_source_link WHERE task_id = ? AND source_event_id = ?',
+        ).all(task.id, selectedSourceId) as Array<{ demand_unit_id: string | null }>;
+        const oldExplicitUnitCount = new Set(oldTaskSourceRows
+          .map((row) => row.demand_unit_id)
+          .filter((value): value is string => value !== null)).size;
+        const mayResolveLegacyOldEdge = selectedUnitId === null || oldExplicitUnitCount === 0;
+        affectedSourceEventId = selectedSourceId;
+        const sourceVersion = input.expectedTaskVersion ?? task.version;
+        const targetVersion = input.expectedTargetTaskVersion ?? targetTask.version;
+        const sourceUpdated = this.database.raw.prepare('UPDATE task SET version = version + 1, updated_at = ? WHERE id = ? AND version = ?').run(timestamp, task.id, sourceVersion);
+        const targetUpdated = this.database.raw.prepare('UPDATE task SET version = version + 1, updated_at = ? WHERE id = ? AND version = ?').run(timestamp, targetTask.id, targetVersion);
+        if (sourceUpdated.changes !== 1 || targetUpdated.changes !== 1) throw new Error('任务已被其他操作更新，请刷新后重试。');
+        if (!task.thread_id || !targetTask.thread_id) throw new Error('源任务或目标任务缺少需求线程，不能安全移动来源。');
+        const unitSources = this.sourceRowsForDemandUnit(selectedUnitId, this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(selectedSourceId) as SourceEventRow);
+        const existingThreadRelation = this.database.raw.prepare(
+          `SELECT * FROM requirement_thread_source WHERE thread_id = ? AND source_event_id = ?`,
+        ).get(task.thread_id, selectedSourceId) as (RequirementThreadSourceRow & {
+          session_id: string | null;
+          conversation_id: string | null;
+          participant_ids_json: string;
+          source_revision: string | null;
+        }) | undefined;
+        if (!existingThreadRelation) throw new Error('所选来源缺少源需求线程关系，不能安全移动。');
+        for (const unitSource of unitSources) this.database.raw.prepare(
+          `INSERT INTO requirement_thread_source
+            (thread_id, source_event_id, demand_unit_id, relation_type, confidence, evidence_json, root_id, parent_id, session_id,
+             conversation_id, participant_ids_json, source_revision, created_at)
+           VALUES (?, ?, ?, 'owner_corrected', 1, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(thread_id, source_event_id) DO UPDATE SET
+             relation_type = 'owner_corrected', confidence = 1, evidence_json = excluded.evidence_json,
+             root_id = excluded.root_id, parent_id = excluded.parent_id, session_id = excluded.session_id,
+             conversation_id = excluded.conversation_id, participant_ids_json = excluded.participant_ids_json,
+             source_revision = excluded.source_revision`,
+        ).run(
+          targetTask.thread_id,
+          unitSource.id,
+          selectedUnitId,
+          JSON.stringify(['系统主人纠正了该来源的需求归属；后续回复应继续进入目标线程。']),
+          existingThreadRelation.root_id,
+          existingThreadRelation.parent_id,
+          existingThreadRelation.session_id,
+          existingThreadRelation.conversation_id,
+          existingThreadRelation.participant_ids_json,
+          existingThreadRelation.source_revision,
+          timestamp,
+        );
+        if (selectedUnitId) this.moveDemandUnitsToThread([selectedUnitId], task.thread_id, targetTask.thread_id, timestamp);
+        for (const unitSource of unitSources) {
+          if (!selectedUnitId || !this.sourceUsedByOtherThreadUnit(task.thread_id, unitSource.id, [selectedUnitId])) {
+            this.database.raw.prepare('DELETE FROM requirement_thread_source WHERE thread_id = ? AND source_event_id = ?')
+              .run(task.thread_id, unitSource.id);
+          }
+        }
+        const source = this.database.raw.prepare('SELECT metadata_json FROM source_event WHERE id = ?').get(selectedSourceId) as { metadata_json: string } | undefined;
+        if (source) {
+          const metadata = parseMetadata(source.metadata_json);
+          metadata.internalRequirementThreadId = targetTask.thread_id;
+          this.database.raw.prepare('UPDATE source_event SET metadata_json = ? WHERE id = ?').run(JSON.stringify(metadata), selectedSourceId);
+        }
+        if (selectedUnitId) {
+          const selectedCandidates = this.database.raw.prepare(
+            'SELECT id, version FROM candidate_request WHERE demand_unit_id = ? AND accepted_task_id = ? ORDER BY id',
+          ).all(selectedUnitId, task.id) as Array<{ id: string; version: number }>;
+          for (const candidateRow of selectedCandidates) {
+            const updated = this.database.raw.prepare(
+              'UPDATE candidate_request SET accepted_task_id = ?, updated_at = ?, version = version + 1 WHERE id = ? AND demand_unit_id = ? AND accepted_task_id = ? AND version = ?',
+            ).run(targetTask.id, timestamp, candidateRow.id, selectedUnitId, task.id, candidateRow.version);
+            if (updated.changes !== 1) throw new CandidateVersionConflictError();
+          }
+        } else {
+          const updated = this.database.raw.prepare(
+            'UPDATE candidate_request SET accepted_task_id = ?, updated_at = ?, version = version + 1 WHERE id = ? AND accepted_task_id = ? AND version = ?',
+          ).run(targetTask.id, timestamp, selectedCandidate.id, task.id, selectedCandidate.version);
+          if (updated.changes !== 1) throw new CandidateVersionConflictError();
+        }
+        for (const unitSource of unitSources) {
+          this.linkTaskSource(targetTask.id, unitSource.id, 'corrected_origin', timestamp, selectedUnitId, { deferIntegrityGapClosure: true });
+          if (selectedUnitId) {
+            pendingTaskSourceGapClosures.push(
+              { gapTaskId: task.id, resolutionTaskId: targetTask.id, sourceEventId: unitSource.id, demandUnitId: selectedUnitId, correctionTaskId: task.id },
+              { gapTaskId: targetTask.id, resolutionTaskId: targetTask.id, sourceEventId: unitSource.id, demandUnitId: selectedUnitId, correctionTaskId: task.id },
+            );
+          }
+          const sourceStillUsedByTask = selectedUnitId ? this.database.raw.prepare(
+            `SELECT COUNT(*) AS count
+             FROM candidate_request
+             JOIN source_demand_unit_source ON source_demand_unit_source.demand_unit_id = candidate_request.demand_unit_id
+             WHERE candidate_request.accepted_task_id = ? AND source_demand_unit_source.source_event_id = ?`,
+          ).get(task.id, unitSource.id) as { count: number } : { count: 0 };
+          if (sourceStillUsedByTask.count === 0) {
+            this.database.raw.prepare(
+              `DELETE FROM task_source_link
+                WHERE task_id = ? AND source_event_id = ?
+                  AND (demand_unit_id = ? OR (demand_unit_id IS NULL AND ? = 1))`,
+            ).run(task.id, unitSource.id, selectedUnitId, mayResolveLegacyOldEdge ? 1 : 0);
+          }
+        }
+        afterCandidate = this.getCandidate(selectedCandidate.id);
+        afterTask = this.getTask(task.id);
+        afterTargetTask = this.getTask(targetTask.id);
+        appendTaskEvent(afterTask!, '系统主人将一条来源移出当前任务。', { task: taskAuditSnapshot(task), linked: true }, { task: taskAuditSnapshot(afterTask), linked: false }, selectedSourceId);
+        appendTaskEvent(afterTargetTask!, '系统主人将一条来源纠正关联到当前任务。', { task: taskAuditSnapshot(targetTask), linked: false }, { task: taskAuditSnapshot(afterTargetTask), linked: true }, selectedSourceId);
+      }
+      this.database.raw
+        .prepare(`INSERT INTO correction_event
+          (id, idempotency_key, task_id, candidate_id, source_event_id, demand_unit_id, correction_type, before_json, after_json, note, visibility, operation, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'private', 'apply', ?)`)
+        .run(
+          correctionId,
+          idempotencyKey,
+          task?.id ?? null,
+          afterCandidate?.id ?? createdCandidateId,
+          affectedSourceEventId,
+          afterCandidate?.demand_unit_id ?? candidate?.demand_unit_id
+            ?? (affectedSourceEventId ? this.uniqueSourceDemandUnitId(affectedSourceEventId) : null),
+          input.correctionType,
+          JSON.stringify(before),
+          JSON.stringify({ candidate: candidateAuditSnapshot(afterCandidate), task: taskAuditSnapshot(afterTask), targetTask: taskAuditSnapshot(afterTargetTask), movedSourceEventId: input.correctionType === 'wrong_association' ? affectedSourceEventId : null }),
+          input.note ?? '',
+          timestamp,
+        );
+      for (const closure of pendingTaskSourceGapClosures) {
+        this.closeTaskSourceIntegrityGap({
+          ...closure,
+          timestamp,
+          correctionEventId: correctionId,
+        });
+      }
+    });
+    const projectionTaskIds = [...new Set([
+      afterTask?.id,
+      input.correctionType === 'wrong_association' ? afterTargetTask?.id : undefined,
+    ].filter((value): value is string => Boolean(value)))];
+    for (const projectionTaskId of projectionTaskIds) this.projectTaskMemory(projectionTaskId);
+    this.log('ai', 'info', 'correction.recorded', '已记录私人纠错，不会生成对外动作。', { correctionType: input.correctionType, candidateId: candidate?.id, taskId: task?.id });
+    return {
+      duplicate: false,
+      candidate: afterCandidate,
+      task: task ? this.getTask(task.id) : null,
+      targetTask: targetTask ? this.getTask(targetTask.id) : null,
+    };
+  }
+
+  async reprocessCandidate(candidateId: string, guidance?: string, recovery?: { jobId: string; leaseOwner: string }, expectedVersion?: number, operationContext?: OperationContext) {
+    const candidate = this.getCandidate(candidateId);
+    if (!candidate) throw new Error('候选需求不存在。');
+    const boundExpectedVersion = expectedVersion ?? candidate.version;
+    this.assertCandidateVersion(candidate, boundExpectedVersion);
+    this.assertCandidateActive(candidate);
+    const acceptedTask = candidate.accepted_task_id ? this.getTask(candidate.accepted_task_id) : null;
+    const sourceRow = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(candidate.source_event_id) as SourceEventRow | undefined;
+    if (!sourceRow) throw new Error('候选的来源消息不存在。');
+    // The durable job is created before the refresh stage. A crash during a
+    // provider/context read therefore leaves a recoverable checkpoint rather
+    // than an untracked side effect.
+    const initialContexts = this.feishuDocumentContext.list(sourceRow.id);
+    const initialRevision = combinedClassificationRevision(sourceRow, initialContexts).revision;
+    const recoveredRuntime = recovery ? this.runtime.get(recovery.jobId) : null;
+    const recoveredPayload = recoveredRuntime ? parseMetadata(recoveredRuntime.payload_json) : null;
+    // New external/direct calls get one canonical envelope here. Recovery must
+    // reuse the durable envelope when present and must not invent a new trace
+    // for a legacy job that never carried one.
+    const effectiveOperationContext = operationContext
+      ?? (recoveredPayload && isOperationContext(recoveredPayload.observability) ? recoveredPayload.observability : null)
+      ?? (recovery ? undefined : createOperationContext({ requestId: randomUUID() }));
+    const runtimeJob = recovery
+      ? recoveredRuntime
+      : this.runtime.begin({
+          jobType: 'reprocess_candidate',
+          payload: {
+            candidateId,
+            candidateVersion: boundExpectedVersion,
+            sourceEventId: candidate.source_event_id,
+            sourceRevision: initialRevision,
+            guidance: guidance?.slice(0, 2_000) ?? null,
+            ...(effectiveOperationContext ? { observability: effectiveOperationContext } : {}),
+          },
+          idempotencyKey: `reprocess:${candidateId}:${initialRevision}:${createHash('sha256').update(guidance ?? '').digest('hex').slice(0, 16)}`,
+          sourceEventId: candidate.source_event_id,
+          taskId: acceptedTask?.id ?? null,
+          traceId: effectiveOperationContext?.trace_id ?? null,
+          leaseMs: this.runtimeLeaseMs(),
+        });
+    if (!runtimeJob) throw new Error('Runtime 工作项不存在。');
+    const runtimePayload = parseMetadata(runtimeJob.payload_json);
+    const boundCandidateVersion = typeof runtimePayload.candidateVersion === 'number' && Number.isInteger(runtimePayload.candidateVersion) && runtimePayload.candidateVersion > 0
+      ? runtimePayload.candidateVersion
+      : null;
+    const boundSourceRevision = typeof runtimePayload.sourceRevision === 'string' && /^[a-f0-9]{64}$/u.test(runtimePayload.sourceRevision)
+      ? runtimePayload.sourceRevision
+      : null;
+    if (boundCandidateVersion === null || boundSourceRevision === null || boundCandidateVersion !== boundExpectedVersion || runtimePayload.candidateId !== candidateId || runtimePayload.sourceEventId !== candidate.source_event_id) {
+      throw new CandidateVersionConflictError();
+    }
+    if (!recovery && (!('acquired' in runtimeJob) || !runtimeJob.acquired || !runtimeJob.lease_owner)) {
+      const result = parseMetadata(runtimeJob.result_json);
+      const proposalId = typeof result.proposalId === 'string' ? result.proposalId : null;
+      return {
+        candidate: this.getCandidate(candidateId),
+        changed: runtimeJob.status === 'completed' && result.changed === true,
+        reason: runtimeJob.status === 'completed' ? '相同的重新整理已经完成。' : '已有相同的重新整理工作项正在处理或等待重试。',
+        proposal: proposalId ? this.getTaskUpdateProposal(proposalId) : null,
+      };
+    }
+    const runtimeJobId = recovery?.jobId ?? runtimeJob.id;
+    const leaseOwner = recovery?.leaseOwner ?? runtimeJob.lease_owner;
+    if (!leaseOwner) throw new Error('Runtime 工作项未取得有效租约。');
+    const durableReprocessKey = `runtime-reprocess:${runtimeJobId}`;
+
+    try {
+      this.assertRuntimeActive(runtimeJobId, leaseOwner);
+      const durableResult = this.database.raw.prepare(
+        'SELECT after_json FROM correction_event WHERE idempotency_key = ?',
+      ).get(durableReprocessKey) as { after_json: string } | undefined;
+      if (durableResult) {
+        const recovered = parseMetadata(durableResult.after_json);
+        const proposalId = typeof recovered.proposalId === 'string' ? recovered.proposalId : null;
+        const changed = recovered.changed !== false;
+        this.runtime.checkpoint(runtimeJobId, 'reprocess_commit_recovered', { candidateId, proposalId, changed }, leaseOwner);
+        this.runtime.complete(runtimeJobId, { candidateId, proposalId, changed }, leaseOwner);
+        return {
+          candidate: this.getCandidate(candidateId),
+          changed,
+          reason: '已从持久化结果恢复重新整理，不会重复生成提案。',
+          proposal: proposalId ? this.getTaskUpdateProposal(proposalId) : null,
+        };
+      }
+      let contexts = this.feishuDocumentContext.list(sourceRow.id);
+      let currentSource = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(sourceRow.id) as SourceEventRow | undefined;
+      if (!currentSource) throw new Error('候选的来源消息已经不存在。');
+      let { sourceHash, contextHash, revision } = combinedClassificationRevision(currentSource, contexts);
+      if (revision !== boundSourceRevision) throw new Error('来源或关联文档在重新整理开始前已经更新，请再次点击重新整理。');
+      let checkpoints = this.runtime.checkpoints(runtimeJobId);
+      const storedContextCheckpoint = [...checkpoints].reverse().find((checkpoint) => {
+        if (checkpoint.step !== 'reprocess_context_loaded') return false;
+        const expected = {
+          candidateId,
+          sourceEventIds: [sourceRow.id],
+          sourceRevision: sourceHash,
+          contextFingerprint: contextHash,
+          revision,
+          contextCount: contexts.length,
+        };
+        return matchesReprocessContextCheckpoint(parseJsonValue<unknown>(String(checkpoint.state_json), null), expected);
+      });
+      if (!storedContextCheckpoint) {
+        contexts = await this.feishuDocumentContext.refresh(currentSource.id, currentSource.content, true);
+        currentSource = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(sourceRow.id) as SourceEventRow | undefined;
+        if (!currentSource) throw new Error('候选的来源消息已经不存在。');
+        ({ sourceHash, contextHash, revision } = combinedClassificationRevision(currentSource, contexts));
+        if (revision !== boundSourceRevision) throw new Error('来源或关联文档在重新整理期间发生更新，请再次点击重新整理。');
+        this.runtime.checkpoint(runtimeJobId, 'reprocess_context_loaded', {
+          candidateId,
+          sourceEventIds: [currentSource.id],
+          sourceRevision: sourceHash,
+          contextFingerprint: contextHash,
+          revision,
+          contextCount: contexts.length,
+        }, leaseOwner);
+        checkpoints = this.runtime.checkpoints(runtimeJobId);
+      }
+      const source = this.sourceRowToEvent(currentSource, contexts);
+      const resumedClassification = checkpoints
+        .reverse()
+        .filter((checkpoint) => checkpoint.step === 'reprocess_model_completed')
+        .map((checkpoint) => parseReusableReprocessCheckpoint(parseJsonValue<unknown>(String(checkpoint.state_json), null), candidateId, revision))
+        .find((value): value is ClassificationResult => Boolean(value)) ?? null;
+      const startedAt = Date.now();
+      const adapterClassification = resumedClassification ?? await this.runtime.executeTool<ClassificationResult>({
+        jobId: runtimeJobId,
+        toolName: 'task.propose_update',
+        toolInput: { candidateId, revision },
+        leaseOwner,
+        run: async (_attempt, signal) => {
+          if (signal.aborted) throw signal.reason ?? new Error('Runtime 重新整理已取消。');
+          const value = await this.adapters.classifier.classify(source, guidance, {
+            signal,
+            retryCooldownGuard: runtimeJobId && leaseOwner
+              ? () => this.runtime.assertLease(runtimeJobId, leaseOwner)
+              : undefined,
+          });
+          this.assertRuntimeActive(runtimeJobId, leaseOwner);
+          return value;
+        },
+        checkpoint: {
+          step: 'reprocess_model_completed',
+          state: (value) => ({
+            candidateId,
+            revision,
+            reusable: !value.deferred && ['valid', 'repaired', 'rule_final'].includes(value.outcome ?? ''),
+            // Reprocess shares the initial classification boundary: only the
+            // safe projection may be recovered after a crash.
+            classification: enforceUntrustedClassificationBoundary(source, value),
+          }),
+        },
+        auditResult: (value, attempts) => {
+          const safe = enforceUntrustedClassificationBoundary(source, value);
+          return {
+            candidateId,
+            isDataRequest: safe.isDataRequest,
+            boundaryRejected: safe.metadata?.boundaryRejected === true,
+            attempts,
+          };
+        },
+      });
+      // SEC-02: reprocessing uses the same untrusted adapter boundary as
+      // initial classification. No model-authored field reaches persistence
+      // before the authoritative service guard runs.
+      const classification = enforceUntrustedClassificationBoundary(source, adapterClassification);
+      this.assertRuntimeActive(runtimeJobId, leaseOwner);
+
+      if (classification.metadata?.boundaryRejected === true) {
+        const reason = '模型输出未通过服务端安全边界，未写入候选、修订、提案或纠错审计。';
+        this.runtime.checkpoint(runtimeJobId, 'reprocess_boundary_rejected', { candidateId, changed: false, reason }, leaseOwner);
+        this.runtime.complete(runtimeJobId, { candidateId, changed: false, boundaryRejected: true }, leaseOwner);
+        return { candidate: this.getCandidate(candidateId), changed: false, reason, proposal: null };
+      }
+
+      const decisionId = id('ai');
+      const timestamp = nowIso();
+      const assertCurrentRevision = () => {
+        const currentSource = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(candidate.source_event_id) as SourceEventRow | undefined;
+        if (!currentSource) throw new Error('候选的来源消息已经不存在。');
+        const currentRevision = combinedClassificationRevision(currentSource, this.feishuDocumentContext.list(currentSource.id)).revision;
+        if (currentRevision !== revision) throw new Error('来源或关联文档在重新整理期间发生更新，请再次点击重新整理。');
+      };
+      const persistDecision = () => {
+        this.database.raw.prepare(
+          `INSERT INTO ai_decision_log
+            (id, source_event_id, source_revision, demand_unit_id, candidate_id, provider, model, prompt_version, is_data_request, confidence, reason, output_json, used_fallback, http_status, provider_request_id, attempts, structured_mode, input_hash, input_char_count, fallback_mode, latency_ms, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          decisionId,
+          candidate.source_event_id,
+          revision,
+          candidate.demand_unit_id,
+          candidateId,
+          this.adapters.classifier.provider,
+          this.adapters.classifier.model,
+          this.adapters.classifier.promptVersion,
+          classification.isDataRequest ? 1 : 0,
+          classification.draft?.confidence ?? null,
+          classification.reason,
+          JSON.stringify({ hasDraft: Boolean(classification.draft), usedFallback: classification.usedFallback, sourceRevision: sourceHash, contextRevision: contextHash }),
+          classification.usedFallback ? 1 : 0,
+          classification.metadata?.httpStatus ?? null,
+          classification.metadata?.requestId ?? null,
+          classification.metadata?.attempts ?? null,
+          classification.metadata?.structuredMode ?? null,
+          classification.metadata?.inputHash ?? null,
+          classification.metadata?.inputCharCount ?? null,
+          classification.metadata?.fallbackMode ?? (classification.usedFallback ? 'rule_fallback' : 'llm'),
+          Date.now() - startedAt,
+          timestamp,
+        );
+        const persistedSource = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(candidate.source_event_id) as SourceEventRow | undefined;
+        if (!persistedSource) throw new Error('候选的来源消息已经不存在。');
+        this.bindAiDecisionRevisions(decisionId, [persistedSource]);
+      };
+
+      if (!classification.draft) {
+        this.database.transaction(() => {
+          this.assertRuntimeActive(runtimeJobId, leaseOwner);
+          const currentCandidate = this.getCandidate(candidateId);
+          if (!currentCandidate) throw new Error('候选需求已经不存在。');
+          this.assertCandidateVersion(currentCandidate, candidate.version);
+          assertCurrentRevision();
+          persistDecision();
+          this.database.raw.prepare(
+            `INSERT INTO correction_event
+              (id, idempotency_key, task_id, candidate_id, source_event_id, demand_unit_id, ai_decision_id, correction_type, before_json, after_json, note, visibility, operation, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'reprocess', ?, ?, ?, 'private', 'apply', ?)`,
+          ).run(
+            id('corr'),
+            durableReprocessKey,
+            acceptedTask?.id ?? null,
+            candidateId,
+            candidate.source_event_id,
+            candidate.demand_unit_id,
+            decisionId,
+            JSON.stringify({ candidate: candidateAuditSnapshot(candidate), task: taskAuditSnapshot(acceptedTask) }),
+            JSON.stringify({ changed: false, proposalId: null }),
+            guidance ?? '',
+            timestamp,
+          );
+        });
+        this.runtime.checkpoint(runtimeJobId, 'reprocess_persisted', { candidateId, changed: false }, leaseOwner);
+        this.runtime.complete(runtimeJobId, { candidateId, changed: false, proposalId: null }, leaseOwner);
+        return { candidate: this.getCandidate(candidateId), changed: false, reason: classification.reason, proposal: null };
+      }
+
+      const draft = classification.draft;
+      let proposalId: string | null = null;
+      let proposalToDispatch: string | null = null;
+      let candidateRevisionId: string | null = null;
+      let threadRevisionId: string | null = null;
+      this.database.transaction(() => {
+        this.assertRuntimeActive(runtimeJobId, leaseOwner);
+        assertCurrentRevision();
+        persistDecision();
+        const currentCandidate = this.getCandidate(candidateId);
+        if (!currentCandidate) throw new Error('候选需求已经不存在。');
+        this.assertCandidateVersion(currentCandidate, candidate.version);
+        const currentTask = currentCandidate.accepted_task_id ? this.getTask(currentCandidate.accepted_task_id) : null;
+        const thread = currentTask?.thread_id
+          ? this.database.raw.prepare('SELECT * FROM requirement_thread WHERE id = ?').get(currentTask.thread_id) as unknown as RequirementThreadRow | undefined
+           : this.threadForCandidate(currentCandidate);
+        const analysisJson = candidateAnalysisJson(draft.analysis, contexts, sourceHash, contextHash);
+        const patch = currentTask ? this.taskPatchFromDraft(currentTask, draft, thread, 'full') : {};
+        const hasProposal = Boolean(currentTask && Object.keys(patch).length);
+
+        if (!currentTask) {
+          const updatedCandidate = this.database.raw.prepare(
+            'UPDATE candidate_request SET title = ?, proposer_name = ?, background = ?, validation_question = ?, describe = ?, analysis_json = ?, confidence = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ? AND accepted_task_id IS NULL',
+          ).run(draft.title, draft.proposerName, draft.background, draft.validationQuestion, draft.describe, analysisJson, draft.confidence, timestamp, candidateId, candidate.version);
+          if (updatedCandidate.changes !== 1) throw new CandidateVersionConflictError();
+          this.database.raw.prepare("UPDATE candidate_revision SET state = 'superseded' WHERE candidate_id = ? AND state = 'current'")
+            .run(candidateId);
+        }
+
+        candidateRevisionId = id('candidate-revision');
+        this.database.raw.prepare(
+          `INSERT INTO candidate_revision
+            (id, candidate_id, source_event_id, demand_unit_id, ai_decision_id, source_revision, title, proposer_name, background,
+             validation_question, describe, analysis_json, confidence, evidence_json, provider, model, prompt_version, state, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          candidateRevisionId,
+          candidateId,
+          currentCandidate.source_event_id,
+          currentCandidate.demand_unit_id,
+          decisionId,
+          revision,
+          draft.title,
+          draft.proposerName,
+          draft.background,
+          draft.validationQuestion,
+          draft.describe,
+          analysisJson,
+          draft.confidence,
+          JSON.stringify([...(draft.analysis?.recognitionEvidence ?? []), ...(guidance ? [`主人补充：${guidance}`] : [])]),
+          this.adapters.classifier.provider,
+          this.adapters.classifier.model,
+          this.adapters.classifier.promptVersion,
+           currentTask ? (hasProposal ? 'proposed' : 'superseded') : 'current',
+           timestamp,
+         );
+        this.database.raw.prepare('UPDATE candidate_revision SET demand_unit_id = ? WHERE id = ?')
+          .run(currentCandidate.demand_unit_id, candidateRevisionId);
+
+        if (currentTask && hasProposal) {
+          if (thread) {
+            threadRevisionId = id('thread-revision');
+            this.database.raw.prepare(
+              `INSERT INTO requirement_thread_revision
+                (id, thread_id, source_event_id, demand_unit_id, base_thread_version, patch_json, evidence_json, state, idempotency_key, created_at, decided_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, NULL)`,
+            ).run(
+              threadRevisionId,
+              thread.id,
+              currentCandidate.source_event_id,
+              currentCandidate.demand_unit_id,
+              thread.version,
+              JSON.stringify({ title: draft.title, background: draft.background, validationQuestion: draft.validationQuestion, describe: draft.describe, analysis: draft.analysis ?? {} }),
+              JSON.stringify([...(draft.analysis?.recognitionEvidence ?? []), ...(guidance ? [`主人补充：${guidance}`] : [])]),
+              `thread-reprocess:${thread.id}:${runtimeJobId}`,
+              timestamp,
+            );
+          }
+          const proposal = this.createTaskUpdateProposal({
+            task: currentTask,
+            threadId: thread?.id ?? null,
+            sourceEventId: currentCandidate.source_event_id,
+            demandUnitId: currentCandidate.demand_unit_id,
+            candidateRevisionId,
+            threadRevisionId,
+            baseThreadVersion: thread?.version ?? null,
+            patch,
+            reason: '重新整理产生了正式任务更新建议，进入统一自动维护安全门禁。',
+            evidence: { guidance: guidance ?? '', aiDecisionId: decisionId, sourceEventId: currentCandidate.source_event_id, relationType: 'owner_confirmed' },
+            origin: 'reprocess',
+            associationConfidence: 1,
+            updateConfidence: draft.analysis?.updateConfidence ?? null,
+            usedFallback: classification.usedFallback,
+            idempotencyKey: `task-update-reprocess:${currentTask.id}:${runtimeJobId}`,
+            createdAt: timestamp,
+          });
+          proposalId = proposal.id;
+          proposalToDispatch = proposal.id;
+          if (thread) {
+            this.database.raw.prepare("UPDATE requirement_thread SET status = 'needs_confirmation', updated_at = ? WHERE id = ?")
+              .run(timestamp, thread.id);
+          }
+        }
+
+        this.database.raw.prepare(
+          `INSERT INTO correction_event
+            (id, idempotency_key, task_id, candidate_id, source_event_id, demand_unit_id, ai_decision_id, correction_type, before_json, after_json, note, visibility, operation, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'reprocess', ?, ?, ?, 'private', 'apply', ?)`,
+        ).run(
+          id('corr'),
+          durableReprocessKey,
+          currentTask?.id ?? null,
+          candidateId,
+          currentCandidate.source_event_id,
+          currentCandidate.demand_unit_id,
+          decisionId,
+          JSON.stringify({ candidate: candidateAuditSnapshot(currentCandidate), task: taskAuditSnapshot(currentTask) }),
+          JSON.stringify({ changed: true, candidateRevisionId, threadRevisionId, proposed: { title: draft.title, proposer_name: draft.proposerName, describe: draft.describe }, task: taskAuditSnapshot(currentTask), proposalId }),
+          guidance ?? '',
+          timestamp,
+        );
+      });
+      if (proposalToDispatch) this.dispatchTaskUpdateProposal(proposalToDispatch, runtimeJobId, leaseOwner);
+      this.runtime.checkpoint(runtimeJobId, 'reprocess_persisted', { candidateId, candidateRevisionId, threadRevisionId, proposalId }, leaseOwner);
+      this.log('ai', classification.usedFallback ? 'warn' : 'info', 'classifier.reprocessed', '已根据纠错提示重新生成候选摘要。', { candidateId, usedFallback: classification.usedFallback, proposalId });
+      this.runtime.complete(runtimeJobId, { candidateId, changed: true, proposalId }, leaseOwner);
+      return {
+        candidate: this.getCandidate(candidateId),
+        changed: true,
+        reason: classification.reason,
+        proposal: proposalId ? this.getTaskUpdateProposal(proposalId) : null,
+      };
+    } catch (error) {
+      this.runtime.fail(runtimeJobId, error, {
+        leaseOwner,
+        retry: classifyRetryFailure(error, this.adapters.classifier.provider),
+      });
+      throw error;
+    }
+  }
+
+  async inspectReference(taskId: string, referenceId: string) {
+    const reference = this.database.raw.prepare('SELECT * FROM reference_binding WHERE id = ? AND task_id = ?').get(referenceId, taskId) as { id: string; reference_path: string; access_mode: string } | undefined;
+    if (!reference) throw new Error('引用路径不存在。');
+    if (reference.access_mode !== 'readonly') throw new Error('该路径仅用于引用；请由系统主人明确启用只读检查后再扫描。');
+    const result = await this.adapters.workspace.inspect(reference.reference_path) as {
+      state: 'not_enabled' | 'ready' | 'unavailable';
+      referencePath: string;
+      entries: unknown[];
+      truncated: boolean;
+      inspectedAt: string;
+      error?: string;
+    };
+    this.database.raw.prepare('INSERT INTO reference_snapshot (id, reference_binding_id, state, entry_count, truncated, entries_json, error, inspected_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(id('snapshot'), reference.id, result.state, result.entries.length, result.truncated ? 1 : 0, JSON.stringify(result.entries), result.error ?? null, result.inspectedAt);
+    this.log('workspace', result.state === 'ready' ? 'info' : 'warn', 'reference.inspected', '已完成只读目录检查。', { taskId, referenceId, state: result.state, entryCount: result.entries.length });
+    return result;
+  }
+
+  private ensureOwnerSourceStates() {
+    const timestamp = nowIso();
+    const mock = this.adapters.feishu.kind !== 'live';
+    const persistedOwner = this.database.raw.prepare('SELECT oauth_status FROM owner_profile WHERE id = ?').get('primary') as { oauth_status: string } | undefined;
+    const persistedOwnerAuthorized = persistedOwner?.oauth_status === 'authorized';
+    const defaults: Array<{
+      kind: OwnerSourceKind;
+      status: OwnerSourceStatus;
+      summary: string;
+      requiresAdmin: boolean;
+      requiresBotInChat: boolean;
+      syncMode: 'realtime' | 'periodic' | 'manual' | 'mixed';
+    }> = [
+      { kind: 'owner_dm', status: mock ? 'mock_ready' : 'unauthorized', summary: mock ? '安全模拟中的系统主人普通私聊。' : '完成主人 OAuth 后，系统会自动发现已有个人单聊；默认不关注，主人选择后才周期读取。', requiresAdmin: true, requiresBotInChat: false, syncMode: 'periodic' },
+      { kind: 'owner_mentions', status: mock ? 'mock_ready' : 'unauthorized', summary: mock ? '安全模拟中的群聊 @主人消息。' : '完成主人 OAuth 后，可按群名选择主人所在群；默认只保存真实 @主人消息。', requiresAdmin: true, requiresBotInChat: false, syncMode: 'periodic' },
+      { kind: 'calendar', status: mock ? 'mock_ready' : 'unauthorized', summary: mock ? '安全模拟中的个人日历线索。' : '需要系统主人 OAuth 和日历只读权限。', requiresAdmin: true, requiresBotInChat: false, syncMode: 'periodic' },
+      { kind: 'minutes', status: mock ? 'mock_ready' : 'unauthorized', summary: mock ? '安全模拟中的会议纪要线索。' : '需要系统主人 OAuth 和妙记只读权限。', requiresAdmin: true, requiresBotInChat: false, syncMode: 'periodic' },
+      { kind: 'bot_supplement', status: mock ? 'mock_ready' : 'partial', summary: '机器人私聊和明确需求群只作为补充与平台受限时的降级入口。', requiresAdmin: false, requiresBotInChat: true, syncMode: 'realtime' },
+    ];
+    const insert = this.database.raw.prepare(
+      `INSERT OR IGNORE INTO information_source_state
+        (source_kind, enabled, status, scope_summary, requires_admin, requires_bot_in_chat, sync_mode, last_success_at, last_error, details_json, updated_at)
+       VALUES (?, 1, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
+    );
+    const update = this.database.raw.prepare(
+      `UPDATE information_source_state
+       SET status = ?, scope_summary = ?, requires_admin = ?, requires_bot_in_chat = ?, sync_mode = ?,
+           details_json = ?, updated_at = ?
+       WHERE source_kind = ?`,
+    );
+    for (const source of defaults) {
+      const existing = this.database.raw
+        .prepare('SELECT status, details_json FROM information_source_state WHERE source_kind = ?')
+        .get(source.kind) as { status: OwnerSourceStatus; details_json: string } | undefined;
+      insert.run(
+        source.kind,
+        source.status,
+        source.summary,
+        source.requiresAdmin ? 1 : 0,
+        source.requiresBotInChat ? 1 : 0,
+        source.syncMode,
+        JSON.stringify({ realTenantValidated: false }),
+        timestamp,
+      );
+
+      // The same SQLite file can be opened first in Mock mode and later with
+      // real credentials (or the reverse). INSERT OR IGNORE alone would leave
+      // the old `mock_ready` label behind and make the UI overstate capability.
+      // Preserve an explicit live status, but always reconcile mode-owned
+      // defaults and replace stale Mock state when entering live mode.
+      const nextStatus = mock
+        ? source.status
+        : existing?.status && existing.status !== 'mock_ready' && !(source.kind === 'owner_dm' && existing.status === 'unsupported')
+          ? existing.status
+          : source.kind !== 'bot_supplement' && persistedOwnerAuthorized
+            ? 'partial'
+            : source.status;
+      let details: Record<string, unknown> = { realTenantValidated: false };
+      try {
+        const parsed = existing?.details_json ? JSON.parse(existing.details_json) as Record<string, unknown> : {};
+        details = { ...parsed, adapterMode: mock ? 'mock' : 'live' };
+        if (mock) details.realTenantValidated = false;
+      } catch {
+        details = { adapterMode: mock ? 'mock' : 'live', realTenantValidated: false };
+      }
+      update.run(
+        nextStatus,
+        source.summary,
+        source.requiresAdmin ? 1 : 0,
+        source.requiresBotInChat ? 1 : 0,
+        source.syncMode,
+        JSON.stringify(details),
+        timestamp,
+        source.kind,
+      );
+      if (!mock && source.kind === 'owner_dm' && existing?.status === 'unsupported') {
+        this.database.raw.prepare('UPDATE information_source_state SET last_error = NULL WHERE source_kind = ?').run(source.kind);
+      }
+    }
+  }
+
+  private saveOwnerIdentity(owner: OwnerIdentity, grantedScopes?: string[], refreshSequence?: number) {
+    if (refreshSequence !== undefined && refreshSequence !== this.ownerRefreshSequence) throw new FeishuAuthStateStaleError();
+    const timestamp = nowIso();
+    const previous = this.database.raw.prepare("SELECT open_id, granted_scopes_json FROM owner_profile WHERE id = 'primary'").get() as { open_id: string; granted_scopes_json: string | null } | undefined;
+    const scopes = grantedScopes ?? parseJsonValue<string[]>(previous?.granted_scopes_json, []);
+    const ownerChanged = Boolean(previous?.open_id && previous.open_id !== owner.openId);
+    const resetOwnerState = !previous?.open_id || ownerChanged;
+    this.database.transaction(() => {
+      this.assertNoActivePrivacyLifecycleClaim(Date.parse(timestamp));
+      this.database.raw.prepare(
+        `INSERT INTO owner_profile
+          (id, open_id, union_id, user_id, name, tenant_key, oauth_status, granted_scopes_json, last_synced_at, created_at, updated_at)
+         VALUES ('primary', ?, ?, ?, ?, ?, 'authorized', ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           open_id = excluded.open_id,
+           union_id = excluded.union_id,
+           user_id = excluded.user_id,
+           name = excluded.name,
+           tenant_key = excluded.tenant_key,
+           oauth_status = 'authorized',
+           granted_scopes_json = excluded.granted_scopes_json,
+           last_synced_at = excluded.last_synced_at,
+           updated_at = excluded.updated_at`,
+      ).run(owner.openId, owner.unionId, owner.userId, owner.name, owner.tenantKey, JSON.stringify(scopes), resetOwnerState ? null : timestamp, timestamp, timestamp);
+      this.database.raw.prepare(
+        `UPDATE privacy_control
+         SET oauth_status = 'authorized', updated_at = ?, version = version + 1
+         WHERE singleton_key = 1 AND oauth_status <> 'authorized'`,
+      ).run(timestamp);
+
+      if (resetOwnerState) {
+        this.database.raw.prepare("DELETE FROM sync_cursor WHERE integration IN ('feishu_owner','feishu_calendar','feishu_minutes')").run();
+        this.database.raw.prepare(
+          `UPDATE information_source_state
+           SET status = 'partial', last_success_at = NULL, last_error = NULL,
+               details_json = ?, updated_at = ?
+           WHERE source_kind IN ('owner_dm','owner_mentions','calendar','minutes')`,
+        ).run(JSON.stringify({ identityResolved: true, scopesVerified: scopes.length > 0, realTenantValidated: false, ownerChanged }), timestamp);
+      }
+
+      for (const kind of resetOwnerState ? [] : ['owner_dm', 'owner_mentions', 'calendar', 'minutes'] satisfies OwnerSourceKind[]) {
+        const existing = this.database.raw.prepare('SELECT status, last_error, details_json FROM information_source_state WHERE source_kind = ?').get(kind) as { status: OwnerSourceStatus; last_error: string | null; details_json: string } | undefined;
+        const details = { ...parseMetadata(existing?.details_json), identityResolved: true, scopesVerified: scopes.length > 0, realTenantValidated: false };
+        const status = existing?.status === 'unauthorized' || existing?.status === 'unsupported' ? 'partial' : existing?.status ?? 'partial';
+        this.database.raw.prepare(
+          `UPDATE information_source_state
+           SET status = ?, last_error = ?, details_json = ?, updated_at = ?
+           WHERE source_kind = ?`,
+        ).run(status, existing?.status === 'unauthorized' || existing?.status === 'unsupported' ? null : existing?.last_error ?? null, JSON.stringify(details), timestamp, kind);
+      }
+    });
+    if (resetOwnerState) this.reconcileFeishuMonitoringStates({ ownerChanged });
+  }
+
+  private markOwnerSourcesUnauthorized(message: string) {
+    const timestamp = nowIso();
+    this.database.transaction(() => {
+      this.database.raw.prepare(
+        `UPDATE information_source_state
+         SET status = 'unauthorized', last_error = ?, updated_at = ?
+         WHERE source_kind IN ('owner_dm','owner_mentions','calendar','minutes')`,
+      ).run(redactDiagnosticText(message, 300), timestamp);
+      const oauthStatus = /revok|撤销/i.test(message) ? 'revoked' : 'expired';
+      this.database.raw.prepare('UPDATE owner_profile SET oauth_status = ?, updated_at = ? WHERE id = ?')
+        .run(oauthStatus, timestamp, 'primary');
+    });
+  }
+
+  private markOwnerSourcesError(message: string) {
+    const timestamp = nowIso();
+    this.database.raw.prepare(
+      `UPDATE information_source_state
+       SET status = CASE WHEN status = 'unauthorized' THEN status ELSE 'error' END, last_error = ?, updated_at = ?
+       WHERE source_kind IN ('owner_dm','owner_mentions','calendar','minutes')`,
+    ).run(redactDiagnosticText(message, 300), timestamp);
+  }
+
+  private markBotSupplementState(status: Extract<OwnerSourceStatus, 'partial' | 'error'>, error: string | null) {
+    const timestamp = nowIso();
+    this.database.raw.prepare(
+      `UPDATE information_source_state
+       SET status = ?, last_error = ?, details_json = ?, updated_at = ?
+       WHERE source_kind = 'bot_supplement'`,
+    ).run(
+      status,
+      error ? redactDiagnosticText(error, 300) : null,
+      JSON.stringify({ adapterMode: 'live', listenerStarted: status !== 'error', realTenantValidated: false }),
+      timestamp,
+    );
+  }
+
+  private log(category: string, level: 'info' | 'warn' | 'error', eventType: string, summary: string, context: Record<string, unknown> = {}) {
+    const safeContext = redactDiagnosticRecord(context, { maxStringLength: 160 });
+    this.database.raw.prepare('INSERT INTO app_log (id, category, level, event_type, summary, context_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(id('log'), category, level, eventType, redactDiagnosticText(summary, 300), JSON.stringify(safeContext), nowIso());
+  }
+
+  private redactStoredJson(value: unknown) {
+    if (typeof value !== 'string' || !value) return JSON.stringify(redactDiagnosticRecord({}));
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (parsed && !Array.isArray(parsed) && typeof parsed === 'object') {
+        return JSON.stringify(redactDiagnosticRecord(parsed as Record<string, unknown>));
+      }
+      return JSON.stringify({ value: redactDiagnosticValue(parsed), redactionSchemaVersion: REDACTION_SCHEMA_VERSION });
+    } catch {
+      return JSON.stringify({ malformed: true, redactionSchemaVersion: REDACTION_SCHEMA_VERSION });
+    }
+  }
+
+  configuration() {
+    const missing = (value: string) => (value ? 'configured' : 'not_configured');
+    const feishuLive = this.adapters.feishu.kind === 'live';
+    const llmLive = this.adapters.classifier.kind === 'live';
+    return {
+      liveConnectionsEnabled: feishuLive || llmLive,
+      notice: feishuLive || llmLive
+        ? '已配置真实适配器；只有完成授权、连接检查或启动监听等主人操作后才会访问外部服务。'
+        : '当前使用本地规则或 Mock，不会访问飞书或外部模型。',
+      integrations: [
+        {
+          id: 'feishu',
+          name: '飞书',
+          adapter: this.adapters.feishu.kind,
+          status: feishuLive ? 'configured' : missing(this.config.feishu.appId && this.config.feishu.appSecret),
+          fields: [
+            'FEISHU_APP_ID',
+            'FEISHU_APP_SECRET',
+            'FEISHU_OAUTH_REDIRECT_URI',
+            'FEISHU_OAUTH_SCOPES',
+            'TOKEN_ENCRYPTION_KEY',
+          ],
+        },
+        {
+          id: 'llm',
+          name: '文本判断模型',
+          adapter: this.adapters.classifier.kind,
+          status: this.adapters.classifier.kind === 'rule_mock' ? 'mock_ready' : 'configured',
+          fields: ['LLM_PROVIDER', 'LLM_MODEL', 'LLM_API_BASE', 'LLM_API_KEY'],
+        },
+        {
+          id: 'database',
+          name: '数据库',
+          adapter: this.config.database.provider,
+          status: this.config.database.provider === 'sqlite' ? 'local_ready' : missing(this.config.database.postgresUrl),
+          fields: ['DATABASE_PROVIDER', 'DATABASE_URL', 'POSTGRES_URL'],
+        },
+        {
+          id: 'workspace',
+          name: '工作区引用',
+          adapter: this.adapters.workspace.kind,
+          status: 'reference_only',
+          fields: ['WORKSPACE_MODE', 'WORKSPACE_READ_ENABLED', 'WORKSPACE_WRITE_ENABLED'],
+        },
+      ],
+    };
+  }
+}

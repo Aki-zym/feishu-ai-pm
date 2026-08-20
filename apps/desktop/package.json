@@ -1,0 +1,20 @@
+{
+  "name": "@ai-pm/desktop",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@ai-pm/url-policy": "0.1.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "verify:build-artifact": "node scripts/verify-build-artifact.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

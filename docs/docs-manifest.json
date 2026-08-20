@@ -1,0 +1,130 @@
+{
+  "schema_version": 2,
+  "canonical_current_state": "docs/current-state.md",
+  "current_state": {
+    "audit_snapshot_as_of": "2026-08-14",
+    "combination_snapshot_as_of": "2026-08-15",
+    "combination_base": "integration/m1-test-20260815",
+    "combination_base_commit": "635290379de2688187988692ecb619c9c109e100",
+    "committed_integration_base": "635290379de2688187988692ecb619c9c109e100",
+    "integration_declaration_kind": "live_tip",
+    "issue42_status": "PR #87 / Issue #42 已合入/关闭",
+    "issue42_pr": "87",
+    "issue40_status": "Issue #40 的 PR #68 已合入且 Issue 已关闭",
+    "issue40_pr": "68",
+    "pr81_event_base": "integration/m1-test-20260815",
+    "pr81_event_base_commit": "f7bdf11bf2578f130f2443c6f67d6d004b82b394",
+    "issue51_integration_base": "integration/m1-test-20260815",
+    "issue51_integration_base_commit": "ad75b68687356a4782779b34ec35c60db68e05ea",
+    "pr84_current_base": "integration/m1-test-20260815",
+    "pr84_current_base_commit": "ad75b68687356a4782779b34ec35c60db68e05ea",
+    "pr86_current_base": "integration/m1-test-20260815",
+    "pr86_current_base_commit": "ebe682aeae067bbf08a6f38ea39de17adceb9ac0",
+    "stage_id": "M1",
+    "stage_name": "Windows 桌面成熟化",
+    "carrier": "Windows Electron EXE",
+    "product_version": "0.2.0",
+    "current_artifact_verification_id": "VER-PACKAGE-020"
+  },
+  "historical_milestones": [
+    {
+      "id": "integration-baseline-2026-08-15",
+      "kind": "synchronized_integration_baseline",
+      "branch": "integration/m1-test-20260815",
+      "commit": "91615486f6ac56b63857897df2e75d6c4c9f97d1",
+      "status": "historical",
+      "source": "current_state.combination_base_commit"
+    },
+    {
+      "id": "qa-01-control-plane",
+      "kind": "governance_milestone",
+      "status": "historical",
+      "source": "verification-matrix.json"
+    }
+  ],
+  "product_snapshot": {
+    "algorithm": "product-source-sha256-v1",
+    "selector": "apps-workspace-default-include-v1",
+    "fingerprint": "596b57af001a973add63baca739f19051d3aa923d07e4b854d2ef99e37c71aa4",
+    "file_count": 87,
+    "snapshot_as_of": "2026-08-15",
+    "equivalent_commit": null,
+    "commit_semantics": "optional_product_snapshot_equivalent_reference; fingerprint_is_authoritative_across_squash_or_merge; test_only_package_scripts_are_excluded"
+  },
+  "project_map": "docs/project-map.md",
+  "domain_contract": "docs/domain-contracts.json",
+  "domain_contract_view": "docs/domain-contracts.md",
+  "domain_contract_generator": "scripts/domain-contracts-check.mjs",
+  "decision_register": "docs/decision-register.json",
+  "decision_register_view": "docs/decision-register.md",
+  "decision_register_checker": "scripts/decision-register-check.mjs",
+  "verification_source": "docs/verification-matrix.json",
+  "verification_view": "docs/verification-matrix.md",
+  "test_selection_source": "docs/test-selection.md",
+  "local_verification_source": "docs/local-verification.md",
+  "local_verification_schema": "docs/local-verification-schema.json",
+  "agent_test_sop": "docs/qa/agent-test-sop.md",
+  "governance": {
+    "contributing": "CONTRIBUTING.md",
+    "handoff_template": "docs/handoff-template.md",
+    "stacked_pr": "docs/stacked-pr.md",
+    "codeowners": ".github/CODEOWNERS",
+    "governance_check": "scripts/governance-check.mjs"
+  },
+  "entrypoints": [
+    "README.md",
+    "AGENTS.md",
+    "docs/README.md"
+  ],
+  "history_locations": [
+    "CHANGELOG.md",
+    "docs/qa/"
+  ],
+  "changed_path_impact": [
+    {
+      "id": "product-snapshot",
+      "selector": "product_source",
+      "requires_all": [
+        "docs/current-state.md",
+        "docs/docs-manifest.json",
+        "docs/verification-matrix.json"
+      ],
+      "reason": "产品源码或运行配置变化必须同步人读当前状态、机器快照和验证事实源。"
+    },
+    {
+      "id": "verification-evidence",
+      "pattern": "^(apps/|tests/|scripts/|package(?:-lock)?\\.json$|playwright\\.config\\.ts$|\\.github/workflows/)",
+      "requires_any": [
+        "docs/verification-matrix.json"
+      ],
+      "reason": "实现、测试、脚本、依赖或 CI 变化必须说明现有验证证据是否仍适用。"
+    },
+    {
+      "id": "release-evidence",
+      "pattern": "^(release/|apps/desktop/electron-builder\\.yml$|package\\.json$)",
+      "requires_any": [
+        "docs/current-state.md",
+        "docs/verification-matrix.json"
+      ],
+      "reason": "安装包或版本变化必须同步当前状态和精确产物证据。"
+    },
+    {
+      "id": "entrypoint-reference",
+      "pattern": "^(README\\.md|AGENTS\\.md|docs/README\\.md)$",
+      "requires_any": [
+        "docs/current-state.md",
+        "docs/docs-manifest.json"
+      ],
+      "reason": "入口变化必须继续指向唯一当前状态。"
+    },
+    {
+      "id": "domain-contract",
+      "pattern": "^(docs/domain-contracts\\.(json|md)|docs/adr/|apps/server/src/(domain|database|service|runtime)\\.ts)$",
+      "requires_any": [
+        "docs/domain-contracts.json",
+        "docs/domain-contracts.md"
+      ],
+      "reason": "领域枚举、SQLite CHECK 或 Runtime 状态变化必须同步领域合同。"
+    }
+  ]
+}

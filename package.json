@@ -1,0 +1,56 @@
+{
+  "name": "feishu-ai-pm",
+  "version": "0.2.0",
+  "private": true,
+  "description": "只记录、整理和管理数据需求的 Windows 个人 AI PM",
+  "author": "guanchen-dotcom",
+  "main": "apps/desktop/dist/main.cjs",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "docs:generate": "node scripts/docs-generate.mjs",
+    "docs:check": "node scripts/docs-check-run.mjs",
+    "docs:test": "node --test scripts/docs-check.test.mjs scripts/domain-contracts-check.test.mjs scripts/governance-check.test.mjs scripts/decision-register-check.test.mjs scripts/prod-07-calendar-contract-check.test.mjs",
+    "governance:test": "node --test scripts/governance-check.test.mjs",
+    "verify:desktop-build-artifact": "npm run verify:build-artifact -w @ai-pm/desktop",
+    "ci:policy:test": "node --test scripts/ci-selection-policy.test.mjs scripts/ci-log-policy.test.mjs scripts/playwright-evidence-policy.test.mjs scripts/evidence-record-policy.test.mjs scripts/run-vitest-inventory.test.mjs",
+    "verify:local": "node scripts/local-verification.mjs local",
+    "test:e2e:matcher": "npm exec --workspace @ai-pm/server -- tsx --test ../../tests/unit/expected-event-matcher.test.ts",
+    "dev": "concurrently -n server,web -c blue,cyan \"npm run dev -w @ai-pm/server\" \"npm run dev -w @ai-pm/web\"",
+    "build": "npm run build -w @ai-pm/web && npm run build -w @ai-pm/server && npm run build -w @ai-pm/desktop",
+    "start": "npm run start -w @ai-pm/server",
+    "test": "node scripts/run-vitest-inventory.mjs",
+    "typecheck": "npm run typecheck -w @ai-pm/server && npm run typecheck -w @ai-pm/web && npm run typecheck -w @ai-pm/desktop",
+    "check:runtime": "npm run test:e2e:matcher && npm run typecheck && npm run test && npm run build && npm run verify:desktop-build-artifact && node scripts/e2e-build-provenance.mjs write",
+    "check": "npm run docs:check && npm run docs:test && npm run ci:policy:test && npm run check:runtime",
+    "desktop:start": "npm run build && electron .",
+    "desktop:dist": "npm run check && electron-builder --config apps/desktop/electron-builder.yml --win nsis --x64 --publish never",
+    "desktop:dist:smoke": "npm run check && npx electron --version && electron-builder --config apps/desktop/electron-builder.yml --win nsis --x64 --publish never --config.appId=com.guanchen.feishu-ai-pm.smoke --config.productName=Data-PM-Smoke --config.nsis.guid=28b726ad-6cc1-4f06-8c91-16e6f74d1c0b --config.directories.output=tmp/smoke-release --config.nsis.createDesktopShortcut=false --config.nsis.createStartMenuShortcut=false",
+    "desktop:smoke:installer": "node scripts/desktop-installer-smoke.mjs --installer tmp/smoke-release/Feishu-AI-PM-0.2.0-x64-Setup.exe --product-name Data-PM-Smoke",
+    "release:manifest:check": "node scripts/release-manifest.mjs --manifest docs/release-manifest.json",
+    "release:l5:harness": "node scripts/release-l5-harness.mjs --require-windows",
+    "test:e2e:lifecycle": "node scripts/test-e2e-lifecycle.mjs",
+    "test:e2e:inventory": "node scripts/playwright-inventory.mjs",
+    "test:e2e:verify": "node scripts/playwright-results-verify.mjs",
+    "test:e2e": "playwright test",
+    "capture:ui": "node scripts/capture-ui.mjs"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0",
+    "concurrently": "^9.2.1",
+    "electron": "^43.3.0",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.25.9"
+  },
+  "allowScripts": {
+    "electron@43.3.0": true,
+    "esbuild@0.25.9": true,
+    "esbuild@0.28.2": true,
+    "protobufjs@7.6.5": true,
+    "electron-winstaller@5.4.0": true
+  }
+}

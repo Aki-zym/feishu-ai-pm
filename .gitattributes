@@ -1,0 +1,10 @@
+release/*.exe filter=lfs diff=lfs merge=lfs -text
+
+docs/decision-register.md text eol=lf
+
+docs/domain-contracts.md text eol=lf
+docs/domain-contracts.json text eol=lf
+docs/verification-matrix.md text eol=lf
+docs/verification-matrix.json text eol=lf
+scripts/domain-contracts-check.mjs text eol=lf
+scripts/domain-contracts-check.test.mjs text eol=lf

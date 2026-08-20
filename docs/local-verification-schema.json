@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "local-verification-v1",
+  "title": "Local Exact Verification Evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "kind", "mode", "runId", "generation", "startedAt", "finishedAt", "provenance", "finalProvenance", "changedPaths", "plan", "commands", "results", "environment", "artifacts", "candidateFingerprint", "publication", "payloadDigest"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "kind": {"const": "local_exact_verification"},
+    "mode": {"const": "local_exact"},
+    "runId": {"type": "string", "pattern": "^local-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$"},
+    "generation": {"type": "string", "pattern": "^[0-9]{17}-[0-9a-f]{8}$"},
+    "startedAt": {"type": "string", "format": "date-time"},
+    "finishedAt": {"type": "string", "format": "date-time"},
+    "provenance": {"$ref": "#/$defs/provenance"},
+    "finalProvenance": {"$ref": "#/$defs/provenance"},
+    "changedPaths": {"type": "array", "items": {"type": "string", "pattern": "^(?!/)(?![A-Za-z]:/)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\\\]*$"}},
+    "plan": {"$ref": "#/$defs/plan"},
+    "commands": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/command"}},
+    "results": {"$ref": "#/$defs/results"},
+    "environment": {"$ref": "#/$defs/environment"},
+    "artifacts": {"type": "array", "items": {"$ref": "#/$defs/artifact"}},
+    "candidateFingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "publication": {"$ref": "#/$defs/publication"},
+    "payloadDigest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["baseCommit", "headCommit", "mergeRef", "tree", "parents", "checkedOutHead", "worktreeClean"],
+      "properties": {
+        "baseCommit": {"$ref": "#/$defs/sha"}, "headCommit": {"$ref": "#/$defs/sha"}, "mergeRef": {"$ref": "#/$defs/sha"}, "tree": {"$ref": "#/$defs/sha"},
+        "parents": {"type": "array", "prefixItems": [{"$ref": "#/$defs/sha"}, {"$ref": "#/$defs/sha"}], "minItems": 2, "maxItems": 2},
+        "checkedOutHead": {"$ref": "#/$defs/sha"}, "worktreeClean": {"const": true}
+      }
+    },
+    "plan": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "mode", "categories", "minimumLevel", "requiredEvidence", "highRisk", "manualReviewRequired", "claimAuthorized", "files", "reason", "gates"],
+      "properties": {
+        "schemaVersion": {"const": 1}, "mode": {"enum": ["docs-only", "full"]},
+        "categories": {"type": "array", "items": {"type": "string"}}, "minimumLevel": {"enum": ["L0", "L1", "L2", "L3", "L4", "L5", "L6"]},
+        "requiredEvidence": {"type": "array", "items": {"type": "string"}}, "highRisk": {"type": "boolean"}, "manualReviewRequired": {"type": "boolean"}, "claimAuthorized": {"const": false},
+        "files": {"type": "array", "items": {"type": "string"}}, "reason": {"type": "string"},
+        "gates": {"type": "object", "additionalProperties": false, "required": ["docs", "check", "lifecycle", "e2e"], "properties": {"docs": {"type": "boolean"}, "check": {"type": "boolean"}, "lifecycle": {"type": "boolean"}, "e2e": {"type": "boolean"}}}
+      }
+    },
+    "results": {
+      "type": "object", "additionalProperties": false, "required": ["passed", "failed", "skipped", "zeroTest"],
+      "properties": {"passed": {"type": "integer", "minimum": 0}, "failed": {"type": "integer", "minimum": 0}, "skipped": {"type": "integer", "minimum": 0}, "zeroTest": {"type": "integer", "minimum": 0}}
+    },
+    "counts": {
+      "type": "object", "additionalProperties": false, "required": ["total", "passed", "failed", "skipped"],
+      "properties": {"total": {"type": "integer", "minimum": 0}, "passed": {"type": "integer", "minimum": 0}, "failed": {"type": "integer", "minimum": 0}, "skipped": {"type": "integer", "minimum": 0}}
+    },
+    "command": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "command", "cwd", "startedAt", "finishedAt", "exitCode", "status", "requiresTests", "observedBytes", "truncated", "counts", "log", "artifacts", "missingArtifacts", "requiresEvidence"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9-]+$"}, "command": {"type": "string"}, "cwd": {"const": "<repo>"},
+        "startedAt": {"type": "string", "format": "date-time"}, "finishedAt": {"type": "string", "format": "date-time"}, "exitCode": {"type": ["integer", "null"]}, "status": {"enum": ["passed", "failed", "skipped"]}, "skipReason": {"type": "string"}, "requiresTests": {"type": "boolean"}, "observedBytes": {"type": "integer", "minimum": 0}, "truncated": {"type": "boolean"},
+        "counts": {"$ref": "#/$defs/counts"}, "log": {"$ref": "#/$defs/log"}, "artifacts": {"type": "array", "items": {"$ref": "#/$defs/artifact"}}, "missingArtifacts": {"type": "array", "items": {"type": "string"}}, "requiresEvidence": {"type": "boolean"}
+      }
+    },
+    "log": {"type": "object", "additionalProperties": false, "required": ["path", "sha256", "bytes"], "properties": {"path": {"type": "string"}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "bytes": {"type": "integer", "minimum": 0}}},
+    "artifact": {"type": "object", "additionalProperties": false, "required": ["path", "sha256", "sizeBytes"], "properties": {"path": {"type": "string"}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "sizeBytes": {"type": "integer", "minimum": 0}}},
+    "environment": {"type": "object", "additionalProperties": false, "required": ["os", "arch", "node", "npm", "git", "runner", "realProvider", "productionData", "windowsL5"], "properties": {"os": {"type": "string"}, "arch": {"type": "string"}, "node": {"type": "string"}, "npm": {"type": "string"}, "git": {"type": "string"}, "runner": {"const": "local-orca"}, "realProvider": {"const": false}, "productionData": {"const": false}, "windowsL5": {"type": "boolean"}}},
+    "publication": {"type": "object", "additionalProperties": false, "required": ["generation", "evidencePath", "pointerPath", "currentPointerDirectory", "rootSlotPath", "previousGeneration", "candidateFingerprint", "payloadDigest"], "properties": {"generation": {"type": "string", "pattern": "^[0-9]{17}-[0-9a-f]{8}$"}, "evidencePath": {"type": "string"}, "pointerPath": {"type": "string"}, "currentPointerDirectory": {"type": "string"}, "rootSlotPath": {"type": "string"}, "previousGeneration": {"type": ["string", "null"], "pattern": "^[0-9]{17}-[0-9a-f]{8}$"}, "candidateFingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "payloadDigest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}}
+  }
+}

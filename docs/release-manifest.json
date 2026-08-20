@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "status": "pending",
+  "authorization": false,
+  "version": "0.2.0",
+  "source": {
+    "commit": "pull_request_62_pending",
+    "tree": "pull_request_62_pending",
+    "base_commit": "pull_request_62_pending",
+    "head_commit": "pull_request_62_pending",
+    "merge_ref": "pull_request_62_pending"
+  },
+  "artifact": {
+    "path": "release/Feishu-AI-PM-0.2.0-x64-Setup.exe",
+    "sha256": "5D69C9DAD525B4CFDDB68CB64EC99C6109DB4E848D209B365C5D3D3B985A81AA",
+    "size_bytes": 101881096,
+    "architecture": "x64",
+    "blockmap_sha256": "871420DA716217B4109DE44D5AE282EA3DC7E8944DEA5003695446B6489ACAA3",
+    "blockmap_size_bytes": 106583
+  },
+  "workflow": {
+    "repository": "guanchen-dotcom/feishu-ai-pm",
+    "workflow_name": "Release L5 Gate",
+    "event": "pull_request",
+    "run_id": "pull_request_62_pending",
+    "job_id": "pull_request_62_pending",
+    "check_name": "windows-l5"
+  },
+  "compatibility": {
+    "electron": "43.3.0",
+    "node_major": 24,
+    "database_schema": "ai-pm-v1-current",
+    "config_schema": "desktop-config-v1"
+  },
+  "signature": {
+    "status": "NotSigned",
+    "thumbprint": null,
+    "timestamp": null,
+    "chain_status": null,
+    "artifact_sha256": null,
+    "artifact_size_bytes": null
+  },
+  "smoke": {
+    "status": "not_run",
+    "evidence_ids": [],
+    "scenarios": [
+      "install",
+      "startup",
+      "second_instance",
+      "window_close",
+      "tray_exit",
+      "uninstall",
+      "upgrade",
+      "reinstall",
+      "downgrade_rejected",
+      "database_corruption",
+      "migration_failure",
+      "disk_full",
+      "file_lock",
+      "config_corruption",
+      "network_offline",
+      "auth_failure",
+      "rate_limit_429",
+      "pagination_failure"
+    ],
+    "environment": "Windows L5 gate pending certificate, exact build and isolated smoke run"
+  },
+  "evidence_contract": {
+    "browser_desktop": "1440x900",
+    "browser_mobile": "Pixel 7 / 320px",
+    "electron_window": "980x680"
+  }
+}
