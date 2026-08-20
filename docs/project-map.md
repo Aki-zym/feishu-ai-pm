@@ -26,7 +26,7 @@
 - 安装包、桌面构建配置或版本变化，要同步当前状态和精确产物证据；构建不等于安装 Smoke。
 - README、AGENTS 或 docs 入口变化，必须继续链接唯一 [当前状态](current-state.md)，不能复制测试数字、包 hash 或历史 Issue 流水账。
 
-changed-path 是“哪些事实源必须同步”的机器门禁，但不替代 [Issue #59](https://github.com/zhaoyiming1-source/feishu-ai-pm/issues/59) 的测试选层，也不替代 PR 中逐项写明文档“不适用”。commit 只是可选的实现导航参照；跨 rebase、squash 和 merge 的新鲜度以产品源码 fingerprint 为准。
+changed-path 是“哪些事实源必须同步”的机器门禁，但不替代 [Issue #59](https://github.com/Aki-zym/feishu-ai-pm/issues/59) 的测试选层，也不替代 PR 中逐项写明文档“不适用”。commit 只是可选的实现导航参照；跨 rebase、squash 和 merge 的新鲜度以产品源码 fingerprint 为准。
 
 `product-source-sha256-v1` 使用 `apps-workspace-default-include-v1`：`apps/<workspace>/**` 默认纳入，集中排除测试/fixture、README 与纯文档、依赖目录，以及 `dist`、`build`、`coverage`、缓存和其他确定生成目录。因此 `lib/`、`config/`、`resources/`、`assets/`、`app/` 和未来新增生产目录无需另加 allowlist。根目录另纳入锁文件、共享 TypeScript 配置和环境变量示例；根 `package.json` 只投影产品版本、入口、workspace、运行依赖及启动/构建/打包脚本。普通文件使用 Git clean filter 后的 blob ID（因此 LFS 展开与否、文本换行差异不改变身份），根 package 使用稳定 JSON 投影；最后按仓库相对路径排序并汇总为 SHA-256。排除规则集中在 `scripts/docs-check-policy.mjs`，changed-path 直接复用同一 selector，不能通过修改 manifest 缩小范围。
 

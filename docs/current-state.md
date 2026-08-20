@@ -79,7 +79,7 @@ M1 与首轮试点固定为 draft-only；当前没有发送执行路径，只生
 - 飞书原文是外部来源事实；本地只在已授权范围内保存受控来源记录。
 - 当前 M1 实现使用本地 SQLite 保存来源、任务和审计；`describe`、文档上下文和任务记忆文件均是派生或可重建内容。
 - 真实工作目录只通过 `reference path` 只读关联；系统不修改真实工作文件，也不依据文件活动自动完成任务。
-- M1、主人单机试用和首个受控单用户试点继续使用 SQLite；只有多人、多设备或远程服务需求出现时才触发 PostgreSQL 评审。迁移与恢复合同见 [ADR 0008](adr/0008-versioned-sqlite-migrations.md)，开放项见 [待决定事项](open_decisions.md) 与 [Issue #66](https://github.com/zhaoyiming1-source/feishu-ai-pm/issues/66)。
+- M1、主人单机试用和首个受控单用户试点继续使用 SQLite；只有多人、多设备或远程服务需求出现时才触发 PostgreSQL 评审。迁移与恢复合同见 [ADR 0008](adr/0008-versioned-sqlite-migrations.md)，开放项见 [待决定事项](open_decisions.md) 与 [Issue #66](https://github.com/Aki-zym/feishu-ai-pm/issues/66)。
 
 对象级数据权威、状态机、错误合同和 ADR supersession 以 [领域合同](domain-contracts.md) 为准，本页不复制第二套定义。
 
@@ -89,7 +89,7 @@ M1 与首轮试点固定为 draft-only；当前没有发送执行路径，只生
 - 产品/构建 source commit：`f9e77aec70aaa846047f987672c9171e0790846a`；artifact/record carrier ancestor：`3dcd9d0779542a7f3b6beebe73048273a0eff68a`。
 - 精确大小、SHA-256、签名、发布状态和 Smoke 结果：验证 ID `VER-PACKAGE-020`。
 
-本轮 exact product/build source 已重建正式 x64 NSIS，并对该精确包执行独立 Smoke（合成 userData；安装、启动、退出、旧库保留、新库重启、受控启动失败和卸载路径通过）；PR #81 后续 docs-only head、merge-ref 和 run/job 只证明证据 freshness，不改变包的 source 或 fingerprint。未取得签名或真实用户数据库升级证据。版本升级、签名、升级回退和 GitHub Release 门禁属于 [Issue #62](https://github.com/zhaoyiming1-source/feishu-ai-pm/issues/62)。
+本轮 exact product/build source 已重建正式 x64 NSIS，并对该精确包执行独立 Smoke（合成 userData；安装、启动、退出、旧库保留、新库重启、受控启动失败和卸载路径通过）；PR #81 后续 docs-only head、merge-ref 和 run/job 只证明证据 freshness，不改变包的 source 或 fingerprint。未取得签名或真实用户数据库升级证据。版本升级、签名、升级回退和 GitHub Release 门禁属于 [Issue #62](https://github.com/Aki-zym/feishu-ai-pm/issues/62)。
 
 ## Issue #56 Phase 1 候选
 
@@ -101,7 +101,7 @@ M1 与首轮试点固定为 draft-only；当前没有发送执行路径，只生
 
 ## 验证状态
 
-验证层级沿用 [Issue #59](https://github.com/zhaoyiming1-source/feishu-ai-pm/issues/59) 的 L0–L6 定义；changed-path 选择、skip 分类和 exact evidence provenance 以 [测试选层与证据门禁](test-selection.md)、`docs/verification-matrix.json.selection_policy` 和 `evidence_contract` 为准。当前可引用的记录：
+验证层级沿用 [Issue #59](https://github.com/Aki-zym/feishu-ai-pm/issues/59) 的 L0–L6 定义；changed-path 选择、skip 分类和 exact evidence provenance 以 [测试选层与证据门禁](test-selection.md)、`docs/verification-matrix.json.selection_policy` 和 `evidence_contract` 为准。当前可引用的记录：
 
 - Issue #55 OUT-01 draft-only 状态闭环：`VER-ISSUE55-DRAFT-ONLY-L4-20260816`。仅证明合成 SQLite/service/API/UI 的草稿幂等、失效终止、脱敏 DTO 和无发送入口；不证明真实 provider、生产数据、Windows L5 或租户 L6。
 - Issue #59 QA-01：`VER-ISSUE59-QA01-SELECTION-20260816`（统一 changed-path → L0–L6 选择、inventory/no-upload、skip 和 provenance 合同；本地 synthetic L4 已取得，当前 PR freshness 仍必须绑定 exact base/head/merge-ref/run/job；不提升 synthetic CI 到 Windows L5 或真实 L6）。
