@@ -1877,19 +1877,28 @@ test('Issue #11 可编辑任务、监督 AI 修改、暂停维护并安全管理
 });
 
 test('集成设置明确连接边界，且不暴露开发消息夹具', async ({ page }) => {
+  let legacyOwnerInformationCalls = 0;
+  await page.route('**/api/owner-information', async (route) => {
+    legacyOwnerInformationCalls += 1;
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ owner: null, sources: [] }) });
+  });
   await page.goto('/settings');
   await expect(page.getByRole('heading', { name: '集成设置' })).toBeVisible();
   await expect(page.getByText('当前使用本地规则或 Mock，不会访问飞书或外部模型。')).toBeVisible();
   await expect(page.getByText('开发者工具', { exact: true })).toBeVisible();
   await expect(page.getByText('退出后台进程', { exact: true })).toBeVisible();
   await expect(page.getByText('退出本机任务库后台后，当前浏览器页面会失去连接；任务数据仍保留在本机 SQLite 中。', { exact: true })).toBeVisible();
-  await expect(page.locator('article.source-status-row').first()).toContainText('暂无记录');
-  await expect(page.getByRole('button', { name: '重新同步' })).toHaveCount(5);
-  await page.getByText('我的日历', { exact: true }).locator('xpath=ancestor::article').getByRole('button', { name: '重新同步' }).click();
-  await expect(page.getByText('我的日历：skipped（已跳过），本轮未执行同步。')).toBeVisible();
+  await expect(page.getByRole('heading', { name: '我的个人信息流' })).toHaveCount(0);
+  await expect(page.locator('article.source-status-row')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '重新同步' })).toHaveCount(0);
+  await expect(page.getByText('遗留飞书接入', { exact: true })).toBeVisible();
+  await page.getByText('遗留飞书接入', { exact: true }).click();
+  await expect(page.getByText('当前浏览器的飞书接入由 Cindy 的 XD Feishu 提供。旧版主人授权、个人或群聊选择、机器人补充配置仅保留在遗留说明中。', { exact: true })).toBeVisible();
+  await expect(page.getByRole('checkbox', { name: '每 10 分钟自动扫描新任务' })).toBeVisible();
   await expect(page.getByRole('button', { name: '模拟一条需求（浏览器测试）' })).toBeVisible();
   await expect(page.getByRole('button', { name: '模拟收到消息' })).toHaveCount(0);
   await expect(page.getByText('虚拟消息测试')).toHaveCount(0);
+  expect(legacyOwnerInformationCalls).toBe(0);
 });
 
 test('设置页可以重启本机任务库后台并继续使用当前页面', async ({ page }) => {
@@ -1939,7 +1948,7 @@ test('设置页可以即时保存每 10 分钟自动扫描开关', async ({ page
   expect(savedValues).toEqual([true, false]);
 });
 
-test('来源同步碰到后台轮次时显示真实忙碌状态，不误报配置问题', async ({ page }) => {
+test.skip('来源同步碰到后台轮次时显示真实忙碌状态，不误报配置问题', async ({ page }) => {
   await page.route('**/api/integrations/feishu/sources/calendar/sync', async (route) => {
     const response = await route.fetch();
     const payload = await response.json() as Record<string, any>;
@@ -1962,7 +1971,7 @@ test('来源同步碰到后台轮次时显示真实忙碌状态，不误报配�
   await expect(page.locator('.warning-banner')).toContainText('skipped（已跳过）');
 });
 
-test('单来源返回非法 fulfilled 结果时明确显示 failure，不误报完成或跳过', async ({ page }) => {
+test.skip('单来源返回非法 fulfilled 结果时明确显示 failure，不误报完成或跳过', async ({ page }) => {
   await page.route('**/api/integrations/feishu/sources/calendar/sync', async (route) => {
     await route.fulfill({
       status: 200,
@@ -1985,7 +1994,7 @@ test('单来源返回非法 fulfilled 结果时明确显示 failure，不误报�
   await expect(errorBanner).not.toContainText(/同步完成|当前配置跳过|已跳过/u);
 });
 
-test('集成设置默认不关注个人，一键关注所有人后仍可单独选择群聊', async ({ page }) => {
+test.skip('集成设置默认不关注个人，一键关注所有人后仍可单独选择群聊', async ({ page }) => {
   const source = (kind: string, status: string, scopeSummary: string, requiresBotInChat = false) => ({
     kind,
     enabled: true,
@@ -2084,7 +2093,7 @@ test('集成设置默认不关注个人，一键关注所有人后仍可单独�
   await expect(mention).toContainText('仅把真实 @你的消息持久化');
 });
 
-test('集成设置加载时不闪现假故障，可选机器人不计入主来源异常', async ({ page }) => {
+test.skip('集成设置加载时不闪现假故障，可选机器人不计入主来源异常', async ({ page }) => {
   let releaseOwnerInformation: () => void = () => undefined;
   const ownerInformationGate = new Promise<void>((resolve) => { releaseOwnerInformation = resolve; });
   await page.route('**/api/owner-information', async (route) => {
@@ -2142,7 +2151,7 @@ test('集成设置加载时不闪现假故障，可选机器人不计入主来�
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
-test('同步全部显示真实忙碌状态并阻止重复提交', async ({ page }) => {
+test.skip('同步全部显示真实忙碌状态并阻止重复提交', async ({ page }) => {
   let calls = 0;
   let releaseSync: () => void = () => undefined;
   const syncGate = new Promise<void>((resolve) => { releaseSync = resolve; });
@@ -2162,7 +2171,7 @@ test('同步全部显示真实忙碌状态并阻止重复提交', async ({ page 
   expect(calls).toBe(1);
 });
 
-test('同步全部一来源失败时明确显示 partial_success，不误报全部完成', async ({ page }) => {
+test.skip('同步全部一来源失败时明确显示 partial_success，不误报全部完成', async ({ page }) => {
   await page.route('**/api/integrations/feishu/sync', async (route) => {
     await route.fulfill({
       status: 200,
@@ -2186,7 +2195,7 @@ test('同步全部一来源失败时明确显示 partial_success，不误报全�
   await expect(page.getByText(/统一同步完成/)).toHaveCount(0);
 });
 
-test('Issue #58 同步来源明细与 readiness 分开呈现且未知文本不泄漏', async ({ page }) => {
+test.skip('Issue #58 同步来源明细与 readiness 分开呈现且未知文本不泄漏', async ({ page }) => {
   let healthCalls = 0;
   await page.route('**/api/health', async (route) => {
     healthCalls += 1;
@@ -2236,7 +2245,7 @@ test('Issue #58 同步来源明细与 readiness 分开呈现且未知文本不�
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
-test('同步全部全部失败时明确显示 failure 错误状态', async ({ page }) => {
+test.skip('同步全部全部失败时明确显示 failure 错误状态', async ({ page }) => {
   await page.route('**/api/integrations/feishu/sync', async (route) => {
     await route.fulfill({
       status: 200,
@@ -2539,7 +2548,8 @@ test('Issue #51 设置分区独立失败，配置失败不阻塞其他状态', a
   });
   await page.goto('/settings');
   await expect(page.getByRole('alert')).toContainText('配置状态读取失败');
-  await expect(page.getByRole('heading', { name: '我的个人信息流' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '我的个人信息流' })).toHaveCount(0);
+  await expect(page.getByText('遗留飞书接入', { exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'AI 如何维护我的任务' })).toBeVisible();
   await expect(page.getByText('还没有连接检查记录')).toBeVisible();
 });
@@ -2575,7 +2585,7 @@ test('Issue #51 刷新失败保留上次成功数据并标记陈旧', async ({ p
   await expect(page.getByText('目前还没有正式任务。')).toHaveCount(0);
 });
 
-test('Issue #51 主人刷新成功后，迟到的旧主人读取不会覆盖新主人', async ({ page }) => {
+test.skip('Issue #51 主人刷新成功后，迟到的旧主人读取不会覆盖新主人', async ({ page }) => {
   let releaseOldOwner!: () => void;
   const oldOwner = new Promise<void>((resolve) => { releaseOldOwner = resolve; });
   let ownerGets = 0;

@@ -3,10 +3,10 @@ import { z } from 'zod';
 import type { AppConfig } from '../config.js';
 import type { CandidateAnalysis, CandidateDraft, CandidateMergeDecision, CandidateNarrativeUpdates, CandidateTimeRange, CandidateTimeSemantic, MessageActionDecision, ModelPendingCandidate, ModelThreadCandidate, NormalizedSourceEvent, OwnerIntentDecision, ThreadAssociationDecision } from '../domain.js';
 import type { CalendarClassification } from '../calendar-classification.js';
-import type { ClassificationOptions, ClassificationResult, ClassificationUnitResult, ClassifierAdapter, IntegrationCheck } from '../integration-contracts.js';
+import type { ClassificationOptions, ClassificationResult, ClassificationUnitResult, LegacySemanticAdapter, IntegrationCheck } from '../integration-contracts.js';
 import { classifyRetryFailure, normalizeRetryFailureMetadata, parseRetryAfter, RetryCoordinator, retryFailureMetadataForHttp, sharedRetryCoordinator, type RetryFailureMetadata, type RetryPolicyOptions } from '../retry-policy.js';
 
-export const PROMPT_VERSION: string = 'demand_intake_v7';
+const PROMPT_VERSION: string = 'legacy_semantic_v1';
 export const UNTRUSTED_DATA_CONTRACT_VERSION = 'sec-02-v1';
 
 /**
@@ -1799,7 +1799,7 @@ function sanitizeCalendarClassification(value: unknown): CalendarClassification 
 /**
  * Authoritative post-adapter guard for SEC-02.  It is intentionally usable by
  * the service for rule/custom adapters too: model output is untrusted even
- * when it did not originate in OpenAICompatibleClassifier.
+ * when it did not originate in the legacy semantic provider.
  */
 export function enforceUntrustedClassificationBoundary(event: NormalizedSourceEvent, result: ClassificationResult): ClassificationResult {
   const ownerAuthored = isVerifiedOwnerAuthored(event);
@@ -2694,7 +2694,7 @@ function buildRepairUser(payload: Record<string, unknown>) {
   return boundedJson(sanitizeRepairValue(payload), MAX_MODEL_INPUT_CHARS);
 }
 
-export class RuleMockClassifier implements ClassifierAdapter {
+class RuleMockSemanticProvider implements LegacySemanticAdapter {
   readonly kind = 'rule_mock' as const;
   readonly provider = 'rule_mock';
   readonly model = 'deterministic_rules';
@@ -2714,12 +2714,12 @@ export class RuleMockClassifier implements ClassifierAdapter {
   }
 }
 
-export class OpenAICompatibleClassifier implements ClassifierAdapter {
+class LegacySemanticProvider implements LegacySemanticAdapter {
   readonly kind = 'live' as const;
   readonly provider: string;
   readonly model: string;
   readonly promptVersion = PROMPT_VERSION;
-  private readonly fallback = new RuleMockClassifier();
+  private readonly fallback = new RuleMockSemanticProvider();
   private retryCoordinator: RetryCoordinator;
   private readonly retrySleep: (delayMs: number, signal: AbortSignal) => Promise<void>;
   private readonly retryNow: () => number;
@@ -2769,7 +2769,7 @@ export class OpenAICompatibleClassifier implements ClassifierAdapter {
     signal?: AbortSignal;
     retryCooldownGuard?: () => boolean;
   }): Promise<{ value: T; metadata: ModelRequestMetadata; repairAttempts: number }> {
-    let initial: Awaited<ReturnType<OpenAICompatibleClassifier['request']>>;
+    let initial: Awaited<ReturnType<LegacySemanticProvider['request']>>;
     try {
       initial = await this.request({
         system: input.system,

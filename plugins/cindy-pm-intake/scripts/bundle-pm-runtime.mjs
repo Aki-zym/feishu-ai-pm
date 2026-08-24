@@ -1,4 +1,4 @@
-import { cp, mkdir, rm } from 'node:fs/promises';
+import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { resolve } from 'node:path';
@@ -26,8 +26,12 @@ await build({
   format: 'cjs',
   target: 'node24',
   external: ['node:*'],
+  define: { 'process.env.CINDY_RUNTIME_BUNDLE': 'true' },
+  minifySyntax: true,
   logLevel: 'info',
 });
+const bundledRuntime = await readFile(runtimeOutput, 'utf8');
+await writeFile(runtimeOutput, bundledRuntime.replace(/[ \t]+$/gmu, ''));
 
 if (process.platform === 'darwin') {
   await execFileAsync('swiftc', ['-O', statusSource, '-o', statusOutput], { cwd: root, stdio: 'inherit' });

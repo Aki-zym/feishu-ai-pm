@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { buildApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
 import { AppDatabase } from '../src/database.js';
-import { createAdapters } from '../src/integrations.js';
+import { createCindyAdapters } from '../src/integrations.js';
 import { PmService } from '../src/service.js';
 import { registerSeedIntakeRoute } from './support/seed-intake-route.js';
 
@@ -13,7 +13,7 @@ describe('浏览器测试模拟需求入口', () => {
   beforeEach(async () => {
     database = new AppDatabase(':memory:', false);
     const config = loadConfig({ NODE_ENV: 'test', DATABASE_URL: ':memory:' });
-    const service = new PmService(database, createAdapters(config), config);
+    const service = new PmService(database, createCindyAdapters(config), config);
     app = await buildApp(service, { serveWeb: false });
     registerSeedIntakeRoute(app, service, {
       testOnly: true,
@@ -64,7 +64,7 @@ describe('浏览器测试模拟需求入口', () => {
   it('生产 buildApp + loopback 可写入 pending 候选且不创建 task', async () => {
     const guardedDatabase = new AppDatabase(':memory:', false);
     const config = loadConfig({ NODE_ENV: 'production', DATABASE_URL: ':memory:' });
-    const guardedService = new PmService(guardedDatabase, createAdapters(config), config);
+    const guardedService = new PmService(guardedDatabase, createCindyAdapters(config), config);
     const guardedApp = await buildApp(guardedService, { serveWeb: false, logger: false });
     try {
       const remote = await guardedApp.inject({
@@ -105,7 +105,7 @@ describe('浏览器测试模拟需求入口', () => {
   it('测试装配 guard 拒绝非 test 或持久化配置', async () => {
     const guardedDatabase = new AppDatabase(':memory:', false);
     const config = loadConfig({ NODE_ENV: 'production', DATABASE_URL: ':memory:' });
-    const guardedService = new PmService(guardedDatabase, createAdapters(config), config);
+    const guardedService = new PmService(guardedDatabase, createCindyAdapters(config), config);
     const guardedApp = await buildApp(guardedService, { serveWeb: false, logger: false });
     try {
       expect(() => registerSeedIntakeRoute(guardedApp, guardedService, {

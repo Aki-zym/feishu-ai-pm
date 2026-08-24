@@ -260,7 +260,7 @@ export type FeishuAdapter = FeishuAuthAdapter &
   FeishuIdentityAdapter &
   FeishuOutboxAdapter;
 
-export interface ClassifierAdapter {
+export interface LegacySemanticAdapter {
   readonly kind: 'rule_mock' | 'live';
   readonly provider: string;
   readonly model: string;

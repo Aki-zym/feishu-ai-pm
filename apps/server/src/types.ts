@@ -1,3 +1,3 @@
-import { createAdapters } from './integrations.js';
+import type { CindyAdapterSet } from './integrations/cindy.js';
 
-export type ReturnTypeOfAdapters = ReturnType<typeof createAdapters>;
+export type ReturnTypeOfAdapters = CindyAdapterSet;

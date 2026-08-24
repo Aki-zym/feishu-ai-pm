@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
 import { AppDatabase } from '../src/database.js';
-import { createAdapters } from '../src/integrations.js';
+import { createCindyAdapters } from '../src/integrations.js';
 import { PmService } from '../src/service.js';
 
 describe('本机后台退出接口', () => {
@@ -14,7 +14,7 @@ describe('本机后台退出接口', () => {
   beforeEach(async () => {
     database = new AppDatabase(':memory:', false);
     const config = loadConfig({ NODE_ENV: 'test', DATABASE_URL: ':memory:' });
-    const service = new PmService(database, createAdapters(config), config);
+    const service = new PmService(database, createCindyAdapters(config), config);
     shutdown.mockReset();
     restart.mockReset();
     app = await buildApp(service, { serveWeb: false, runtimeShutdown: shutdown, runtimeRestart: restart });
@@ -74,7 +74,7 @@ describe('本机后台重启接口', () => {
   beforeEach(async () => {
     database = new AppDatabase(':memory:', false);
     const config = loadConfig({ NODE_ENV: 'test', DATABASE_URL: ':memory:' });
-    const service = new PmService(database, createAdapters(config), config);
+    const service = new PmService(database, createCindyAdapters(config), config);
     restart.mockReset();
     app = await buildApp(service, { serveWeb: false, runtimeRestart: restart });
   });
@@ -116,7 +116,7 @@ describe('本机后台重启 listener', () => {
   it('重新监听相同端口并保持 SQLite 连接可用', async () => {
     const database = new AppDatabase(':memory:', false);
     const config = loadConfig({ NODE_ENV: 'test', DATABASE_URL: ':memory:' });
-    const service = new PmService(database, createAdapters(config), config);
+    const service = new PmService(database, createCindyAdapters(config), config);
     let activeApp: Awaited<ReturnType<typeof buildApp>>;
     let restartInProgress: Promise<void> | null = null;
     const restart = async () => {
