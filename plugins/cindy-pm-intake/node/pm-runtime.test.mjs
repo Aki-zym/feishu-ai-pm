@@ -254,10 +254,13 @@ test('restart can rotate the Bearer while preserving receipts under the stable a
       headers: { authorization: 'Bearer rotated-test-token', 'content-type': 'application/json' },
       body: JSON.stringify({
         decision_request_id: 'runtime-decision-after-rotation',
+        batch_id: 'runtime-batch-after-rotation',
         window_id: 'runtime-window-after-rotation',
         window_start: '2026-08-24T00:00:00.000Z',
         window_end: '2026-08-24T00:05:00.000Z',
-        decisions: [{ decision_ref: 'skip', action: 'skip', source_receipts: [receipt], reason: '合成验证。' }],
+        snapshot_receipts: [receipt],
+        groups: [],
+        primary_dispositions: [{ disposition_ref: 'skip', source_receipt: receipt, disposition: 'skip', reason: '合成验证。' }],
       }),
     });
     assert.equal(decision.status, 200);

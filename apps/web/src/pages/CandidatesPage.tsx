@@ -5,7 +5,7 @@ import { AsyncState } from '../components/AsyncState';
 import { candidateStateText, formatDate } from '../format';
 import { beginResource, beginResourceMutation, beginResourceRequest, failureResource, isLatestResourceMutation, isLatestResourceRequest, loadingResource, mutationRefreshFailure, MUTATION_REFRESH_FAILURE_MESSAGE, successResource, type ResourceMutation, type ResourceState } from '../resource-state';
 import { externalLinkFeedbackMessage, requestExternalLinkOpen } from '../external-links';
-import type { Candidate, CandidateEvidenceBasis, CandidateMergeSource, CandidateSourceRole, CandidateState, PendingOwnerAction, SourceFailure, Task } from '../types';
+import type { Candidate, CandidateEvidenceBasis, CandidateMergeSource, CandidateSourceRole, CandidateState, CindyOwnerDecision, PendingOwnerAction, SourceFailure, Task } from '../types';
 
 const filters: { value: CandidateState | 'all'; label: string }[] = [
   { value: 'all', label: '全部' },
@@ -200,7 +200,7 @@ function CandidateMergeSourceRow({
 }
 
 export default function CandidatesPage() {
-  type CandidatePayload = { items: Candidate[]; ownerActions?: PendingOwnerAction[] };
+  type CandidatePayload = { items: Candidate[]; ownerActions?: PendingOwnerAction[]; ownerDecisions: CindyOwnerDecision[] };
   const [resource, setResource] = useState<ResourceState<CandidatePayload>>(loadingResource);
   const [sourceFailures, setSourceFailures] = useState<SourceFailure[]>([]);
   const [filter, setFilter] = useState<CandidateView>('pending');
@@ -231,10 +231,11 @@ export default function CandidatesPage() {
     const request = Promise.all([
       api.get<{ items: Candidate[]; ownerActions?: PendingOwnerAction[] }>('/api/candidates?deleted=all', controller.signal),
       api.get<{ items: SourceFailure[] }>('/api/source-failures?status=all', controller.signal),
+      api.get<{ items: CindyOwnerDecision[] }>('/api/owner-decisions?status=pending&limit=50', controller.signal),
     ])
-      .then(([data, failureData]) => {
+      .then(([data, failureData, ownerDecisionData]) => {
         if (!controller.signal.aborted && isLatestResourceRequest(requestGenerationRef.current, requestIdentity)) {
-          setResource(successResource(data, data.items.length === 0));
+          setResource(successResource({ ...data, ownerDecisions: ownerDecisionData.items }, data.items.length === 0 && ownerDecisionData.items.length === 0));
           setSourceFailures(failureData.items);
         }
       });
@@ -264,6 +265,7 @@ export default function CandidatesPage() {
   }, [load]);
   const items = resource.data?.items ?? [];
   const pendingOwnerActions = resource.data?.ownerActions ?? [];
+  const ownerDecisions = resource.data?.ownerDecisions ?? [];
   const visible = useMemo(() => filter === 'trash'
     ? items.filter((item) => Boolean(item.deleted_at))
     : items.filter((item) => !item.deleted_at && (filter === 'all' || item.state === filter)), [filter, items]);
@@ -288,6 +290,44 @@ export default function CandidatesPage() {
     }
     return { grouped, unassigned };
   }, [items, pendingOwnerActions]);
+
+  const resolveOwnerDecision = async (decision: CindyOwnerDecision, action: 'skip' | 'create_candidate', optionKey: string) => {
+    const operation = `owner-decision-${decision.decision_id}`;
+    setBusy(operation);
+    setError('');
+    try {
+      await api.post(`/api/owner-decisions/${encodeURIComponent(decision.decision_id)}/resolve`, {
+        decision_request_id: `owner-${crypto.randomUUID()}`,
+        expected_version: decision.version,
+        action,
+        option_key: optionKey,
+      });
+      setMessage(action === 'create_candidate' ? '已按主人选择建立候选。' : '已按主人选择跳过这些来源。');
+      await load({ silent: true });
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '主人决定执行失败，请刷新后重试。');
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const cancelOwnerDecision = async (decision: CindyOwnerDecision) => {
+    const operation = `owner-decision-${decision.decision_id}`;
+    setBusy(operation);
+    setError('');
+    try {
+      await api.post(`/api/owner-decisions/${encodeURIComponent(decision.decision_id)}/cancel`, {
+        decision_request_id: `owner-cancel-${crypto.randomUUID()}`,
+        expected_version: decision.version,
+      });
+      setMessage('已取消这次主人决定；来源会保留，之后可由 Cindy 重新判断。');
+      await load({ silent: true });
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '主人决定取消失败，请刷新后重试。');
+    } finally {
+      setBusy('');
+    }
+  };
 
   const activeSourceFailures = useMemo(
     () => sourceFailures.filter((item) => item.status === 'open' || item.status === 'retrying' || item.status === 'stale'),
@@ -684,6 +724,28 @@ export default function CandidatesPage() {
       </div>
       {message && <div className="success-banner">{message}</div>}
       {error && <div className="error-banner">{error}</div>}
+      {ownerDecisions.length > 0 && <section className="source-failure-inbox" aria-label="等待主人决定的来源">
+        <div className="source-failure-heading"><div><strong>等待你决定（{ownerDecisions.length}）</strong><span>Cindy 无法安全确定处理方式。这里只展示安全摘要，不显示聊天正文或技术标识。</span></div></div>
+        <div className="source-failure-list">
+          {ownerDecisions.map((decision) => <article className="source-failure-card" key={decision.decision_id}>
+            <div className="source-failure-card-main">
+              <div className="source-failure-card-title"><strong>{decision.reason_summary}</strong><span>{decision.source_count} 条已保存来源</span><em>等待确认</em></div>
+              {decision.last_error && <p>上次执行未完成：{decision.last_error}</p>}
+              <div className="candidate-owner-action-list">
+                {decision.options.map((option) => <section className="candidate-owner-action" key={option.option_key}>
+                  <div><strong>{option.action === 'skip' ? '跳过' : option.action === 'create_candidate' ? option.title || '建立候选' : option.title || '追加到已有候选'}</strong><span>{option.available ? '可以执行' : '等待后续追加能力'}</span></div>
+                  {option.describe && <p>{option.describe}</p>}
+                  {option.next_step && <small>下一步：{option.next_step}</small>}
+                  {option.available && option.action !== 'append_candidate' && <button className="secondary-button" type="button" disabled={Boolean(busy)} onClick={() => void resolveOwnerDecision(decision, option.action === 'skip' ? 'skip' : 'create_candidate', option.option_key)}>
+                    {option.action === 'skip' ? '确认跳过' : '建立候选'}
+                  </button>}
+                </section>)}
+              </div>
+            </div>
+            <div className="source-failure-actions"><button className="quiet-button" type="button" disabled={Boolean(busy)} onClick={() => void cancelOwnerDecision(decision)}>暂不处理</button></div>
+          </article>)}
+        </div>
+      </section>}
       {hasSourceFailureHistory && <section className="source-failure-inbox" aria-label="失败来源收件箱">
         <div className="source-failure-heading">
           <div><strong>失败来源收件箱（{activeSourceFailures.length}）</strong><span>来源已保存，但 AI 整理没有完成。这里不显示聊天正文，只提供脱敏诊断和主人确认后的本地重试。</span></div>

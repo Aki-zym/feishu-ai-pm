@@ -287,6 +287,29 @@ export type PendingOwnerAction = {
   message: string;
 };
 
+export type CindyOwnerDecision = {
+  decision_id: string;
+  batch_id: string;
+  status: 'pending' | 'resolved' | 'superseded' | 'cancelled';
+  version: number;
+  reason_summary: string;
+  options: Array<{
+    option_key: string;
+    action: 'skip' | 'create_candidate' | 'append_candidate';
+    title: string | null;
+    describe: string | null;
+    next_step: string | null;
+    available: boolean;
+  }>;
+  source_count: number;
+  last_error: string | null;
+  resolution_action: 'skip' | 'create_candidate' | null;
+  resolved_candidate_id: string | null;
+  created_at: string;
+  updated_at: string;
+  resolved_at: string | null;
+};
+
 export type TaskEvent = {
   id: string;
   event_type: string;

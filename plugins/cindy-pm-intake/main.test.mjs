@@ -69,7 +69,7 @@ function setup({ errandText = '{"accepted":true}', errandResponse = null, errand
         }
         if (request.params.path.endsWith('/decisions')) {
           decisionPosts.push(request.params.body);
-          return { ok: true, result: { decision_request_id: request.params.body.decision_request_id, duplicate: false, decisions: [] } };
+          return { ok: true, result: { decision_request_id: request.params.body.decision_request_id, batch_id: request.params.body.batch_id, duplicate: false, groups: [], dispositions: [], owner_decisions: [] } };
         }
         throw new Error(`unexpected node request: ${JSON.stringify(request)}`);
       },
@@ -133,6 +133,9 @@ test('scan_intake_window starts the fixed intake errand session and returns its 
   assert.match(errandCalls[0].task, /im_read_messages/);
   assert.match(errandCalls[0].task, /最多回读 4 小时/);
   assert.match(errandCalls[0].task, /empty_window/);
+  assert.match(errandCalls[0].task, /共同对象、共同目标、共同交付物/);
+  assert.match(errandCalls[0].task, /snapshot_receipts/);
+  assert.match(errandCalls[0].task, /shared_context/);
   assert.match(errandCalls[0].task, /\[\{"action"/);
   assert.equal('model' in errandCalls[0], false);
   assert.equal('provider' in errandCalls[0], false);
@@ -150,14 +153,8 @@ test('scan_intake_window starts the fixed intake errand session and returns its 
   assert.ok(firstWindowDuration < 10 * 60 * 1000 + 2000);
   assert.equal(nodeCalls[0].method, 'pm/ensure');
   assert.equal(nodeCalls.some((call) => call.params?.path === '/api/runtime/intake-cursor'), true);
-  assert.deepEqual(JSON.parse(JSON.stringify(cursorWrites)), []);
-  assert.deepEqual(JSON.parse(JSON.stringify(decisionPosts)), [{
-    decision_request_id: result.result.window_id,
-    window_id: result.result.window_id,
-    window_start: result.result.window_start,
-    window_end: result.result.window_end,
-    decisions: [],
-  }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(cursorWrites)), [{ window_end: result.result.window_end }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(decisionPosts)), []);
 });
 
 test('scan_intake_window starts after the last successful intake window end', async () => {
@@ -300,7 +297,7 @@ test('scan result uses human language for candidates, formal task updates, and e
 });
 
 test('ghost declares schedule support while retaining errand', () => {
-  assert.equal(ghost.version, '0.5.0');
+  assert.equal(ghost.version, '0.6.0');
   assert.equal(ghost.id, 'ai-pm-intake');
   assert.equal(ghost.name, 'TooManyTasks');
   assert.match(ghost.description, /本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台/);
@@ -440,10 +437,13 @@ test('submit_pm_decisions posts receipts only and rejects update_task without CA
   const { onHostMessage, nodeCalls, sent } = setup();
   const args = {
     decision_request_id: 'decision-window-1',
+    batch_id: 'batch-window-1',
     window_id: 'window-1',
     window_start: '2026-08-24T01:00:00.000Z',
     window_end: '2026-08-24T01:10:00.000Z',
-    decisions: [{ decision_ref: 'd1', action: 'create_candidate', source_receipts: ['r'.repeat(43)], title: '新增需求' }],
+    snapshot_receipts: ['r'.repeat(43)],
+    groups: [{ group_key: 'g1', action: 'create_candidate', anchor_receipt: 'r'.repeat(43), field_evidence_receipts: [], title: '新增需求' }],
+    primary_dispositions: [{ disposition_ref: 'd1', source_receipt: 'r'.repeat(43), disposition: 'group', primary_group_key: 'g1' }],
   };
   onHostMessage({ type: 'tool-call', tool: 'submit_pm_decisions', callId: 'call-decide', args });
   await waitFor(() => sent.some((message) => message.callId === 'call-decide'));
@@ -457,10 +457,13 @@ test('submit_pm_decisions posts receipts only and rejects update_task without CA
     callId: 'call-invalid-update',
     args: {
       decision_request_id: 'decision-invalid',
+      batch_id: 'batch-invalid',
       window_id: 'window-1',
       window_start: '2026-08-24T01:00:00.000Z',
       window_end: '2026-08-24T01:10:00.000Z',
-      decisions: [{ decision_ref: 'd1', action: 'update_task', source_receipts: ['r'.repeat(43)], next_step: '缺少 CAS 信息。' }],
+      snapshot_receipts: ['r'.repeat(43)],
+      groups: [{ group_key: 'g1', action: 'update_task', anchor_receipt: 'r'.repeat(43), field_evidence_receipts: [], next_step: '缺少 CAS 信息。' }],
+      primary_dispositions: [{ disposition_ref: 'd1', source_receipt: 'r'.repeat(43), disposition: 'group', primary_group_key: 'g1' }],
     },
   });
   await waitFor(() => sent.some((message) => message.callId === 'call-invalid-update'));

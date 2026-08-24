@@ -42927,7 +42927,7 @@ var require_extension = __commonJS({
 var require_websocket = __commonJS({
   "node_modules/ws/lib/websocket.js"(exports2, module2) {
     "use strict";
-    var EventEmitter = require("events"), https = require("https"), http = require("http"), net = require("net"), tls = require("tls"), { randomBytes: randomBytes2, createHash: createHash11 } = require("crypto"), { Duplex, Readable } = require("stream"), { URL: URL2 } = require("url"), PerMessageDeflate = require_permessage_deflate(), Receiver = require_receiver(), Sender = require_sender(), { isBlob } = require_validation3(), {
+    var EventEmitter = require("events"), https = require("https"), http = require("http"), net = require("net"), tls = require("tls"), { randomBytes: randomBytes2, createHash: createHash12 } = require("crypto"), { Duplex, Readable } = require("stream"), { URL: URL2 } = require("url"), PerMessageDeflate = require_permessage_deflate(), Receiver = require_receiver(), Sender = require_sender(), { isBlob } = require_validation3(), {
       BINARY_TYPES,
       CLOSE_TIMEOUT,
       EMPTY_BUFFER,
@@ -43389,7 +43389,7 @@ var require_websocket = __commonJS({
           abortHandshake(websocket, socket, "Invalid Upgrade header");
           return;
         }
-        let digest = createHash11("sha1").update(key + GUID).digest("base64");
+        let digest = createHash12("sha1").update(key + GUID).digest("base64");
         if (res.headers["sec-websocket-accept"] !== digest) {
           abortHandshake(websocket, socket, "Invalid Sec-WebSocket-Accept header");
           return;
@@ -43627,7 +43627,7 @@ var require_subprotocol = __commonJS({
 var require_websocket_server = __commonJS({
   "node_modules/ws/lib/websocket-server.js"(exports2, module2) {
     "use strict";
-    var EventEmitter = require("events"), http = require("http"), { Duplex } = require("stream"), { createHash: createHash11 } = require("crypto"), extension = require_extension(), PerMessageDeflate = require_permessage_deflate(), subprotocol = require_subprotocol(), WebSocket = require_websocket(), { CLOSE_TIMEOUT, GUID, kWebSocket } = require_constants3(), keyRegex = /^[+/0-9A-Za-z]{22}==$/, RUNNING = 0, CLOSING = 1, CLOSED = 2, WebSocketServer = class extends EventEmitter {
+    var EventEmitter = require("events"), http = require("http"), { Duplex } = require("stream"), { createHash: createHash12 } = require("crypto"), extension = require_extension(), PerMessageDeflate = require_permessage_deflate(), subprotocol = require_subprotocol(), WebSocket = require_websocket(), { CLOSE_TIMEOUT, GUID, kWebSocket } = require_constants3(), keyRegex = /^[+/0-9A-Za-z]{22}==$/, RUNNING = 0, CLOSING = 1, CLOSED = 2, WebSocketServer = class extends EventEmitter {
       /**
        * Create a `WebSocketServer` instance.
        *
@@ -43874,7 +43874,7 @@ var require_websocket_server = __commonJS({
           "HTTP/1.1 101 Switching Protocols",
           "Upgrade: websocket",
           "Connection: Upgrade",
-          `Sec-WebSocket-Accept: ${createHash11("sha1").update(key + GUID).digest("base64")}`
+          `Sec-WebSocket-Accept: ${createHash12("sha1").update(key + GUID).digest("base64")}`
         ], ws = new this.options.WebSocket(null, void 0, this.options);
         if (protocols.size) {
           let protocol = this.options.handleProtocols ? this.options.handleProtocols(protocols, req) : protocols.values().next().value;
@@ -134265,7 +134265,7 @@ module.exports = __toCommonJS(pm_runtime_entry_exports);
 var import_node_fs4 = require("node:fs"), import_promises2 = require("node:fs/promises"), import_node_child_process = require("node:child_process"), import_node_path5 = require("node:path");
 
 // apps/server/src/app.ts
-var import_node_fs3 = require("node:fs"), import_node_crypto12 = require("node:crypto"), import_promises = require("node:fs/promises"), import_node_path3 = require("node:path"), import_cors = __toESM(require_cors(), 1), import_fastify = __toESM(require_fastify(), 1);
+var import_node_fs3 = require("node:fs"), import_node_crypto13 = require("node:crypto"), import_promises = require("node:fs/promises"), import_node_path3 = require("node:path"), import_cors = __toESM(require_cors(), 1), import_fastify = __toESM(require_fastify(), 1);
 
 // node_modules/zod/v4/classic/external.js
 var external_exports = {};
@@ -145365,7 +145365,7 @@ function canonicalRevisionSetHash(entries) {
 }
 
 // apps/server/src/service.ts
-var import_node_crypto11 = require("node:crypto"), import_node_fs2 = require("node:fs"), import_node_path2 = require("node:path");
+var import_node_crypto12 = require("node:crypto"), import_node_fs2 = require("node:fs"), import_node_path2 = require("node:path");
 
 // apps/server/src/database.ts
 var import_node_fs = require("node:fs"), import_node_crypto2 = require("node:crypto"), import_node_path = require("node:path"), import_node_sqlite = require("node:sqlite");
@@ -145443,7 +145443,7 @@ function projectShanghaiCalendarPlan(startAt, endAt, fallbackAt = null) {
 }
 
 // apps/server/src/database.ts
-var CURRENT_SCHEMA_VERSION = 10;
+var CURRENT_SCHEMA_VERSION = 11;
 function registerData04SqlFunctions(database) {
   database.function("sha256", { deterministic: !0 }, (value) => (0, import_node_crypto2.createHash)("sha256").update(String(value ?? "")).digest("hex"));
 }
@@ -148249,7 +148249,154 @@ var CINDY_OWNER_CONTEXT_SCHEMA_CHECKSUM = cindyOwnerContextSchemaChecksum(), CIN
       userVersion: 10
     })
   ])
-})), CINDY_OWNER_CONTEXT_MIGRATION_CHECKSUM = migrationDescriptorChecksum(CINDY_OWNER_CONTEXT_MIGRATION_DESCRIPTOR), MIGRATIONS = [
+})), CINDY_OWNER_CONTEXT_MIGRATION_CHECKSUM = migrationDescriptorChecksum(CINDY_OWNER_CONTEXT_MIGRATION_DESCRIPTOR), CINDY_GROUPED_BATCH_MIGRATION_SQL = Object.freeze([
+  `CREATE TABLE cindy_batch (
+    owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    decision_request_id TEXT NOT NULL,
+    payload_hash TEXT NOT NULL CHECK (length(payload_hash) = 64),
+    snapshot_hash TEXT NOT NULL CHECK (length(snapshot_hash) = 64),
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(owner_scope, account_anchor, batch_id),
+    UNIQUE(owner_scope, account_anchor, decision_request_id)
+  );`,
+  `CREATE TABLE cindy_batch_group (
+    owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    group_key TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('create_candidate','update_task')),
+    anchor_revision_id TEXT NOT NULL REFERENCES source_event_revision(id) ON DELETE RESTRICT,
+    candidate_id TEXT REFERENCES candidate_request(id) ON DELETE SET NULL,
+    task_id TEXT REFERENCES task(id) ON DELETE SET NULL,
+    task_version INTEGER CHECK (task_version IS NULL OR task_version >= 1),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(owner_scope, account_anchor, batch_id, group_key),
+    FOREIGN KEY(owner_scope, account_anchor, batch_id)
+      REFERENCES cindy_batch(owner_scope, account_anchor, batch_id) ON DELETE CASCADE
+  );`,
+  `CREATE TABLE cindy_batch_snapshot (
+    owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    source_revision_id TEXT NOT NULL REFERENCES source_event_revision(id) ON DELETE RESTRICT,
+    revision_hash TEXT NOT NULL CHECK (length(revision_hash) = 64),
+    disposition_ref TEXT NOT NULL,
+    primary_disposition TEXT NOT NULL CHECK (primary_disposition IN ('group','skip','needs_owner')),
+    primary_group_key TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(owner_scope, account_anchor, batch_id, source_revision_id),
+    UNIQUE(owner_scope, account_anchor, batch_id, disposition_ref),
+    CHECK ((primary_disposition = 'group' AND primary_group_key IS NOT NULL)
+        OR (primary_disposition <> 'group' AND primary_group_key IS NULL)),
+    FOREIGN KEY(owner_scope, account_anchor, batch_id)
+      REFERENCES cindy_batch(owner_scope, account_anchor, batch_id) ON DELETE CASCADE,
+    FOREIGN KEY(owner_scope, account_anchor, batch_id, primary_group_key)
+      REFERENCES cindy_batch_group(owner_scope, account_anchor, batch_id, group_key) ON DELETE RESTRICT
+  );`,
+  `CREATE TABLE cindy_batch_shared_context (
+    owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    source_revision_id TEXT NOT NULL REFERENCES source_event_revision(id) ON DELETE RESTRICT,
+    primary_group_key TEXT NOT NULL,
+    shared_group_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(owner_scope, account_anchor, batch_id, source_revision_id, primary_group_key, shared_group_key),
+    CHECK (primary_group_key <> shared_group_key),
+    FOREIGN KEY(owner_scope, account_anchor, batch_id, source_revision_id)
+      REFERENCES cindy_batch_snapshot(owner_scope, account_anchor, batch_id, source_revision_id) ON DELETE CASCADE,
+    FOREIGN KEY(owner_scope, account_anchor, batch_id, primary_group_key)
+      REFERENCES cindy_batch_group(owner_scope, account_anchor, batch_id, group_key) ON DELETE RESTRICT,
+    FOREIGN KEY(owner_scope, account_anchor, batch_id, shared_group_key)
+      REFERENCES cindy_batch_group(owner_scope, account_anchor, batch_id, group_key) ON DELETE RESTRICT
+  );`,
+  `CREATE TABLE cindy_owner_decision (
+    id TEXT PRIMARY KEY,
+    owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    decision_key TEXT NOT NULL,
+    reason_summary TEXT NOT NULL CHECK (length(reason_summary) BETWEEN 1 AND 500),
+    options_json TEXT NOT NULL CHECK (length(options_json) <= 10000),
+    status TEXT NOT NULL CHECK (status IN ('pending','resolved','superseded','cancelled')),
+    version INTEGER NOT NULL CHECK (version >= 1),
+    resolution_action TEXT CHECK (resolution_action IS NULL OR resolution_action IN ('skip','create_candidate')),
+    resolution_request_id TEXT,
+    resolution_payload_hash TEXT CHECK (resolution_payload_hash IS NULL OR length(resolution_payload_hash) = 64),
+    resolution_response_json TEXT,
+    resolved_candidate_id TEXT REFERENCES candidate_request(id) ON DELETE SET NULL,
+    last_error TEXT CHECK (last_error IS NULL OR length(last_error) <= 240),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    resolved_at TEXT,
+    UNIQUE(owner_scope, account_anchor, batch_id, decision_key),
+    FOREIGN KEY(owner_scope, account_anchor, batch_id)
+      REFERENCES cindy_batch(owner_scope, account_anchor, batch_id) ON DELETE CASCADE
+  );`,
+  `CREATE TABLE cindy_owner_decision_source (
+    decision_id TEXT NOT NULL REFERENCES cindy_owner_decision(id) ON DELETE CASCADE,
+    source_revision_id TEXT NOT NULL REFERENCES source_event_revision(id) ON DELETE RESTRICT,
+    source_order INTEGER NOT NULL CHECK (source_order >= 0),
+    source_role TEXT NOT NULL CHECK (source_role IN ('anchor','evidence')),
+    PRIMARY KEY(decision_id, source_revision_id),
+    UNIQUE(decision_id, source_order)
+  );`,
+  "CREATE INDEX idx_cindy_batch_snapshot_revision ON cindy_batch_snapshot(source_revision_id, owner_scope, batch_id);",
+  "CREATE INDEX idx_cindy_owner_decision_status ON cindy_owner_decision(owner_scope, status, updated_at DESC);",
+  "CREATE INDEX idx_cindy_owner_decision_source_revision ON cindy_owner_decision_source(source_revision_id, decision_id);",
+  `CREATE UNIQUE INDEX idx_cindy_owner_decision_resolution_request
+     ON cindy_owner_decision(owner_scope, account_anchor, resolution_request_id)
+     WHERE resolution_request_id IS NOT NULL;`
+]);
+function cindyGroupedBatchSchemaChecksum() {
+  let canonical = new import_node_sqlite.DatabaseSync(":memory:");
+  try {
+    registerData04SqlFunctions(canonical), executeMigrationOperations(canonical, { ...BASELINE_MIGRATION_DESCRIPTOR, checksum: BASELINE_MIGRATION_CHECKSUM }, {
+      databaseInstanceId: "00000000000000000000000000000000",
+      instanceCreatedAt: "2026-08-15T00:00:00.000Z",
+      appliedAt: "2026-08-15T00:00:00.000Z",
+      preexistingTables: []
+    });
+    for (let statement of RELATION_CONSTRAINT_MIGRATION_SQL) !statement.startsWith("UPDATE ") && !statement.startsWith("INSERT ") && canonical.exec(statement);
+    for (let statement of RUNTIME_TOOL_IDEMPOTENCY_MIGRATION_SQL) canonical.exec(statement);
+    for (let statement of CANDIDATE_VERSION_MIGRATION_SQL) canonical.exec(statement);
+    for (let statement of PRIVACY_MIGRATION_SQL) statement.startsWith("INSERT ") || canonical.exec(statement);
+    for (let statement of PRIVACY_FENCING_MIGRATION_SQL) canonical.exec(statement);
+    for (let statement of SOURCE_REVISION_MIGRATION_SQL) !statement.startsWith("INSERT ") && !statement.startsWith("UPDATE ") && canonical.exec(statement);
+    for (let statement of PROVIDER_RETRY_COOLDOWN_MIGRATION_SQL) canonical.exec(statement);
+    for (let statement of CINDY_TRUSTED_SOURCE_MIGRATION_SQL) statement.startsWith("INSERT ") || canonical.exec(statement);
+    for (let statement of CINDY_OWNER_CONTEXT_MIGRATION_SQL) statement.startsWith("UPDATE ") || canonical.exec(statement);
+    for (let statement of CINDY_GROUPED_BATCH_MIGRATION_SQL) canonical.exec(statement);
+    return schemaIdentityChecksum(captureSchemaIdentity(canonical));
+  } finally {
+    canonical.close();
+  }
+}
+var CINDY_GROUPED_BATCH_SCHEMA_CHECKSUM = cindyGroupedBatchSchemaChecksum(), CINDY_GROUPED_BATCH_MIGRATION_DESCRIPTOR = deepFreeze(Object.freeze({
+  version: 11,
+  name: "cindy-grouped-batch-snapshot",
+  expectedPostSchemaIdentity: "current-schema-v11",
+  orderedOperations: Object.freeze([
+    Object.freeze({ id: "cindy-grouped-batch-schema", kind: "sql_batch", statements: CINDY_GROUPED_BATCH_MIGRATION_SQL }),
+    Object.freeze({
+      id: "verify-post-schema",
+      kind: "assert_database",
+      expectedSchemaIdentityChecksum: CINDY_GROUPED_BATCH_SCHEMA_CHECKSUM,
+      checks: Object.freeze(["schema", "foreign_keys", "integrity"])
+    }),
+    Object.freeze({
+      id: "record-migration",
+      kind: "record_migration",
+      ledgerTable: "schema_migration",
+      userVersion: 11
+    })
+  ])
+})), CINDY_GROUPED_BATCH_MIGRATION_CHECKSUM = migrationDescriptorChecksum(CINDY_GROUPED_BATCH_MIGRATION_DESCRIPTOR), MIGRATIONS = [
   {
     ...BASELINE_MIGRATION_DESCRIPTOR,
     checksum: BASELINE_MIGRATION_CHECKSUM
@@ -148289,10 +148436,14 @@ var CINDY_OWNER_CONTEXT_SCHEMA_CHECKSUM = cindyOwnerContextSchemaChecksum(), CIN
   {
     ...CINDY_OWNER_CONTEXT_MIGRATION_DESCRIPTOR,
     checksum: CINDY_OWNER_CONTEXT_MIGRATION_CHECKSUM
+  },
+  {
+    ...CINDY_GROUPED_BATCH_MIGRATION_DESCRIPTOR,
+    checksum: CINDY_GROUPED_BATCH_MIGRATION_CHECKSUM
   }
 ];
 function assertExecutableMigrationDescriptor(descriptor) {
-  if (!Number.isInteger(descriptor.version) || descriptor.version < 1 || !["current-schema-v1", "current-schema-v2", "current-schema-v3", "current-schema-v4", "current-schema-v5", "current-schema-v6", "current-schema-v7", "current-schema-v8", "current-schema-v9", "current-schema-v10"].includes(descriptor.expectedPostSchemaIdentity) || descriptor.orderedOperations.length === 0)
+  if (!Number.isInteger(descriptor.version) || descriptor.version < 1 || !["current-schema-v1", "current-schema-v2", "current-schema-v3", "current-schema-v4", "current-schema-v5", "current-schema-v6", "current-schema-v7", "current-schema-v8", "current-schema-v9", "current-schema-v10", "current-schema-v11"].includes(descriptor.expectedPostSchemaIdentity) || descriptor.orderedOperations.length === 0)
     throw new DatabaseUpgradeError("migration", "\u6570\u636E\u5E93\u8FC1\u79FB\u63CF\u8FF0\u7B26\u7248\u672C\u6216\u8D1F\u8F7D\u65E0\u6548\uFF1B\u5DF2\u62D2\u7EDD\u63A8\u8FDB\u7248\u672C\u3002");
   let operationIds = /* @__PURE__ */ new Set(), assertionCount = 0, recordCount = 0;
   for (let operation of descriptor.orderedOperations) {
@@ -149714,10 +149865,19 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
         generation,
         revisionId,
         sourceEventId
-      ), current && current.processing_status !== "legacy_read_only" && database.raw.prepare(
+      ), current && current.processing_status !== "legacy_read_only" && (database.raw.prepare(
         `UPDATE source_event_revision SET processing_status = 'superseded'
               WHERE id = ? AND processing_status NOT IN ('revoked','invalid')`
-      ).run(current.id)) : (database.raw.prepare(
+      ).run(current.id), database.raw.prepare(
+        `UPDATE cindy_owner_decision
+                SET status = 'superseded', version = version + 1, updated_at = ?, last_error = NULL
+              WHERE owner_scope = ? AND account_anchor = ? AND status = 'pending'
+                AND EXISTS (
+                  SELECT 1 FROM cindy_owner_decision_source AS decision_source
+                   WHERE decision_source.decision_id = cindy_owner_decision.id
+                     AND decision_source.source_revision_id = ?
+                )`
+      ).run(timestamp, auth.ownerScope, auth.accountAnchor, current.id))) : (database.raw.prepare(
         `INSERT INTO source_event
             (id, external_id, source_type, conversation_id, sender_id, sender_name, content, owner_mentioned,
              source_url, completeness, discovery_reason, metadata_json, occurred_at, captured_at,
@@ -149836,29 +149996,39 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
     ).run(auth.ownerScope, auth.accountAnchor, input.save_request_id, requestHash, JSON.stringify(stored), timestamp), { save_request_id: input.save_request_id, duplicate: !1, sources };
   });
 }
-function hashCindyDecisionRequest(value) {
-  return sha256(stableJson(value));
+
+// apps/server/src/cindy-batch.ts
+var import_node_crypto4 = require("node:crypto"), cindyBatchKeyPattern = /^[A-Za-z0-9_-]{1,128}$/u, cindyGroupKeyPattern = /^[A-Za-z0-9_-]{1,64}$/u;
+function canonicalize(value) {
+  return Array.isArray(value) ? value.map(canonicalize) : value && typeof value == "object" ? Object.fromEntries(Object.entries(value).filter(([, child]) => child !== void 0).sort(([left], [right]) => left.localeCompare(right)).map(([key, child]) => [key, canonicalize(child)])) : value;
 }
-function cindyDecisionReplay(database, auth, decisionRequestId, requestHash) {
-  let row = database.raw.prepare(
-    `SELECT request_hash, response_json FROM cindy_decision_request
-      WHERE owner_scope = ? AND account_anchor = ? AND decision_request_id = ?`
-  ).get(auth.ownerScope, auth.accountAnchor, decisionRequestId);
-  if (row) {
-    if (row.request_hash !== requestHash) throw new CindySourceContractError("CONFLICT", "decision_request_id \u5DF2\u7ED1\u5B9A\u5230\u4E0D\u540C\u8BF7\u6C42\u3002");
-    return JSON.parse(row.response_json);
-  }
+function canonicalCindyBatchInput(input) {
+  return canonicalize({
+    ...input,
+    snapshot_receipts: [...input.snapshot_receipts].sort(),
+    groups: [...input.groups].map((group) => ({ ...group, field_evidence_receipts: [...group.field_evidence_receipts].sort() })).sort((left, right) => left.group_key.localeCompare(right.group_key)),
+    primary_dispositions: [...input.primary_dispositions].sort((left, right) => left.disposition_ref.localeCompare(right.disposition_ref)),
+    shared_context: [...input.shared_context ?? []].sort((left, right) => left.source_receipt.localeCompare(right.source_receipt) || left.shared_group_key.localeCompare(right.shared_group_key)),
+    owner_decisions: [...input.owner_decisions ?? []].map((decision) => ({
+      ...decision,
+      options: [...decision.options].sort((left, right) => left.option_key.localeCompare(right.option_key))
+    })).sort((left, right) => left.decision_key.localeCompare(right.decision_key))
+  });
 }
-function recordCindyDecisionRequest(database, auth, decisionRequestId, requestHash, result, timestamp) {
-  database.raw.prepare(
-    `INSERT INTO cindy_decision_request
-      (owner_scope, account_anchor, decision_request_id, request_hash, response_json, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(auth.ownerScope, auth.accountAnchor, decisionRequestId, requestHash, JSON.stringify(result), timestamp);
+function hashCindyBatchInput(input) {
+  return (0, import_node_crypto4.createHash)("sha256").update(JSON.stringify(canonicalCindyBatchInput(input))).digest("hex");
+}
+function hashCindyBatchSnapshot(entries) {
+  let canonical = [...entries].sort((left, right) => left.revisionId.localeCompare(right.revisionId)).map((entry) => `${entry.revisionId}\0${entry.revisionHash}
+`).join("");
+  return (0, import_node_crypto4.createHash)("sha256").update(canonical).digest("hex");
+}
+function hashCindyOwnerDecisionResolution(value) {
+  return (0, import_node_crypto4.createHash)("sha256").update(JSON.stringify(canonicalize(value))).digest("hex");
 }
 
 // apps/server/src/calendar-classification.ts
-var import_node_crypto4 = require("node:crypto");
+var import_node_crypto5 = require("node:crypto");
 
 // docs/product-rules/PROD-07-calendar-classification.json
 var PROD_07_calendar_classification_default = {
@@ -150392,7 +150562,7 @@ function metadataBoolean(metadata, key) {
   return metadata[key] === !0;
 }
 function sourceReference(externalId) {
-  return `sha256:${(0, import_node_crypto4.createHash)("sha256").update(externalId).digest("hex").slice(0, 16)}`;
+  return `sha256:${(0, import_node_crypto5.createHash)("sha256").update(externalId).digest("hex").slice(0, 16)}`;
 }
 function eventTitle(event) {
   let metadataTitle = metadataString(event.metadata ?? {}, "calendarTitle");
@@ -150560,13 +150730,13 @@ function calendarClassificationDraft(event, classification) {
 }
 
 // apps/server/src/integrations/feishu.ts
-var import_node_crypto6 = require("node:crypto"), lark = __toESM(require_lib3(), 1);
+var import_node_crypto7 = require("node:crypto"), lark = __toESM(require_lib3(), 1);
 
 // apps/server/src/redaction.ts
 var import_node_util = require("node:util"), import_node_url = require("node:url");
 
 // apps/server/src/integrations/llm.ts
-var import_node_crypto5 = require("node:crypto");
+var import_node_crypto6 = require("node:crypto");
 
 // apps/server/src/retry-policy.ts
 var TRANSPORT_ERROR_NAMES = /* @__PURE__ */ new Set(["AbortError", "ECONNRESET", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "FetchError"]), TRANSPORT_ERROR_CODES = /* @__PURE__ */ new Set(["ECONNRESET", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET"]), SAFE_RETRY_TOKEN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$/u, STRICT_RETRY_AT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
@@ -152077,7 +152247,7 @@ var FeishuAuthError = class extends Error {
 };
 
 // apps/server/src/integrations/feishu-document-context.ts
-var import_node_crypto7 = require("node:crypto");
+var import_node_crypto8 = require("node:crypto");
 var MAX_CONTEXT_CHARS = 8e3, FEISHU_DOCUMENT_REFRESH_TTL_MS = 300 * 1e3, MAX_SNAPSHOT_ATTEMPTS = 3;
 function safeErrorText(error51) {
   return redactDiagnosticText(error51 instanceof Error ? error51 : error51 ?? "\u98DE\u4E66\u6587\u6863\u8BFB\u53D6\u5931\u8D25\u3002", 300);
@@ -152124,7 +152294,7 @@ function extractFeishuDocumentLinks(content) {
   return [...links.values()];
 }
 function contextHash(value) {
-  return (0, import_node_crypto7.createHash)("sha256").update(value).digest("hex");
+  return (0, import_node_crypto8.createHash)("sha256").update(value).digest("hex");
 }
 function numericVersion(value) {
   if (!value || !/^\d+$/.test(value)) return null;
@@ -152304,7 +152474,7 @@ var FeishuDocumentContextService = class {
          checked_at = excluded.checked_at,
          updated_at = excluded.updated_at`
     ).run(
-      `ctx_${(0, import_node_crypto7.randomUUID)()}`,
+      `ctx_${(0, import_node_crypto8.randomUUID)()}`,
       sourceEventId,
       context.sourceUrl,
       context.documentId,
@@ -152327,8 +152497,8 @@ var FeishuDocumentContextService = class {
 };
 
 // apps/server/src/runtime.ts
-var import_node_crypto8 = require("node:crypto");
-var systemClock = { now: () => Date.now() }, newId = (prefix) => `${prefix}_${(0, import_node_crypto8.randomUUID)()}`, RuntimeLeaseLostError = class extends Error {
+var import_node_crypto9 = require("node:crypto");
+var systemClock = { now: () => Date.now() }, newId = (prefix) => `${prefix}_${(0, import_node_crypto9.randomUUID)()}`, RuntimeLeaseLostError = class extends Error {
   constructor() {
     super("Runtime \u5DE5\u4F5C\u9879\u5DF2\u53D6\u6D88\u6216\u79DF\u7EA6\u5DF2\u5931\u6548\u3002"), this.name = "RuntimeLeaseLostError";
   }
@@ -152400,7 +152570,7 @@ var defaultTools = [
     }));
   }
   tools = new RuntimeToolRegistry();
-  generation = (0, import_node_crypto8.randomUUID)();
+  generation = (0, import_node_crypto9.randomUUID)();
   clock;
   lifecycle = "running";
   activeControllers = /* @__PURE__ */ new Map();
@@ -152623,7 +152793,7 @@ var defaultTools = [
    * uniqueness at the database level while allowing blocked duplicate rows.
    */
   externalClaimKey(idempotencyKey) {
-    return `runtime-external:${(0, import_node_crypto8.createHash)("sha256").update(idempotencyKey).digest("hex")}`;
+    return `runtime-external:${(0, import_node_crypto9.createHash)("sha256").update(idempotencyKey).digest("hex")}`;
   }
   claimExternalSend(idempotencyKey, toolName, inputHash, timeoutMs, timestamp) {
     let claimJobId = newId("external-claim"), claimKey = this.externalClaimKey(idempotencyKey), lockedUntil = new Date(this.now() + Math.max(1e3, timeoutMs)).toISOString();
@@ -152822,7 +152992,7 @@ var defaultTools = [
     if (jobFenceRequired && !leaseOwner) throw new RuntimeLeaseLostError();
     let normalizedIdempotencyKey = idempotencyKey?.trim() || null, decision = this.tools.authorize(toolName, approved);
     toolName === "external.send" && decision.allowed && !normalizedIdempotencyKey && (decision = { ...decision, allowed: !1, reason: "idempotency_required" });
-    let callId = newId("tool"), timestamp = this.nowIso(), inputHash = (0, import_node_crypto8.createHash)("sha256").update(JSON.stringify(input ?? null)).digest("hex"), externalClaim = null, insertAudit = (claim) => {
+    let callId = newId("tool"), timestamp = this.nowIso(), inputHash = (0, import_node_crypto9.createHash)("sha256").update(JSON.stringify(input ?? null)).digest("hex"), externalClaim = null, insertAudit = (claim) => {
       let duplicate2 = claim?.duplicate ?? !1, auditJobId2 = jobId ?? claim?.claimJobId ?? null, blockedReason = duplicate2 ? "duplicate_idempotency_key" : decision.allowed ? null : decision.reason, insert = jobFenceRequired ? this.database.raw.prepare(
         `INSERT INTO runtime_tool_call
             (id, job_id, tool_name, policy, status, idempotency_key, input_hash, result_json, error, started_at, finished_at)
@@ -153096,21 +153266,21 @@ var defaultTools = [
 };
 
 // apps/server/src/observability.ts
-var import_node_crypto9 = require("node:crypto"), import_node_util2 = require("node:util");
+var import_node_crypto10 = require("node:crypto"), import_node_util2 = require("node:util");
 function createOperationContext(input) {
   return {
-    operation_id: input.operationId ?? (0, import_node_crypto9.randomUUID)(),
+    operation_id: input.operationId ?? (0, import_node_crypto10.randomUUID)(),
     request_id: input.requestId,
-    trace_id: input.traceId ?? (0, import_node_crypto9.randomUUID)(),
+    trace_id: input.traceId ?? (0, import_node_crypto10.randomUUID)(),
     parent_span_id: input.parentSpanId ?? null,
-    span_id: input.spanId ?? (0, import_node_crypto9.randomUUID)()
+    span_id: input.spanId ?? (0, import_node_crypto10.randomUUID)()
   };
 }
 function childOperationContext(parent) {
   return {
     ...parent,
     parent_span_id: parent.span_id,
-    span_id: (0, import_node_crypto9.randomUUID)()
+    span_id: (0, import_node_crypto10.randomUUID)()
   };
 }
 function isOperationContext(value) {
@@ -153274,7 +153444,7 @@ function releaseIdentity(input) {
 }
 function operationEnvelope(input) {
   let completedAtMillis = Date.now(), context = input.context ?? createOperationContext({
-    requestId: input.requestId ?? (0, import_node_crypto9.randomUUID)(),
+    requestId: input.requestId ?? (0, import_node_crypto10.randomUUID)(),
     traceId: input.traceId,
     parentSpanId: input.parentSpanId,
     operationId: input.operationId,
@@ -153517,7 +153687,7 @@ function decideOwnerIntent(input) {
 }
 
 // apps/server/src/source-privacy.ts
-var import_node_crypto10 = require("node:crypto");
+var import_node_crypto11 = require("node:crypto");
 var sourceScopeSchema = external_exports.string().regex(/^src_scope_[a-f0-9]{32}$/u), minimalSourceDtoSchema = external_exports.object({
   source_scope: sourceScopeSchema,
   source_type: external_exports.enum(["bot_dm", "owner_dm", "group", "calendar", "meeting", "manual"]),
@@ -153927,7 +154097,7 @@ var sourceScopeSchema = external_exports.string().regex(/^src_scope_[a-f0-9]{32}
   targetTask: taskDtoSchema.nullable()
 }).strict();
 function sourceScope(taskId, sourceEventId) {
-  return `src_scope_${(0, import_node_crypto10.createHash)("sha256").update(`source-verification:v1:${taskId}:${sourceEventId}`).digest("hex").slice(0, 32)}`;
+  return `src_scope_${(0, import_node_crypto11.createHash)("sha256").update(`source-verification:v1:${taskId}:${sourceEventId}`).digest("hex").slice(0, 32)}`;
 }
 function sourceExcerpt(value) {
   return value.replace(/[\u0000-\u001f\u007f]/gu, " ").replace(/\s+/gu, " ").trim().slice(0, 280);
@@ -153962,7 +154132,7 @@ var CANDIDATE_VERSION_CONFLICT_MESSAGE = "\u5019\u9009\u5DF2\u88AB\u5176\u4ED6\u
   }
 };
 function replayHashEquals(left, right) {
-  return !/^[a-f0-9]{64}$/u.test(left) || !/^[a-f0-9]{64}$/u.test(right) ? !1 : (0, import_node_crypto11.timingSafeEqual)(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+  return !/^[a-f0-9]{64}$/u.test(left) || !/^[a-f0-9]{64}$/u.test(right) ? !1 : (0, import_node_crypto12.timingSafeEqual)(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 function assertReplayCapabilityBinding(binding) {
   if (!binding || typeof binding != "object" || !/^[a-f0-9]{64}$/u.test(binding.tokenHash) || !/^[a-f0-9]{64}$/u.test(binding.csrfTokenHash) || binding.origin !== "app://local")
@@ -153982,7 +154152,7 @@ function isSourceFailureCode(value) {
   return SOURCE_FAILURE_CODES.has(value);
 }
 function sourceFailureId(sourceEventId, sourceRevision2) {
-  return `failure_${(0, import_node_crypto11.createHash)("sha256").update(`${sourceEventId}:${sourceRevision2}`).digest("hex").slice(0, 24)}`;
+  return `failure_${(0, import_node_crypto12.createHash)("sha256").update(`${sourceEventId}:${sourceRevision2}`).digest("hex").slice(0, 24)}`;
 }
 function stableSourceFailureCode(code, error51) {
   let normalized = typeof code == "string" ? code.trim() : "";
@@ -154034,7 +154204,7 @@ function diagnosticBoolean(value) {
   return value === !0 || value === 1;
 }
 function diagnosticInternalId(value) {
-  return typeof value == "string" && /^[A-Za-z0-9:_-]{1,200}$/u.test(value) ? value : `redacted_${(0, import_node_crypto11.createHash)("sha256").update(typeof value == "string" ? value : "").digest("hex").slice(0, 16)}`;
+  return typeof value == "string" && /^[A-Za-z0-9:_-]{1,200}$/u.test(value) ? value : `redacted_${(0, import_node_crypto12.createHash)("sha256").update(typeof value == "string" ? value : "").digest("hex").slice(0, 16)}`;
 }
 function optionalDiagnosticInternalId(value) {
   return value == null ? null : diagnosticInternalId(value);
@@ -154381,7 +154551,7 @@ var PRIVACY_PURGE_TABLES = [
   Object.freeze({ kind: "diagnostics", table: "integration_health", timestamp: "checked_at" })
 ]);
 function privacyHash(value) {
-  return (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify(value)).digest("hex");
+  return (0, import_node_crypto12.createHash)("sha256").update(JSON.stringify(value)).digest("hex");
 }
 var PRIVACY_DELETION_INTENT = "privacy.deletion.hard-delete.v1", PRIVACY_OWNER_ACTION_INTENT = "privacy.owner-action.v1";
 function privacyCapabilityBindingHash(binding) {
@@ -154480,7 +154650,40 @@ var taskStatusValues = [
   thread: taskUpdateThreadSnapshotSchema.nullable(),
   candidate: taskUpdateCandidateSnapshotSchema.nullable(),
   previousCandidateRevisionId: nullableStringSchema.optional().default(null)
-}), INVALID_TASK_UPDATE_SNAPSHOT_ERROR = "\u81EA\u52A8\u66F4\u65B0\u7684\u524D\u7F6E\u5FEB\u7167\u635F\u574F\uFF0C\u4E0D\u80FD\u5B89\u5168\u64A4\u9500\u3002", nowIso = () => (/* @__PURE__ */ new Date()).toISOString(), id = (prefix) => prefix + "_" + (0, import_node_crypto11.randomUUID)();
+}), INVALID_TASK_UPDATE_SNAPSHOT_ERROR = "\u81EA\u52A8\u66F4\u65B0\u7684\u524D\u7F6E\u5FEB\u7167\u635F\u574F\uFF0C\u4E0D\u80FD\u5B89\u5168\u64A4\u9500\u3002";
+function parseCindyOwnerDecisionOptions(value) {
+  try {
+    let parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((item) => !!(item && typeof item == "object" && typeof item.optionKey == "string" && ["skip", "create_candidate", "append_candidate"].includes(item.action))).slice(0, 10) : [];
+  } catch {
+    return [];
+  }
+}
+function projectCindyOwnerDecision(row, sourceCount) {
+  return {
+    decision_id: row.id,
+    batch_id: row.batch_id,
+    status: row.status,
+    version: row.version,
+    reason_summary: row.reason_summary,
+    options: parseCindyOwnerDecisionOptions(row.options_json).map((option) => ({
+      option_key: option.optionKey,
+      action: option.action,
+      title: option.title,
+      describe: option.describe,
+      next_step: option.nextStep,
+      available: option.action !== "append_candidate"
+    })),
+    source_count: sourceCount,
+    last_error: row.last_error,
+    resolution_action: row.resolution_action,
+    resolved_candidate_id: row.resolved_candidate_id,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    resolved_at: row.resolved_at
+  };
+}
+var nowIso = () => (/* @__PURE__ */ new Date()).toISOString(), id = (prefix) => prefix + "_" + (0, import_node_crypto12.randomUUID)();
 function stableJson2(value) {
   if (value === null || typeof value != "object") return JSON.stringify(value) ?? "null";
   if (Array.isArray(value)) return `[${value.map((item) => stableJson2(item)).join(",")}]`;
@@ -155100,7 +155303,7 @@ function combinedClassificationRevision(source, contexts) {
   return {
     sourceHash,
     contextHash: contextHash2,
-    revision: (0, import_node_crypto11.createHash)("sha256").update(`${sourceHash}:${contextHash2}`).digest("hex")
+    revision: (0, import_node_crypto12.createHash)("sha256").update(`${sourceHash}:${contextHash2}`).digest("hex")
   };
 }
 function candidateAnalysisJson(draftAnalysis, contexts, sourceHash, contextHash2) {
@@ -155139,7 +155342,7 @@ function candidateAnalysisJson(draftAnalysis, contexts, sourceHash, contextHash2
   return JSON.stringify(analysis);
 }
 function candidateSnapshotRevision(candidate, thread) {
-  return (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify({
+  return (0, import_node_crypto12.createHash)("sha256").update(JSON.stringify({
     candidateId: candidate.id,
     candidateUpdatedAt: candidate.updated_at,
     candidateState: candidate.state,
@@ -155152,7 +155355,7 @@ function candidateSnapshotRevision(candidate, thread) {
   })).digest("hex");
 }
 function candidateGroupVersionHash(candidates) {
-  return (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify([...candidates].map((candidate) => ({ id: candidate.id, version: candidate.version, updatedAt: candidate.updated_at })).sort((left, right) => left.id.localeCompare(right.id)))).digest("hex");
+  return (0, import_node_crypto12.createHash)("sha256").update(JSON.stringify([...candidates].map((candidate) => ({ id: candidate.id, version: candidate.version, updatedAt: candidate.updated_at })).sort((left, right) => left.id.localeCompare(right.id)))).digest("hex");
 }
 function candidatePairVersionHash(current, target) {
   return candidateGroupVersionHash([current, target]);
@@ -155217,15 +155420,15 @@ function explicitMessageKeys(source) {
   ].filter((value) => !!value))];
 }
 function combinedBatchClassificationRevision(sources, contextsBySource) {
-  let ordered = [...sources].sort(stableSourceOrder), sourceEntries = ordered.map((source) => ({ id: source.id, revision: sourceRevision(source) })), contextEntries = ordered.map((source) => ({ id: source.id, revision: sourceContextRevision(contextsBySource.get(source.id) ?? []) })), sourceHash = (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify(sourceEntries)).digest("hex"), contextHash2 = (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify(contextEntries)).digest("hex");
+  let ordered = [...sources].sort(stableSourceOrder), sourceEntries = ordered.map((source) => ({ id: source.id, revision: sourceRevision(source) })), contextEntries = ordered.map((source) => ({ id: source.id, revision: sourceContextRevision(contextsBySource.get(source.id) ?? []) })), sourceHash = (0, import_node_crypto12.createHash)("sha256").update(JSON.stringify(sourceEntries)).digest("hex"), contextHash2 = (0, import_node_crypto12.createHash)("sha256").update(JSON.stringify(contextEntries)).digest("hex");
   return {
     sourceHash,
     contextHash: contextHash2,
-    revision: (0, import_node_crypto11.createHash)("sha256").update(`${sourceHash}:${contextHash2}`).digest("hex")
+    revision: (0, import_node_crypto12.createHash)("sha256").update(`${sourceHash}:${contextHash2}`).digest("hex")
   };
 }
 function guidanceRevision(guidance) {
-  return (0, import_node_crypto11.createHash)("sha256").update(guidance?.slice(0, 2e3) ?? "").digest("hex").slice(0, 16);
+  return (0, import_node_crypto12.createHash)("sha256").update(guidance?.slice(0, 2e3) ?? "").digest("hex").slice(0, 16);
 }
 function aggregateClassificationSource(sources, primary, forcedThreadId) {
   let ordered = [...sources].sort(stableSourceOrder), latest = ordered[ordered.length - 1] ?? primary, metadata = parseMetadata(primary.metadata_json), activeSources = ordered.filter((source) => {
@@ -155698,10 +155901,10 @@ var PmService = class {
     };
     return {
       status: "ok",
-      operation_id: (0, import_node_crypto11.randomUUID)(),
-      request_id: requestId ?? (0, import_node_crypto11.randomUUID)(),
-      trace_id: (0, import_node_crypto11.randomUUID)(),
-      span_id: (0, import_node_crypto11.randomUUID)(),
+      operation_id: (0, import_node_crypto12.randomUUID)(),
+      request_id: requestId ?? (0, import_node_crypto12.randomUUID)(),
+      trace_id: (0, import_node_crypto12.randomUUID)(),
+      span_id: (0, import_node_crypto12.randomUUID)(),
       liveness: { status: "alive" },
       readiness: { status: combinedReadiness.status, reasons: combinedReadiness.reasons.map((reason) => ({ ...reason })) },
       dependencies: dependencyState.dependencies,
@@ -155801,13 +156004,13 @@ var PmService = class {
   }
   lifecycleCapabilityBinding(binding) {
     return binding ? (privacyCapabilityBindingHash(binding), binding) : {
-      tokenHash: (0, import_node_crypto11.createHash)("sha256").update("synthetic-internal-owner-action-token").digest("hex"),
-      csrfTokenHash: (0, import_node_crypto11.createHash)("sha256").update("synthetic-internal-owner-action-csrf").digest("hex"),
+      tokenHash: (0, import_node_crypto12.createHash)("sha256").update("synthetic-internal-owner-action-token").digest("hex"),
+      csrfTokenHash: (0, import_node_crypto12.createHash)("sha256").update("synthetic-internal-owner-action-csrf").digest("hex"),
       origin: "app://local"
     };
   }
   claimPrivacyLifecycle(operationType, expectedVersion, capabilityBinding2, snapshot, mutate) {
-    let ownerOpenId = this.assertPrivacyOwnerAuthorization(), binding = this.lifecycleCapabilityBinding(capabilityBinding2), operationId = id("privacy-lifecycle"), operationToken = (0, import_node_crypto11.randomUUID)().replaceAll("-", ""), now = nowIso(), expiresAt = new Date(Date.parse(now) + PRIVACY_LIFECYCLE_LEASE_MS).toISOString(), durableSnapshot = "adapterState" in snapshot ? { control: snapshot.control, sourceStates: snapshot.sourceStates, owner: snapshot.owner, cursors: snapshot.cursors, monitorTargets: snapshot.monitorTargets } : snapshot;
+    let ownerOpenId = this.assertPrivacyOwnerAuthorization(), binding = this.lifecycleCapabilityBinding(capabilityBinding2), operationId = id("privacy-lifecycle"), operationToken = (0, import_node_crypto12.randomUUID)().replaceAll("-", ""), now = nowIso(), expiresAt = new Date(Date.parse(now) + PRIVACY_LIFECYCLE_LEASE_MS).toISOString(), durableSnapshot = "adapterState" in snapshot ? { control: snapshot.control, sourceStates: snapshot.sourceStates, owner: snapshot.owner, cursors: snapshot.cursors, monitorTargets: snapshot.monitorTargets } : snapshot;
     return this.database.transaction(() => {
       let control = this.privacyControl();
       if (expectedVersion !== void 0 && expectedVersion !== control.version)
@@ -156646,7 +156849,7 @@ var PmService = class {
       "SELECT id, status, requested_at, confirmed_at, completed_at, proof_hash, deleted_record_count FROM privacy_deletion WHERE idempotency_key = ?"
     ).get(input.idempotencyKey);
     if (existing) return { deletionId: existing.id, status: existing.status, confirmationToken: null, requestedAt: existing.requested_at, confirmedAt: existing.confirmed_at, completedAt: existing.completed_at, proofHash: existing.proof_hash, deletedRecordCount: existing.deleted_record_count };
-    let control = this.privacyControl(), deletionId = id("privacy-deletion"), confirmationToken = (0, import_node_crypto11.randomUUID)() + (0, import_node_crypto11.randomUUID)(), now = nowIso();
+    let control = this.privacyControl(), deletionId = id("privacy-deletion"), confirmationToken = (0, import_node_crypto12.randomUUID)() + (0, import_node_crypto12.randomUUID)(), now = nowIso();
     return this.database.transaction(() => {
       this.assertNoActivePrivacyLifecycleClaim(Date.parse(now)), this.database.raw.prepare(
         `INSERT INTO privacy_deletion
@@ -156754,7 +156957,7 @@ var PmService = class {
           };
           visit(taskDir, relativeTaskDir);
         }
-        let quarantine = (0, import_node_path2.join)(root, `.privacy-delete-${(0, import_node_crypto11.randomUUID)().replaceAll("-", "")}`);
+        let quarantine = (0, import_node_path2.join)(root, `.privacy-delete-${(0, import_node_crypto12.randomUUID)().replaceAll("-", "")}`);
         (0, import_node_fs2.mkdirSync)(quarantine);
         let temporary = (0, import_node_path2.join)(quarantine, "tasks");
         (0, import_node_fs2.renameSync)(tasks, temporary), staged.push({ root, original: tasks, temporary });
@@ -156834,7 +157037,7 @@ var PmService = class {
       let reclaimedParent = this.assertNoActivePrivacyLifecycleClaim(nowMs).find((candidate) => candidate.claimed_version === control.version), sourceStates = this.database.raw.prepare(
         `SELECT source_kind, enabled, status, last_success_at, last_error, updated_at
          FROM information_source_state ORDER BY source_kind`
-      ).all(), initialSnapshot = { control, sourceStates }, operationId = id("privacy-lifecycle"), operationToken = (0, import_node_crypto11.randomUUID)().replaceAll("-", ""), claimedVersion = control.version + 1, claimedAt = nowIso(), expiresAt = new Date(Date.now() + 900 * 1e3).toISOString();
+      ).all(), initialSnapshot = { control, sourceStates }, operationId = id("privacy-lifecycle"), operationToken = (0, import_node_crypto12.randomUUID)().replaceAll("-", ""), claimedVersion = control.version + 1, claimedAt = nowIso(), expiresAt = new Date(Date.now() + 900 * 1e3).toISOString();
       if (this.database.raw.prepare(
         `INSERT INTO privacy_lifecycle_claim
          (operation_id, operation_token, operation_type, owner_open_id,
@@ -157510,7 +157713,7 @@ var PmService = class {
     }
   }
   async legacyIngestSource(event, guidance, options = {}, operationContext) {
-    let effectiveOperationContext = operationContext ?? createOperationContext({ requestId: (0, import_node_crypto11.randomUUID)() }), persisted = this.persistSourceEvent(event), backfill = await this.backfillConversationContext(persisted.row, effectiveOperationContext), classificationRow = backfill.rows.find((row) => row.id === persisted.row.id) ?? persisted.row, classified = await this.legacyClassifyStoredBatch(
+    let effectiveOperationContext = operationContext ?? createOperationContext({ requestId: (0, import_node_crypto12.randomUUID)() }), persisted = this.persistSourceEvent(event), backfill = await this.backfillConversationContext(persisted.row, effectiveOperationContext), classificationRow = backfill.rows.find((row) => row.id === persisted.row.id) ?? persisted.row, classified = await this.legacyClassifyStoredBatch(
       classificationRow,
       guidance,
       persisted.deduplicated,
@@ -157584,7 +157787,7 @@ var PmService = class {
       demandUnitIds: [],
       threadIds: []
     };
-    let effectiveOperationContext = operationContext ?? createOperationContext({ requestId: (0, import_node_crypto11.randomUUID)() }), persisted = events.map((event) => this.persistSourceEvent(event)), changedIds = new Set(persisted.filter((item) => item.changed || options.retryFailed === !0 || !metadataText(parseMetadata(item.row.metadata_json), "classificationRevision")).map((item) => item.row.id)), backfilledRows = /* @__PURE__ */ new Map();
+    let effectiveOperationContext = operationContext ?? createOperationContext({ requestId: (0, import_node_crypto12.randomUUID)() }), persisted = events.map((event) => this.persistSourceEvent(event)), changedIds = new Set(persisted.filter((item) => item.changed || options.retryFailed === !0 || !metadataText(parseMetadata(item.row.metadata_json), "classificationRevision")).map((item) => item.row.id)), backfilledRows = /* @__PURE__ */ new Map();
     if (this.feishuOwnerSync) {
       let backfillCandidates = persisted.map((item) => item.row).filter((row) => changedIds.has(row.id) && isMessageSource(row) && looksLikeConversationContinuation(row.content) && !parseMetadata(row.metadata_json).contextOnly).sort(stableSourceOrder), seenConversations = /* @__PURE__ */ new Set();
       for (let row of [...backfillCandidates].reverse())
@@ -157750,7 +157953,7 @@ var PmService = class {
   registerAuditReplayCapability(capability) {
     if (typeof capability.token != "string" || capability.token.length < 32 || typeof capability.csrfToken != "string" || capability.csrfToken.length < 32 || !Number.isFinite(capability.expiresAt) || capability.origin !== "app://local")
       throw new ReplayAuthorizationError("AI \u51B3\u7B56\u56DE\u653E\u80FD\u529B\u51ED\u8BC1\u65E0\u6548\uFF1B\u5DF2\u62D2\u7EDD\u8BBF\u95EE\u3002");
-    let tokenHash = (0, import_node_crypto11.createHash)("sha256").update(capability.token).digest("hex"), csrfTokenHash = (0, import_node_crypto11.createHash)("sha256").update(capability.csrfToken).digest("hex"), now = nowIso(), expiresAt = new Date(capability.expiresAt).toISOString();
+    let tokenHash = (0, import_node_crypto12.createHash)("sha256").update(capability.token).digest("hex"), csrfTokenHash = (0, import_node_crypto12.createHash)("sha256").update(capability.csrfToken).digest("hex"), now = nowIso(), expiresAt = new Date(capability.expiresAt).toISOString();
     return this.database.transaction(() => {
       this.database.raw.prepare(
         `INSERT INTO audit_replay_capability
@@ -158133,7 +158336,7 @@ var PmService = class {
         participantOverlap: item.participantOverlap,
         explicitReference: item.explicitReference
       }
-    })), candidateSetHash = (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify({
+    })), candidateSetHash = (0, import_node_crypto12.createHash)("sha256").update(JSON.stringify({
       candidateSetComplete,
       candidates: candidates.map((candidate) => ({
         candidateKey: candidate.candidateKey,
@@ -158209,7 +158412,7 @@ var PmService = class {
         participantOverlap: item.participantOverlap,
         explicitContinuation: item.explicitContinuation
       }
-    })), candidateSetHash = (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify({
+    })), candidateSetHash = (0, import_node_crypto12.createHash)("sha256").update(JSON.stringify({
       candidateSetComplete,
       candidates: candidates.map((candidate) => ({
         candidateKey: candidate.candidateKey,
@@ -158222,10 +158425,10 @@ var PmService = class {
     return { candidates, candidateSetHash, candidateSetComplete };
   }
   classificationRevisionContext(rows) {
-    let strong = this.strongThreadContext(rows), association = strong ? { candidates: [], candidateSetComplete: !0, candidateSetHash: (0, import_node_crypto11.createHash)("sha256").update(`strong:${strong.thread.id}:${strong.task.id}`).digest("hex") } : this.buildThreadClassificationContext(rows), candidateMerge = strong ? { candidates: [], candidateSetComplete: !0, candidateSetHash: (0, import_node_crypto11.createHash)("sha256").update(`strong-pending:${strong.thread.id}:${strong.task.id}`).digest("hex") } : this.buildCandidateMergeContext(rows);
+    let strong = this.strongThreadContext(rows), association = strong ? { candidates: [], candidateSetComplete: !0, candidateSetHash: (0, import_node_crypto12.createHash)("sha256").update(`strong:${strong.thread.id}:${strong.task.id}`).digest("hex") } : this.buildThreadClassificationContext(rows), candidateMerge = strong ? { candidates: [], candidateSetComplete: !0, candidateSetHash: (0, import_node_crypto12.createHash)("sha256").update(`strong-pending:${strong.thread.id}:${strong.task.id}`).digest("hex") } : this.buildCandidateMergeContext(rows);
     return {
       strong,
-      revision: (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify({
+      revision: (0, import_node_crypto12.createHash)("sha256").update(JSON.stringify({
         strong: strong ? {
           taskId: strong.task.id,
           taskVersion: strong.task.version,
@@ -158715,7 +158918,7 @@ var PmService = class {
          FROM task_source_link
         WHERE task_id = ? AND source_event_id = ? AND demand_unit_id IS NULL`
     ).get(input.gapTaskId, input.sourceEventId)) return null;
-    let idempotencyKey = `integrity-gap:${gap.id}`, deterministicCorrectionId = `corr-integrity-${(0, import_node_crypto11.createHash)("sha256").update(idempotencyKey).digest("hex").slice(0, 32)}`, correctionId = input.correctionEventId ?? deterministicCorrectionId;
+    let idempotencyKey = `integrity-gap:${gap.id}`, deterministicCorrectionId = `corr-integrity-${(0, import_node_crypto12.createHash)("sha256").update(idempotencyKey).digest("hex").slice(0, 32)}`, correctionId = input.correctionEventId ?? deterministicCorrectionId;
     if (!input.correctionEventId) {
       let existing = this.database.raw.prepare(
         "SELECT id FROM correction_event WHERE idempotency_key = ?"
@@ -159194,13 +159397,13 @@ var PmService = class {
       let placeholders = input.orderedRows.map(() => "?").join(","), currentRows = this.database.raw.prepare(`SELECT * FROM source_event WHERE id IN (${placeholders})`).all(...input.orderedRows.map((row) => row.id)).sort(stableSourceOrder);
       if (currentRows.length !== input.orderedRows.length) throw new Error("\u5F85\u5224\u65AD\u7684\u6765\u6E90\u8BB0\u5F55\u5DF2\u7ECF\u4E0D\u5B58\u5728\u3002");
       let currentContextsBySource = new Map(currentRows.map((row) => [row.id, this.feishuDocumentContext.list(row.id)])), currentBaseRevision = currentRows.length === 1 ? combinedClassificationRevision(currentRows[0], currentContextsBySource.get(currentRows[0].id) ?? []) : combinedBatchClassificationRevision(currentRows, currentContextsBySource), currentConfirmedContextRevision = this.classificationRevisionContext(currentRows).revision;
-      if ((currentConfirmedContextRevision ? (0, import_node_crypto11.createHash)("sha256").update(`${currentBaseRevision.revision}:${currentConfirmedContextRevision}`).digest("hex") : currentBaseRevision.revision) !== input.revision) {
+      if ((currentConfirmedContextRevision ? (0, import_node_crypto12.createHash)("sha256").update(`${currentBaseRevision.revision}:${currentConfirmedContextRevision}`).digest("hex") : currentBaseRevision.revision) !== input.revision) {
         staleRows = currentRows;
         return;
       }
       input.candidateFence && this.assertCandidateRuntimeFence(input.orderedRows.map((row) => row.id), input.candidateFence);
       for (let unit of units) {
-        let unitSourceHash = (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify(unit.sourceRows.map((row) => ({ id: row.id, revision: sourceRevision(row) })))).digest("hex"), unitContextRows = unit.sourceRows.flatMap((row) => input.contextsBySource.get(row.id) ?? []), unitContextHash = sourceContextRevision(unitContextRows), unitAnalysis = unit.draft ? candidateAnalysisJson(unit.draft.analysis, unitContextRows, unitSourceHash, unitContextHash) : JSON.stringify({ reason: unit.reason, sourceRevision: unitSourceHash, contextRevision: unitContextHash }), unitState = input.classification.usedFallback ? "provisional" : "ready", unitRow = this.upsertDemandUnit({
+        let unitSourceHash = (0, import_node_crypto12.createHash)("sha256").update(JSON.stringify(unit.sourceRows.map((row) => ({ id: row.id, revision: sourceRevision(row) })))).digest("hex"), unitContextRows = unit.sourceRows.flatMap((row) => input.contextsBySource.get(row.id) ?? []), unitContextHash = sourceContextRevision(unitContextRows), unitAnalysis = unit.draft ? candidateAnalysisJson(unit.draft.analysis, unitContextRows, unitSourceHash, unitContextHash) : JSON.stringify({ reason: unit.reason, sourceRevision: unitSourceHash, contextRevision: unitContextHash }), unitState = input.classification.usedFallback ? "provisional" : "ready", unitRow = this.upsertDemandUnit({
           anchor: unit.anchor,
           unitKey: unit.unitKey,
           unitKind: unit.isDataRequest && unit.draft ? "demand" : "context_only",
@@ -160274,7 +160477,7 @@ var PmService = class {
       ).all(...input.orderedRows.map((row) => row.id)).sort(stableSourceOrder);
       if (liveRows.length !== input.orderedRows.length) throw new Error("\u5F85\u66F4\u65B0\u7684\u6765\u6E90\u8BB0\u5F55\u5DF2\u7ECF\u4E0D\u5B58\u5728\u3002");
       let liveContextsBySource = new Map(liveRows.map((row) => [row.id, this.feishuDocumentContext.list(row.id)])), liveBaseRevision = liveRows.length === 1 ? combinedClassificationRevision(liveRows[0], liveContextsBySource.get(liveRows[0].id) ?? []) : combinedBatchClassificationRevision(liveRows, liveContextsBySource), liveConfirmedContextRevision = this.classificationRevisionContext(liveRows).revision;
-      if ((liveConfirmedContextRevision ? (0, import_node_crypto11.createHash)("sha256").update(`${liveBaseRevision.revision}:${liveConfirmedContextRevision}`).digest("hex") : liveBaseRevision.revision) !== input.revision) throw new ClassificationRevisionChangedError(liveRows);
+      if ((liveConfirmedContextRevision ? (0, import_node_crypto12.createHash)("sha256").update(`${liveBaseRevision.revision}:${liveConfirmedContextRevision}`).digest("hex") : liveBaseRevision.revision) !== input.revision) throw new ClassificationRevisionChangedError(liveRows);
       if (input.candidateFence && this.assertCandidateRuntimeFence(input.orderedRows.map((row) => row.id), input.candidateFence), this.database.raw.prepare(
         `INSERT OR IGNORE INTO ai_decision_log
           (id, source_event_id, source_revision, candidate_id, provider, model, prompt_version, is_data_request, confidence, reason, output_json, used_fallback, http_status, provider_request_id, attempts, structured_mode, input_hash, input_char_count, fallback_mode, latency_ms, created_at)
@@ -160509,7 +160712,7 @@ var PmService = class {
     for (let partition of partitions.values()) {
       let parent = partition.map((_, index) => index), storedBatchMarkers = partition.map((item) => {
         let metadata = parseMetadata(item.row.metadata_json), batchIds = Array.isArray(metadata.classificationBatchSourceIds) ? metadata.classificationBatchSourceIds.filter((value) => typeof value == "string" && !!value).sort() : [];
-        return batchIds.length > 1 ? `batch:${(0, import_node_crypto11.createHash)("sha256").update(JSON.stringify(batchIds)).digest("hex")}` : null;
+        return batchIds.length > 1 ? `batch:${(0, import_node_crypto12.createHash)("sha256").update(JSON.stringify(batchIds)).digest("hex")}` : null;
       }), strongMarkers = partition.map((item) => {
         let markers = threadMarkers(item.row), index = partition.indexOf(item);
         return new Set([markers.rootId, markers.sessionId, markers.threadId, storedBatchMarkers[index]].filter((value) => !!value));
@@ -160593,7 +160796,7 @@ var PmService = class {
     ), this.database.raw.prepare("SELECT * FROM task_update_proposal WHERE idempotency_key = ?").get(input.idempotencyKey);
   }
   ensureRequirementThread(sourceRow, draft, classification, candidateRevisionId, batchRows = [sourceRow], classificationContext = { candidates: [], candidateSetHash: "", candidateSetComplete: !0 }) {
-    let markers = threadMarkers(sourceRow), orderedBatch = [...batchRows].sort(stableSourceOrder), participants = [...new Set(orderedBatch.flatMap((source) => threadParticipants(source)))], batchRevisionEntries = orderedBatch.map((source) => ({ id: source.id, revision: sourceRevision(source) })), revisionHash = orderedBatch.length === 1 ? batchRevisionEntries[0].revision : (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify(batchRevisionEntries)).digest("hex"), revisionKeyFor = (threadId) => `thread-revision:${threadId}:${sourceRow.id}:${revisionHash}`, candidateRevisionDemandUnitId = candidateRevisionId ? this.database.raw.prepare("SELECT demand_unit_id FROM candidate_revision WHERE id = ?").get(candidateRevisionId)?.demand_unit_id ?? null : null, baseThreadVersion = 0, thread = markers.threadId ? this.database.raw.prepare("SELECT * FROM requirement_thread WHERE id = ?").get(markers.threadId) : void 0, relationType = "primary", confidence = 1, evidence = ["\u9996\u6B21\u6765\u6E90\u5EFA\u7ACB\u9700\u6C42\u7EBF\u7A0B\u3002"], associationCandidates = [], threadBeforeUpdate = null, proposalId = null, internalThreadId = metadataText(parseMetadata(sourceRow.metadata_json), "internalRequirementThreadId");
+    let markers = threadMarkers(sourceRow), orderedBatch = [...batchRows].sort(stableSourceOrder), participants = [...new Set(orderedBatch.flatMap((source) => threadParticipants(source)))], batchRevisionEntries = orderedBatch.map((source) => ({ id: source.id, revision: sourceRevision(source) })), revisionHash = orderedBatch.length === 1 ? batchRevisionEntries[0].revision : (0, import_node_crypto12.createHash)("sha256").update(JSON.stringify(batchRevisionEntries)).digest("hex"), revisionKeyFor = (threadId) => `thread-revision:${threadId}:${sourceRow.id}:${revisionHash}`, candidateRevisionDemandUnitId = candidateRevisionId ? this.database.raw.prepare("SELECT demand_unit_id FROM candidate_revision WHERE id = ?").get(candidateRevisionId)?.demand_unit_id ?? null : null, baseThreadVersion = 0, thread = markers.threadId ? this.database.raw.prepare("SELECT * FROM requirement_thread WHERE id = ?").get(markers.threadId) : void 0, relationType = "primary", confidence = 1, evidence = ["\u9996\u6B21\u6765\u6E90\u5EFA\u7ACB\u9700\u6C42\u7EBF\u7A0B\u3002"], associationCandidates = [], threadBeforeUpdate = null, proposalId = null, internalThreadId = metadataText(parseMetadata(sourceRow.metadata_json), "internalRequirementThreadId");
     if (!thread && internalThreadId && (thread = this.database.raw.prepare("SELECT * FROM requirement_thread WHERE id = ?").get(internalThreadId), thread && (relationType = "batch_context", confidence = 1, evidence = ["\u540C\u4E00\u6279\u8FDE\u7EED\u6D88\u606F\u4E2D\u5DF2\u6709\u6765\u6E90\u5DF2\u660E\u786E\u5173\u8054\u8BE5\u9700\u6C42\u7EBF\u7A0B\u3002"])), !thread && markers.rootId && (thread = this.database.raw.prepare(
       `SELECT requirement_thread.* FROM requirement_thread
           JOIN requirement_thread_source ON requirement_thread_source.thread_id = requirement_thread.id
@@ -160832,7 +161035,7 @@ var PmService = class {
     ).all(...ids);
     if (rows.length !== ids.length) return null;
     let ordered = rows.sort(stableSourceOrder), contextsBySource = new Map(ordered.map((row) => [row.id, this.feishuDocumentContext.list(row.id)])), base = ordered.length === 1 ? combinedClassificationRevision(ordered[0], contextsBySource.get(ordered[0].id) ?? []) : combinedBatchClassificationRevision(ordered, contextsBySource), confirmed = this.classificationRevisionContext(ordered).revision;
-    return confirmed ? (0, import_node_crypto11.createHash)("sha256").update(`${base.revision}:${confirmed}`).digest("hex") : base.revision;
+    return confirmed ? (0, import_node_crypto12.createHash)("sha256").update(`${base.revision}:${confirmed}`).digest("hex") : base.revision;
   }
   sourceFailureAudit(record2, action, sourceEventId) {
     let timestamp = nowIso();
@@ -161101,7 +161304,7 @@ var PmService = class {
     return completed && sourceRevision2 && this.resolveSourceFailure(sourceEventIds, sourceRevision2, jobId), completed;
   }
   async legacyClassifyCaptured(sourceRow, guidance, deduplicated, staleAttempts = 0, retryFailed = !1, operationContext) {
-    let contexts = this.feishuDocumentContext.list(sourceRow.id), baseClassificationRevision = combinedClassificationRevision(sourceRow, contexts).revision, confirmedContextRevision = this.classificationRevisionContext(this.classificationRowsForSource(sourceRow)).revision, classificationRevision = confirmedContextRevision ? (0, import_node_crypto11.createHash)("sha256").update(`${baseClassificationRevision}:${confirmedContextRevision}`).digest("hex") : baseClassificationRevision, queuedOwnerTargets = this.isTrustedOwnerSource(sourceRow) ? this.captureOwnerDecisionTargets(sourceRow) : null, initialContext = this.classificationRevisionContext(this.classificationRowsForSource(sourceRow)), candidateFence = this.candidateRuntimeFenceForSources(
+    let contexts = this.feishuDocumentContext.list(sourceRow.id), baseClassificationRevision = combinedClassificationRevision(sourceRow, contexts).revision, confirmedContextRevision = this.classificationRevisionContext(this.classificationRowsForSource(sourceRow)).revision, classificationRevision = confirmedContextRevision ? (0, import_node_crypto12.createHash)("sha256").update(`${baseClassificationRevision}:${confirmedContextRevision}`).digest("hex") : baseClassificationRevision, queuedOwnerTargets = this.isTrustedOwnerSource(sourceRow) ? this.captureOwnerDecisionTargets(sourceRow) : null, initialContext = this.classificationRevisionContext(this.classificationRowsForSource(sourceRow)), candidateFence = this.candidateRuntimeFenceForSources(
       [sourceRow.id],
       initialContext.candidateMerge.candidates.map((candidate) => candidate.candidateId)
     ), runtimeJob = this.runtime.begin({
@@ -161152,7 +161355,7 @@ var PmService = class {
     if (ordered.length === 1) return this.legacyClassifyCaptured(primary, guidance, !0, 0, retryFailed, operationContext);
     let contextsBySource = /* @__PURE__ */ new Map();
     for (let row of ordered) contextsBySource.set(row.id, this.feishuDocumentContext.list(row.id));
-    let baseClassificationRevision = combinedBatchClassificationRevision(ordered, contextsBySource).revision, confirmedContextRevision = this.classificationRevisionContext(ordered).revision, classificationRevision = confirmedContextRevision ? (0, import_node_crypto11.createHash)("sha256").update(`${baseClassificationRevision}:${confirmedContextRevision}`).digest("hex") : baseClassificationRevision, sourceIds = ordered.map((row) => row.id), batchHash = (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify(sourceIds)).digest("hex"), queuedOwnerSource = ordered.every((row) => this.isTrustedOwnerSource(row)) ? ordered.at(-1) ?? null : null, queuedOwnerTargets = queuedOwnerSource ? this.captureOwnerDecisionTargets(queuedOwnerSource) : null, initialContext = this.classificationRevisionContext(ordered), candidateFence = this.candidateRuntimeFenceForSources(
+    let baseClassificationRevision = combinedBatchClassificationRevision(ordered, contextsBySource).revision, confirmedContextRevision = this.classificationRevisionContext(ordered).revision, classificationRevision = confirmedContextRevision ? (0, import_node_crypto12.createHash)("sha256").update(`${baseClassificationRevision}:${confirmedContextRevision}`).digest("hex") : baseClassificationRevision, sourceIds = ordered.map((row) => row.id), batchHash = (0, import_node_crypto12.createHash)("sha256").update(JSON.stringify(sourceIds)).digest("hex"), queuedOwnerSource = ordered.every((row) => this.isTrustedOwnerSource(row)) ? ordered.at(-1) ?? null : null, queuedOwnerTargets = queuedOwnerSource ? this.captureOwnerDecisionTargets(queuedOwnerSource) : null, initialContext = this.classificationRevisionContext(ordered), candidateFence = this.candidateRuntimeFenceForSources(
       sourceIds,
       initialContext.candidateMerge.candidates.map((candidate) => candidate.candidateId)
     ), runtimeJob = this.runtime.begin({
@@ -161264,7 +161467,7 @@ var PmService = class {
       occurredAt: row.occurred_at,
       contextOnly: !0
     }));
-    let startedAt = Date.now(), baseRevision = orderedRows.length === 1 ? combinedClassificationRevision(sourceRow, contexts) : combinedBatchClassificationRevision(orderedRows, contextsBySource), sourceHash = baseRevision.sourceHash, contextHash2 = baseRevision.contextHash, revision = confirmedContext.revision ? (0, import_node_crypto11.createHash)("sha256").update(`${baseRevision.revision}:${confirmedContext.revision}`).digest("hex") : baseRevision.revision;
+    let startedAt = Date.now(), baseRevision = orderedRows.length === 1 ? combinedClassificationRevision(sourceRow, contexts) : combinedBatchClassificationRevision(orderedRows, contextsBySource), sourceHash = baseRevision.sourceHash, contextHash2 = baseRevision.contextHash, revision = confirmedContext.revision ? (0, import_node_crypto12.createHash)("sha256").update(`${baseRevision.revision}:${confirmedContext.revision}`).digest("hex") : baseRevision.revision;
     if (orderedRows.every((row) => parseMetadata(row.metadata_json).classificationRevision === revision)) {
       this.dispatchPendingProposalsForSources(orderedRows.map((row) => row.id), runtimeJobId ?? null, leaseOwner ?? null);
       let ownerSource = [...orderedRows].reverse().find((row) => this.isTrustedOwnerSource(row)), storedIntents = ownerSource ? this.storedOwnerIntents(ownerSource.id) : [];
@@ -161450,7 +161653,7 @@ var PmService = class {
       let placeholders = orderedRows.map(() => "?").join(","), currentRows = this.database.raw.prepare(`SELECT * FROM source_event WHERE id IN (${placeholders})`).all(...orderedRows.map((row) => row.id)).sort(stableSourceOrder);
       if (currentRows.length !== orderedRows.length) throw new Error("\u5F85\u5224\u65AD\u7684\u6765\u6E90\u8BB0\u5F55\u5DF2\u7ECF\u4E0D\u5B58\u5728\u3002");
       let currentContextsBySource = new Map(currentRows.map((row) => [row.id, this.feishuDocumentContext.list(row.id)])), currentBaseRevision = currentRows.length === 1 ? combinedClassificationRevision(currentRows[0], currentContextsBySource.get(currentRows[0].id) ?? []) : combinedBatchClassificationRevision(currentRows, currentContextsBySource), currentClassificationContext = this.classificationRevisionContext(currentRows), currentConfirmedContextRevision = currentClassificationContext.revision;
-      if ((currentConfirmedContextRevision ? (0, import_node_crypto11.createHash)("sha256").update(`${currentBaseRevision.revision}:${currentConfirmedContextRevision}`).digest("hex") : currentBaseRevision.revision) !== revision) {
+      if ((currentConfirmedContextRevision ? (0, import_node_crypto12.createHash)("sha256").update(`${currentBaseRevision.revision}:${currentConfirmedContextRevision}`).digest("hex") : currentBaseRevision.revision) !== revision) {
         staleSources = currentRows;
         return;
       }
@@ -163532,158 +163735,289 @@ var PmService = class {
     return saveCindySources(this.database, auth, input);
   }
   processCindyDecisions(auth, input) {
-    if (!/^[A-Za-z0-9_-]{1,128}$/u.test(input.decision_request_id))
-      throw new CindySourceContractError("INVALID_INPUT", "decision_request_id \u683C\u5F0F\u65E0\u6548\u3002");
+    if (!cindyBatchKeyPattern.test(input.decision_request_id) || !cindyBatchKeyPattern.test(input.batch_id))
+      throw new CindySourceContractError("INVALID_INPUT", "decision_request_id \u6216 batch_id \u683C\u5F0F\u65E0\u6548\u3002");
     if (!input.window_id.trim() || !Number.isFinite(Date.parse(input.window_start)) || !Number.isFinite(Date.parse(input.window_end)))
       throw new CindySourceContractError("INVALID_INPUT", "\u7A97\u53E3\u8EAB\u4EFD\u6216\u65F6\u95F4\u65E0\u6548\u3002");
     if (Date.parse(input.window_start) > Date.parse(input.window_end))
       throw new CindySourceContractError("INVALID_INPUT", "window_start \u4E0D\u80FD\u665A\u4E8E window_end\u3002");
-    let decisionRefs = input.decisions.map((decision) => decision.decision_ref);
-    if (new Set(decisionRefs).size !== decisionRefs.length || decisionRefs.some((value) => !/^[A-Za-z0-9_-]{1,64}$/u.test(value)))
-      throw new CindySourceContractError("INVALID_INPUT", "decision_ref \u683C\u5F0F\u65E0\u6548\u6216\u91CD\u590D\u3002");
-    let allReceipts = input.decisions.flatMap((decision) => decision.source_receipts);
-    if (new Set(allReceipts).size !== allReceipts.length)
-      throw new CindySourceContractError("INVALID_INPUT", "\u540C\u4E00\u6765\u6E90 receipt \u4E0D\u80FD\u5728\u4E00\u4E2A\u51B3\u7B56\u8BF7\u6C42\u4E2D\u91CD\u590D\u6D88\u8D39\u3002");
-    for (let decision of input.decisions) {
-      if (!decision.source_receipts.length || new Set(decision.source_receipts).size !== decision.source_receipts.length)
-        throw new CindySourceContractError("INVALID_INPUT", "\u6BCF\u6761\u51B3\u7B56\u5FC5\u987B\u5F15\u7528\u4E0D\u91CD\u590D\u7684 source_receipts\u3002");
-      if (decision.action === "update_task") {
-        if (!decision.task_key) throw new CindySourceContractError("INVALID_INPUT", "update_task \u5FC5\u987B\u63D0\u4F9B task_key\u3002");
-        if (!Number.isInteger(decision.expected_version) || decision.expected_version < 1)
-          throw new CindySourceContractError("INVALID_INPUT", "update_task \u5FC5\u987B\u63D0\u4F9B\u6B63\u6574\u6570 expected_version\u3002");
-        if (decision.title === void 0 && decision.describe === void 0 && decision.next_step === void 0)
-          throw new CindySourceContractError("INVALID_INPUT", "update_task \u81F3\u5C11\u9700\u8981 title\u3001describe \u6216 next_step\u3002");
+    if (!input.snapshot_receipts.length || new Set(input.snapshot_receipts).size !== input.snapshot_receipts.length)
+      throw new CindySourceContractError("INVALID_INPUT", "snapshot_receipts \u5FC5\u987B\u975E\u7A7A\u4E14\u4E0D\u53EF\u91CD\u590D\u3002");
+    let snapshotSet = new Set(input.snapshot_receipts), groupByKey = new Map(input.groups.map((group) => [group.group_key, group]));
+    if (groupByKey.size !== input.groups.length || input.groups.some((group) => !cindyGroupKeyPattern.test(group.group_key)))
+      throw new CindySourceContractError("INVALID_INPUT", "group_key \u683C\u5F0F\u65E0\u6548\u6216\u91CD\u590D\u3002");
+    for (let group of input.groups) {
+      if (!snapshotSet.has(group.anchor_receipt) || new Set(group.field_evidence_receipts).size !== group.field_evidence_receipts.length || group.field_evidence_receipts.includes(group.anchor_receipt) || group.field_evidence_receipts.some((receipt) => !snapshotSet.has(receipt)))
+        throw new CindySourceContractError("INVALID_INPUT", "group anchor/evidence \u5FC5\u987B\u6765\u81EA\u5F53\u524D snapshot\u3001\u89D2\u8272\u4E92\u65A5\u4E14\u4E0D\u53EF\u91CD\u590D\u3002");
+      if (group.action === "update_task") {
+        if (!group.task_key || !Number.isInteger(group.expected_version) || group.expected_version < 1)
+          throw new CindySourceContractError("INVALID_INPUT", "update_task group \u5FC5\u987B\u63D0\u4F9B task_key \u548C\u6B63\u6574\u6570 expected_version\u3002");
+        if (group.title === void 0 && group.describe === void 0 && group.next_step === void 0)
+          throw new CindySourceContractError("INVALID_INPUT", "update_task group \u81F3\u5C11\u9700\u8981 title\u3001describe \u6216 next_step\u3002");
+      } else {
+        if (!group.title?.trim()) throw new CindySourceContractError("INVALID_INPUT", "create_candidate group \u5FC5\u987B\u63D0\u4F9B\u7531 Agent \u751F\u6210\u7684 title\u3002");
+        if (group.task_key !== void 0 || group.expected_version !== void 0)
+          throw new CindySourceContractError("INVALID_INPUT", "create_candidate group \u4E0D\u80FD\u58F0\u660E task CAS \u5B57\u6BB5\u3002");
       }
     }
-    let requestHash = hashCindyDecisionRequest(input), updatedTaskIds = /* @__PURE__ */ new Set(), result = this.database.transaction(() => {
-      let replay = cindyDecisionReplay(this.database, auth, input.decision_request_id, requestHash);
-      if (replay) return { ...replay, duplicate: !0 };
-      let timestamp = nowIso(), resolved = input.decisions.map((decision) => ({
-        decision,
-        revisions: decision.source_receipts.map((receipt) => resolveCindyDecisionReceipt(this.database, auth, receipt))
-      })), sourceRows = /* @__PURE__ */ new Map();
-      for (let item of resolved)
-        for (let revision of item.revisions) {
-          if (sourceRows.has(revision.source_event_id)) continue;
-          let source = this.database.raw.prepare("SELECT * FROM source_event WHERE id = ? AND ingest_state = 'trusted_current'").get(revision.source_event_id);
-          if (!source) throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "receipt \u5BF9\u5E94\u6765\u6E90\u5DF2\u5931\u6548\u3002");
-          sourceRows.set(source.id, source);
-        }
+    let dispositionRefs = input.primary_dispositions.map((item) => item.disposition_ref), dispositionReceipts = input.primary_dispositions.map((item) => item.source_receipt);
+    if (new Set(dispositionRefs).size !== dispositionRefs.length || dispositionRefs.some((value) => !cindyGroupKeyPattern.test(value)))
+      throw new CindySourceContractError("INVALID_INPUT", "disposition_ref \u683C\u5F0F\u65E0\u6548\u6216\u91CD\u590D\u3002");
+    if (new Set(dispositionReceipts).size !== dispositionReceipts.length || dispositionReceipts.length !== snapshotSet.size || dispositionReceipts.some((receipt) => !snapshotSet.has(receipt)))
+      throw new CindySourceContractError("INVALID_INPUT", "\u6BCF\u6761 snapshot receipt \u5FC5\u987B\u4E14\u53EA\u80FD\u6709\u4E00\u4E2A primary disposition\u3002");
+    let primaryByReceipt = new Map(input.primary_dispositions.map((item) => [item.source_receipt, item]));
+    for (let disposition of input.primary_dispositions) {
+      if (disposition.disposition === "group") {
+        if (!disposition.primary_group_key || !groupByKey.has(disposition.primary_group_key) || disposition.owner_decision_key !== void 0)
+          throw new CindySourceContractError("INVALID_INPUT", "group primary \u5FC5\u987B\u7ED1\u5B9A\u5B58\u5728\u4E14\u552F\u4E00\u7684 primary_group_key\u3002");
+      } else if (disposition.primary_group_key !== void 0)
+        throw new CindySourceContractError("INVALID_INPUT", "skip/needs_owner \u4E0D\u80FD\u7ED1\u5B9A primary_group_key\u3002");
+      if (disposition.disposition === "needs_owner" && !disposition.owner_decision_key)
+        throw new CindySourceContractError("INVALID_INPUT", "needs_owner \u5FC5\u987B\u7ED1\u5B9A owner_decision_key\u3002");
+      if (disposition.disposition !== "needs_owner" && disposition.owner_decision_key !== void 0)
+        throw new CindySourceContractError("INVALID_INPUT", "\u53EA\u6709 needs_owner \u53EF\u4EE5\u7ED1\u5B9A owner_decision_key\u3002");
+    }
+    for (let group of input.groups) {
+      let primaryReceipts = input.primary_dispositions.filter((item) => item.disposition === "group" && item.primary_group_key === group.group_key).map((item) => item.source_receipt), allowed = /* @__PURE__ */ new Set([group.anchor_receipt, ...group.field_evidence_receipts]);
+      if (!primaryReceipts.length || !primaryReceipts.includes(group.anchor_receipt) || primaryReceipts.some((receipt) => !allowed.has(receipt)) || group.field_evidence_receipts.some((receipt) => primaryByReceipt.get(receipt)?.primary_group_key !== group.group_key))
+        throw new CindySourceContractError("INVALID_INPUT", "group \u53EA\u80FD\u4F7F\u7528\u672C\u7EC4 primary receipt \u4F5C\u4E3A anchor/\u5B57\u6BB5 evidence\uFF0C\u4E14\u81F3\u5C11\u6709\u4E00\u4E2A anchor\u3002");
+    }
+    let sharedRelations = input.shared_context ?? [], sharedKeys = sharedRelations.map((item) => `${item.source_receipt}\0${item.shared_group_key}`);
+    if (new Set(sharedKeys).size !== sharedKeys.length)
+      throw new CindySourceContractError("INVALID_INPUT", "shared_context \u5173\u7CFB\u4E0D\u53EF\u91CD\u590D\u3002");
+    for (let relation of sharedRelations) {
+      let primary = primaryByReceipt.get(relation.source_receipt), sharedGroup = groupByKey.get(relation.shared_group_key);
+      if (!primary || primary.disposition !== "group" || !primary.primary_group_key || !sharedGroup || primary.primary_group_key === relation.shared_group_key || sharedGroup.anchor_receipt === relation.source_receipt || sharedGroup.field_evidence_receipts.includes(relation.source_receipt))
+        throw new CindySourceContractError("INVALID_INPUT", "shared_context \u53EA\u80FD\u628A\u5176\u4ED6 primary group \u7684 receipt \u4F5C\u4E3A\u975E anchor \u80CC\u666F\u3002");
+    }
+    let ownerDecisionByKey = new Map((input.owner_decisions ?? []).map((item) => [item.decision_key, item]));
+    if (ownerDecisionByKey.size !== (input.owner_decisions ?? []).length || [...ownerDecisionByKey.keys()].some((key) => !cindyGroupKeyPattern.test(key)))
+      throw new CindySourceContractError("INVALID_INPUT", "owner decision key \u683C\u5F0F\u65E0\u6548\u6216\u91CD\u590D\u3002");
+    let usedOwnerDecisionKeys = new Set(input.primary_dispositions.filter((item) => item.disposition === "needs_owner").map((item) => item.owner_decision_key));
+    if ([...usedOwnerDecisionKeys].some((key) => !ownerDecisionByKey.has(key)) || [...ownerDecisionByKey.keys()].some((key) => !usedOwnerDecisionKeys.has(key)))
+      throw new CindySourceContractError("INVALID_INPUT", "owner_decisions \u5FC5\u987B\u4E0E needs_owner primary \u7CBE\u786E\u5BF9\u5E94\u3002");
+    for (let decision of ownerDecisionByKey.values()) {
+      let optionKeys = decision.options.map((option) => option.option_key);
+      if (!decision.reason.trim() || !decision.options.length || new Set(optionKeys).size !== optionKeys.length || optionKeys.some((key) => !cindyGroupKeyPattern.test(key)))
+        throw new CindySourceContractError("INVALID_INPUT", "owner decision \u539F\u56E0\u6216\u9009\u9879\u65E0\u6548\u3002");
+      for (let option of decision.options) {
+        if (option.action === "create_candidate" && !option.title?.trim())
+          throw new CindySourceContractError("INVALID_INPUT", "create_candidate \u9009\u9879\u5FC5\u987B\u63D0\u4F9B\u7531 Agent \u751F\u6210\u7684 title\u3002");
+        if (option.action === "append_candidate" && !option.candidate_key)
+          throw new CindySourceContractError("INVALID_INPUT", "append_candidate \u610F\u56FE\u5FC5\u987B\u7ED1\u5B9A\u5019\u9009\uFF0C\u4F46 003 \u4E0D\u4F1A\u6267\u884C\u8BE5\u52A8\u4F5C\u3002");
+        if (option.action !== "append_candidate" && option.candidate_key !== void 0)
+          throw new CindySourceContractError("INVALID_INPUT", "\u53EA\u6709 append_candidate \u610F\u56FE\u53EF\u4EE5\u7ED1\u5B9A\u5019\u9009\u3002");
+      }
+    }
+    let payloadHash = hashCindyBatchInput(input), updatedTaskIds = /* @__PURE__ */ new Set(), result = this.database.transaction(() => {
+      let replay = this.database.raw.prepare(
+        `SELECT payload_hash, response_json FROM cindy_batch
+          WHERE owner_scope = ? AND account_anchor = ? AND batch_id = ?`
+      ).get(auth.ownerScope, auth.accountAnchor, input.batch_id);
+      if (replay) {
+        if (replay.payload_hash !== payloadHash) throw new CindySourceContractError("CONFLICT", "batch_id \u5DF2\u7ED1\u5B9A\u5230\u4E0D\u540C canonical payload\u3002");
+        return { ...JSON.parse(replay.response_json), duplicate: !0 };
+      }
+      if (this.database.raw.prepare(
+        `SELECT batch_id, payload_hash FROM cindy_batch
+          WHERE owner_scope = ? AND account_anchor = ? AND decision_request_id = ?`
+      ).get(auth.ownerScope, auth.accountAnchor, input.decision_request_id)) throw new CindySourceContractError("CONFLICT", "decision_request_id \u5DF2\u7ED1\u5B9A\u5230\u5176\u4ED6\u6279\u6B21\u6216 payload\u3002");
+      let timestamp = nowIso(), revisionByReceipt = new Map(input.snapshot_receipts.map((receipt) => [receipt, resolveCindyDecisionReceipt(this.database, auth, receipt)]));
+      if (new Set([...revisionByReceipt.values()].map((revision) => revision.id)).size !== revisionByReceipt.size)
+        throw new CindySourceContractError("INVALID_INPUT", "snapshot \u4E0D\u80FD\u901A\u8FC7\u591A\u4E2A receipt \u91CD\u590D\u5F15\u7528\u540C\u4E00 revision\u3002");
+      for (let revision of revisionByReceipt.values())
+        if (this.database.raw.prepare(
+          `SELECT decision.id FROM cindy_owner_decision_source AS source
+             JOIN cindy_owner_decision AS decision ON decision.id = source.decision_id
+            WHERE source.source_revision_id = ? AND decision.status = 'pending' LIMIT 1`
+        ).get(revision.id)) throw new CindySourceContractError("CONFLICT", "\u6765\u6E90\u6B63\u5728\u7B49\u5F85\u4E3B\u4EBA\u51B3\u5B9A\uFF0C\u4E0D\u80FD\u8FDB\u5165\u5176\u4ED6\u6279\u6B21\u3002");
+      let sourceByRevision = /* @__PURE__ */ new Map();
+      for (let revision of revisionByReceipt.values()) {
+        let source = this.database.raw.prepare(
+          `SELECT source_event.* FROM source_event
+            JOIN cindy_source_identity ON cindy_source_identity.source_event_id = source_event.id
+           WHERE source_event.id = ? AND source_event.current_revision_id = ?
+             AND source_event.ingest_state = 'trusted_current'
+             AND cindy_source_identity.owner_scope = ? AND cindy_source_identity.account_anchor = ?
+             AND cindy_source_identity.current_revision_id = ? AND cindy_source_identity.state = 'active'`
+        ).get(revision.source_event_id, revision.id, auth.ownerScope, auth.accountAnchor, revision.id);
+        if (!source) throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "snapshot revision \u5DF2\u53D8\u5316\u6216\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8BA4\u8BC1\u4E0A\u4E0B\u6587\u3002");
+        sourceByRevision.set(revision.id, source);
+      }
+      let snapshotHash = hashCindyBatchSnapshot([...revisionByReceipt.values()].map((revision) => ({
+        revisionId: revision.id,
+        revisionHash: revision.revision_hash
+      })));
+      this.database.raw.prepare(
+        `INSERT INTO cindy_batch
+          (owner_scope, account_anchor, batch_id, decision_request_id, payload_hash, snapshot_hash,
+           window_start, window_end, response_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?)`
+      ).run(
+        auth.ownerScope,
+        auth.accountAnchor,
+        input.batch_id,
+        input.decision_request_id,
+        payloadHash,
+        snapshotHash,
+        input.window_start,
+        input.window_end,
+        timestamp
+      );
+      for (let group of input.groups) {
+        let anchorRevision = revisionByReceipt.get(group.anchor_receipt);
+        this.database.raw.prepare(
+          `INSERT INTO cindy_batch_group
+            (owner_scope, account_anchor, batch_id, group_key, action, anchor_revision_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        ).run(auth.ownerScope, auth.accountAnchor, input.batch_id, group.group_key, group.action, anchorRevision.id, timestamp);
+      }
+      for (let disposition of input.primary_dispositions) {
+        let revision = revisionByReceipt.get(disposition.source_receipt);
+        this.database.raw.prepare(
+          `INSERT INTO cindy_batch_snapshot
+            (owner_scope, account_anchor, batch_id, source_revision_id, revision_hash, disposition_ref,
+             primary_disposition, primary_group_key, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(
+          auth.ownerScope,
+          auth.accountAnchor,
+          input.batch_id,
+          revision.id,
+          revision.revision_hash,
+          disposition.disposition_ref,
+          disposition.disposition,
+          disposition.primary_group_key ?? null,
+          timestamp
+        );
+      }
+      for (let relation of sharedRelations) {
+        let revision = revisionByReceipt.get(relation.source_receipt), primaryGroupKey = primaryByReceipt.get(relation.source_receipt).primary_group_key;
+        this.database.raw.prepare(
+          `INSERT INTO cindy_batch_shared_context
+            (owner_scope, account_anchor, batch_id, source_revision_id, primary_group_key, shared_group_key, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        ).run(auth.ownerScope, auth.accountAnchor, input.batch_id, revision.id, primaryGroupKey, relation.shared_group_key, timestamp);
+      }
+      let ownerDecisionIdByKey = /* @__PURE__ */ new Map(), ownerDecisionDtos = [];
+      for (let [decisionKey, decision] of ownerDecisionByKey) {
+        let dispositions = input.primary_dispositions.filter((item) => item.disposition === "needs_owner" && item.owner_decision_key === decisionKey).sort((left, right) => left.disposition_ref.localeCompare(right.disposition_ref)), sourceContents = dispositions.map((item) => sourceByRevision.get(revisionByReceipt.get(item.source_receipt).id)).map((source) => source.content), storedOptions = decision.options.map((option) => {
+          let candidateTitle = null;
+          if (option.action === "append_candidate") {
+            let candidate = this.database.raw.prepare(
+              "SELECT id, title FROM candidate_request WHERE id = ? AND deleted_at IS NULL AND state <> 'accepted'"
+            ).get(option.candidate_key);
+            if (!candidate) throw new CindySourceContractError("CONFLICT", "append_candidate \u610F\u56FE\u5BF9\u5E94\u5019\u9009\u4E0D\u53EF\u7528\u3002");
+            candidateTitle = safeCandidateNarrative(candidate.title, sourceContents, "\u5DF2\u6709\u5019\u9009", 160);
+          }
+          return {
+            optionKey: option.option_key,
+            action: option.action,
+            title: option.title === void 0 ? candidateTitle : safeCandidateNarrative(option.title, sourceContents, option.action === "create_candidate" ? "\u5F85\u4E3B\u4EBA\u786E\u8BA4\u7684\u65B0\u5019\u9009" : "\u5DF2\u6709\u5019\u9009", 160),
+            describe: option.describe === void 0 ? null : safeCandidateNarrative(option.describe, sourceContents, "\u5019\u9009\u6458\u8981\u5F85\u4E3B\u4EBA\u786E\u8BA4\u3002", 2e3),
+            nextStep: option.next_step === void 0 ? null : safeCandidateNarrative(option.next_step, sourceContents, "\u4E0B\u4E00\u6B65\u5F85\u4E3B\u4EBA\u786E\u8BA4\u3002", 1e3),
+            candidateKey: option.action === "append_candidate" ? option.candidate_key : null
+          };
+        }), decisionId = id("cindy_owner_decision"), reasonSummary = safeCandidateNarrative(decision.reason, sourceContents, "\u8FD9\u7EC4\u6765\u6E90\u9700\u8981\u4E3B\u4EBA\u51B3\u5B9A\u5982\u4F55\u5904\u7406\u3002", 500);
+        this.database.raw.prepare(
+          `INSERT INTO cindy_owner_decision
+            (id, owner_scope, account_anchor, batch_id, decision_key, reason_summary, options_json,
+             status, version, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?)`
+        ).run(
+          decisionId,
+          auth.ownerScope,
+          auth.accountAnchor,
+          input.batch_id,
+          decisionKey,
+          reasonSummary,
+          JSON.stringify(storedOptions),
+          timestamp,
+          timestamp
+        ), dispositions.forEach((disposition, index) => {
+          let revision = revisionByReceipt.get(disposition.source_receipt);
+          this.database.raw.prepare(
+            `INSERT INTO cindy_owner_decision_source
+              (decision_id, source_revision_id, source_order, source_role) VALUES (?, ?, ?, ?)`
+          ).run(decisionId, revision.id, index, index === 0 ? "anchor" : "evidence");
+        }), ownerDecisionIdByKey.set(decisionKey, decisionId), ownerDecisionDtos.push(projectCindyOwnerDecision(
+          this.database.raw.prepare("SELECT * FROM cindy_owner_decision WHERE id = ?").get(decisionId),
+          dispositions.length
+        ));
+      }
       let attachCandidateSources = (demandUnitId, sources) => {
         let insert = this.database.raw.prepare(
-          `INSERT OR IGNORE INTO source_demand_unit_source
+          `INSERT INTO source_demand_unit_source
             (demand_unit_id, source_event_id, source_key, source_role, sequence, created_at)
            VALUES (?, ?, ?, ?, ?, ?)`
         );
         sources.forEach((source, index) => insert.run(
           demandUnitId,
           source.id,
-          `receipt-ref-${index + 1}`,
+          `batch-source-${index + 1}`,
           index === 0 ? "anchor" : "evidence",
           index,
           timestamp
         ));
-      }, decisionResults = [];
-      for (let { decision, revisions } of resolved) {
-        let sources = revisions.map((revision) => sourceRows.get(revision.source_event_id)), anchor = sources[0];
-        if (decision.action === "retry_later") {
-          let finalStatus = "retryable";
-          for (let revision of revisions) {
-            let nextRetry = revision.retry_count + 1;
-            finalStatus = nextRetry >= 3 ? "invalid" : finalStatus, this.database.raw.prepare(
-              `UPDATE source_event_revision
-                  SET processing_status = ?, retry_count = ?
-                WHERE id = ? AND processing_status IN ('pending_decision','retryable')`
-            ).run(nextRetry >= 3 ? "invalid" : "retryable", nextRetry, revision.id), nextRetry >= 3 && this.database.raw.prepare(
-              "UPDATE source_event SET ingest_state = 'invalid' WHERE current_revision_id = ?"
-            ).run(revision.id);
-          }
-          decisionResults.push({
-            decision_ref: decision.decision_ref,
-            action: decision.action,
-            source_status: finalStatus,
-            reason: decision.reason
+      }, groupResults = [];
+      for (let group of input.groups) {
+        let primaryReceipts = input.primary_dispositions.filter((item) => item.disposition === "group" && item.primary_group_key === group.group_key).map((item) => item.source_receipt), revisions = [group.anchor_receipt, ...primaryReceipts.filter((receipt) => receipt !== group.anchor_receipt)].map((receipt) => revisionByReceipt.get(receipt)), sources = revisions.map((revision) => sourceByRevision.get(revision.id)), anchor = sources[0];
+        if (group.action === "create_candidate") {
+          let sourceContents = sources.map((source) => source.content), title = safeCandidateNarrative(group.title, sourceContents, "\u5F85\u4E3B\u4EBA\u786E\u8BA4\u7684\u65B0\u5019\u9009", 160), describe3 = safeCandidateNarrative(group.describe, sourceContents, "\u5019\u9009\u6458\u8981\u5F85\u4E3B\u4EBA\u786E\u8BA4\u3002", 2e3), nextStep = safeCandidateNarrative(group.next_step, sourceContents, "\u4E0B\u4E00\u6B65\u5F85\u4E3B\u4EBA\u786E\u8BA4\u3002", 1e3), safeReason = safeCandidateNarrative(group.reason, sourceContents, "Cindy \u6574\u6279\u5206\u7EC4\u51B3\u7B56\u3002", 500), candidateId = id("cand"), demandUnitId = id("unit"), analysisJson = JSON.stringify({
+            origin: "cindy_grouped_batch",
+            batchId: input.batch_id,
+            groupKey: group.group_key,
+            reason: safeReason,
+            nextStep
           });
-          continue;
-        }
-        if (decision.action === "create_candidate") {
-          let sourceIds = sources.map((source) => source.id), placeholders = sourceIds.map(() => "?").join(","), existingCandidate = this.database.raw.prepare(
-            `SELECT candidate_request.*
-               FROM candidate_request
-               LEFT JOIN source_demand_unit_source
-                 ON source_demand_unit_source.demand_unit_id = candidate_request.demand_unit_id
-              WHERE candidate_request.source_event_id IN (${placeholders})
-                 OR source_demand_unit_source.source_event_id IN (${placeholders})
-              ORDER BY candidate_request.created_at ASC, candidate_request.id ASC
-              LIMIT 1`
-          ).get(...sourceIds, ...sourceIds);
-          if (existingCandidate) {
-            let demandUnitId = existingCandidate.demand_unit_id;
-            !demandUnitId && !existingCandidate.accepted_task_id && !existingCandidate.deleted_at && existingCandidate.state !== "accepted" && (demandUnitId = this.ensureCandidateDemandUnitRecord(existingCandidate, timestamp)), demandUnitId && attachCandidateSources(demandUnitId, sources), decisionResults.push({
-              decision_ref: decision.decision_ref,
-              action: decision.action,
-              source_status: "processed",
-              candidate_id: existingCandidate.id
-            });
-          } else {
-            let draft = createManualCandidate(anchor.content, anchor.sender_name, anchor.occurred_at), candidateId = id("cand"), demandUnitId = id("unit"), title = decision.title ?? draft.title, describe3 = decision.describe ?? draft.describe, analysisJson = JSON.stringify({
-              ...draft.analysis,
-              origin: "cindy_receipt_decision",
-              decisionRequestId: input.decision_request_id,
-              decisionRef: decision.decision_ref,
-              reason: decision.reason ?? null
-            });
-            this.database.raw.prepare(
-              `INSERT INTO source_demand_unit
-                (id, anchor_source_event_id, unit_key, unit_kind, state, classification_revision, ai_decision_id,
-                 analysis_json, reason, created_at, updated_at)
-               VALUES (?, ?, ?, 'demand', 'ready', ?, NULL, ?, ?, ?, ?)`
-            ).run(
-              demandUnitId,
-              anchor.id,
-              `cindy:${candidateId}`,
-              `cindy:${input.decision_request_id}`,
-              analysisJson,
-              decision.reason ?? "Cindy receipt \u51B3\u7B56\u3002",
-              timestamp,
-              timestamp
-            ), this.database.raw.prepare(
-              `INSERT INTO candidate_request
-                (id, source_event_id, demand_unit_id, title, proposer_name, background, validation_question, describe,
-                 analysis_json, confidence, state, snoozed_until, accepted_task_id, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', NULL, NULL, ?, ?)`
-            ).run(
-              candidateId,
-              anchor.id,
-              demandUnitId,
-              title,
-              anchor.sender_name,
-              draft.background,
-              draft.validationQuestion,
-              describe3,
-              analysisJson,
-              timestamp,
-              timestamp
-            ), attachCandidateSources(demandUnitId, sources), decisionResults.push({
-              decision_ref: decision.decision_ref,
-              action: decision.action,
-              source_status: "processed",
-              candidate_id: candidateId
-            });
-          }
-        } else if (decision.action === "update_task") {
-          let task = this.getTask(decision.task_key);
+          this.database.raw.prepare(
+            `INSERT INTO source_demand_unit
+              (id, anchor_source_event_id, unit_key, unit_kind, state, classification_revision, ai_decision_id,
+               analysis_json, reason, created_at, updated_at)
+             VALUES (?, ?, ?, 'demand', 'ready', ?, NULL, ?, ?, ?, ?)`
+          ).run(
+            demandUnitId,
+            anchor.id,
+            `cindy-batch:${input.batch_id}:${group.group_key}`,
+            `cindy-batch:${input.batch_id}`,
+            analysisJson,
+            safeReason,
+            timestamp,
+            timestamp
+          ), this.database.raw.prepare(
+            `INSERT INTO candidate_request
+              (id, source_event_id, demand_unit_id, title, proposer_name, background, validation_question, describe,
+               analysis_json, confidence, state, snoozed_until, accepted_task_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', NULL, NULL, ?, ?)`
+          ).run(
+            candidateId,
+            anchor.id,
+            demandUnitId,
+            title,
+            anchor.sender_name,
+            describe3,
+            nextStep,
+            describe3,
+            analysisJson,
+            timestamp,
+            timestamp
+          ), attachCandidateSources(demandUnitId, sources), this.database.raw.prepare(
+            `UPDATE cindy_batch_group SET candidate_id = ?
+              WHERE owner_scope = ? AND account_anchor = ? AND batch_id = ? AND group_key = ?`
+          ).run(candidateId, auth.ownerScope, auth.accountAnchor, input.batch_id, group.group_key), groupResults.push({ group_key: group.group_key, action: group.action, source_status: "processed", candidate_id: candidateId });
+        } else {
+          let task = this.getTask(group.task_key);
           if (!task) throw new CindyIntakeConflictError("update_task \u5BF9\u5E94\u7684\u4EFB\u52A1\u4E0D\u5B58\u5728\u3002");
           if (task.record_state !== "active" || task.deleted_at || task.status === "archived")
             throw new CindyIntakeConflictError("update_task \u5BF9\u5E94\u7684\u4EFB\u52A1\u5F53\u524D\u4E0D\u53EF\u66F4\u65B0\u3002", task.version);
-          if (task.version !== decision.expected_version)
+          if (task.version !== group.expected_version)
             throw new CindyIntakeConflictError("\u4EFB\u52A1\u5DF2\u88AB\u5176\u4ED6\u64CD\u4F5C\u66F4\u65B0\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002", task.version);
-          let next = this.resolveTaskPatch(task, {
-            title: decision.title,
-            describe: decision.describe,
-            nextStep: decision.next_step,
-            expectedVersion: decision.expected_version
-          }), nextVersion = task.version + 1;
+          let sourceContents = sources.map((source) => source.content), next = this.resolveTaskPatch(task, {
+            title: group.title === void 0 ? void 0 : safeCandidateNarrative(group.title, sourceContents, task.title, 160),
+            describe: group.describe === void 0 ? void 0 : safeCandidateNarrative(group.describe, sourceContents, task.describe, 2e3),
+            nextStep: group.next_step === void 0 ? void 0 : safeCandidateNarrative(group.next_step, sourceContents, task.next_step, 1e3),
+            expectedVersion: group.expected_version
+          }), safeReason = safeCandidateNarrative(group.reason, sourceContents, "Cindy \u6574\u6279\u5206\u7EC4\u66F4\u65B0\u4E86\u4EFB\u52A1\u5B57\u6BB5\u3002", 500), nextVersion = task.version + 1;
           if (this.database.raw.prepare(
             `UPDATE task SET title = ?, describe = ?, next_step = ?, version = ?, updated_at = ?
               WHERE id = ? AND version = ?`
@@ -163699,7 +164033,7 @@ var PmService = class {
           ).run(
             id("evt"),
             task.id,
-            decision.reason?.trim() || "Cindy receipt \u51B3\u7B56\u66F4\u65B0\u4E86\u4EFB\u52A1\u5B57\u6BB5\u3002",
+            safeReason,
             anchor.id,
             JSON.stringify(taskAuditSnapshot(task)),
             JSON.stringify({
@@ -163713,52 +164047,268 @@ var PmService = class {
             anchor.occurred_at,
             timestamp,
             nextVersion
-          ), updatedTaskIds.add(task.id), decisionResults.push({
-            decision_ref: decision.decision_ref,
-            action: decision.action,
-            source_status: "processed",
-            task_key: task.id,
-            version: nextVersion
-          });
-        } else {
-          let correctionType = decision.action === "skip" ? "cindy_skip" : "cindy_needs_owner";
-          this.database.raw.prepare(
+          ), this.database.raw.prepare(
+            `UPDATE cindy_batch_group SET task_id = ?, task_version = ?
+              WHERE owner_scope = ? AND account_anchor = ? AND batch_id = ? AND group_key = ?`
+          ).run(task.id, nextVersion, auth.ownerScope, auth.accountAnchor, input.batch_id, group.group_key), updatedTaskIds.add(task.id), groupResults.push({ group_key: group.group_key, action: group.action, source_status: "processed", task_key: task.id, version: nextVersion });
+        }
+        for (let revision of revisions)
+          if (this.database.raw.prepare(
+            `UPDATE source_event_revision SET processing_status = 'processed'
+              WHERE id = ? AND processing_status IN ('pending_decision','retryable')`
+          ).run(revision.id).changes !== 1) throw new CindySourceContractError("CONFLICT", "\u6765\u6E90\u72B6\u6001\u5DF2\u53D8\u5316\uFF1B\u6574\u6279\u4E1A\u52A1\u5199\u5165\u5DF2\u56DE\u6EDA\u3002");
+      }
+      let dispositionResults = [];
+      for (let disposition of input.primary_dispositions) {
+        let revision = revisionByReceipt.get(disposition.source_receipt), source = sourceByRevision.get(revision.id);
+        if (disposition.disposition === "skip") {
+          if (this.database.raw.prepare(
             `INSERT INTO correction_event
               (id, task_id, candidate_id, source_event_id, correction_type, before_json, after_json,
                created_at, idempotency_key, note)
-             VALUES (?, NULL, NULL, ?, ?, NULL, ?, ?, ?, ?)`
+             VALUES (?, NULL, NULL, ?, 'cindy_skip', NULL, ?, ?, ?, ?)`
           ).run(
             id("correction"),
-            anchor.id,
-            correctionType,
-            JSON.stringify({ action: decision.action, decisionRef: decision.decision_ref, reason: decision.reason ?? null }),
+            source.id,
+            JSON.stringify({ batchId: input.batch_id, dispositionRef: disposition.disposition_ref }),
             timestamp,
-            `cindy-decision:${input.decision_request_id}:${decision.decision_ref}`,
-            decision.reason ?? ""
-          ), decisionResults.push({
-            decision_ref: decision.decision_ref,
-            action: decision.action,
-            source_status: decision.action === "skip" ? "skipped" : "processed",
-            reason: decision.reason
-          });
-        }
-        let nextStatus = decision.action === "skip" ? "skipped" : "processed";
-        for (let revision of revisions)
-          if (this.database.raw.prepare(
-            `UPDATE source_event_revision SET processing_status = ?
+            `cindy-batch:${input.batch_id}:skip:${disposition.disposition_ref}`,
+            disposition.reason ?? "Cindy \u6574\u6279\u5224\u65AD\u4E3A\u8DF3\u8FC7\u3002"
+          ), this.database.raw.prepare(
+            `UPDATE source_event_revision SET processing_status = 'skipped'
               WHERE id = ? AND processing_status IN ('pending_decision','retryable')`
-          ).run(nextStatus, revision.id).changes !== 1) throw new CindySourceContractError("CONFLICT", "\u6765\u6E90\u5904\u7406\u72B6\u6001\u5DF2\u53D8\u5316\uFF1B\u672C\u6279\u51B3\u7B56\u5DF2\u56DE\u6EDA\u3002");
+          ).run(revision.id).changes !== 1) throw new CindySourceContractError("CONFLICT", "\u6765\u6E90\u72B6\u6001\u5DF2\u53D8\u5316\uFF1B\u6574\u6279\u4E1A\u52A1\u5199\u5165\u5DF2\u56DE\u6EDA\u3002");
+          dispositionResults.push({ disposition_ref: disposition.disposition_ref, disposition: "skip", source_status: "skipped" });
+        } else disposition.disposition === "needs_owner" ? dispositionResults.push({
+          disposition_ref: disposition.disposition_ref,
+          disposition: "needs_owner",
+          source_status: "pending_decision",
+          owner_decision_id: ownerDecisionIdByKey.get(disposition.owner_decision_key)
+        }) : dispositionResults.push({
+          disposition_ref: disposition.disposition_ref,
+          disposition: "group",
+          source_status: "processed",
+          group_key: disposition.primary_group_key
+        });
       }
       let storedResult = {
         decision_request_id: input.decision_request_id,
+        batch_id: input.batch_id,
         window_id: input.window_id,
         duplicate: !1,
-        decisions: decisionResults
+        groups: groupResults,
+        dispositions: dispositionResults,
+        owner_decisions: ownerDecisionDtos
       };
-      return this.advanceIntakeWindowCursorUnsafe(input.window_end, timestamp), recordCindyDecisionRequest(this.database, auth, input.decision_request_id, requestHash, storedResult, timestamp), storedResult;
+      return this.advanceIntakeWindowCursorUnsafe(input.window_end, timestamp), this.database.raw.prepare(
+        `UPDATE cindy_batch SET response_json = ?
+          WHERE owner_scope = ? AND account_anchor = ? AND batch_id = ?`
+      ).run(JSON.stringify(storedResult), auth.ownerScope, auth.accountAnchor, input.batch_id), storedResult;
     });
     for (let taskId of updatedTaskIds) this.projectTaskMemory(taskId);
     return result;
+  }
+  listCindyOwnerDecisions(auth, limit = 50, status = "pending") {
+    let boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit))), timestamp = nowIso();
+    return this.database.raw.prepare(
+      `UPDATE cindy_owner_decision
+          SET status = 'superseded', version = version + 1, updated_at = ?, last_error = NULL
+        WHERE owner_scope = ? AND account_anchor = ? AND status = 'pending'
+          AND EXISTS (
+            SELECT 1 FROM cindy_owner_decision_source AS decision_source
+            JOIN source_event_revision AS revision ON revision.id = decision_source.source_revision_id
+            LEFT JOIN cindy_source_identity AS identity ON identity.current_revision_id = revision.id
+              AND identity.owner_scope = cindy_owner_decision.owner_scope
+              AND identity.account_anchor = cindy_owner_decision.account_anchor
+              AND identity.state = 'active'
+            WHERE decision_source.decision_id = cindy_owner_decision.id
+              AND (identity.id IS NULL OR revision.processing_status IN ('superseded','revoked','invalid','legacy_read_only'))
+          )`
+    ).run(timestamp, auth.ownerScope, auth.accountAnchor), { items: this.database.raw.prepare(
+      `SELECT decision.*,
+              (SELECT COUNT(*) FROM cindy_owner_decision_source AS source WHERE source.decision_id = decision.id) AS source_count
+         FROM cindy_owner_decision AS decision
+        WHERE decision.owner_scope = ? AND decision.account_anchor = ?
+          ${status === "pending" ? "AND decision.status = 'pending'" : ""}
+        ORDER BY decision.updated_at DESC, decision.id DESC LIMIT ?`
+    ).all(auth.ownerScope, auth.accountAnchor, boundedLimit).map((row) => projectCindyOwnerDecision(row, row.source_count)) };
+  }
+  resolveCindyOwnerDecision(auth, decisionId, input) {
+    if (!/^cindy_owner_decision_[0-9a-f-]{36}$/iu.test(decisionId) || !cindyBatchKeyPattern.test(input.decision_request_id) || !Number.isInteger(input.expected_version) || input.expected_version < 1)
+      throw new CindySourceContractError("INVALID_INPUT", "\u4E3B\u4EBA\u51B3\u5B9A\u6807\u8BC6\u3001\u8BF7\u6C42\u6807\u8BC6\u6216 version \u65E0\u6548\u3002");
+    let payloadHash = hashCindyOwnerDecisionResolution(input), supersededVersion = null;
+    try {
+      let result = this.database.transaction(() => {
+        let row = this.database.raw.prepare(
+          "SELECT * FROM cindy_owner_decision WHERE id = ? AND owner_scope = ? AND account_anchor = ?"
+        ).get(decisionId, auth.ownerScope, auth.accountAnchor);
+        if (!row) throw new CindySourceContractError("INVALID_INPUT", "\u4E3B\u4EBA\u51B3\u5B9A\u4E0D\u5B58\u5728\u6216\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8BA4\u8BC1\u4E0A\u4E0B\u6587\u3002", 403);
+        if (row.resolution_request_id === input.decision_request_id) {
+          if (row.resolution_payload_hash !== payloadHash || !row.resolution_response_json)
+            throw new CindySourceContractError("CONFLICT", "decision_request_id \u5DF2\u7ED1\u5B9A\u5230\u4E0D\u540C\u4E3B\u4EBA\u51B3\u5B9A payload\u3002");
+          return JSON.parse(row.resolution_response_json);
+        }
+        if (row.status !== "pending") throw new CindyIntakeConflictError("\u4E3B\u4EBA\u51B3\u5B9A\u5DF2\u4E0D\u518D\u7B49\u5F85\u5904\u7406\u3002", row.version);
+        if (row.version !== input.expected_version) throw new CindyIntakeConflictError("\u4E3B\u4EBA\u51B3\u5B9A\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002", row.version);
+        let sourceRows = this.database.raw.prepare(
+          `SELECT revision.id AS revision_id,
+                  revision.processing_status,
+                  source.id AS source_event_id,
+                  source.content,
+                  source.sender_name,
+                  source.occurred_at,
+                  decision_source.source_order,
+                  decision_source.source_role,
+                  identity.id AS current_identity_id
+             FROM cindy_owner_decision_source AS decision_source
+             JOIN source_event_revision AS revision ON revision.id = decision_source.source_revision_id
+             JOIN source_event AS source ON source.id = revision.source_event_id
+             LEFT JOIN cindy_source_identity AS identity ON identity.current_revision_id = revision.id
+               AND identity.owner_scope = ? AND identity.account_anchor = ? AND identity.state = 'active'
+            WHERE decision_source.decision_id = ?
+            ORDER BY decision_source.source_order`
+        ).all(auth.ownerScope, auth.accountAnchor, row.id);
+        if (!sourceRows.length || sourceRows.some((source) => !source.current_identity_id || !["pending_decision", "retryable"].includes(source.processing_status))) {
+          let nextVersion2 = row.version + 1;
+          return this.database.raw.prepare(
+            `UPDATE cindy_owner_decision
+                SET status = 'superseded', version = ?, updated_at = ?, last_error = NULL
+              WHERE id = ? AND status = 'pending' AND version = ?`
+          ).run(nextVersion2, nowIso(), row.id, row.version), supersededVersion = nextVersion2, projectCindyOwnerDecision({ ...row, status: "superseded", version: nextVersion2, updated_at: nowIso() }, sourceRows.length);
+        }
+        let priorResolution = this.database.raw.prepare(
+          `SELECT id, resolution_payload_hash, resolution_response_json
+             FROM cindy_owner_decision
+            WHERE owner_scope = ? AND account_anchor = ? AND resolution_request_id = ?`
+        ).get(auth.ownerScope, auth.accountAnchor, input.decision_request_id);
+        if (priorResolution && priorResolution.id !== row.id)
+          throw new CindySourceContractError("CONFLICT", "decision_request_id \u5DF2\u7ED1\u5B9A\u5230\u5176\u4ED6\u4E3B\u4EBA\u51B3\u5B9A\u3002");
+        let options = parseCindyOwnerDecisionOptions(row.options_json), option = input.option_key ? options.find((item) => item.optionKey === input.option_key) : void 0;
+        if (!option || option.action !== input.action)
+          throw new CindySourceContractError("INVALID_INPUT", "\u4E3B\u4EBA\u51B3\u5B9A\u5FC5\u987B\u9009\u62E9\u4E0E\u52A8\u4F5C\u4E00\u81F4\u7684\u53EF\u7528\u9009\u9879\u3002");
+        let timestamp = nowIso(), candidateId = null;
+        if (input.action === "create_candidate") {
+          let anchor = sourceRows[0];
+          candidateId = id("cand");
+          let demandUnitId = id("unit"), title = option.title ?? "\u5F85\u4E3B\u4EBA\u786E\u8BA4\u7684\u65B0\u5019\u9009", describe3 = option.describe ?? "\u5019\u9009\u6458\u8981\u5F85\u4E3B\u4EBA\u786E\u8BA4\u3002", nextStep = option.nextStep ?? "\u4E0B\u4E00\u6B65\u5F85\u4E3B\u4EBA\u786E\u8BA4\u3002", analysisJson = JSON.stringify({ origin: "cindy_owner_decision", decisionId: row.id, nextStep });
+          this.database.raw.prepare(
+            `INSERT INTO source_demand_unit
+              (id, anchor_source_event_id, unit_key, unit_kind, state, classification_revision, ai_decision_id,
+               analysis_json, reason, created_at, updated_at)
+             VALUES (?, ?, ?, 'demand', 'ready', ?, NULL, ?, ?, ?, ?)`
+          ).run(
+            demandUnitId,
+            anchor.source_event_id,
+            `cindy-owner:${row.id}`,
+            `cindy-owner:${row.batch_id}`,
+            analysisJson,
+            row.reason_summary,
+            timestamp,
+            timestamp
+          ), this.database.raw.prepare(
+            `INSERT INTO candidate_request
+              (id, source_event_id, demand_unit_id, title, proposer_name, background, validation_question, describe,
+               analysis_json, confidence, state, snoozed_until, accepted_task_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', NULL, NULL, ?, ?)`
+          ).run(
+            candidateId,
+            anchor.source_event_id,
+            demandUnitId,
+            title,
+            anchor.sender_name,
+            describe3,
+            nextStep,
+            describe3,
+            analysisJson,
+            timestamp,
+            timestamp
+          );
+          let insertSource = this.database.raw.prepare(
+            `INSERT INTO source_demand_unit_source
+              (demand_unit_id, source_event_id, source_key, source_role, sequence, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)`
+          );
+          sourceRows.forEach((source, index) => insertSource.run(
+            demandUnitId,
+            source.source_event_id,
+            `owner-source-${index + 1}`,
+            index === 0 ? "anchor" : "evidence",
+            index,
+            timestamp
+          ));
+        }
+        for (let source of sourceRows)
+          if (this.database.raw.prepare(
+            `UPDATE source_event_revision SET processing_status = ?
+              WHERE id = ? AND processing_status IN ('pending_decision','retryable')`
+          ).run(input.action === "skip" ? "skipped" : "processed", source.revision_id).changes !== 1) throw new CindySourceContractError("CONFLICT", "\u4E3B\u4EBA\u51B3\u5B9A\u6267\u884C\u65F6\u6765\u6E90\u5DF2\u53D8\u5316\uFF1B\u4E1A\u52A1\u5199\u5165\u5DF2\u56DE\u6EDA\u3002");
+        let nextVersion = row.version + 1;
+        this.database.raw.prepare(
+          `UPDATE cindy_owner_decision
+              SET status = 'resolved', version = ?, resolution_action = ?, resolution_request_id = ?,
+                  resolution_payload_hash = ?, resolved_candidate_id = ?, last_error = NULL,
+                  updated_at = ?, resolved_at = ?
+            WHERE id = ? AND status = 'pending' AND version = ?`
+        ).run(
+          nextVersion,
+          input.action,
+          input.decision_request_id,
+          payloadHash,
+          candidateId,
+          timestamp,
+          timestamp,
+          row.id,
+          row.version
+        );
+        let resolved = this.database.raw.prepare("SELECT * FROM cindy_owner_decision WHERE id = ?").get(row.id), dto = projectCindyOwnerDecision(resolved, sourceRows.length);
+        return this.database.raw.prepare(
+          "UPDATE cindy_owner_decision SET resolution_response_json = ? WHERE id = ?"
+        ).run(JSON.stringify(dto), row.id), dto;
+      });
+      if (supersededVersion !== null) throw new CindyIntakeConflictError("\u6765\u6E90 revision \u5DF2\u53D8\u5316\uFF1B\u4E3B\u4EBA\u51B3\u5B9A\u5DF2\u6807\u8BB0\u4E3A superseded\u3002", supersededVersion);
+      return result;
+    } catch (error51) {
+      if (error51 instanceof CindySourceContractError || error51 instanceof CindyIntakeConflictError) throw error51;
+      let safeError = redactDiagnosticText(error51 instanceof Error ? error51.message : "\u4E3B\u4EBA\u51B3\u5B9A\u6267\u884C\u5931\u8D25\u3002", 240);
+      throw this.database.raw.prepare(
+        `UPDATE cindy_owner_decision SET last_error = ?, updated_at = ?
+          WHERE id = ? AND owner_scope = ? AND account_anchor = ? AND status = 'pending'`
+      ).run(safeError, nowIso(), decisionId, auth.ownerScope, auth.accountAnchor), new CindyIntakeConflictError("\u4E3B\u4EBA\u51B3\u5B9A\u6682\u65F6\u65E0\u6CD5\u6267\u884C\uFF0C\u5DF2\u4FDD\u7559 pending \u4F9B\u91CD\u8BD5\u3002");
+    }
+  }
+  cancelCindyOwnerDecision(auth, decisionId, input) {
+    if (!/^cindy_owner_decision_[0-9a-f-]{36}$/iu.test(decisionId) || !cindyBatchKeyPattern.test(input.decision_request_id) || !Number.isInteger(input.expected_version) || input.expected_version < 1)
+      throw new CindySourceContractError("INVALID_INPUT", "\u4E3B\u4EBA\u51B3\u5B9A\u6807\u8BC6\u3001\u8BF7\u6C42\u6807\u8BC6\u6216 version \u65E0\u6548\u3002");
+    let payloadHash = hashCindyOwnerDecisionResolution({ ...input, action: "cancel" });
+    return this.database.transaction(() => {
+      let row = this.database.raw.prepare(
+        "SELECT * FROM cindy_owner_decision WHERE id = ? AND owner_scope = ? AND account_anchor = ?"
+      ).get(decisionId, auth.ownerScope, auth.accountAnchor);
+      if (!row) throw new CindySourceContractError("INVALID_INPUT", "\u4E3B\u4EBA\u51B3\u5B9A\u4E0D\u5B58\u5728\u6216\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8BA4\u8BC1\u4E0A\u4E0B\u6587\u3002", 403);
+      let priorResolution = this.database.raw.prepare(
+        `SELECT id, resolution_payload_hash, resolution_response_json
+           FROM cindy_owner_decision
+          WHERE owner_scope = ? AND account_anchor = ? AND resolution_request_id = ?`
+      ).get(auth.ownerScope, auth.accountAnchor, input.decision_request_id);
+      if (priorResolution) {
+        if (priorResolution.id !== row.id || priorResolution.resolution_payload_hash !== payloadHash || !priorResolution.resolution_response_json)
+          throw new CindySourceContractError("CONFLICT", "decision_request_id \u5DF2\u7ED1\u5B9A\u5230\u5176\u4ED6\u4E3B\u4EBA\u51B3\u5B9A\u6216 payload\u3002");
+        return JSON.parse(priorResolution.resolution_response_json);
+      }
+      if (row.status !== "pending") throw new CindyIntakeConflictError("\u4E3B\u4EBA\u51B3\u5B9A\u5DF2\u4E0D\u518D\u7B49\u5F85\u5904\u7406\u3002", row.version);
+      if (row.version !== input.expected_version) throw new CindyIntakeConflictError("\u4E3B\u4EBA\u51B3\u5B9A\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002", row.version);
+      let timestamp = nowIso(), nextVersion = row.version + 1;
+      if (this.database.raw.prepare(
+        `UPDATE cindy_owner_decision
+            SET status = 'cancelled', version = ?, resolution_request_id = ?, resolution_payload_hash = ?,
+                last_error = NULL, updated_at = ?
+          WHERE id = ? AND status = 'pending' AND version = ?`
+      ).run(nextVersion, input.decision_request_id, payloadHash, timestamp, row.id, row.version).changes !== 1) throw new CindyIntakeConflictError("\u4E3B\u4EBA\u51B3\u5B9A\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002");
+      let sourceCount = this.database.raw.prepare(
+        "SELECT COUNT(*) AS count FROM cindy_owner_decision_source WHERE decision_id = ?"
+      ).get(row.id).count, cancelled = this.database.raw.prepare("SELECT * FROM cindy_owner_decision WHERE id = ?").get(row.id), dto = projectCindyOwnerDecision(cancelled, sourceCount);
+      return this.database.raw.prepare("UPDATE cindy_owner_decision SET resolution_response_json = ? WHERE id = ?").run(JSON.stringify(dto), row.id), dto;
+    });
   }
   listTasks(status, recordState = "active", deletedState = "active") {
     let stateClause = recordState === "all" ? "" : " AND record_state = ?", stateArgs = recordState === "all" ? [] : [recordState], deletedClause = deletedState === "all" ? "" : deletedState === "only" ? " AND deleted_at IS NOT NULL" : " AND deleted_at IS NULL", scheduleOrder = "COALESCE(planned_start_at, planned_due_at, schedule_at)";
@@ -163947,7 +164497,7 @@ var PmService = class {
         status === "local_snapshot_verified" ? "source.verification.completed" : "source.verification.failed",
         status === "local_snapshot_verified" ? "\u7CFB\u7EDF\u4E3B\u4EBA\u4E3B\u52A8\u6838\u9A8C\u4E86\u4E00\u9879\u672C\u5730\u6765\u6E90\u5FEB\u7167\uFF1B\u53EA\u8FD4\u56DE\u53D7\u63A7\u8131\u654F\u7247\u6BB5\uFF0C\u4E0D\u4EA7\u751F\u5BF9\u5916\u52A8\u4F5C\u3002" : "\u7CFB\u7EDF\u4E3B\u4EBA\u4E3B\u52A8\u6838\u9A8C\u672C\u5730\u6765\u6E90\u5FEB\u7167\u672A\u5B8C\u6210\uFF1B\u53EA\u8BB0\u5F55\u53D7\u63A7\u72B6\u6001\uFF0C\u4E0D\u4EA7\u751F\u5BF9\u5916\u52A8\u4F5C\u3002",
         {
-          relationFingerprint: (0, import_node_crypto11.createHash)("sha256").update(`${taskId}:${relation.sourceEventId}`).digest("hex").slice(0, 16),
+          relationFingerprint: (0, import_node_crypto12.createHash)("sha256").update(`${taskId}:${relation.sourceEventId}`).digest("hex").slice(0, 16),
           sourceType: source.source_type,
           verificationStatus: status,
           verificationReason: reason,
@@ -164370,7 +164920,7 @@ var PmService = class {
     return directory;
   }
   atomicMemoryWrite(path, content) {
-    let temporary = `${path}.${(0, import_node_crypto11.randomUUID)()}.tmp`;
+    let temporary = `${path}.${(0, import_node_crypto12.randomUUID)()}.tmp`;
     (0, import_node_fs2.writeFileSync)(temporary, content, "utf8"), (0, import_node_fs2.renameSync)(temporary, path);
   }
   pathWithin(childPath, parentPath) {
@@ -164535,12 +165085,12 @@ var PmService = class {
         "# \u6765\u6E90\u7D22\u5F15",
         "",
         ...detail.sources.map((source) => {
-          let sourceContent = typeof source.content == "string" ? source.content : "", sourceHash = (0, import_node_crypto11.createHash)("sha256").update(sourceContent).digest("hex");
+          let sourceContent = typeof source.content == "string" ? source.content : "", sourceHash = (0, import_node_crypto12.createHash)("sha256").update(sourceContent).digest("hex");
           return [
             `## ${String(source.occurred_at ?? "\u672A\u77E5\u65F6\u95F4")} \xB7 ${String(source.sender_name ?? "\u672A\u77E5\u53D1\u9001\u4EBA")}`,
             `- \u6765\u6E90\u7C7B\u578B\uFF1A${String(source.source_type ?? "\u672A\u77E5")}`,
             `- \u6765\u6E90\u94FE\u63A5\uFF1A${String(source.source_url ?? "\u65E0")}`,
-            `- \u6765\u6E90\u6807\u8BC6\u54C8\u5E0C\uFF1A${(0, import_node_crypto11.createHash)("sha256").update(String(source.external_id ?? "")).digest("hex").slice(0, 16) || "\u672A\u77E5"}`,
+            `- \u6765\u6E90\u6807\u8BC6\u54C8\u5E0C\uFF1A${(0, import_node_crypto12.createHash)("sha256").update(String(source.external_id ?? "")).digest("hex").slice(0, 16) || "\u672A\u77E5"}`,
             `- \u6B63\u6587\u54C8\u5E0C\uFF1A${sourceHash}`,
             `- \u6B63\u6587\u957F\u5EA6\uFF1A${sourceContent.length}`,
             ""
@@ -164643,7 +165193,7 @@ ${evidenceJson}
 `
         );
       }
-      let checksum = (0, import_node_crypto11.createHash)("sha256").update(`${taskJson}
+      let checksum = (0, import_node_crypto12.createHash)("sha256").update(`${taskJson}
 ${brief}
 ${sources}
 ${artifacts}
@@ -165178,7 +165728,7 @@ ${JSON.stringify(confirmedRevisions)}`).digest("hex");
       throw new Error("\u65E0\u6548\u8BB0\u5F55\u4E0D\u80FD\u751F\u6210\u5BF9\u5916\u52A8\u4F5C\u3002");
     if (task.deleted_at)
       throw new Error("\u56DE\u6536\u7AD9\u4E2D\u7684\u4EFB\u52A1\u4E0D\u80FD\u751F\u6210\u5BF9\u5916\u52A8\u4F5C\u3002");
-    let timestamp = nowIso(), payloadJson = stableJson2(payload ?? {}), requestFingerprint = (0, import_node_crypto11.createHash)("sha256").update(`${taskId}
+    let timestamp = nowIso(), payloadJson = stableJson2(payload ?? {}), requestFingerprint = (0, import_node_crypto12.createHash)("sha256").update(`${taskId}
 ${task.version}
 ${actionType}
 ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version}:${requestFingerprint}`, approvalId = `approval_${requestFingerprint}`, outboxId = `outbox_${requestFingerprint}`, draft = this.database.transaction(() => {
@@ -165429,7 +165979,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
     };
   }
   diagnostics(requestId) {
-    let operationId = (0, import_node_crypto11.randomUUID)(), traceId = (0, import_node_crypto11.randomUUID)(), readiness = this.readiness(), counts = { sources: 0, candidates: 0, tasks: 0, logs: 0, decisions: 0, corrections: 0 }, recentErrors = [];
+    let operationId = (0, import_node_crypto12.randomUUID)(), traceId = (0, import_node_crypto12.randomUUID)(), readiness = this.readiness(), counts = { sources: 0, candidates: 0, tasks: 0, logs: 0, decisions: 0, corrections: 0 }, recentErrors = [];
     if (readiness.status !== "not_ready")
       try {
         counts = {
@@ -165453,7 +166003,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
       diagnostic_bundle_version: "obs-01-v1",
       generatedAt: nowIso(),
       operation_id: operationId,
-      request_id: requestId ?? (0, import_node_crypto11.randomUUID)(),
+      request_id: requestId ?? (0, import_node_crypto12.randomUUID)(),
       trace_id: traceId,
       health,
       readiness,
@@ -165685,7 +166235,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
     return runner ? operation(runner) : { skipped: !0, reason: "adapter_unavailable" };
   }
   async legacySyncFeishuOnce(requestId, traceContext = {}, suppliedContext) {
-    let startedAt = Date.now(), operationContext = suppliedContext ?? createOperationContext({ requestId: requestId ?? (0, import_node_crypto11.randomUUID)(), traceId: traceContext.traceId, parentSpanId: traceContext.parentSpanId });
+    let startedAt = Date.now(), operationContext = suppliedContext ?? createOperationContext({ requestId: requestId ?? (0, import_node_crypto12.randomUUID)(), traceId: traceContext.traceId, parentSpanId: traceContext.parentSpanId });
     if (this.privacyControl().collection_status === "stopped") {
       let sources2 = ["owner_messages", "bot_supplement", "calendar", "minutes", "documents"].map((source) => syncSourceOutcome(source, { skipped: !0, reason: "privacy_collection_stopped" }, 0));
       return { ...operationEnvelope({ context: operationContext, startedAt, sources: sources2, release: this.releaseIdentity() }), ...safeSyncTotals(sources2) };
@@ -165722,7 +166272,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
     }), { ...observable, ...totals };
   }
   async legacySyncFeishuSource(kind, requestId, traceContext = {}, suppliedContext) {
-    let startedAt = Date.now(), operationContext = suppliedContext ?? createOperationContext({ requestId: requestId ?? (0, import_node_crypto11.randomUUID)(), traceId: traceContext.traceId, parentSpanId: traceContext.parentSpanId });
+    let startedAt = Date.now(), operationContext = suppliedContext ?? createOperationContext({ requestId: requestId ?? (0, import_node_crypto12.randomUUID)(), traceId: traceContext.traceId, parentSpanId: traceContext.parentSpanId });
     if (this.privacyControl().collection_status === "stopped") {
       let safeSource = syncSourceOutcome(kind, { skipped: !0, reason: "privacy_collection_stopped" }, 0), observable = operationEnvelope({ context: operationContext, startedAt, sources: [safeSource], release: this.releaseIdentity() });
       return { ...observable, ...safeSyncTotals(observable.sources) };
@@ -166030,7 +166580,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
     this.assertCandidateVersion(candidate, boundExpectedVersion), this.assertCandidateActive(candidate);
     let acceptedTask = candidate.accepted_task_id ? this.getTask(candidate.accepted_task_id) : null, sourceRow = this.database.raw.prepare("SELECT * FROM source_event WHERE id = ?").get(candidate.source_event_id);
     if (!sourceRow) throw new Error("\u5019\u9009\u7684\u6765\u6E90\u6D88\u606F\u4E0D\u5B58\u5728\u3002");
-    let initialContexts = this.feishuDocumentContext.list(sourceRow.id), initialRevision = combinedClassificationRevision(sourceRow, initialContexts).revision, recoveredRuntime = recovery ? this.runtime.get(recovery.jobId) : null, recoveredPayload = recoveredRuntime ? parseMetadata(recoveredRuntime.payload_json) : null, effectiveOperationContext = operationContext ?? (recoveredPayload && isOperationContext(recoveredPayload.observability) ? recoveredPayload.observability : null) ?? (recovery ? void 0 : createOperationContext({ requestId: (0, import_node_crypto11.randomUUID)() })), runtimeJob = recovery ? recoveredRuntime : this.runtime.begin({
+    let initialContexts = this.feishuDocumentContext.list(sourceRow.id), initialRevision = combinedClassificationRevision(sourceRow, initialContexts).revision, recoveredRuntime = recovery ? this.runtime.get(recovery.jobId) : null, recoveredPayload = recoveredRuntime ? parseMetadata(recoveredRuntime.payload_json) : null, effectiveOperationContext = operationContext ?? (recoveredPayload && isOperationContext(recoveredPayload.observability) ? recoveredPayload.observability : null) ?? (recovery ? void 0 : createOperationContext({ requestId: (0, import_node_crypto12.randomUUID)() })), runtimeJob = recovery ? recoveredRuntime : this.runtime.begin({
       jobType: "reprocess_candidate",
       payload: {
         candidateId,
@@ -166040,7 +166590,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
         guidance: guidance?.slice(0, 2e3) ?? null,
         ...effectiveOperationContext ? { observability: effectiveOperationContext } : {}
       },
-      idempotencyKey: `reprocess:${candidateId}:${initialRevision}:${(0, import_node_crypto11.createHash)("sha256").update(guidance ?? "").digest("hex").slice(0, 16)}`,
+      idempotencyKey: `reprocess:${candidateId}:${initialRevision}:${(0, import_node_crypto12.createHash)("sha256").update(guidance ?? "").digest("hex").slice(0, 16)}`,
       sourceEventId: candidate.source_event_id,
       taskId: acceptedTask?.id ?? null,
       traceId: effectiveOperationContext?.trace_id ?? null,
@@ -166520,8 +167070,8 @@ function candidateMutationError(error51, fallback, current) {
 var risks = ["low", "medium", "high"], PRIVACY_OWNER_ACTION_INTENT2 = "privacy.owner-action.v1", PRIVACY_DELETION_INTENT2 = "privacy.deletion.hard-delete.v1";
 function capabilityBinding(capability) {
   return {
-    tokenHash: (0, import_node_crypto12.createHash)("sha256").update(capability.token).digest("hex"),
-    csrfTokenHash: (0, import_node_crypto12.createHash)("sha256").update(capability.csrfToken).digest("hex"),
+    tokenHash: (0, import_node_crypto13.createHash)("sha256").update(capability.token).digest("hex"),
+    csrfTokenHash: (0, import_node_crypto13.createHash)("sha256").update(capability.csrfToken).digest("hex"),
     origin: capability.origin
   };
 }
@@ -166545,9 +167095,9 @@ async function buildApp(service, input = "http://localhost:5173") {
   if (app.addHook("onRequest", async (request, reply) => {
     if (!request.url.startsWith("/api/integrations/cindy/") || request.method === "OPTIONS") return;
     let expected = cindyIntegrationToken, authorization = String(request.headers.authorization ?? ""), expectedAuthorization = expected ? `Bearer ${expected}` : "";
-    if (!(!!expectedAuthorization && authorization.length === expectedAuthorization.length && (0, import_node_crypto12.timingSafeEqual)(Buffer.from(authorization, "utf8"), Buffer.from(expectedAuthorization, "utf8"))))
+    if (!(!!expectedAuthorization && authorization.length === expectedAuthorization.length && (0, import_node_crypto13.timingSafeEqual)(Buffer.from(authorization, "utf8"), Buffer.from(expectedAuthorization, "utf8"))))
       return reply.code(401).send({ error: "Cindy \u96C6\u6210\u4EE4\u724C\u65E0\u6548\u6216\u5C1A\u672A\u914D\u7F6E\u3002" });
-  }), app.get("/api/health", async () => service.health((0, import_node_crypto12.randomUUID)())), app.post("/api/runtime/shutdown", async (request, reply) => isLoopbackRequest(request) ? options.runtimeShutdown ? runtimeShutdownScheduled ? reply.code(409).send({ error: "\u540E\u53F0\u8FDB\u7A0B\u5DF2\u7ECF\u5728\u9000\u51FA\u3002" }) : (runtimeShutdownScheduled = !0, reply.code(200).send({ message: "\u672C\u673A\u4EFB\u52A1\u5E93\u540E\u53F0\u5DF2\u6536\u5230\u9000\u51FA\u8BF7\u6C42\uFF0C4310 \u5373\u5C06\u5173\u95ED\u3002" }), setTimeout(() => {
+  }), app.get("/api/health", async () => service.health((0, import_node_crypto13.randomUUID)())), app.post("/api/runtime/shutdown", async (request, reply) => isLoopbackRequest(request) ? options.runtimeShutdown ? runtimeShutdownScheduled ? reply.code(409).send({ error: "\u540E\u53F0\u8FDB\u7A0B\u5DF2\u7ECF\u5728\u9000\u51FA\u3002" }) : (runtimeShutdownScheduled = !0, reply.code(200).send({ message: "\u672C\u673A\u4EFB\u52A1\u5E93\u540E\u53F0\u5DF2\u6536\u5230\u9000\u51FA\u8BF7\u6C42\uFF0C4310 \u5373\u5C06\u5173\u95ED\u3002" }), setTimeout(() => {
     Promise.resolve(options.runtimeShutdown?.()).catch(() => {
     });
   }, 25), reply) : reply.code(409).send({ error: "\u5F53\u524D\u8FD0\u884C\u65B9\u5F0F\u4E0D\u652F\u6301\u5173\u95ED\u540E\u53F0\u8FDB\u7A0B\u3002" }) : reply.code(403).send({ error: "\u540E\u53F0\u5173\u95ED\u63A5\u53E3\u53EA\u63A5\u53D7\u672C\u673A\u8BF7\u6C42\u3002" })), app.post("/api/runtime/restart", async (request, reply) => isLoopbackRequest(request) ? options.runtimeRestart ? runtimeShutdownScheduled ? reply.code(409).send({ error: "\u540E\u53F0\u8FDB\u7A0B\u5DF2\u7ECF\u5728\u9000\u51FA\u3002" }) : runtimeRestartScheduled ? reply.code(409).send({ error: "\u540E\u53F0\u8FDB\u7A0B\u5DF2\u7ECF\u5728\u91CD\u542F\u3002" }) : (runtimeRestartScheduled = !0, reply.code(200).send({ message: "\u672C\u673A\u4EFB\u52A1\u5E93\u540E\u53F0\u5DF2\u6536\u5230\u91CD\u542F\u8BF7\u6C42\uFF0C4310 \u5373\u5C06\u91CD\u65B0\u76D1\u542C\u3002" }), setTimeout(() => {
@@ -166590,7 +167140,7 @@ async function buildApp(service, input = "http://localhost:5173") {
     } catch (error51) {
       return reply.code(error51 instanceof external_exports.ZodError ? 400 : 409).send({ error: error51 instanceof Error ? error51.message : "\u81EA\u52A8\u7EF4\u62A4\u8BBE\u7F6E\u66F4\u65B0\u5931\u8D25\u3002" });
     }
-  }), app.get("/api/diagnostics", async () => service.diagnostics((0, import_node_crypto12.randomUUID)())), app.get("/api/audit/ai-decisions/:id/replay", async (request, reply) => {
+  }), app.get("/api/diagnostics", async () => service.diagnostics((0, import_node_crypto13.randomUUID)())), app.get("/api/audit/ai-decisions/:id/replay", async (request, reply) => {
     let binding = requirePrivacyCapability(request, reply, options.desktopCapability, AUDIT_REPLAY_INTENT);
     if (!binding) return;
     let params = external_exports.object({ id: external_exports.string().min(1).max(200) }).parse(request.params);
@@ -166699,22 +167249,49 @@ async function buildApp(service, input = "http://localhost:5173") {
     }
   }), app.post("/api/integrations/cindy/decisions", async (request, reply) => {
     try {
-      let isoTimestamp = external_exports.string().datetime({ offset: !0 }), body = external_exports.object({
+      let isoTimestamp = external_exports.string().datetime({ offset: !0 }), receipt = external_exports.string().min(32).max(200), body = external_exports.object({
         decision_request_id: external_exports.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
+        batch_id: external_exports.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
         window_id: external_exports.string().trim().min(1).max(200),
         window_start: isoTimestamp,
         window_end: isoTimestamp,
-        decisions: external_exports.array(external_exports.object({
-          decision_ref: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
-          action: external_exports.enum(["create_candidate", "update_task", "skip", "needs_owner", "retry_later"]),
-          source_receipts: external_exports.array(external_exports.string().min(32).max(200)).min(1).max(100),
+        snapshot_receipts: external_exports.array(receipt).min(1).max(100),
+        groups: external_exports.array(external_exports.object({
+          group_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+          action: external_exports.enum(["create_candidate", "update_task"]),
+          anchor_receipt: receipt,
+          field_evidence_receipts: external_exports.array(receipt).max(99),
           task_key: external_exports.string().trim().min(1).max(200).optional(),
-          expected_version: external_exports.number().int().nonnegative().optional(),
+          expected_version: external_exports.number().int().positive().optional(),
           title: external_exports.string().trim().min(1).max(160).optional(),
           describe: external_exports.string().trim().min(1).max(2e3).optional(),
           next_step: external_exports.string().trim().min(1).max(1e3).optional(),
-          reason: external_exports.string().trim().max(2e3).optional()
-        }).strict()).max(500)
+          reason: external_exports.string().trim().max(500).optional()
+        }).strict()).max(100),
+        primary_dispositions: external_exports.array(external_exports.object({
+          disposition_ref: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+          source_receipt: receipt,
+          disposition: external_exports.enum(["group", "skip", "needs_owner"]),
+          primary_group_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u).optional(),
+          owner_decision_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u).optional(),
+          reason: external_exports.string().trim().max(500).optional()
+        }).strict()).min(1).max(100),
+        shared_context: external_exports.array(external_exports.object({
+          source_receipt: receipt,
+          shared_group_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u)
+        }).strict()).max(500).optional(),
+        owner_decisions: external_exports.array(external_exports.object({
+          decision_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+          reason: external_exports.string().trim().min(1).max(500),
+          options: external_exports.array(external_exports.object({
+            option_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+            action: external_exports.enum(["skip", "create_candidate", "append_candidate"]),
+            title: external_exports.string().trim().min(1).max(160).optional(),
+            describe: external_exports.string().trim().min(1).max(2e3).optional(),
+            next_step: external_exports.string().trim().min(1).max(1e3).optional(),
+            candidate_key: external_exports.string().trim().min(1).max(200).optional()
+          }).strict()).min(1).max(10)
+        }).strict()).max(100).optional()
       }).strict().parse(request.body);
       return service.processCindyDecisions(cindyAuthContext(), body);
     } catch (error51) {
@@ -166722,6 +167299,41 @@ async function buildApp(service, input = "http://localhost:5173") {
         error: error51 instanceof Error ? error51.message : "Cindy \u51B3\u7B56\u63D0\u4EA4\u5931\u8D25\u3002"
       };
       return error51 instanceof CindySourceContractError && (payload.error_code = error51.errorCode), error51 instanceof CindyIntakeConflictError && (payload.error_code = error51.errorCode, payload.current_version = error51.currentVersion), reply.code(status).send(payload);
+    }
+  }), app.get("/api/owner-decisions", async (request, reply) => {
+    try {
+      let query = external_exports.object({
+        status: external_exports.enum(["pending", "all"]).default("pending"),
+        limit: external_exports.coerce.number().int().min(1).max(100).default(50)
+      }).parse(request.query ?? {});
+      return service.listCindyOwnerDecisions(cindyAuthContext(), query.limit, query.status);
+    } catch (error51) {
+      let status = error51 instanceof external_exports.ZodError ? 400 : error51 instanceof CindySourceContractError ? error51.statusCode : 409;
+      return reply.code(status).send({ error: error51 instanceof Error ? error51.message : "\u4E3B\u4EBA\u51B3\u5B9A\u8BFB\u53D6\u5931\u8D25\u3002" });
+    }
+  }), app.post("/api/owner-decisions/:decisionId/resolve", async (request, reply) => {
+    try {
+      let params = external_exports.object({ decisionId: external_exports.string().min(1).max(200) }).parse(request.params), body = external_exports.object({
+        decision_request_id: external_exports.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
+        expected_version: external_exports.number().int().positive(),
+        action: external_exports.enum(["skip", "create_candidate"]),
+        option_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u)
+      }).strict().parse(request.body);
+      return service.resolveCindyOwnerDecision(cindyAuthContext(), params.decisionId, body);
+    } catch (error51) {
+      let status = error51 instanceof external_exports.ZodError ? 400 : error51 instanceof CindySourceContractError ? error51.statusCode : (error51 instanceof CindyIntakeConflictError, 409), payload = { error: error51 instanceof Error ? error51.message : "\u4E3B\u4EBA\u51B3\u5B9A\u6267\u884C\u5931\u8D25\u3002" };
+      return error51 instanceof CindyIntakeConflictError && (payload.current_version = error51.currentVersion), error51 instanceof CindySourceContractError && (payload.error_code = error51.errorCode), reply.code(status).send(payload);
+    }
+  }), app.post("/api/owner-decisions/:decisionId/cancel", async (request, reply) => {
+    try {
+      let params = external_exports.object({ decisionId: external_exports.string().min(1).max(200) }).parse(request.params), body = external_exports.object({
+        decision_request_id: external_exports.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
+        expected_version: external_exports.number().int().positive()
+      }).strict().parse(request.body);
+      return service.cancelCindyOwnerDecision(cindyAuthContext(), params.decisionId, body);
+    } catch (error51) {
+      let status = error51 instanceof external_exports.ZodError ? 400 : error51 instanceof CindySourceContractError ? error51.statusCode : (error51 instanceof CindyIntakeConflictError, 409), payload = { error: error51 instanceof Error ? error51.message : "\u4E3B\u4EBA\u51B3\u5B9A\u53D6\u6D88\u5931\u8D25\u3002" };
+      return error51 instanceof CindyIntakeConflictError && (payload.current_version = error51.currentVersion), error51 instanceof CindySourceContractError && (payload.error_code = error51.errorCode), reply.code(status).send(payload);
     }
   }), app.get("/api/owner-information", async () => service.ownerInformation()), app.get("/api/privacy/status", async () => service.privacyStatus()), app.post("/api/privacy/collection/stop", async (request, reply) => {
     let binding = requirePrivacyCapability(request, reply, options.desktopCapability, PRIVACY_OWNER_ACTION_INTENT2);

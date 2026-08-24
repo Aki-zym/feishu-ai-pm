@@ -4,7 +4,7 @@
   "name": "TooManyTasks",
   "description": "把已授权飞书消息整理为 TooManyTasks 入库候选，并维护当前会话的任务进度。本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台。",
   "whenToUse": "需要扫描已授权飞书消息或把当前会话的实际进展写回任务台时使用；本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台。",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "entry": "main.js",
   "launch": "resident",
   "slots": ["tool", "agent", "node", "cindy", "session-context", "skill", "subscribe"],
@@ -94,24 +94,35 @@
     },
     {
       "name": "submit_pm_decisions",
-      "description": "只用已保存来源的 source_receipt 提交结构化入库判断；不得重传 raw sources。",
+      "description": "只用已保存来源的 source_receipt 提交完整 snapshot 的 batch/group/primary/shared_context 判断；不得重传 raw sources。",
       "parameters": {
         "type": "object",
         "properties": {
           "decision_request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$" },
+          "batch_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$" },
           "window_id": { "type": "string", "minLength": 1, "maxLength": 200 },
           "window_start": { "type": "string", "minLength": 1, "maxLength": 80 },
           "window_end": { "type": "string", "minLength": 1, "maxLength": 80 },
-          "decisions": {
+          "snapshot_receipts": {
             "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "uniqueItems": true,
+            "items": { "type": "string", "minLength": 32, "maxLength": 200 }
+          },
+          "groups": {
+            "type": "array",
+            "maxItems": 100,
             "items": {
               "type": "object",
               "properties": {
-                "decision_ref": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
-                "action": { "type": "string", "enum": ["create_candidate", "update_task", "skip", "needs_owner", "retry_later"] },
-                "source_receipts": {
+                "group_key": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+                "action": { "type": "string", "enum": ["create_candidate", "update_task"] },
+                "anchor_receipt": { "type": "string", "minLength": 32, "maxLength": 200 },
+                "field_evidence_receipts": {
                   "type": "array",
-                  "minItems": 1,
+                  "maxItems": 99,
+                  "uniqueItems": true,
                   "items": { "type": "string", "minLength": 32, "maxLength": 200 }
                 },
                 "task_key": { "type": "string", "maxLength": 200 },
@@ -119,14 +130,76 @@
                 "title": { "type": "string", "maxLength": 160 },
                 "describe": { "type": "string", "maxLength": 2000 },
                 "next_step": { "type": "string", "maxLength": 1000 },
-                "reason": { "type": "string", "maxLength": 2000 }
+                "reason": { "type": "string", "maxLength": 500 }
               },
-              "required": ["decision_ref", "action", "source_receipts"],
+              "required": ["group_key", "action", "anchor_receipt", "field_evidence_receipts"],
+              "additionalProperties": false
+            }
+          },
+          "primary_dispositions": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "properties": {
+                "disposition_ref": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+                "source_receipt": { "type": "string", "minLength": 32, "maxLength": 200 },
+                "disposition": { "type": "string", "enum": ["group", "skip", "needs_owner"] },
+                "primary_group_key": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+                "owner_decision_key": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+                "reason": { "type": "string", "maxLength": 500 }
+              },
+              "required": ["disposition_ref", "source_receipt", "disposition"],
+              "additionalProperties": false
+            }
+          },
+          "shared_context": {
+            "type": "array",
+            "maxItems": 500,
+            "items": {
+              "type": "object",
+              "properties": {
+                "source_receipt": { "type": "string", "minLength": 32, "maxLength": 200 },
+                "shared_group_key": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" }
+              },
+              "required": ["source_receipt", "shared_group_key"],
+              "additionalProperties": false
+            }
+          },
+          "owner_decisions": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "properties": {
+                "decision_key": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+                "reason": { "type": "string", "minLength": 1, "maxLength": 500 },
+                "options": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 10,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "option_key": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+                      "action": { "type": "string", "enum": ["skip", "create_candidate", "append_candidate"] },
+                      "title": { "type": "string", "maxLength": 160 },
+                      "describe": { "type": "string", "maxLength": 2000 },
+                      "next_step": { "type": "string", "maxLength": 1000 },
+                      "candidate_key": { "type": "string", "maxLength": 200 }
+                    },
+                    "required": ["option_key", "action"],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": ["decision_key", "reason", "options"],
               "additionalProperties": false
             }
           }
         },
-        "required": ["decision_request_id", "window_id", "window_start", "window_end", "decisions"],
+        "required": ["decision_request_id", "batch_id", "window_id", "window_start", "window_end", "snapshot_receipts", "groups", "primary_dispositions"],
         "additionalProperties": false
       }
     },
