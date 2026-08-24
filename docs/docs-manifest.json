@@ -45,8 +45,8 @@
   "product_snapshot": {
     "algorithm": "product-source-sha256-v1",
     "selector": "apps-workspace-default-include-v1",
-    "fingerprint": "067062679e06ea577df8095f841444a6476a24ac7b3cf70dac27874d136ee611",
-    "file_count": 84,
+    "fingerprint": "62f2e79cc617eb726409b8c8f8c9da254b58c33f0acdc68bd9bcac58e6c31d89",
+    "file_count": 85,
     "snapshot_as_of": "2026-08-15",
     "equivalent_commit": null,
     "commit_semantics": "optional_product_snapshot_equivalent_reference; fingerprint_is_authoritative_across_squash_or_merge; test_only_package_scripts_are_excluded"

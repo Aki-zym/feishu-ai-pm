@@ -7,6 +7,7 @@
 | Windows 桌面壳 | Electron 生命周期、受限 IPC、本机配置与安装 | `apps/desktop/src/`、`apps/desktop/electron-builder.yml` | `docs/architecture.md`、`docs/security_and_privacy.md` | `apps/desktop/src/*.test.ts`、`scripts/desktop-installer-smoke.mjs` | 使用指南、架构、安全、当前状态、验证矩阵 |
 | React 界面 | 工作台、候选、任务、日历、设置与日志 | `apps/web/src/` | `docs/implementation_brief.md`、`docs/user-guide.md` | `apps/web/src/*.test.ts`、`tests/e2e/` | 使用指南、QA；用户流程改变时更新当前状态 |
 | 服务与领域行为 | API、候选/任务、Runtime、主人判断和审计 | `apps/server/src/app.ts`、`service.ts`、`runtime.ts`、`domain.ts` | `docs/architecture.md`、相关 ADR | `apps/server/tests/` | 架构、安全、实施说明；能力状态改变时更新当前状态 |
+| Cindy 入库插件 | 已授权来源先保存、整批 snapshot 分组、主人决定与本机 Runtime | `plugins/cindy-pm-intake/`、`apps/server/src/cindy-source.ts`、`cindy-batch.ts` | `docs/architecture.md`、`docs/security_and_privacy.md` | `apps/server/tests/cindy-*.test.ts`、插件 main/runtime/worker 测试 | 当前状态、架构、安全、插件 README、验证矩阵 |
 | 当前本地数据层 | SQLite schema、迁移与本地事实记录 | `apps/server/src/database.ts` | `docs/architecture.md`、`docs/security_and_privacy.md` | server 数据库/迁移测试 | 架构、安全；未来数据库方向只记录开放决策 |
 | 飞书适配 | OAuth、P2P/群、日历、妙记和文档上下文 | `apps/server/src/integrations/feishu*.ts` | `docs/feishu-integration.md`、`docs/security_and_privacy.md` | `apps/server/tests/feishu*.test.ts` | 飞书接入、安全、使用指南、验证矩阵 |
 | LLM 分类 | OpenAI-compatible/DeepSeek 分阶段结构与本地校验 | `apps/server/src/integrations/llm.ts` | `docs/implementation_brief.md`、`docs/adr/0006-staged-semantic-classification.md` | `apps/server/tests/llm.test.ts`、回放测试 | 实施说明、架构、安全、验证矩阵 |

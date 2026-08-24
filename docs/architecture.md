@@ -96,6 +96,10 @@ schema v9 在既有 `source_event` / `source_event_revision` 之上增加稳定�
 
 schema v10 在每个 current revision 上追加最小 owner-context：服务端使用认证 owner/account 与 MCP 回显的 sender/chat/thread 技术 ID 做域分离摘要，只保存内部引用；display name 先 NFC，去除控制/Bidi 后再次 NFC，再折叠空白，按完整 grapheme 截到最多 80 个且不超过最严格下游的 160 UTF-16 单元。第二次 NFC 确保过滤字符后新相邻的组合序列仍以 canonical 形式持久化。非字符串、空值、字符串化对象占位或 `ou_`/`oc_` 飞书技术 ID 固定回退“需求方”。mention、sender-is-owner、message type 与 reaction 不从正文推断；reaction 只保留主人白名单类别 `acknowledge / approve / done`，非主人和未知 reaction 忽略。关系目标必须是同认证上下文、同 chat、兼容 thread 的 current receipt 或同批 `client_ref`。服务端只执行结构、scope、引用和上下文上限，不新增相关性分类器；相关/跳过/候选仍由 Cindy Agent 决定。
 
+schema v11 把后续判断固定为 `cindy_batch` snapshot。调用方只能引用当前 receipts，并为每条 snapshot revision 提交唯一 primary disposition；group anchor 与字段 evidence 必须来自该组 primary，其他组只能通过 `cindy_batch_shared_context` 使用非归属背景。`owner_scope + account_anchor + batch_id` 和 canonical payload hash 提供重放/冲突边界，`BEGIN IMMEDIATE` 事务在业务写入前重校验 current revision、处理状态、完整覆盖和 task CAS；任一失败整批回滚，但此前已保存来源不回滚。服务端不按文本、发送者、会话或时间自动分组，也不从正文生成候选字段。
+
+`needs_owner` 写入 `cindy_owner_decision` 与内部 revision 引用。主人私有 API 只投影 opaque decision id、安全原因、选项、状态、version 和时间，不返回 receipt、来源技术 ID、正文、prompt 或推理链。003 可按 version 幂等执行 `skip/create_candidate`，可取消等待；来源 revision 变化会使 pending decision superseded。append_candidate 仅保存为不可执行选项并保持 pending，候选追加和 receipt consumption 留给 004。
+
 首期采用自有最小领域层，至少包含：
 
 ```text

@@ -4,8 +4,8 @@
   "product_snapshot": {
     "algorithm": "product-source-sha256-v1",
     "selector": "apps-workspace-default-include-v1",
-    "fingerprint": "067062679e06ea577df8095f841444a6476a24ac7b3cf70dac27874d136ee611",
-    "file_count": 84,
+    "fingerprint": "62f2e79cc617eb726409b8c8f8c9da254b58c33f0acdc68bd9bcac58e6c31d89",
+    "file_count": 85,
     "snapshot_as_of": "2026-08-15",
     "equivalent_commit": null
   },
@@ -102,6 +102,47 @@
     "record_rule": "evidence_status=attained 必须绑定 source_commit、实际 run、environment 和 provenance；新增或修改记录以及所有 attained 记录必须声明 evidence_contract_version=1、严格 provenance/skip 字段集合和 exact sentinel 组合；exact_merge_ref_ci 的本地 checker 仅证明声明的 run/job identity 与本地 Git 对象、parents/tree/source/head 绑定，不证明 GitHub Actions、repository、workflow/check、SUCCESS、event、head_sha 或 merge checkout 的真实性；可选远端 verifier 必须绑定 repository-scoped API 路径、run.repository.full_name（若存在）、run/job、workflow/check、pull_request、terminal SUCCESS、base/head/merge commit objects、merge-ref parents/tree 和 source=head，commit/job 响应不虚构 repository 字段；run 使用真实 name/workflow_id，job.workflow_name 仅在存在时校验；job.check_run_url 必须是受控的 exact check-run ID，直接读取该 ID 的 exact check-run API 对象，不依赖 head commit check-runs 列表或分页，并绑定 API URL、ID、name、head_sha、status/conclusion 和受控 GitHub details_url；apiBase 必须是受控的 https://api.github.com 根地址，禁止重定向或 foreign host；私有仓库只能在显式 token 参数或 GITHUB_TOKEN/GH_TOKEN 环境变量存在时发送 Bearer Authorization，token 不得写入、返回或日志输出；无 token 的公共仓库请求仍可用，401/403/404、网络或权限不可用时固定返回 unavailable；不查询 synthetic merge commit 的 check-runs，merge commit 不需要 check-run；缺少 verifier 或离线时返回 unavailable 而不是授权通过；最终授权必须由 PR body 与 Lead 的远端 anti-drift 核验绑定；not_run/historical 不能声明 attained 或 real environment。"
   },
   "records": [
+    {
+      "id": "VER-LOCAL20260824-003-CINDY-GROUPED-BATCH-L2-20260824",
+      "evidence_contract_version": 1,
+      "capability": "Cindy 对有界 receipt snapshot 整体理解后提交零个、一个或多个任务组，服务端执行覆盖、幂等、CAS、事务和主人决定合同",
+      "implementation_state": "implemented_pending_independent_review_and_local_main_merge",
+      "target_level": "L4",
+      "attained_level": "L2",
+      "evidence_status": "attained",
+      "evidence_type": "synthetic_local_sqlite_service_plugin_renderer_contract",
+      "scope": "synthetic_local_cindy_grouped_batch_contract",
+      "source_commit": "36caa0c557e07593993a0e49701c1fc05cacfe50",
+      "record_commit": "local-20260824-003-pending",
+      "run_id": "local-20260824-003-grouped-batch-01",
+      "run_at": "2026-08-24",
+      "environment": "Windows local worktree; Node.js 24.19.0; in-memory and temporary-file SQLite; Fastify inject; bundled Cindy plugin runtime; synthetic data only",
+      "command_or_scenario": "npm test -w @ai-pm/server -- --run tests/cindy-batch.test.ts tests/cindy-intake.test.ts tests/cindy-source-migration.test.ts (32/32); npm test -w @ai-pm/server (41/41); npm run typecheck -w @ai-pm/server; npm test -w @ai-pm/web (50/50); npm run typecheck -w @ai-pm/web; node --test plugins/cindy-pm-intake/main.test.mjs plugins/cindy-pm-intake/settings.test.mjs plugins/cindy-pm-intake/node/worker.test.mjs plugins/cindy-pm-intake/node/pm-runtime.test.mjs plugins/cindy-pm-intake/node/pm-runtime.shutdown.test.mjs (46/46); node plugins/cindy-pm-intake/scripts/bundle-pm-runtime.mjs; git diff --check",
+      "result": "passed",
+      "skips": "No real Cindy model grouping evaluation, real Feishu tenant/account/permissions, MCP provenance attestation, production database/data, browser E2E, remote GitHub validation, installed Windows package L5 or real tenant/provider L6 validation.",
+      "skip_classification": {
+        "status": "present",
+        "kinds": ["capability", "platform"],
+        "reason": "The authorized task is synthetic/local only; real model quality, tenant behavior, production concurrency, remote writes and installed-package validation are outside the attained evidence."
+      },
+      "provenance": {
+        "mode": "local_run",
+        "base_commit": "not_applicable",
+        "head_commit": "36caa0c557e07593993a0e49701c1fc05cacfe50",
+        "merge_ref": "not_applicable",
+        "parents": [],
+        "tree": "not_applicable",
+        "run_id": "local-20260824-003-grouped-batch-01",
+        "job_id": "not_applicable",
+        "environment": "Windows local worktree; Node.js 24.19.0; in-memory and temporary-file SQLite; Fastify inject; bundled Cindy plugin runtime; synthetic data only",
+        "command": "npm test -w @ai-pm/server -- --run tests/cindy-batch.test.ts tests/cindy-intake.test.ts tests/cindy-source-migration.test.ts (32/32); npm test -w @ai-pm/server (41/41); npm run typecheck -w @ai-pm/server; npm test -w @ai-pm/web (50/50); npm run typecheck -w @ai-pm/web; node --test plugins/cindy-pm-intake/main.test.mjs plugins/cindy-pm-intake/settings.test.mjs plugins/cindy-pm-intake/node/worker.test.mjs plugins/cindy-pm-intake/node/pm-runtime.test.mjs plugins/cindy-pm-intake/node/pm-runtime.shutdown.test.mjs (46/46); node plugins/cindy-pm-intake/scripts/bundle-pm-runtime.mjs; git diff --check"
+      },
+      "target_real_scope": false,
+      "real_environment_attained": false,
+      "artifact": null,
+      "evidence_path": "apps/server/tests/cindy-batch.test.ts",
+      "limitations": "Synthetic/local L2 evidence proves exact snapshot coverage, stable batch/group keys, primary/shared relation uniqueness, canonical replay/conflict, transaction rollback, task CAS competition, current receipt fencing, safe owner-decision list/resolve/cancel/retry/supersede behavior, append-pending boundary, v10→v11 atomic migration recovery, plugin schema/prompt and private renderer projection. The grouping examples use a controllable Agent substitute; they do not prove long-term real Cindy model quality, real Feishu context/provenance, production concurrency, browser E2E, Windows L5 or external L6 behavior."
+    },
     {
       "id": "VER-LOCAL20260824-002-CINDY-CONTEXT-L2-20260824",
       "evidence_contract_version": 1,
