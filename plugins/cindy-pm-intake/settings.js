@@ -99,11 +99,19 @@ async function updateAutoScanState(enabled) {
   return response.result;
 }
 
+function progressModeValue() {
+  return document.querySelector?.('input[name="progressMode"]:checked')?.value === 'automatic' ? 'automatic' : 'manual';
+}
+
 Promise.all([
   fetch('/kv').then((response) => response.json()),
   fetch('/secrets').then((response) => response.json()),
 ]).then(([config, secrets]) => {
   byId('pmBaseUrl').value = isLoopbackUrl(config.pmBaseUrl) ? config.pmBaseUrl : DEFAULT_PM_BASE_URL;
+  byId('progressEnabled').checked = config.progressEnabled !== false;
+  const progressMode = config.progressMode === 'automatic' ? 'automatic' : 'manual';
+  const progressRadio = document.querySelector?.(`input[name="progressMode"][value="${progressMode}"]`);
+  if (progressRadio) progressRadio.checked = true;
   const saved = Array.isArray(secrets) && secrets.some((item) => item.key === 'pm_token' && item.saved);
   byId('token').placeholder = saved ? '已保存；留空保持不变' : '请输入本机服务令牌';
   void requestAutoScanState().then((state) => {
@@ -123,6 +131,8 @@ byId('save').onclick = async () => {
     method: 'PUT',
     body: JSON.stringify({
       pmBaseUrl,
+      progressEnabled: byId('progressEnabled').checked,
+      progressMode: progressModeValue(),
     }),
   });
   const token = byId('token').value;

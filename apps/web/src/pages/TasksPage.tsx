@@ -63,7 +63,7 @@ export default function TasksPage() {
         </select>
       </div>
       {resource.data !== null && resource.status !== 'error' && <div className="list-summary">共 {visible.length} 项任务</div>}
-      <AsyncState resource={resource} empty={visible.length === 0} emptyText={status ? `“${statusText[status]}”下还没有任务。` : '目前还没有正式任务。'} loadingText="正在读取任务台账…" errorTitle="任务列表读取失败" onRetry={load}>
+      <AsyncState resource={resource} empty={visible.length === 0} emptyText={status ? `“${statusText[status]}”下还没有任务。` : '目前还没有正式任务。回到 Cindy 说「扫近10分钟」即可扫描已授权消息。'} loadingText="正在读取任务台账…" errorTitle="任务列表读取失败" onRetry={load}>
         <TaskTable tasks={visible} />
       </AsyncState>
     </div>

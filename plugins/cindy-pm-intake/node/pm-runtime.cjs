@@ -174355,10 +174355,15 @@ function rewriteCreateTableName(sql, replacement) {
 function currentSchemaTableNames() {
   return [...schema.matchAll(/CREATE TABLE IF NOT EXISTS ([a-z_][a-z0-9_]*)/gu)].map((match) => match[1]);
 }
+var CINDY_PROGRESS_TABLES = /* @__PURE__ */ new Set([
+  "cindy_session_task_binding",
+  "cindy_task_binding_suggestion",
+  "cindy_turn_evaluation"
+]);
 function applicationTableNames(database) {
   return database.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-  ).all().map((table) => table.name);
+  ).all().map((table) => table.name).filter((table) => !CINDY_PROGRESS_TABLES.has(table));
 }
 function assertNoUnknownSchemaObjects(database, stage) {
   const unknown2 = database.prepare(
@@ -176819,6 +176824,52 @@ function openAppDatabase(path) {
     throw new DatabaseUpgradeError("ledger", "\u65E0\u6CD5\u6253\u5F00\u672C\u5730 SQLite\uFF1B\u5DF2\u62D2\u7EDD\u542F\u52A8\u3002");
   }
 }
+function ensureCindyProgressTables(database) {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS cindy_session_task_binding (
+      session_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL REFERENCES task(id) ON DELETE CASCADE,
+      confidence REAL NOT NULL,
+      binding_source TEXT NOT NULL DEFAULT 'model',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      invalidated_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS cindy_task_binding_suggestion (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      task_id TEXT NOT NULL REFERENCES task(id) ON DELETE CASCADE,
+      confidence REAL NOT NULL,
+      reason TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','confirmed','rejected','stale')),
+      created_at TEXT NOT NULL,
+      decided_at TEXT,
+      UNIQUE(session_id, turn_id)
+    );
+    CREATE TABLE IF NOT EXISTS cindy_turn_evaluation (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      task_id TEXT REFERENCES task(id) ON DELETE SET NULL,
+      decision TEXT NOT NULL,
+      association_confidence REAL,
+      update_confidence REAL,
+      reason TEXT NOT NULL,
+      evidence_json TEXT NOT NULL DEFAULT '[]',
+      provider TEXT NOT NULL DEFAULT '',
+      model TEXT NOT NULL DEFAULT '',
+      input_hash TEXT NOT NULL DEFAULT '',
+      prompt_version TEXT NOT NULL DEFAULT '',
+      proposal_id TEXT REFERENCES task_update_proposal(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(session_id, turn_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_cindy_binding_task ON cindy_session_task_binding(task_id, invalidated_at);
+    CREATE INDEX IF NOT EXISTS idx_cindy_suggestion_state ON cindy_task_binding_suggestion(state, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_cindy_turn_task ON cindy_turn_evaluation(task_id, created_at DESC);
+  `);
+}
 var AppDatabase = class {
   raw;
   databasePath;
@@ -176848,6 +176899,7 @@ var AppDatabase = class {
         upgradeBackupPath = backupPath;
         upgradeDatabaseInstanceId = instanceId;
       });
+      ensureCindyProgressTables(this.raw);
       this.databaseInstanceId = readDatabaseInstanceIdentity(this.raw, "ledger", true)?.instanceId;
     } catch (error51) {
       try {
@@ -188272,6 +188324,9 @@ var PRIVACY_PURGE_TABLES = [
   "job_source_link",
   "task_update_proposal",
   "requirement_thread_revision",
+  "cindy_turn_evaluation",
+  "cindy_task_binding_suggestion",
+  "cindy_session_task_binding",
   "requirement_thread_unit",
   "requirement_thread_source",
   "notification",
@@ -199201,6 +199256,174 @@ var PmService = class {
       updated_at: row.updated_at
     }));
   }
+  getCindySessionBinding(sessionId) {
+    const row = this.database.raw.prepare(
+      `SELECT binding.*, task.title, task.describe, task.status, task.next_step, task.waiting_reason,
+              task.version, task.updated_at, task.deleted_at, task.record_state, task.auto_update_paused
+       FROM cindy_session_task_binding AS binding
+       JOIN task ON task.id = binding.task_id
+       WHERE binding.session_id = ? AND binding.invalidated_at IS NULL`
+    ).get(sessionId);
+    if (!row) return null;
+    if (row.deleted_at || row.record_state !== "active" || row.status === "archived") {
+      const timestamp = nowIso4();
+      this.database.raw.prepare(
+        "UPDATE cindy_session_task_binding SET invalidated_at = ?, updated_at = ? WHERE session_id = ? AND invalidated_at IS NULL"
+      ).run(timestamp, timestamp, sessionId);
+      return null;
+    }
+    return {
+      sessionId,
+      confidence: Number(row.confidence),
+      bindingSource: String(row.binding_source),
+      task: {
+        id: String(row.task_id),
+        title: String(row.title),
+        describe: String(row.describe),
+        status: String(row.status),
+        nextStep: String(row.next_step ?? ""),
+        waitingReason: row.waiting_reason === null ? null : String(row.waiting_reason),
+        version: Number(row.version),
+        updatedAt: String(row.updated_at),
+        autoUpdatePaused: Boolean(row.auto_update_paused)
+      }
+    };
+  }
+  confirmCindySessionBinding(sessionId, taskId) {
+    const task = this.getTask(taskId);
+    if (!task || task.record_state !== "active" || task.deleted_at || task.status === "archived") {
+      throw new Error("\u76EE\u6807\u4EFB\u52A1\u4E0D\u5B58\u5728\u6216\u5DF2\u4E0D\u53EF\u7ED1\u5B9A\u3002");
+    }
+    const timestamp = nowIso4();
+    this.database.raw.prepare(
+      `INSERT INTO cindy_session_task_binding
+        (session_id, task_id, confidence, binding_source, created_at, updated_at, invalidated_at)
+       VALUES (?, ?, 1, 'owner', ?, ?, NULL)
+       ON CONFLICT(session_id) DO UPDATE SET
+         task_id = excluded.task_id, confidence = 1, binding_source = 'owner',
+         updated_at = excluded.updated_at, invalidated_at = NULL`
+    ).run(sessionId, taskId, timestamp, timestamp);
+    this.database.raw.prepare(
+      `UPDATE cindy_task_binding_suggestion SET state = 'confirmed', decided_at = ?
+       WHERE session_id = ? AND task_id = ? AND state = 'pending'`
+    ).run(timestamp, sessionId, taskId);
+    return this.getCindySessionBinding(sessionId);
+  }
+  recordCindyTurnEvaluation(input) {
+    const existing = this.database.raw.prepare(
+      "SELECT * FROM cindy_turn_evaluation WHERE session_id = ? AND turn_id = ?"
+    ).get(input.sessionId, input.turnId);
+    if (existing) {
+      const proposalId2 = typeof existing.proposal_id === "string" ? existing.proposal_id : null;
+      const decision = String(existing.decision);
+      return {
+        duplicate: true,
+        evaluation: existing,
+        binding: this.getCindySessionBinding(input.sessionId),
+        suggestion: decision === "suggest_binding" ? this.database.raw.prepare("SELECT * FROM cindy_task_binding_suggestion WHERE session_id = ? AND turn_id = ?").get(input.sessionId, input.turnId) : null,
+        proposal: proposalId2 ? this.getTaskUpdateProposal(proposalId2) : null
+      };
+    }
+    const binding = this.getCindySessionBinding(input.sessionId);
+    const requestedDecision = input.decision;
+    if (binding) {
+      if (!["no_update", "progress_update"].includes(requestedDecision)) throw new Error("\u5DF2\u6709\u4F1A\u8BDD\u7ED1\u5B9A\u65F6\u53EA\u80FD\u63D0\u4EA4\u5F53\u524D\u4EFB\u52A1\u7684\u8FDB\u5EA6\u5224\u65AD\u3002");
+    } else if (!["no_match", "suggest_binding", "bind"].includes(requestedDecision)) {
+      throw new Error("\u672A\u7ED1\u5B9A\u4F1A\u8BDD\u53EA\u80FD\u63D0\u4EA4\u5339\u914D\u3001\u5EFA\u8BAE\u7ED1\u5B9A\u6216\u65E0\u5339\u914D\u5224\u65AD\u3002");
+    }
+    const associationConfidence = input.associationConfidence ?? null;
+    const effectiveDecision = requestedDecision === "bind" && (associationConfidence ?? 0) < 0.9 ? "suggest_binding" : requestedDecision;
+    let taskId = input.taskId ?? binding?.task.id ?? null;
+    const candidateTaskIds = new Set(input.candidateTaskIds ?? []);
+    if (!binding && taskId && !candidateTaskIds.has(taskId)) throw new Error("\u672A\u7ED1\u5B9A\u4F1A\u8BDD\u5F15\u7528\u7684\u4EFB\u52A1\u4E0D\u5728\u672C\u8F6E\u5019\u9009\u96C6\u5185\u3002");
+    if (!binding && taskId && !this.database.raw.prepare(
+      `SELECT 1 FROM task WHERE id = ? AND record_state = 'active' AND deleted_at IS NULL AND status <> 'archived'`
+    ).get(taskId)) throw new Error("\u672A\u7ED1\u5B9A\u4F1A\u8BDD\u53EA\u80FD\u5F15\u7528\u5F53\u524D\u672A\u5F52\u6863\u4EFB\u52A1\u5019\u9009\u3002");
+    const task = taskId ? this.getTask(taskId) : null;
+    if (taskId && (!task || task.record_state !== "active" || task.deleted_at || task.status === "archived")) throw new Error("\u5224\u65AD\u6307\u5411\u7684\u4EFB\u52A1\u4E0D\u5B58\u5728\u6216\u5DF2\u4E0D\u53EF\u7EF4\u62A4\u3002");
+    if (binding && taskId && binding.task.id !== taskId) throw new Error("\u8FD9\u6761\u4F1A\u8BDD\u5DF2\u6709\u6709\u6548\u7ED1\u5B9A\uFF0C\u4E0D\u80FD\u7531\u6A21\u578B\u6539\u7ED1\u5230\u5176\u4ED6\u4EFB\u52A1\u3002");
+    const updateConfidence = input.updateConfidence ?? null;
+    const timestamp = nowIso4();
+    if (effectiveDecision === "bind" && taskId && associationConfidence !== null && associationConfidence >= 0.9) {
+      this.database.raw.prepare(
+        `INSERT INTO cindy_session_task_binding
+          (session_id, task_id, confidence, binding_source, created_at, updated_at, invalidated_at)
+         VALUES (?, ?, ?, 'model', ?, ?, NULL)
+         ON CONFLICT(session_id) DO UPDATE SET
+           task_id = excluded.task_id, confidence = excluded.confidence, binding_source = 'model',
+           updated_at = excluded.updated_at, invalidated_at = NULL`
+      ).run(input.sessionId, taskId, associationConfidence, timestamp, timestamp);
+    } else if (effectiveDecision === "suggest_binding" && taskId && associationConfidence !== null) {
+      this.database.raw.prepare(
+        `INSERT OR IGNORE INTO cindy_task_binding_suggestion
+          (id, session_id, turn_id, task_id, confidence, reason, state, created_at, decided_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL)`
+      ).run(id("cindy-binding"), input.sessionId, input.turnId, taskId, associationConfidence, input.reason, timestamp);
+    }
+    let proposalId = null;
+    if (effectiveDecision === "progress_update" && task) {
+      const patchRecord = input.patch ?? {};
+      const unknownKeys = Object.keys(patchRecord).filter((key) => !["status", "nextStep", "waitingReason"].includes(key));
+      if (unknownKeys.length) throw new Error("\u5F53\u524D\u8F6E\u6B21\u66F4\u65B0\u5305\u542B\u8D8A\u6743\u5B57\u6BB5\u3002");
+      const patch = {};
+      if (patchRecord.status !== void 0 && patchRecord.status !== task.status) patch.status = patchRecord.status;
+      if (patchRecord.nextStep !== void 0 && patchRecord.nextStep !== task.next_step) patch.nextStep = patchRecord.nextStep;
+      if (patchRecord.waitingReason !== void 0 && patchRecord.waitingReason !== task.waiting_reason) patch.waitingReason = patchRecord.waitingReason;
+      if (Object.keys(patch).length) {
+        const proposal = this.createTaskUpdateProposal({
+          task,
+          threadId: null,
+          sourceEventId: null,
+          demandUnitId: null,
+          candidateRevisionId: null,
+          threadRevisionId: null,
+          baseThreadVersion: null,
+          patch,
+          reason: input.reason,
+          evidence: { sessionId: input.sessionId, turnId: input.turnId, relationType: "cindy_session_binding", excerpts: (input.evidence ?? []).slice(0, 8) },
+          provider: input.provider ?? "cindy",
+          model: input.model ?? "",
+          promptVersion: input.promptVersion ?? "cindy-manual-v2",
+          origin: "cindy_turn",
+          associationConfidence,
+          updateConfidence,
+          usedFallback: false,
+          idempotencyKey: `cindy-turn:${input.sessionId}:${input.turnId}`,
+          createdAt: timestamp
+        });
+        proposalId = proposal.id;
+      }
+    }
+    this.database.raw.prepare(
+      `INSERT INTO cindy_turn_evaluation
+        (id, session_id, turn_id, task_id, decision, association_confidence, update_confidence,
+         reason, evidence_json, provider, model, input_hash, prompt_version, proposal_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id("cindy-turn"),
+      input.sessionId,
+      input.turnId,
+      taskId,
+      effectiveDecision,
+      associationConfidence,
+      updateConfidence,
+      input.reason,
+      JSON.stringify((input.evidence ?? []).slice(0, 8)),
+      input.provider ?? "cindy",
+      input.model ?? "",
+      input.inputHash ?? "",
+      input.promptVersion ?? "",
+      proposalId,
+      timestamp
+    );
+    if (proposalId) this.dispatchTaskUpdateProposal(proposalId, null);
+    return {
+      duplicate: false,
+      binding: this.getCindySessionBinding(input.sessionId),
+      suggestion: effectiveDecision === "suggest_binding" ? this.database.raw.prepare("SELECT * FROM cindy_task_binding_suggestion WHERE session_id = ? AND turn_id = ?").get(input.sessionId, input.turnId) : null,
+      proposal: proposalId ? this.getTaskUpdateProposal(proposalId) : null
+    };
+  }
   listCindyCandidates() {
     const candidates = this.database.raw.prepare(
       `SELECT candidate_request.id,
@@ -203207,6 +203430,50 @@ async function buildApp(service, input = "http://localhost:5173") {
     candidates: service.listCindyCandidates(),
     cursors: service.listCindyConversationCursors()
   }));
+  app.get("/api/integrations/cindy/bindings/:sessionId", async (request) => {
+    const params = external_exports.object({ sessionId: external_exports.string().min(1).max(200) }).parse(request.params);
+    return { binding: service.getCindySessionBinding(params.sessionId) };
+  });
+  app.post("/api/integrations/cindy/bindings/:sessionId/confirm", async (request, reply) => {
+    try {
+      const params = external_exports.object({ sessionId: external_exports.string().min(1).max(200) }).parse(request.params);
+      const body = external_exports.object({ taskId: external_exports.string().min(1).max(200) }).parse(request.body);
+      return { binding: service.confirmCindySessionBinding(params.sessionId, body.taskId) };
+    } catch (error51) {
+      return reply.code(error51 instanceof external_exports.ZodError ? 400 : 409).send({ error: error51 instanceof Error ? error51.message : "\u4F1A\u8BDD\u7ED1\u5B9A\u786E\u8BA4\u5931\u8D25\u3002" });
+    }
+  });
+  app.post("/api/integrations/cindy/turn-evaluations", async (request, reply) => {
+    try {
+      const body = external_exports.object({
+        sessionId: external_exports.string().min(1).max(200),
+        turnId: external_exports.string().min(1).max(200),
+        candidateTaskIds: external_exports.array(external_exports.string().min(1).max(200)).max(200).default([]),
+        decision: external_exports.enum(["no_match", "suggest_binding", "bind", "no_update", "progress_update"]),
+        taskId: external_exports.string().min(1).max(200).nullable().optional(),
+        associationConfidence: external_exports.number().min(0).max(1).nullable().optional(),
+        updateConfidence: external_exports.number().min(0).max(1).nullable().optional(),
+        patch: external_exports.object({
+          status: external_exports.enum(taskStatuses).optional(),
+          nextStep: external_exports.string().max(1e3).optional(),
+          waitingReason: external_exports.string().max(1e3).nullable().optional()
+        }).strict().optional(),
+        reason: external_exports.string().min(1).max(2e3),
+        evidence: external_exports.array(external_exports.string().max(500)).max(8).optional(),
+        provider: external_exports.string().max(100).optional(),
+        model: external_exports.string().max(256).optional(),
+        inputHash: external_exports.string().max(128).optional(),
+        promptVersion: external_exports.string().max(100).optional()
+      }).parse(request.body);
+      return service.recordCindyTurnEvaluation({
+        ...body,
+        taskId: body.taskId ?? void 0,
+        patch: body.patch ? { ...body.patch, status: body.patch.status } : void 0
+      });
+    } catch (error51) {
+      return reply.code(error51 instanceof external_exports.ZodError ? 400 : 409).send({ error: error51 instanceof Error ? error51.message : "\u8F6E\u6B21\u5224\u65AD\u5199\u5165\u5931\u8D25\u3002" });
+    }
+  });
   app.post("/api/integrations/cindy/intake", async (request, reply) => {
     try {
       const isoTimestamp = external_exports.string().datetime({ offset: true });

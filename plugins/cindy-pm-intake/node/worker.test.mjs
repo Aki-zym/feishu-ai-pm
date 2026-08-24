@@ -1,10 +1,52 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { DatabaseSync } from 'node:sqlite';
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import test from 'node:test';
 
 const workerPath = path.resolve(import.meta.dirname, 'worker.cjs');
+
+function createCindyFixture({ source = 'desktop', orcaRole = null, sessionId = 'session-a' } = {}) {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'cindy-pm-worker-'));
+  const database = new DatabaseSync(path.join(directory, 'cindy-test.db'));
+  database.exec('CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, orca_role TEXT); CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL, agent_meta TEXT, rewind_at INTEGER);');
+  database.prepare('INSERT INTO sessions VALUES (?, ?, ?)').run(sessionId, source, orcaRole);
+  return {
+    directory,
+    insert(id, role, content, createdAt, agentMeta = null) {
+      database.prepare('INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, NULL)').run(id, sessionId, role, content, createdAt, agentMeta);
+    },
+    close() { database.close(); },
+    cleanup() { rmSync(directory, { recursive: true, force: true }); },
+  };
+}
+
+function callWorkerWithDataDir(request, userDataDir) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [workerPath], {
+      env: { ...process.env, NODE_ENV: 'test', CINDY_PM_TEST_USER_DATA_DIR: userDataDir },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+      const newline = stdout.indexOf('\n');
+      if (newline < 0) return;
+      child.kill();
+      try { resolve(JSON.parse(stdout.slice(0, newline))); } catch (error) { reject(error); }
+    });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('exit', (code) => { if (!stdout && code !== 0) reject(new Error(stderr || `worker exited ${code}`)); });
+    child.stdin.end(`${JSON.stringify(request)}\n`);
+  });
+}
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -252,6 +294,40 @@ test('PUT auto-scan forwards the enabled JSON body', async () => {
     assert.deepEqual(JSON.parse(receivedBody), { enabled: true });
   } finally {
     await close(server);
+  }
+});
+
+test('cindy/read-completed-turn only returns the current turn final reply', async () => {
+  const fixture = createCindyFixture();
+  try {
+    fixture.insert('m1', 'user', '{"text":"执行本轮测试。"}', 2000);
+    fixture.insert('m2', 'assistant', '过程更新', 2100);
+    fixture.insert('m3', 'assistant', '本轮最终回复', 2300, '{"turnCompleted":true}');
+    fixture.close();
+    const response = await callWorkerWithDataDir({
+      jsonrpc: '2.0', id: 50, method: 'cindy/read-completed-turn',
+      params: { sessionId: 'session-a', startedAt: 2000, expectedUserMessage: '执行本轮测试。', waitMs: 200 },
+    }, fixture.directory);
+    assert.equal(response.result.userMessage, '执行本轮测试。');
+    assert.equal(response.result.assistantReply, '本轮最终回复');
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('source=plugin 自动进度读取明确跳过', async () => {
+  const fixture = createCindyFixture({ source: 'plugin' });
+  try {
+    fixture.insert('m1', 'user', '{"text":"插件来源回合。"}', 2000);
+    fixture.insert('m2', 'assistant', '插件回复', 2300, '{"turnCompleted":true}');
+    fixture.close();
+    const response = await callWorkerWithDataDir({
+      jsonrpc: '2.0', id: 51, method: 'cindy/read-completed-turn',
+      params: { sessionId: 'session-a', startedAt: 2000, expectedUserMessage: '插件来源回合。', waitMs: 200 },
+    }, fixture.directory);
+    assert.match(response.error.message, /source=plugin/);
+  } finally {
+    fixture.cleanup();
   }
 });
 

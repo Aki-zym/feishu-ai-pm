@@ -850,10 +850,18 @@ function currentSchemaTableNames() {
     .map((match) => match[1]!);
 }
 
+const CINDY_PROGRESS_TABLES = new Set([
+  'cindy_session_task_binding',
+  'cindy_task_binding_suggestion',
+  'cindy_turn_evaluation',
+]);
+
 function applicationTableNames(database: DatabaseSync) {
   return (database.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-  ).all() as Array<{ name: string }>).map((table) => table.name);
+  ).all() as Array<{ name: string }>)
+    .map((table) => table.name)
+    .filter((table) => !CINDY_PROGRESS_TABLES.has(table));
 }
 
 function assertNoUnknownSchemaObjects(database: DatabaseSync, stage: DatabaseUpgradeStage) {
@@ -3502,6 +3510,56 @@ function openAppDatabase(path: string) {
   }
 }
 
+/** Progress tables are additive plugin state. Keep them outside the numbered
+ * core schema so opening an existing v8 database remains compatible with the
+ * core migration identity and backup contract. */
+function ensureCindyProgressTables(database: DatabaseSync) {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS cindy_session_task_binding (
+      session_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL REFERENCES task(id) ON DELETE CASCADE,
+      confidence REAL NOT NULL,
+      binding_source TEXT NOT NULL DEFAULT 'model',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      invalidated_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS cindy_task_binding_suggestion (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      task_id TEXT NOT NULL REFERENCES task(id) ON DELETE CASCADE,
+      confidence REAL NOT NULL,
+      reason TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','confirmed','rejected','stale')),
+      created_at TEXT NOT NULL,
+      decided_at TEXT,
+      UNIQUE(session_id, turn_id)
+    );
+    CREATE TABLE IF NOT EXISTS cindy_turn_evaluation (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      task_id TEXT REFERENCES task(id) ON DELETE SET NULL,
+      decision TEXT NOT NULL,
+      association_confidence REAL,
+      update_confidence REAL,
+      reason TEXT NOT NULL,
+      evidence_json TEXT NOT NULL DEFAULT '[]',
+      provider TEXT NOT NULL DEFAULT '',
+      model TEXT NOT NULL DEFAULT '',
+      input_hash TEXT NOT NULL DEFAULT '',
+      prompt_version TEXT NOT NULL DEFAULT '',
+      proposal_id TEXT REFERENCES task_update_proposal(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(session_id, turn_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_cindy_binding_task ON cindy_session_task_binding(task_id, invalidated_at);
+    CREATE INDEX IF NOT EXISTS idx_cindy_suggestion_state ON cindy_task_binding_suggestion(state, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_cindy_turn_task ON cindy_turn_evaluation(task_id, created_at DESC);
+  `);
+}
+
 export class AppDatabase {
   readonly raw: DatabaseSync;
   private readonly databasePath: string;
@@ -3536,6 +3594,7 @@ export class AppDatabase {
         upgradeBackupPath = backupPath;
         upgradeDatabaseInstanceId = instanceId;
       });
+      ensureCindyProgressTables(this.raw);
       this.databaseInstanceId = readDatabaseInstanceIdentity(this.raw, 'ledger', true)?.instanceId;
     } catch (error) {
       try { this.raw.close(); } catch {}

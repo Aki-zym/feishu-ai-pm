@@ -19,7 +19,7 @@ function waitFor(predicate, timeoutMs = 1000) {
   });
 }
 
-function setup({ errandText = '{"accepted":true}', autoScanEnabled = false } = {}) {
+function setup({ errandText = '{"accepted":true}', autoScanEnabled = false, progressMode = 'manual', progressEnabled = true, progressModelText = '{"decision":"no_update","reason":"无变化","evidence":[]}' } = {}) {
   let onHostMessage;
   const nodeCalls = [];
   const sent = [];
@@ -36,6 +36,14 @@ function setup({ errandText = '{"accepted":true}', autoScanEnabled = false } = {
         if (request.params.path === '/api/runtime/auto-scan') return {
           ok: true,
           result: { enabled: autoScanEnabled },
+        };
+        if (request.params.path.includes('/bindings/')) return {
+          ok: true,
+          result: { binding: null },
+        };
+        if (request.params.path.endsWith('/turn-evaluations')) return {
+          ok: true,
+          result: { duplicate: false, binding: null, proposal: null, suggestion: null },
         };
         if (request.params.path.endsWith('/tasks')) return {
           ok: true,
@@ -57,6 +65,7 @@ function setup({ errandText = '{"accepted":true}', autoScanEnabled = false } = {
     },
     async send(message) {
       sent.push(message);
+      if (message.type === 'cindy-request') return { ok: true, text: progressModelText, model: 'codex/gpt-5.6-luna' };
       return { ok: true };
     },
   };
@@ -71,7 +80,7 @@ function setup({ errandText = '{"accepted":true}', autoScanEnabled = false } = {
         secretCalls.push({ url, options });
         return { ok: true, json: async () => ({}) };
       }
-      return { json: async () => ({ pmBaseUrl: 'http://127.0.0.1:4310' }) };
+      return { json: async () => ({ pmBaseUrl: 'http://127.0.0.1:4310', progressMode, progressEnabled }) };
     },
     setInterval,
     clearInterval,
@@ -169,17 +178,35 @@ test('scan result returns a readable short proposal list with action and title',
     { action: 'update_task', title: '活动留存分析' },
     { action: 'skip', title: '礼貌确认' },
   ]);
-  assert.equal(result.result.summary, '已更新已有任务。');
+  assert.equal(result.result.summary, '已更新正式任务：活动留存分析。');
+  assert.equal(result.result.model_summary, '已更新已有任务。');
+});
+
+test('scan result uses human language for candidates, formal task updates, and empty windows', async () => {
+  const { onHostMessage, sent } = setup({
+    errandText: '{"status":"done","proposals":[{"action":"create_candidate","title":"新候选"},{"action":"update_task","title":"正式任务 A"},{"action":"update_task","title":"正式任务 B"}]}' ,
+  });
+  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-readable', args: {} });
+  await waitFor(() => sent.some((message) => message.callId === 'call-readable'));
+  const result = sent.find((message) => message.callId === 'call-readable');
+  assert.equal(result.result.summary, '新建 1 张候选；已更新正式任务：正式任务 A、正式任务 B。');
 });
 
 test('ghost declares schedule support while retaining errand', () => {
-  assert.equal(ghost.version, '0.2.5');
+  assert.equal(ghost.version, '0.3.0');
+  assert.equal(ghost.id, 'ai-pm-intake');
+  assert.equal(ghost.name, 'TooManyTasks');
+  assert.equal(ghost.launch, 'resident');
   assert.deepEqual(Object.keys(ghost.agent).sort(), ['errand', 'schedule']);
   assert.equal(ghost.agent.errand, true);
   assert.equal(ghost.agent.schedule, true);
   const scanTool = ghost.tools.find((tool) => tool.name === 'scan_intake_window');
   assert.deepEqual(scanTool.parameters.properties.trigger.enum, ['manual', 'schedule']);
   assert.equal(scanTool.parameters.properties.trigger.default, 'manual');
+  assert.equal(ghost.cindy.oneshotModel, 'codex/gpt-5.6-luna');
+  assert.deepEqual(ghost.subscribe.topics, ['turn']);
+  assert.deepEqual(ghost.subscribe.hooks, ['will-user-message']);
+  assert.ok(ghost.tools.some((tool) => tool.name === 'update_pm_progress'));
 });
 
 test('main flow creates a local task-service token through settings before ensuring the resident service', async () => {
@@ -255,4 +282,52 @@ test('submit_intake rejects an empty window so the errand must short-circuit', a
   const failure = sent.find((message) => message.callId === 'call-empty-window');
   assert.equal(failure.ok, false);
   assert.match(failure.message, /empty_window/);
+});
+
+test('update_pm_progress keeps progress oneshot separate from intake errand', async () => {
+  const { onHostMessage, nodeCalls, sent, errandCalls } = setup({
+    progressModelText: JSON.stringify({ decision: 'bind', taskId: 'task-1', associationConfidence: 0.95, updateConfidence: 0, reason: '当前会话与候选任务匹配。', evidence: [] }),
+  });
+  onHostMessage({
+    type: 'tool-call',
+    tool: 'update_pm_progress',
+    callId: 'call-progress',
+    args: {
+      goal: '完成活动留存核验',
+      completed: '已复核数据口径',
+      verification: '测试通过',
+      blockers: '',
+      next_step: '补充分组',
+      status_hint: 'in_progress',
+      session_context: { session_id: 'session-progress-1' },
+    },
+  });
+  await waitFor(() => sent.some((message) => message.type === 'tool-result' && message.callId === 'call-progress'));
+  const result = sent.find((message) => message.type === 'tool-result' && message.callId === 'call-progress');
+  assert.equal(result.ok, true);
+  assert.equal(result.result.mode, 'manual');
+  assert.equal(errandCalls.length, 0);
+  assert.equal(sent.some((message) => message.type === 'cindy-request' && message.kind === 'oneshot_text'), true);
+  assert.equal(nodeCalls.some((request) => request.params?.path?.endsWith('/intake')), false);
+  assert.equal(nodeCalls.some((request) => request.params?.path?.endsWith('/turn-evaluations')), true);
+});
+
+test('automatic progress skips the intake errand session', async () => {
+  const { onHostMessage, nodeCalls, sent } = setup({ progressMode: 'automatic' });
+  onHostMessage({
+    type: 'event',
+    name: 'will-user-message',
+    hookId: 'hook-intake',
+    ts: Date.now(),
+    data: { sessionId: 'session-intake', sessionKey: 'intake', source: 'plugin', text: '入库 errand' },
+  });
+  onHostMessage({
+    type: 'event',
+    name: 'did-turn-end',
+    ts: Date.now(),
+    data: { sessionId: 'session-intake', sessionKey: 'intake', source: 'plugin', endReason: 'completed' },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(nodeCalls.some((request) => request.method === 'cindy/read-completed-turn'), false);
+  assert.equal(sent.some((message) => message.type === 'cindy-request'), false);
 });

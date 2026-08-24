@@ -1,4 +1,4 @@
-import { cp, mkdir } from 'node:fs/promises';
+import { cp, mkdir, rm } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { resolve } from 'node:path';
@@ -12,6 +12,7 @@ const runtimeEntry = resolve(root, 'plugins', 'cindy-pm-intake', 'node', 'pm-run
 const runtimeOutput = resolve(root, 'plugins', 'cindy-pm-intake', 'node', 'pm-runtime.cjs');
 
 await execFileAsync('npm', ['run', 'build', '-w', '@ai-pm/web'], { cwd: root, stdio: 'inherit' });
+await rm(webTarget, { recursive: true, force: true });
 await mkdir(webTarget, { recursive: true });
 await cp(webSource, webTarget, { recursive: true, force: true });
 
