@@ -4,7 +4,7 @@
   "product_snapshot": {
     "algorithm": "product-source-sha256-v1",
     "selector": "apps-workspace-default-include-v1",
-    "fingerprint": "82b039e9da8fd011f42c8d8baf237269830516640489c98e3f0a5785b3ca9b41",
+    "fingerprint": "e22347bf862d87773a026038537d9ba0ade538f3df2322c02683f8d1630d720b",
     "file_count": 85,
     "snapshot_as_of": "2026-08-15",
     "equivalent_commit": null
@@ -102,6 +102,47 @@
     "record_rule": "evidence_status=attained 必须绑定 source_commit、实际 run、environment 和 provenance；新增或修改记录以及所有 attained 记录必须声明 evidence_contract_version=1、严格 provenance/skip 字段集合和 exact sentinel 组合；exact_merge_ref_ci 的本地 checker 仅证明声明的 run/job identity 与本地 Git 对象、parents/tree/source/head 绑定，不证明 GitHub Actions、repository、workflow/check、SUCCESS、event、head_sha 或 merge checkout 的真实性；可选远端 verifier 必须绑定 repository-scoped API 路径、run.repository.full_name（若存在）、run/job、workflow/check、pull_request、terminal SUCCESS、base/head/merge commit objects、merge-ref parents/tree 和 source=head，commit/job 响应不虚构 repository 字段；run 使用真实 name/workflow_id，job.workflow_name 仅在存在时校验；job.check_run_url 必须是受控的 exact check-run ID，直接读取该 ID 的 exact check-run API 对象，不依赖 head commit check-runs 列表或分页，并绑定 API URL、ID、name、head_sha、status/conclusion 和受控 GitHub details_url；apiBase 必须是受控的 https://api.github.com 根地址，禁止重定向或 foreign host；私有仓库只能在显式 token 参数或 GITHUB_TOKEN/GH_TOKEN 环境变量存在时发送 Bearer Authorization，token 不得写入、返回或日志输出；无 token 的公共仓库请求仍可用，401/403/404、网络或权限不可用时固定返回 unavailable；不查询 synthetic merge commit 的 check-runs，merge commit 不需要 check-run；缺少 verifier 或离线时返回 unavailable 而不是授权通过；最终授权必须由 PR body 与 Lead 的远端 anti-drift 核验绑定；not_run/historical 不能声明 attained 或 real environment。"
   },
   "records": [
+    {
+      "id": "VER-LOCAL20260824-004-CINDY-APPEND-L2-20260824",
+      "evidence_contract_version": 1,
+      "capability": "Cindy 将新的可信 primary group 来源安全追加到一个可编辑候选，并让歧义由主人按 version 原子解决",
+      "implementation_state": "implemented_pending_independent_review_and_local_main_merge",
+      "target_level": "L4",
+      "attained_level": "L2",
+      "evidence_status": "attained",
+      "evidence_type": "synthetic_local_sqlite_service_plugin_renderer_contract",
+      "scope": "synthetic_local_cindy_cross_window_candidate_append_contract",
+      "source_commit": "83ba69d07da1978c069eaecb9aea97b4548b0210",
+      "record_commit": "local-20260824-004-pending",
+      "run_id": "local-20260824-004-candidate-append-01",
+      "run_at": "2026-08-24",
+      "environment": "Windows local worktree; Node.js 24.19.0; in-memory and temporary-file SQLite; Fastify inject; bundled Cindy plugin runtime; React renderer; synthetic data only",
+      "command_or_scenario": "focused Cindy append/batch/intake/migration (44/44); npm test -w @ai-pm/server (53/53); npm run typecheck -w @ai-pm/server; npm test -w @ai-pm/web (51/51); npm run typecheck -w @ai-pm/web; node --test plugins/cindy-pm-intake/main.test.mjs plugins/cindy-pm-intake/settings.test.mjs plugins/cindy-pm-intake/node/worker.test.mjs plugins/cindy-pm-intake/node/pm-runtime.test.mjs plugins/cindy-pm-intake/node/pm-runtime.shutdown.test.mjs (49/49); node plugins/cindy-pm-intake/scripts/verify-bundle-reproducibility.mjs; git diff --check",
+      "result": "passed",
+      "skips": "No real Cindy model cross-window association evaluation, real Feishu tenant/account/permissions, MCP provenance attestation, production database/data or scale, browser E2E, remote GitHub validation, installed Windows package L5 or real tenant/provider L6 validation.",
+      "skip_classification": {
+        "status": "present",
+        "kinds": ["capability", "platform"],
+        "reason": "The authorized task is synthetic/local only; real model association quality, tenant behavior, production scale, remote writes and installed-package validation are outside the attained evidence."
+      },
+      "provenance": {
+        "mode": "local_run",
+        "base_commit": "not_applicable",
+        "head_commit": "83ba69d07da1978c069eaecb9aea97b4548b0210",
+        "merge_ref": "not_applicable",
+        "parents": [],
+        "tree": "not_applicable",
+        "run_id": "local-20260824-004-candidate-append-01",
+        "job_id": "not_applicable",
+        "environment": "Windows local worktree; Node.js 24.19.0; in-memory and temporary-file SQLite; Fastify inject; bundled Cindy plugin runtime; React renderer; synthetic data only",
+        "command": "focused Cindy append/batch/intake/migration (44/44); npm test -w @ai-pm/server (53/53); npm run typecheck -w @ai-pm/server; npm test -w @ai-pm/web (51/51); npm run typecheck -w @ai-pm/web; node --test plugins/cindy-pm-intake/main.test.mjs plugins/cindy-pm-intake/settings.test.mjs plugins/cindy-pm-intake/node/worker.test.mjs plugins/cindy-pm-intake/node/pm-runtime.test.mjs plugins/cindy-pm-intake/node/pm-runtime.shutdown.test.mjs (49/49); node plugins/cindy-pm-intake/scripts/verify-bundle-reproducibility.mjs; git diff --check"
+      },
+      "target_real_scope": false,
+      "real_environment_attained": false,
+      "artifact": null,
+      "evidence_path": "apps/server/tests/cindy-append.test.ts",
+      "limitations": "Synthetic/local L2 evidence proves owner/account-scoped context pagination and deterministic filtering, opaque candidate/conversation/cursor handles, append request replay/conflict, editable-state and candidate-version CAS, same-batch/group/current receipt fencing, primary consumption uniqueness, shared-context rejection, per-field Agent evidence persistence, atomic candidate/source/audit/decision writes, disk-SQLite two-connection append races, owner-decision recovery, v11→v12 migration recovery, plugin schema/prompt and private UI projection. It does not prove real Cindy semantic association quality, real Feishu context/provenance, production scale, browser E2E, Windows L5 or external L6 behavior."
+    },
     {
       "id": "VER-LOCAL20260824-003-CINDY-GROUPED-BATCH-L2-20260824",
       "evidence_contract_version": 1,

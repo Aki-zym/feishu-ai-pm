@@ -98,7 +98,9 @@ schema v10 在每个 current revision 上追加最小 owner-context：服务端�
 
 schema v11 把后续判断固定为 `cindy_batch` snapshot。调用方只能引用当前 receipts，并为每条 snapshot revision 提交唯一 primary disposition；group anchor 与字段 evidence 必须来自该组 primary，其他组只能通过 `cindy_batch_shared_context` 使用非归属背景。`owner_scope + account_anchor + batch_id` 和 canonical payload hash 提供重放/冲突边界，`BEGIN IMMEDIATE` 事务在业务写入前重校验 current revision、处理状态、完整覆盖和 task CAS；任一失败整批回滚，但此前已保存来源不回滚。Cindy 只在已保存 snapshot 内按共同对象、目标和交付物做语义分组；语义匹配不得扩大回读范围或全局拉取会话，服务端和第二套 Runtime 也不按文本、发送者、会话或时间自动分组或从正文生成候选字段。
 
-`needs_owner` 写入 `cindy_owner_decision` 与内部 revision 引用。主人私有 API 只投影 opaque decision id、安全原因、选项、状态、version、来源数量、时间和固定 `last_attempt_failed`，不返回 batch id、receipt、内部 revision、原始错误、正文、prompt 或推理链。options 先转换为唯一 canonical stored projection，并在插件、HTTP 和服务层共同执行每 decision 最多 10000 个 SQLite 文本字符的聚合上限；数据库 CHECK 是同值最终门禁。003 可按 version 幂等执行 `skip/create_candidate`，可取消等待；来源 revision 变化会使 pending decision superseded。append_candidate 仅保存为不可执行选项并保持 pending，不消费来源或改变既有候选归属，候选追加和 receipt consumption 留给 004。
+`needs_owner` 写入 `cindy_owner_decision` 与内部 revision 引用。主人私有 API 只投影 opaque decision id、安全原因、选项、状态、version、来源数量、时间和固定 `last_attempt_failed`，不返回 batch id、receipt、内部 revision、原始错误、正文、prompt 或推理链。options 先转换为唯一 canonical stored projection，并在插件、HTTP 和服务层共同执行每 decision 最多 10000 个 SQLite 文本字符的聚合上限；数据库 CHECK 是同值最终门禁。003 可按 version 幂等执行 `skip/create_candidate`，可取消等待；来源 revision 变化会使 pending decision superseded。
+
+schema v12 开放 `append_candidate`：`get_pm_context` 只返回当前 owner/account 的正式任务与 pending/snoozed 候选安全摘要、opaque candidate key、version 和受签名 cursor；query 只做 NFKC/大小写折叠子串过滤，conversation filter 只能由 current receipts 派生，服务端不做语义归属。append request 绑定 owner/account、batch/group、candidate key/version、精确 primary receipts、patch 和逐字段 evidence 的 canonical payload hash。事务内重校验候选仍可编辑、receipt current/status/primary group、未被其他 candidate 消费，再原子写 candidate-source、consumption、field evidence、candidate version、审计和首次安全响应。主人选择 append option 时，普通 UI 只提交 decision/option/version 与新 request id；服务端从内部 decision 恢复 batch/group/candidate/evidence。v12 新 option 持久化 Agent 声明 evidence 的内部 source-order 索引，v11 旧 pending append 保留原先隐式全组 evidence 兼容语义。
 
 首期采用自有最小领域层，至少包含：
 
