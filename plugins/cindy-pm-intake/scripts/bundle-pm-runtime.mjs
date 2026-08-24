@@ -1,7 +1,7 @@
-import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { resolve } from 'node:path';
+import { extname, resolve } from 'node:path';
 import { build } from 'esbuild';
 
 const execFileAsync = promisify(execFile);
@@ -12,6 +12,19 @@ const runtimeEntry = resolve(root, 'plugins', 'cindy-pm-intake', 'node', 'pm-run
 const runtimeOutput = resolve(root, 'plugins', 'cindy-pm-intake', 'node', 'pm-runtime.cjs');
 const statusSource = resolve(root, 'plugins', 'cindy-pm-intake', 'node', 'macos-status', 'main.swift');
 const statusOutput = resolve(root, 'plugins', 'cindy-pm-intake', 'node', 'macos-status', 'TooManyTasksStatus');
+const textExtensions = new Set(['.html', '.js', '.css', '.json', '.map', '.txt', '.md', '.svg']);
+
+const normalizeLf = (value) => value.replace(/\r+\n/g, '\n').replace(/\r/g, '\n');
+
+async function normalizeTextTree(directory) {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = resolve(directory, entry.name);
+    if (entry.isDirectory()) await normalizeTextTree(path);
+    else if (entry.isFile() && textExtensions.has(extname(entry.name).toLowerCase())) {
+      await writeFile(path, normalizeLf(await readFile(path, 'utf8')), 'utf8');
+    }
+  }
+}
 
 if (process.platform === 'win32') {
   await execFileAsync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', 'npm run build -w @ai-pm/web'], { cwd: root, stdio: 'inherit' });
@@ -21,6 +34,7 @@ if (process.platform === 'win32') {
 await rm(webTarget, { recursive: true, force: true });
 await mkdir(webTarget, { recursive: true });
 await cp(webSource, webTarget, { recursive: true, force: true });
+await normalizeTextTree(webTarget);
 
 await build({
   entryPoints: [runtimeEntry],
@@ -35,7 +49,7 @@ await build({
   logLevel: 'info',
 });
 const bundledRuntime = await readFile(runtimeOutput, 'utf8');
-await writeFile(runtimeOutput, bundledRuntime.replace(/[ \t]+$/gmu, ''));
+await writeFile(runtimeOutput, normalizeLf(bundledRuntime).replace(/[ \t]+$/gmu, ''), 'utf8');
 
 if (process.platform === 'darwin') {
   await execFileAsync('swiftc', ['-O', statusSource, '-o', statusOutput], { cwd: root, stdio: 'inherit' });
