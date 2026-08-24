@@ -45,7 +45,7 @@
   "product_snapshot": {
     "algorithm": "product-source-sha256-v1",
     "selector": "apps-workspace-default-include-v1",
-    "fingerprint": "e22347bf862d87773a026038537d9ba0ade538f3df2322c02683f8d1630d720b",
+    "fingerprint": "66031d3ec0cd58c3a670be6e938fc7dc0e62180aaa7084f1d103967be25456ad",
     "file_count": 85,
     "snapshot_as_of": "2026-08-15",
     "equivalent_commit": null,

@@ -4,7 +4,7 @@
   "product_snapshot": {
     "algorithm": "product-source-sha256-v1",
     "selector": "apps-workspace-default-include-v1",
-    "fingerprint": "e22347bf862d87773a026038537d9ba0ade538f3df2322c02683f8d1630d720b",
+    "fingerprint": "66031d3ec0cd58c3a670be6e938fc7dc0e62180aaa7084f1d103967be25456ad",
     "file_count": 85,
     "snapshot_as_of": "2026-08-15",
     "equivalent_commit": null
@@ -112,12 +112,12 @@
       "evidence_status": "attained",
       "evidence_type": "synthetic_local_sqlite_service_plugin_renderer_contract",
       "scope": "synthetic_local_cindy_cross_window_candidate_append_contract",
-      "source_commit": "83ba69d07da1978c069eaecb9aea97b4548b0210",
+      "source_commit": "18063f431f0e82ff338e44f1d222a88cbd0d72a3",
       "record_commit": "local-20260824-004-pending",
-      "run_id": "local-20260824-004-candidate-append-01",
+      "run_id": "local-20260824-004-candidate-append-02",
       "run_at": "2026-08-24",
       "environment": "Windows local worktree; Node.js 24.19.0; in-memory and temporary-file SQLite; Fastify inject; bundled Cindy plugin runtime; React renderer; synthetic data only",
-      "command_or_scenario": "focused Cindy append/batch/intake/migration (44/44); npm test -w @ai-pm/server (53/53); npm run typecheck -w @ai-pm/server; npm test -w @ai-pm/web (51/51); npm run typecheck -w @ai-pm/web; node --test plugins/cindy-pm-intake/main.test.mjs plugins/cindy-pm-intake/settings.test.mjs plugins/cindy-pm-intake/node/worker.test.mjs plugins/cindy-pm-intake/node/pm-runtime.test.mjs plugins/cindy-pm-intake/node/pm-runtime.shutdown.test.mjs (49/49); node plugins/cindy-pm-intake/scripts/verify-bundle-reproducibility.mjs; git diff --check",
+      "command_or_scenario": "focused Cindy append/batch/intake/migration (47/47); npm test -w @ai-pm/server (56/56); npm run typecheck -w @ai-pm/server; npm test -w @ai-pm/web (52/52); npm run typecheck -w @ai-pm/web; node --test plugins/cindy-pm-intake/main.test.mjs plugins/cindy-pm-intake/settings.test.mjs plugins/cindy-pm-intake/node/worker.test.mjs plugins/cindy-pm-intake/node/pm-runtime.test.mjs plugins/cindy-pm-intake/node/pm-runtime.shutdown.test.mjs (51/51); node plugins/cindy-pm-intake/scripts/verify-bundle-reproducibility.mjs; git diff --exit-code; git diff --check",
       "result": "passed",
       "skips": "No real Cindy model cross-window association evaluation, real Feishu tenant/account/permissions, MCP provenance attestation, production database/data or scale, browser E2E, remote GitHub validation, installed Windows package L5 or real tenant/provider L6 validation.",
       "skip_classification": {
@@ -128,20 +128,20 @@
       "provenance": {
         "mode": "local_run",
         "base_commit": "not_applicable",
-        "head_commit": "83ba69d07da1978c069eaecb9aea97b4548b0210",
+        "head_commit": "18063f431f0e82ff338e44f1d222a88cbd0d72a3",
         "merge_ref": "not_applicable",
         "parents": [],
         "tree": "not_applicable",
-        "run_id": "local-20260824-004-candidate-append-01",
+        "run_id": "local-20260824-004-candidate-append-02",
         "job_id": "not_applicable",
         "environment": "Windows local worktree; Node.js 24.19.0; in-memory and temporary-file SQLite; Fastify inject; bundled Cindy plugin runtime; React renderer; synthetic data only",
-        "command": "focused Cindy append/batch/intake/migration (44/44); npm test -w @ai-pm/server (53/53); npm run typecheck -w @ai-pm/server; npm test -w @ai-pm/web (51/51); npm run typecheck -w @ai-pm/web; node --test plugins/cindy-pm-intake/main.test.mjs plugins/cindy-pm-intake/settings.test.mjs plugins/cindy-pm-intake/node/worker.test.mjs plugins/cindy-pm-intake/node/pm-runtime.test.mjs plugins/cindy-pm-intake/node/pm-runtime.shutdown.test.mjs (49/49); node plugins/cindy-pm-intake/scripts/verify-bundle-reproducibility.mjs; git diff --check"
+        "command": "focused Cindy append/batch/intake/migration (47/47); npm test -w @ai-pm/server (56/56); npm run typecheck -w @ai-pm/server; npm test -w @ai-pm/web (52/52); npm run typecheck -w @ai-pm/web; node --test plugins/cindy-pm-intake/main.test.mjs plugins/cindy-pm-intake/settings.test.mjs plugins/cindy-pm-intake/node/worker.test.mjs plugins/cindy-pm-intake/node/pm-runtime.test.mjs plugins/cindy-pm-intake/node/pm-runtime.shutdown.test.mjs (51/51); node plugins/cindy-pm-intake/scripts/verify-bundle-reproducibility.mjs; git diff --exit-code; git diff --check"
       },
       "target_real_scope": false,
       "real_environment_attained": false,
       "artifact": null,
       "evidence_path": "apps/server/tests/cindy-append.test.ts",
-      "limitations": "Synthetic/local L2 evidence proves owner/account-scoped context pagination and deterministic filtering, opaque candidate/conversation/cursor handles, append request replay/conflict, editable-state and candidate-version CAS, same-batch/group/current receipt fencing, primary consumption uniqueness, shared-context rejection, per-field Agent evidence persistence, atomic candidate/source/audit/decision writes, disk-SQLite two-connection append races, owner-decision recovery, v11→v12 migration recovery, plugin schema/prompt and private UI projection. It does not prove real Cindy semantic association quality, real Feishu context/provenance, production scale, browser E2E, Windows L5 or external L6 behavior."
+      "limitations": "Synthetic/local L2 evidence proves owner/account/kind-bound encrypted context cursors, stable pagination and deterministic filtering, append request replay/conflict, editable-state and candidate-version CAS, same-batch/group/current receipt fencing, primary consumption uniqueness, shared-context rejection, per-field Agent evidence persistence, atomic candidate/source/audit/decision writes, disk-SQLite two-connection append races, owner-decision recovery, deterministic v11 pending-append/effective-key migration with fail-closed legacy checks, fixed ordinary error projection, plugin preflight validation and append summary, and an esbuild-pinned clean-HEAD reproducible bundle. It does not prove real Cindy semantic association quality, real Feishu context/provenance, production scale, browser E2E, Windows L5 or external L6 behavior."
     },
     {
       "id": "VER-LOCAL20260824-003-CINDY-GROUPED-BATCH-L2-20260824",
