@@ -3310,19 +3310,21 @@ const CINDY_TRUSTED_SOURCE_MIGRATION_SQL = Object.freeze([
   'CREATE INDEX idx_cindy_source_relation_target ON cindy_source_relation(target_revision_id, source_revision_id);',
   `CREATE TABLE cindy_save_request (
     owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
     save_request_id TEXT NOT NULL,
     request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
     response_map_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    PRIMARY KEY(owner_scope, save_request_id)
+    PRIMARY KEY(owner_scope, account_anchor, save_request_id)
   );`,
   `CREATE TABLE cindy_decision_request (
     owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
     decision_request_id TEXT NOT NULL,
     request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
     response_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    PRIMARY KEY(owner_scope, decision_request_id)
+    PRIMARY KEY(owner_scope, account_anchor, decision_request_id)
   );`,
   `INSERT INTO cindy_source_identity
     (id, owner_scope, account_anchor, provider, source_kind, stable_id_hash, source_event_id,

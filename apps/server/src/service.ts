@@ -13937,9 +13937,6 @@ export class PmService {
             ).run(nextRetry >= 3 ? 'invalid' : 'retryable', nextRetry, revision.id);
             if (nextRetry >= 3) {
               this.database.raw.prepare(
-                `UPDATE cindy_source_identity SET state = 'invalid', updated_at = ? WHERE current_revision_id = ?`,
-              ).run(timestamp, revision.id);
-              this.database.raw.prepare(
                 `UPDATE source_event SET ingest_state = 'invalid' WHERE current_revision_id = ?`,
               ).run(revision.id);
             }

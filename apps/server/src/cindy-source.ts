@@ -331,15 +331,23 @@ export function saveCindySources(
   const requestHash = sha256(stableJson(canonicalSaveRequest(input)));
   return database.transaction(() => {
     const replay = database.raw.prepare(
-      'SELECT request_hash, response_map_json FROM cindy_save_request WHERE owner_scope = ? AND save_request_id = ?',
-    ).get(auth.ownerScope, input.save_request_id) as { request_hash: string; response_map_json: string } | undefined;
+      `SELECT request_hash, response_map_json FROM cindy_save_request
+        WHERE owner_scope = ? AND account_anchor = ? AND save_request_id = ?`,
+    ).get(auth.ownerScope, auth.accountAnchor, input.save_request_id) as { request_hash: string; response_map_json: string } | undefined;
     if (replay) {
       if (replay.request_hash !== requestHash) throw new CindySourceContractError('CONFLICT', 'save_request_id 已绑定到不同请求。');
       const stored = JSON.parse(replay.response_map_json) as ReplayMapItem[];
       const sources = stored.map((item) => {
         const row = database.raw.prepare('SELECT * FROM source_event_revision WHERE id = ?').get(item.revision_id) as SourceRevisionRow | undefined;
         if (!row) throw new CindySourceContractError('CONFLICT', '保存请求的幂等记录不完整。');
-        return { ...item, source_receipt: sourceReceipt(auth, row) };
+        const identity = database.raw.prepare(
+          `SELECT current_revision_id, state FROM cindy_source_identity
+            WHERE owner_scope = ? AND account_anchor = ? AND source_event_id = ?`,
+        ).get(auth.ownerScope, auth.accountAnchor, row.source_event_id) as { current_revision_id: string | null; state: string } | undefined;
+        const sourceStatus = identity?.state === 'active' && identity.current_revision_id === row.id
+          ? row.processing_status
+          : 'superseded';
+        return { ...item, source_status: sourceStatus, source_receipt: sourceReceipt(auth, row) };
       }).map(({ revision_id: _revisionId, ...item }) => item);
       return { save_request_id: input.save_request_id, duplicate: true, sources };
     }
@@ -567,12 +575,22 @@ export function saveCindySources(
       replayItems.set(clientRef, { client_ref: clientRef, source_status: saved.source_status, revision: saved.revision, revision_id: row.id });
     }
 
+    // A later source in this same batch may have superseded a receipt that an
+    // earlier source used as a relation target. Re-resolve every external
+    // relation before commit so the whole batch remains current-or-zero-write.
+    for (const source of input.sources) {
+      for (const relation of source.relations ?? []) {
+        if (relation.source_receipt) resolveReceiptRow(database, auth, relation.source_receipt);
+      }
+    }
+
     const sources = input.sources.map((source) => outputByRef.get(source.client_ref)!);
     const stored = input.sources.map((source) => replayItems.get(source.client_ref)!);
     database.raw.prepare(
-      `INSERT INTO cindy_save_request (owner_scope, save_request_id, request_hash, response_map_json, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
-    ).run(auth.ownerScope, input.save_request_id, requestHash, JSON.stringify(stored), timestamp);
+      `INSERT INTO cindy_save_request
+        (owner_scope, account_anchor, save_request_id, request_hash, response_map_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(auth.ownerScope, auth.accountAnchor, input.save_request_id, requestHash, JSON.stringify(stored), timestamp);
     return { save_request_id: input.save_request_id, duplicate: false, sources };
   });
 }
@@ -588,8 +606,9 @@ export function cindyDecisionReplay(
   requestHash: string,
 ) {
   const row = database.raw.prepare(
-    'SELECT request_hash, response_json FROM cindy_decision_request WHERE owner_scope = ? AND decision_request_id = ?',
-  ).get(auth.ownerScope, decisionRequestId) as { request_hash: string; response_json: string } | undefined;
+    `SELECT request_hash, response_json FROM cindy_decision_request
+      WHERE owner_scope = ? AND account_anchor = ? AND decision_request_id = ?`,
+  ).get(auth.ownerScope, auth.accountAnchor, decisionRequestId) as { request_hash: string; response_json: string } | undefined;
   if (!row) return undefined;
   if (row.request_hash !== requestHash) throw new CindySourceContractError('CONFLICT', 'decision_request_id 已绑定到不同请求。');
   return JSON.parse(row.response_json) as unknown;
@@ -605,7 +624,7 @@ export function recordCindyDecisionRequest(
 ) {
   database.raw.prepare(
     `INSERT INTO cindy_decision_request
-      (owner_scope, decision_request_id, request_hash, response_json, created_at)
-     VALUES (?, ?, ?, ?, ?)`,
-  ).run(auth.ownerScope, decisionRequestId, requestHash, JSON.stringify(result), timestamp);
+      (owner_scope, account_anchor, decision_request_id, request_hash, response_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(auth.ownerScope, auth.accountAnchor, decisionRequestId, requestHash, JSON.stringify(result), timestamp);
 }

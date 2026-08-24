@@ -148103,19 +148103,21 @@ var PROVIDER_RETRY_COOLDOWN_SCHEMA_CHECKSUM = providerRetryCooldownSchemaChecksu
   "CREATE INDEX idx_cindy_source_relation_target ON cindy_source_relation(target_revision_id, source_revision_id);",
   `CREATE TABLE cindy_save_request (
     owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
     save_request_id TEXT NOT NULL,
     request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
     response_map_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    PRIMARY KEY(owner_scope, save_request_id)
+    PRIMARY KEY(owner_scope, account_anchor, save_request_id)
   );`,
   `CREATE TABLE cindy_decision_request (
     owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
     decision_request_id TEXT NOT NULL,
     request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
     response_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    PRIMARY KEY(owner_scope, decision_request_id)
+    PRIMARY KEY(owner_scope, account_anchor, decision_request_id)
   );`,
   `INSERT INTO cindy_source_identity
     (id, owner_scope, account_anchor, provider, source_kind, stable_id_hash, source_event_id,
@@ -149332,14 +149334,19 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
   let requestHash = sha256(stableJson(canonicalSaveRequest(input)));
   return database.transaction(() => {
     let replay = database.raw.prepare(
-      "SELECT request_hash, response_map_json FROM cindy_save_request WHERE owner_scope = ? AND save_request_id = ?"
-    ).get(auth.ownerScope, input.save_request_id);
+      `SELECT request_hash, response_map_json FROM cindy_save_request
+        WHERE owner_scope = ? AND account_anchor = ? AND save_request_id = ?`
+    ).get(auth.ownerScope, auth.accountAnchor, input.save_request_id);
     if (replay) {
       if (replay.request_hash !== requestHash) throw new CindySourceContractError("CONFLICT", "save_request_id \u5DF2\u7ED1\u5B9A\u5230\u4E0D\u540C\u8BF7\u6C42\u3002");
       let sources2 = JSON.parse(replay.response_map_json).map((item) => {
         let row = database.raw.prepare("SELECT * FROM source_event_revision WHERE id = ?").get(item.revision_id);
         if (!row) throw new CindySourceContractError("CONFLICT", "\u4FDD\u5B58\u8BF7\u6C42\u7684\u5E42\u7B49\u8BB0\u5F55\u4E0D\u5B8C\u6574\u3002");
-        return { ...item, source_receipt: sourceReceipt(auth, row) };
+        let identity = database.raw.prepare(
+          `SELECT current_revision_id, state FROM cindy_source_identity
+            WHERE owner_scope = ? AND account_anchor = ? AND source_event_id = ?`
+        ).get(auth.ownerScope, auth.accountAnchor, row.source_event_id), sourceStatus = identity?.state === "active" && identity.current_revision_id === row.id ? row.processing_status : "superseded";
+        return { ...item, source_status: sourceStatus, source_receipt: sourceReceipt(auth, row) };
       }).map(({ revision_id: _revisionId, ...item }) => item);
       return { save_request_id: input.save_request_id, duplicate: !0, sources: sources2 };
     }
@@ -149550,11 +149557,15 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
       };
       revisionByRef.set(clientRef, row), outputByRef.set(clientRef, saved), replayItems.set(clientRef, { client_ref: clientRef, source_status: saved.source_status, revision: saved.revision, revision_id: row.id });
     }
+    for (let source of input.sources)
+      for (let relation of source.relations ?? [])
+        relation.source_receipt && resolveReceiptRow(database, auth, relation.source_receipt);
     let sources = input.sources.map((source) => outputByRef.get(source.client_ref)), stored = input.sources.map((source) => replayItems.get(source.client_ref));
     return database.raw.prepare(
-      `INSERT INTO cindy_save_request (owner_scope, save_request_id, request_hash, response_map_json, created_at)
-       VALUES (?, ?, ?, ?, ?)`
-    ).run(auth.ownerScope, input.save_request_id, requestHash, JSON.stringify(stored), timestamp), { save_request_id: input.save_request_id, duplicate: !1, sources };
+      `INSERT INTO cindy_save_request
+        (owner_scope, account_anchor, save_request_id, request_hash, response_map_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(auth.ownerScope, auth.accountAnchor, input.save_request_id, requestHash, JSON.stringify(stored), timestamp), { save_request_id: input.save_request_id, duplicate: !1, sources };
   });
 }
 function hashCindyDecisionRequest(value) {
@@ -149562,8 +149573,9 @@ function hashCindyDecisionRequest(value) {
 }
 function cindyDecisionReplay(database, auth, decisionRequestId, requestHash) {
   let row = database.raw.prepare(
-    "SELECT request_hash, response_json FROM cindy_decision_request WHERE owner_scope = ? AND decision_request_id = ?"
-  ).get(auth.ownerScope, decisionRequestId);
+    `SELECT request_hash, response_json FROM cindy_decision_request
+      WHERE owner_scope = ? AND account_anchor = ? AND decision_request_id = ?`
+  ).get(auth.ownerScope, auth.accountAnchor, decisionRequestId);
   if (row) {
     if (row.request_hash !== requestHash) throw new CindySourceContractError("CONFLICT", "decision_request_id \u5DF2\u7ED1\u5B9A\u5230\u4E0D\u540C\u8BF7\u6C42\u3002");
     return JSON.parse(row.response_json);
@@ -149572,9 +149584,9 @@ function cindyDecisionReplay(database, auth, decisionRequestId, requestHash) {
 function recordCindyDecisionRequest(database, auth, decisionRequestId, requestHash, result, timestamp) {
   database.raw.prepare(
     `INSERT INTO cindy_decision_request
-      (owner_scope, decision_request_id, request_hash, response_json, created_at)
-     VALUES (?, ?, ?, ?, ?)`
-  ).run(auth.ownerScope, decisionRequestId, requestHash, JSON.stringify(result), timestamp);
+      (owner_scope, account_anchor, decision_request_id, request_hash, response_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(auth.ownerScope, auth.accountAnchor, decisionRequestId, requestHash, JSON.stringify(result), timestamp);
 }
 
 // apps/server/src/calendar-classification.ts
@@ -163299,11 +163311,9 @@ var PmService = class {
               `UPDATE source_event_revision
                   SET processing_status = ?, retry_count = ?
                 WHERE id = ? AND processing_status IN ('pending_decision','retryable')`
-            ).run(nextRetry >= 3 ? "invalid" : "retryable", nextRetry, revision.id), nextRetry >= 3 && (this.database.raw.prepare(
-              "UPDATE cindy_source_identity SET state = 'invalid', updated_at = ? WHERE current_revision_id = ?"
-            ).run(timestamp, revision.id), this.database.raw.prepare(
+            ).run(nextRetry >= 3 ? "invalid" : "retryable", nextRetry, revision.id), nextRetry >= 3 && this.database.raw.prepare(
               "UPDATE source_event SET ingest_state = 'invalid' WHERE current_revision_id = ?"
-            ).run(revision.id));
+            ).run(revision.id);
           }
           decisionResults.push({
             decision_ref: decision.decision_ref,

@@ -265,6 +265,9 @@ describe('Cindy 对话入库接口', () => {
     const b = await saveSources(app, { save_request_id: 'save-order-b', sources: [trustedSource({ revision: { sequence: 2 }, text: '第二版正文。' })] });
     expect(b.statusCode).toBe(200);
     expect(b.json().sources[0].source_receipt).not.toBe(receiptA);
+    const originalRequestReplay = await saveSources(app, { save_request_id: 'save-order-a', sources: [trustedSource({ revision: { sequence: 1 } })] });
+    expect(originalRequestReplay.statusCode).toBe(200);
+    expect(originalRequestReplay.json().sources[0]).toMatchObject({ source_receipt: receiptA, source_status: 'superseded' });
     const oldReplay = await saveSources(app, { save_request_id: 'save-order-a-again', sources: [trustedSource({ revision: { sequence: 1 } })] });
     expect(oldReplay.statusCode).toBe(200);
     expect(oldReplay.json().sources[0]).toMatchObject({ source_receipt: receiptA, source_status: 'superseded' });
@@ -328,6 +331,25 @@ describe('Cindy 对话入库接口', () => {
       sources: [trustedSource({ client_ref: 'same', stable_message_id: 'same-a' }), trustedSource({ client_ref: 'same', stable_message_id: 'same-b' })],
     });
     expect(repeatedRef.statusCode).toBe(400);
+    const beforeSupersedingRelation = (database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count;
+    const supersededLaterInBatch = await saveSources(app, {
+      save_request_id: 'save-relations-superseded-later',
+      sources: [
+        trustedSource({
+          client_ref: 'early-reply',
+          stable_message_id: 'early-reply',
+          relations: [{ kind: 'reply_to', source_receipt: valid.json().sources[0].source_receipt }],
+        }),
+        trustedSource({
+          client_ref: 'late-root-edit',
+          stable_message_id: 'relation-root',
+          revision: { sequence: 2 },
+          text: '关系根消息第二版。',
+        }),
+      ],
+    });
+    expect(supersededLaterInBatch.statusCode).toBe(403);
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(beforeSupersedingRelation);
     expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(before + 1);
   });
 
@@ -354,6 +376,12 @@ describe('Cindy 对话入库接口', () => {
       decisions: [{ decision_ref: 'd1', action: 'skip', source_receipts: [receipt] }],
     });
     expect(denied.statusCode).toBe(403);
+    const reread = await saveSources(app, {
+      save_request_id: 'save-retry-limit-reread',
+      sources: [trustedSource({ revision: { sequence: 2 }, text: '重新读取后的当前版本。' })],
+    });
+    expect(reread.statusCode).toBe(200);
+    expect(reread.json().sources[0]).toMatchObject({ source_status: 'pending_decision', revision: { generation: 2, sequence: 2 } });
   });
 
   it('receipt 决策只接受当前同 owner 来源；伪造、跨 owner、旧 revision 和 invalid 均零业务写入', async () => {
@@ -404,6 +432,12 @@ describe('Cindy 对话入库接口', () => {
     expect(replay.statusCode).toBe(200);
     expect(replay.json()).toMatchObject({ duplicate: true });
     expect(database.raw.prepare('SELECT version, next_step FROM task WHERE id = ?').get('task-cindy-intake-1')).toEqual({ version: 2, next_step: '新口径' });
+    const foreignToken = 'different-cindy-account-token';
+    const { app: foreignApp } = await makeApp(foreignToken, database);
+    const foreignReplay = await submitDecisions(foreignApp, successPayload, foreignToken);
+    expect(foreignReplay.statusCode).toBe(403);
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM task_event WHERE event_type = ?').get('task_cindy_intake_update'))
+      .toEqual({ count: 1 });
   });
 
   it('认证上下文由服务端派生，body 自报 owner/account 被拒；空 decisions 仍推进窗口', async () => {
