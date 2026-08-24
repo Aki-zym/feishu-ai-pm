@@ -22,7 +22,7 @@ errand 提示要求工作线程使用当前已授权的飞书 MCP 读取窗口�
 
 启用插件后 Cindy 运行即拉起本机任务库并保持本机 `4310` 服务。本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台。任务台浏览器设置中可使用「退出后台进程」。Cindy 退出后后台服务停止。
 
-在插件设置中保存本机任务库地址，默认值为 `http://127.0.0.1:4310`，并保存与本机任务库服务一致的 `pm_token`。设置页和 Node Worker 都校验本机 HTTP 回环地址，任务接口保持在 `/api/integrations/cindy/` 前缀下，自动扫描开关使用 `/api/runtime/auto-scan`。intake 会话保持只读，只授权飞书 MCP，不开 shell、工作区写入或飞书写接口。
+在插件设置中保存本机任务库地址，默认值为 `http://127.0.0.1:4310`。插件首次启动会分别生成并保存 `pm_token`、稳定的 `pm_account_anchor` 和独立的 `pm_receipt_secret`；`pm_token` 只做本机 HTTP Bearer 鉴权，轮换它不会改变旧 receipt 或来源身份。设置页和 Node Worker 都校验本机 HTTP 回环地址，任务接口保持在 `/api/integrations/cindy/` 前缀下，自动扫描开关使用 `/api/runtime/auto-scan`。intake 会话保持只读，只授权飞书 MCP，不开 shell、工作区写入或飞书写接口。
 
 入库 errand、自动化扫描和进度 oneshot 的配置请在插件详情「AI 代办」中手动保存为折扣路由 `codex/gpt-5.6-luna`、思考强度 `high`。插件详情「AI 代办」权限选「自动审核」(`auto`)，不要选只读 `plan` 或完全访问 `bypassPermissions`。请勿选择原价 `gpt-5.6-luna`。Cindy 草稿默认可能显示 `fable5`，首次使用时需改一次；插件不会静默修改 Cindy 的全局默认模型。
 

@@ -4,7 +4,7 @@
   "product_snapshot": {
     "algorithm": "product-source-sha256-v1",
     "selector": "apps-workspace-default-include-v1",
-    "fingerprint": "f0a13267f6e943175337dd3f6f81a8c7dc27c92cf9c7c2577a9ea5312b9255a5",
+    "fingerprint": "fa07fce14afeb4308aafcf35202390ff193e18b6cdbcad30d90a95453b0d0139",
     "file_count": 84,
     "snapshot_as_of": "2026-08-15",
     "equivalent_commit": null
@@ -112,12 +112,12 @@
       "evidence_status": "attained",
       "evidence_type": "synthetic_local_sqlite_service_plugin_contract",
       "scope": "synthetic_local_cindy_source_receipt_contract",
-      "source_commit": "001b81d81e0114c990a4d1923862a37400ba203b",
+      "source_commit": "14777d08b4a7f216d0bb323b58c513a02407c3fc",
       "record_commit": "local-20260824-001-pending",
       "run_id": "local-20260824-001-source-receipt-01",
       "run_at": "2026-08-24",
       "environment": "Windows local worktree; Node.js 24.19.0; in-memory and temporary-file SQLite; Fastify inject; bundled Cindy plugin runtime; synthetic data only",
-      "command_or_scenario": "npm exec --workspace @ai-pm/server -- vitest run tests/cindy-intake.test.ts tests/cindy-source-migration.test.ts --pool=threads --poolOptions.threads.singleThread=true --no-file-parallelism; npm test -w @ai-pm/server; npm run typecheck -w @ai-pm/server; node --test plugins/cindy-pm-intake/main.test.mjs plugins/cindy-pm-intake/node/worker.test.mjs plugins/cindy-pm-intake/node/pm-runtime.test.mjs plugins/cindy-pm-intake/node/pm-runtime.shutdown.test.mjs; node plugins/cindy-pm-intake/scripts/bundle-pm-runtime.mjs",
+      "command_or_scenario": "npm test -w @ai-pm/server -- --run tests/cindy-intake.test.ts tests/cindy-source-migration.test.ts tests/seed-intake-route.test.ts tests/app.test.ts (23/23); npm test -w @ai-pm/server (27/27); npm run typecheck -w @ai-pm/server; npm test -w @ai-pm/web -- --run (50/50); npm run typecheck -w @ai-pm/web; node --test plugins/cindy-pm-intake/main.test.mjs plugins/cindy-pm-intake/node/worker.test.mjs plugins/cindy-pm-intake/node/pm-runtime.test.mjs plugins/cindy-pm-intake/node/pm-runtime.shutdown.test.mjs (37/37); node plugins/cindy-pm-intake/scripts/bundle-pm-runtime.mjs; git diff --check",
       "result": "passed",
       "skips": "No real Cindy errand, Feishu tenant/account/permissions, MCP provenance attestation, production database/data, remote GitHub validation, installed Windows package L5 or real tenant/provider L6 validation.",
       "skip_classification": {
@@ -128,20 +128,20 @@
       "provenance": {
         "mode": "local_run",
         "base_commit": "not_applicable",
-        "head_commit": "001b81d81e0114c990a4d1923862a37400ba203b",
+        "head_commit": "14777d08b4a7f216d0bb323b58c513a02407c3fc",
         "merge_ref": "not_applicable",
         "parents": [],
         "tree": "not_applicable",
         "run_id": "local-20260824-001-source-receipt-01",
         "job_id": "not_applicable",
         "environment": "Windows local worktree; Node.js 24.19.0; in-memory and temporary-file SQLite; Fastify inject; bundled Cindy plugin runtime; synthetic data only",
-        "command": "npm exec --workspace @ai-pm/server -- vitest run tests/cindy-intake.test.ts tests/cindy-source-migration.test.ts --pool=threads --poolOptions.threads.singleThread=true --no-file-parallelism; npm test -w @ai-pm/server; npm run typecheck -w @ai-pm/server; node --test plugins/cindy-pm-intake/main.test.mjs plugins/cindy-pm-intake/node/worker.test.mjs plugins/cindy-pm-intake/node/pm-runtime.test.mjs plugins/cindy-pm-intake/node/pm-runtime.shutdown.test.mjs; node plugins/cindy-pm-intake/scripts/bundle-pm-runtime.mjs"
+        "command": "npm test -w @ai-pm/server -- --run tests/cindy-intake.test.ts tests/cindy-source-migration.test.ts tests/seed-intake-route.test.ts tests/app.test.ts (23/23); npm test -w @ai-pm/server (27/27); npm run typecheck -w @ai-pm/server; npm test -w @ai-pm/web -- --run (50/50); npm run typecheck -w @ai-pm/web; node --test plugins/cindy-pm-intake/main.test.mjs plugins/cindy-pm-intake/node/worker.test.mjs plugins/cindy-pm-intake/node/pm-runtime.test.mjs plugins/cindy-pm-intake/node/pm-runtime.shutdown.test.mjs (37/37); node plugins/cindy-pm-intake/scripts/bundle-pm-runtime.mjs; git diff --check"
       },
       "target_real_scope": false,
       "real_environment_attained": false,
       "artifact": null,
       "evidence_path": "apps/server/tests/cindy-intake.test.ts",
-      "limitations": "Synthetic/local L2 evidence proves SQLite persistence, replay/conflict/revision ordering, receipt fencing, relation atomicity, decision state transitions, authentication body rejection, interruption recovery and legacy migration only. It does not prove real Feishu reads, account identity stability across token rotation, MCP provenance, production data behavior or external delivery."
+      "limitations": "Synthetic/local L2 evidence proves SQLite persistence, replay/conflict/revision ordering, receipt fencing, relation atomicity, decision state transitions, authentication body rejection, Bearer rotation under one persisted account anchor/receipt secret, interruption recovery, production raw-route absence and atomic v8→v9 migration failure recovery only. It does not prove real Cindy/Feishu account identity stability, MCP provenance, production data behavior, installed Windows lifecycle or external delivery."
     },
     {
       "id": "VER-ISSUE85-PROD07-L0-20260816",
