@@ -149199,16 +149199,17 @@ function normalizedRevision(source) {
     sequence: sequence ?? null
   };
 }
-function deriveCindyAuthContext(token) {
-  let secret = token.trim();
-  if (!secret) throw new CindySourceContractError("INVALID_INPUT", "Cindy \u96C6\u6210\u8BA4\u8BC1\u4E0A\u4E0B\u6587\u5C1A\u672A\u914D\u7F6E\u3002");
+function deriveCindyAuthContext(material) {
+  let accountAnchor = material.accountAnchor.trim(), receiptSecret = material.receiptSecret.trim();
+  if (!accountAnchor || !receiptSecret)
+    throw new CindySourceContractError("INVALID_INPUT", "Cindy \u7A33\u5B9A\u8D26\u53F7\u951A\u70B9\u6216 receipt \u5BC6\u94A5\u5C1A\u672A\u914D\u7F6E\u3002");
   return {
-    // M1 is a single-owner local product. The authenticated plugin route binds
-    // that durable owner scope; the connected-account anchor separates token
-    // contexts without accepting either value from request bodies.
+    // M1 is a single-owner local product. Bearer authentication is checked by
+    // the HTTP route, while these separately persisted plugin secrets bind the
+    // durable connected account and receipt signature across bearer rotation.
     ownerScope: "primary",
-    accountAnchor: `cindy_account_${sha256(`account\0${secret}`)}`,
-    receiptSecret: secret
+    accountAnchor: `cindy_account_${sha256(`connected-account\0${accountAnchor}`)}`,
+    receiptSecret
   };
 }
 function receiptForNonce(auth, nonce) {
@@ -163477,227 +163478,6 @@ var PmService = class {
     for (let taskId of updatedTaskIds) this.projectTaskMemory(taskId);
     return result;
   }
-  processCindyIntake(input) {
-    let sourceKeys = input.sources.map((source) => source.source_key);
-    if (new Set(sourceKeys).size !== sourceKeys.length)
-      throw new CindyIntakeValidationError("sources.source_key \u4E0D\u80FD\u91CD\u590D\u3002");
-    let sourceKeySet = new Set(sourceKeys);
-    if (!Number.isFinite(Date.parse(input.window_start)) || !Number.isFinite(Date.parse(input.window_end)))
-      throw new CindyIntakeValidationError("window_start \u6216 window_end \u4E0D\u662F\u6709\u6548\u65F6\u95F4\u3002");
-    if (Date.parse(input.window_start) > Date.parse(input.window_end))
-      throw new CindyIntakeValidationError("window_start \u4E0D\u80FD\u665A\u4E8E window_end\u3002");
-    for (let source of input.sources)
-      if (!source.source_key.trim() || !source.text.trim() || !Number.isFinite(Date.parse(source.occurred_at)))
-        throw new CindyIntakeValidationError("source_key\u3001text \u548C occurred_at \u5FC5\u987B\u6709\u6548\u3002");
-    for (let proposal of input.proposals) {
-      if (new Set(proposal.source_keys).size !== proposal.source_keys.length)
-        throw new CindyIntakeValidationError("proposal.source_keys \u4E0D\u80FD\u91CD\u590D\u3002");
-      if (proposal.source_keys.some((sourceKey) => !sourceKeySet.has(sourceKey)))
-        throw new CindyIntakeValidationError("proposal \u5F15\u7528\u4E86\u672C\u7A97\u53E3\u672A\u63D0\u4EA4\u7684 source_key\u3002");
-      if (proposal.action === "update_task") {
-        if (!proposal.task_key) throw new CindyIntakeValidationError("update_task \u5FC5\u987B\u63D0\u4F9B task_key\u3002");
-        if (proposal.expected_version === void 0) throw new CindyIntakeValidationError("update_task \u5FC5\u987B\u63D0\u4F9B expected_version\u3002");
-        if (proposal.title === void 0 && proposal.describe === void 0 && proposal.next_step === void 0)
-          throw new CindyIntakeValidationError("update_task \u81F3\u5C11\u9700\u8981 title\u3001describe \u6216 next_step\u3002");
-      }
-    }
-    let updatedTaskIds = /* @__PURE__ */ new Set(), result = this.database.transaction(() => {
-      let timestamp = nowIso();
-      if (this.database.raw.prepare(
-        `INSERT OR IGNORE INTO sync_cursor
-          (integration, scope_key, cursor, last_success_at, last_error, updated_at)
-         VALUES ('cindy_intake', ?, NULL, NULL, NULL, ?)`
-      ).run(input.window_id, timestamp).changes !== 1) {
-        let existing = this.database.raw.prepare(
-          "SELECT cursor FROM sync_cursor WHERE integration = 'cindy_intake' AND scope_key = ?"
-        ).get(input.window_id);
-        if (!existing?.cursor) throw new CindyIntakeConflictError("Cindy \u7A97\u53E3\u5DF2\u5B58\u5728\u4F46\u7ED3\u679C\u5C1A\u672A\u5B8C\u6210\u3002");
-        let stored = parseJsonValue(existing.cursor, null);
-        if (!stored || stored.window_id !== input.window_id) throw new CindyIntakeConflictError("Cindy \u7A97\u53E3\u5E42\u7B49\u8BB0\u5F55\u65E0\u6548\u3002");
-        return { ...stored, duplicate: !0 };
-      }
-      let sourceRows = /* @__PURE__ */ new Map(), conversationCursors = /* @__PURE__ */ new Map();
-      for (let source of input.sources) {
-        let conversationId = source.conversation_key?.trim() || `cindy:source:${source.source_key}`, persisted = this.persistSourceEventUnsafe({
-          externalId: `cindy:${(0, import_node_crypto11.createHash)("sha256").update(`${conversationId}\0${source.source_key}`).digest("hex")}`,
-          sourceType: "manual",
-          conversationId,
-          senderId: `cindy:${source.sender_role ?? "unknown"}`,
-          senderName: source.sender_role ?? "Cindy",
-          content: source.text,
-          occurredAt: source.occurred_at,
-          ownerMentioned: !1,
-          completeness: "complete",
-          discoveryReason: "Cindy \u5BF9\u8BDD\u7A97\u53E3\u5165\u5E93\u3002",
-          metadata: {
-            ownerScope: DATA04_OWNER_SCOPE,
-            sourceScope: "cindy",
-            cindyWindowId: input.window_id,
-            cindySourceKey: source.source_key,
-            cindyConversationKey: source.conversation_key?.trim() ?? null,
-            windowStart: input.window_start,
-            windowEnd: input.window_end
-          }
-        });
-        if (sourceRows.set(source.source_key, persisted.row), source.conversation_key?.trim()) {
-          let previous = conversationCursors.get(source.conversation_key.trim());
-          (!previous || Date.parse(source.occurred_at) > Date.parse(previous)) && conversationCursors.set(source.conversation_key.trim(), source.occurred_at);
-        }
-      }
-      let attachCandidateSources = (demandUnitId, proposalSources, proposalSourceKeys) => {
-        let insert = this.database.raw.prepare(
-          `INSERT OR IGNORE INTO source_demand_unit_source
-            (demand_unit_id, source_event_id, source_key, source_role, sequence, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`
-        );
-        for (let [sourceIndex, sourceRow] of proposalSources.entries())
-          insert.run(demandUnitId, sourceRow.id, proposalSourceKeys[sourceIndex], sourceIndex === 0 ? "anchor" : "evidence", sourceIndex, timestamp);
-      }, proposalResults = [];
-      for (let [proposalIndex, proposal] of input.proposals.entries()) {
-        let proposalSources = proposal.source_keys.map((sourceKey) => sourceRows.get(sourceKey)), anchor = proposalSources[0];
-        if (proposal.action === "create_candidate") {
-          let sourceIds = proposalSources.map((source) => source.id), sourcePlaceholders = sourceIds.map(() => "?").join(","), existingCandidate = this.database.raw.prepare(
-            `SELECT candidate_request.*
-               FROM candidate_request
-               LEFT JOIN source_demand_unit_source
-                 ON source_demand_unit_source.demand_unit_id = candidate_request.demand_unit_id
-              WHERE candidate_request.source_event_id IN (${sourcePlaceholders})
-                 OR source_demand_unit_source.source_event_id IN (${sourcePlaceholders})
-              ORDER BY candidate_request.created_at ASC, candidate_request.id ASC
-              LIMIT 1`
-          ).get(...sourceIds, ...sourceIds);
-          if (existingCandidate) {
-            let demandUnitId2 = existingCandidate.demand_unit_id;
-            !demandUnitId2 && !existingCandidate.accepted_task_id && !existingCandidate.deleted_at && existingCandidate.state !== "accepted" && (demandUnitId2 = this.ensureCandidateDemandUnitRecord(existingCandidate, timestamp)), demandUnitId2 && attachCandidateSources(demandUnitId2, proposalSources, proposal.source_keys), proposalResults.push({ action: proposal.action, source_keys: proposal.source_keys, candidate_id: existingCandidate.id });
-            continue;
-          }
-          let draft = createManualCandidate(anchor.content, anchor.sender_name, anchor.occurred_at), candidateId = id("cand"), demandUnitId = id("unit"), title = proposal.title ?? draft.title, describe3 = proposal.describe ?? draft.describe, analysisJson = JSON.stringify({
-            ...draft.analysis,
-            origin: "cindy_intake",
-            windowId: input.window_id,
-            sourceKeys: proposal.source_keys,
-            reason: proposal.reason ?? null
-          });
-          this.database.raw.prepare(
-            `INSERT INTO source_demand_unit
-              (id, anchor_source_event_id, unit_key, unit_kind, state, classification_revision, ai_decision_id,
-               analysis_json, reason, created_at, updated_at)
-             VALUES (?, ?, ?, 'demand', 'ready', ?, NULL, ?, ?, ?, ?)`
-          ).run(
-            demandUnitId,
-            anchor.id,
-            `cindy:${candidateId}`,
-            `cindy:${input.window_id}`,
-            analysisJson,
-            proposal.reason ?? "Cindy \u5165\u5E93\u63D0\u6848\u3002",
-            timestamp,
-            timestamp
-          ), this.database.raw.prepare(
-            `INSERT INTO candidate_request
-              (id, source_event_id, demand_unit_id, title, proposer_name, background, validation_question, describe,
-               analysis_json, confidence, state, snoozed_until, accepted_task_id, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', NULL, NULL, ?, ?)`
-          ).run(
-            candidateId,
-            anchor.id,
-            demandUnitId,
-            title,
-            anchor.sender_name,
-            draft.background,
-            draft.validationQuestion,
-            describe3,
-            analysisJson,
-            timestamp,
-            timestamp
-          ), attachCandidateSources(demandUnitId, proposalSources, proposal.source_keys), proposalResults.push({ action: proposal.action, source_keys: proposal.source_keys, candidate_id: candidateId });
-          continue;
-        }
-        if (proposal.action === "update_task") {
-          let task = this.getTask(proposal.task_key);
-          if (!task) throw new CindyIntakeConflictError("update_task \u5BF9\u5E94\u7684\u4EFB\u52A1\u4E0D\u5B58\u5728\u3002");
-          if (task.record_state !== "active" || task.deleted_at || task.status === "archived")
-            throw new CindyIntakeConflictError("update_task \u5BF9\u5E94\u7684\u4EFB\u52A1\u5F53\u524D\u4E0D\u53EF\u66F4\u65B0\u3002", task.version);
-          if (task.version !== proposal.expected_version)
-            throw new CindyIntakeConflictError("\u4EFB\u52A1\u5DF2\u88AB\u5176\u4ED6\u64CD\u4F5C\u66F4\u65B0\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002", task.version);
-          let patch = {
-            title: proposal.title,
-            describe: proposal.describe,
-            nextStep: proposal.next_step,
-            expectedVersion: proposal.expected_version
-          }, next = this.resolveTaskPatch(task, patch), nextVersion = task.version + 1;
-          if (this.database.raw.prepare(
-            `UPDATE task
-                SET title = ?, describe = ?, next_step = ?, version = ?, updated_at = ?
-              WHERE id = ? AND version = ?`
-          ).run(next.title, next.describe, next.nextStep, nextVersion, timestamp, task.id, task.version).changes !== 1) {
-            let current = this.getTask(task.id);
-            throw new CindyIntakeConflictError("\u4EFB\u52A1\u5DF2\u88AB\u5176\u4ED6\u64CD\u4F5C\u66F4\u65B0\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002", current?.version ?? null);
-          }
-          let afterSnapshot = {
-            ...taskAuditSnapshot(task),
-            title: next.title,
-            describe: next.describe,
-            next_step: next.nextStep,
-            version: nextVersion,
-            updated_at: timestamp
-          };
-          this.database.raw.prepare(
-            `INSERT INTO task_event
-              (id, task_id, event_type, actor_type, visibility, summary, source_event_id, demand_unit_id,
-               before_json, after_json, occurred_at, recorded_at, version)
-             VALUES (?, ?, 'task_cindy_intake_update', 'cindy', 'private', ?, ?, NULL, ?, ?, ?, ?, ?)`
-          ).run(
-            id("evt"),
-            task.id,
-            proposal.reason?.trim() || "Cindy \u63D0\u6848\u66F4\u65B0\u4E86\u4EFB\u52A1\u5B57\u6BB5\u3002",
-            anchor.id,
-            JSON.stringify(taskAuditSnapshot(task)),
-            JSON.stringify(afterSnapshot),
-            anchor.occurred_at,
-            timestamp,
-            nextVersion
-          ), updatedTaskIds.add(task.id), proposalResults.push({ action: proposal.action, source_keys: proposal.source_keys, task_key: task.id, version: nextVersion });
-          continue;
-        }
-        let correctionType = proposal.action === "skip" ? "cindy_skip" : "cindy_needs_owner";
-        this.database.raw.prepare(
-          `INSERT OR IGNORE INTO correction_event
-            (id, task_id, candidate_id, source_event_id, correction_type, before_json, after_json,
-             created_at, idempotency_key, note)
-           VALUES (?, NULL, NULL, ?, ?, NULL, ?, ?, ?, ?)`
-        ).run(
-          id("correction"),
-          anchor.id,
-          correctionType,
-          JSON.stringify({
-            action: proposal.action,
-            windowId: input.window_id,
-            sourceKeys: proposal.source_keys,
-            reason: proposal.reason ?? null
-          }),
-          timestamp,
-          `cindy-intake:${input.window_id}:${proposalIndex}`,
-          proposal.reason ?? ""
-        ), proposalResults.push({ action: proposal.action, source_keys: proposal.source_keys, reason: proposal.reason });
-      }
-      let storedResult = {
-        window_id: input.window_id,
-        duplicate: !1,
-        source_event_ids: [...sourceRows.values()].map((source) => source.id),
-        proposals: proposalResults
-      };
-      this.database.raw.prepare(
-        `UPDATE sync_cursor
-            SET cursor = ?, last_success_at = ?, updated_at = ?
-          WHERE integration = 'cindy_intake' AND scope_key = ?`
-      ).run(JSON.stringify(storedResult), timestamp, timestamp, input.window_id), this.advanceIntakeWindowCursorUnsafe(input.window_end, timestamp);
-      for (let [conversationKey, occurredAt] of conversationCursors)
-        this.database.advanceCindyConversationCursor(conversationKey, occurredAt, timestamp);
-      return storedResult;
-    });
-    for (let taskId of updatedTaskIds) this.projectTaskMemory(taskId);
-    return result;
-  }
   listTasks(status, recordState = "active", deletedState = "active") {
     let stateClause = recordState === "all" ? "" : " AND record_state = ?", stateArgs = recordState === "all" ? [] : [recordState], deletedClause = deletedState === "all" ? "" : deletedState === "only" ? " AND deleted_at IS NOT NULL" : " AND deleted_at IS NULL", scheduleOrder = "COALESCE(planned_start_at, planned_due_at, schedule_at)";
     return status ? this.database.raw.prepare(`SELECT * FROM task WHERE status = ?${stateClause}${deletedClause} ORDER BY ${scheduleOrder} IS NULL, ${scheduleOrder}, updated_at DESC`).all(status, ...stateArgs).map((task) => normalizeTaskRecord(task)) : this.database.raw.prepare(`SELECT * FROM task WHERE 1 = 1${stateClause}${deletedClause} ORDER BY deleted_at IS NOT NULL, record_state = 'invalidated', status = 'archived', ${scheduleOrder} IS NULL, ${scheduleOrder}, updated_at DESC`).all(...stateArgs).map((task) => normalizeTaskRecord(task));
@@ -166425,11 +166205,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
 };
 
 // apps/server/src/app.ts
-var candidateStates = ["pending", "snoozed", "ignored", "accepted"], taskStatuses = ["unplanned", "planned", "in_progress", "waiting", "review", "completed", "archived"], seedIntakeBodySchema = external_exports.object({
-  title: external_exports.string().trim().min(1).max(160),
-  describe: external_exports.string().trim().min(1).max(2e3).optional(),
-  background: external_exports.string().trim().min(1).max(8e3).optional()
-}).strict();
+var candidateStates = ["pending", "snoozed", "ignored", "accepted"], taskStatuses = ["unplanned", "planned", "in_progress", "waiting", "review", "completed", "archived"];
 function isLoopbackRequest(request) {
   let normalizedAddress = (request.socket.remoteAddress ?? request.ip)?.replace(/^::ffff:/u, "").replace(/^\[|\]$/gu, "").split("%")[0];
   return normalizedAddress === "127.0.0.1" || normalizedAddress === "::1";
@@ -166470,47 +166246,20 @@ function requirePrivacyCapability(request, reply, capability, expectedIntent) {
   let token = request.headers["x-ai-pm-desktop-capability"], csrfToken = request.headers["x-csrf-token"], origin = request.headers.origin, referer = request.headers.referer, intent = request.headers["x-ai-pm-privacy-intent"];
   return typeof token != "string" || typeof csrfToken != "string" || typeof origin != "string" || typeof intent != "string" ? (reply.code(401).send({ error: "\u7F3A\u5C11\u684C\u9762\u4E3B\u4EBA\u64CD\u4F5C\u80FD\u529B\u51ED\u8BC1\u3002", error_code: "DESKTOP_CAPABILITY_REQUIRED" }), !1) : !Number.isFinite(capability.expiresAt) || Date.now() >= capability.expiresAt || token !== capability.token || csrfToken !== capability.csrfToken ? (reply.code(403).send({ error: "\u684C\u9762\u4E3B\u4EBA\u64CD\u4F5C\u80FD\u529B\u51ED\u8BC1\u65E0\u6548\u6216\u5DF2\u8FC7\u671F\u3002", error_code: "DESKTOP_CAPABILITY_INVALID" }), !1) : origin !== capability.origin || typeof referer == "string" && !referer.startsWith(`${capability.origin}/`) ? (reply.code(403).send({ error: "\u8DE8\u6765\u6E90\u9690\u79C1\u64CD\u4F5C\u5DF2\u62D2\u7EDD\u3002", error_code: "CSRF_ORIGIN_MISMATCH" }), !1) : intent !== expectedIntent ? (reply.code(403).send({ error: "\u9690\u79C1\u64CD\u4F5C\u610F\u56FE\u4E0D\u5339\u914D\u3002", error_code: "PRIVACY_INTENT_MISMATCH" }), !1) : capabilityBinding(capability);
 }
-function registerSeedIntakeRoute(app, service) {
-  app.hasRoute({ method: "POST", url: "/api/dev/seed-intake" }) || app.post("/api/dev/seed-intake", async (request, reply) => {
-    let normalizedAddress = (request.socket.remoteAddress ?? request.ip)?.replace(/^::ffff:/u, "").replace(/^\[|\]$/gu, "").split("%")[0];
-    if (normalizedAddress !== "127.0.0.1" && normalizedAddress !== "::1")
-      return reply.code(403).send({ error: "\u6A21\u62DF\u9700\u6C42\u5165\u53E3\u53EA\u63A5\u53D7\u672C\u673A\u56DE\u73AF\u8BF7\u6C42\u3002" });
-    try {
-      let body = seedIntakeBodySchema.parse(request.body), occurredAt = (/* @__PURE__ */ new Date()).toISOString(), sourceKey = `dev-seed-source-${(0, import_node_crypto12.randomUUID)()}`, background = body.background ?? body.describe ?? body.title, candidateId = service.processCindyIntake({
-        window_id: `dev-seed-window-${(0, import_node_crypto12.randomUUID)()}`,
-        window_start: occurredAt,
-        window_end: occurredAt,
-        sources: [{
-          source_key: sourceKey,
-          occurred_at: occurredAt,
-          conversation_key: `dev-seed-conversation-${sourceKey}`,
-          sender_role: "\u6D4B\u8BD5\u6A21\u62DF\u9700\u6C42",
-          text: background
-        }],
-        proposals: [{
-          action: "create_candidate",
-          source_keys: [sourceKey],
-          title: body.title,
-          ...body.describe === void 0 ? {} : { describe: body.describe },
-          reason: "\u6D4F\u89C8\u5668 HTML \u6D4B\u8BD5\u6A21\u62DF\u9700\u6C42\u3002"
-        }]
-      }).proposals.find((proposal) => proposal.action === "create_candidate")?.candidate_id;
-      return candidateId ? { candidate_id: candidateId } : reply.code(500).send({ error: "\u6A21\u62DF\u9700\u6C42\u672A\u751F\u6210\u5019\u9009\u3002" });
-    } catch (error51) {
-      let status = error51 instanceof external_exports.ZodError ? 400 : 409;
-      return reply.code(status).send({ error: error51 instanceof Error ? error51.message : "\u6A21\u62DF\u9700\u6C42\u5199\u5165\u5931\u8D25\u3002" });
-    }
-  });
-}
 async function buildApp(service, input = "http://localhost:5173") {
-  let options = typeof input == "string" ? { webOrigin: input } : input, webOrigin = options.webOrigin ?? "http://localhost:5173";
+  let options = typeof input == "string" ? { webOrigin: input } : input, webOrigin = options.webOrigin ?? "http://localhost:5173", cindyIntegrationToken = options.cindyIntegrationToken?.trim() ?? "", cindyIntegrationAccountAnchor = options.cindyIntegrationAccountAnchor?.trim() ?? "", cindyReceiptSecret = options.cindyReceiptSecret?.trim() ?? "";
+  if (cindyIntegrationToken && (!cindyIntegrationAccountAnchor || !cindyReceiptSecret))
+    throw new Error("Cindy \u96C6\u6210\u5DF2\u914D\u7F6E Bearer\uFF0C\u4F46\u7F3A\u5C11\u7A33\u5B9A\u8D26\u53F7\u951A\u70B9\u6216\u72EC\u7ACB receipt \u5BC6\u94A5\u3002");
   options.desktopCapability && service.registerAuditReplayCapability(options.desktopCapability);
   let app = (0, import_fastify.default)({ logger: options.logger ?? process.env.NODE_ENV !== "test" });
   await app.register(import_cors.default, { origin: webOrigin });
-  let runtimeShutdownScheduled = !1, runtimeRestartScheduled = !1, cindyAuthContext = () => deriveCindyAuthContext(options.cindyIntegrationToken ?? "");
+  let runtimeShutdownScheduled = !1, runtimeRestartScheduled = !1, cindyAuthContext = () => deriveCindyAuthContext({
+    accountAnchor: cindyIntegrationAccountAnchor,
+    receiptSecret: cindyReceiptSecret
+  });
   if (app.addHook("onRequest", async (request, reply) => {
     if (!request.url.startsWith("/api/integrations/cindy/") || request.method === "OPTIONS") return;
-    let expected = options.cindyIntegrationToken?.trim(), authorization = String(request.headers.authorization ?? ""), expectedAuthorization = expected ? `Bearer ${expected}` : "";
+    let expected = cindyIntegrationToken, authorization = String(request.headers.authorization ?? ""), expectedAuthorization = expected ? `Bearer ${expected}` : "";
     if (!(!!expectedAuthorization && authorization.length === expectedAuthorization.length && (0, import_node_crypto12.timingSafeEqual)(Buffer.from(authorization, "utf8"), Buffer.from(expectedAuthorization, "utf8"))))
       return reply.code(401).send({ error: "Cindy \u96C6\u6210\u4EE4\u724C\u65E0\u6548\u6216\u5C1A\u672A\u914D\u7F6E\u3002" });
   }), app.get("/api/health", async () => service.health((0, import_node_crypto12.randomUUID)())), app.post("/api/runtime/shutdown", async (request, reply) => isLoopbackRequest(request) ? options.runtimeShutdown ? runtimeShutdownScheduled ? reply.code(409).send({ error: "\u540E\u53F0\u8FDB\u7A0B\u5DF2\u7ECF\u5728\u9000\u51FA\u3002" }) : (runtimeShutdownScheduled = !0, reply.code(200).send({ message: "\u672C\u673A\u4EFB\u52A1\u5E93\u540E\u53F0\u5DF2\u6536\u5230\u9000\u51FA\u8BF7\u6C42\uFF0C4310 \u5373\u5C06\u5173\u95ED\u3002" }), setTimeout(() => {
@@ -166533,7 +166282,7 @@ async function buildApp(service, input = "http://localhost:5173") {
       let status = error51 instanceof CindyIntakeConflictError ? 409 : 400;
       return reply.code(status).send({ error: error51 instanceof Error ? error51.message : "\u5165\u5E93\u7A97\u53E3\u6E38\u6807\u66F4\u65B0\u5931\u8D25\u3002" });
     }
-  }), registerSeedIntakeRoute(app, service), app.get("/api/dashboard", async () => dashboardDtoSchema.parse(service.dashboard())), app.get("/api/calendar", async () => service.calendar()), app.get("/api/calendar/sources", async (request) => {
+  }), app.get("/api/dashboard", async () => dashboardDtoSchema.parse(service.dashboard())), app.get("/api/calendar", async () => service.calendar()), app.get("/api/calendar/sources", async (request) => {
     let query = external_exports.object({
       route: external_exports.enum(["calendar_fact", "candidate_review", "owner_confirmation"]).optional(),
       limit: external_exports.coerce.number().int().min(1).max(500).default(100)
@@ -167232,7 +166981,9 @@ var booleanFromEnv = external_exports.enum(["true", "false"]).default("false").t
   WORKSPACE_WRITE_ENABLED: booleanFromEnv,
   WORKSPACE_ALLOWED_PATHS: external_exports.string().default("[]"),
   TASK_MEMORY_ROOT: external_exports.string().default(""),
-  CINDY_INTEGRATION_TOKEN: external_exports.string().default("")
+  CINDY_INTEGRATION_TOKEN: external_exports.string().default(""),
+  CINDY_ACCOUNT_ANCHOR: external_exports.string().default(""),
+  CINDY_RECEIPT_SECRET: external_exports.string().default("")
 });
 function parseAllowedPaths(value) {
   try {
@@ -167293,7 +167044,9 @@ function loadConfig(source = process.env) {
       allowedPaths: parseAllowedPaths(parsed.WORKSPACE_ALLOWED_PATHS)
     },
     taskMemoryRoot: parsed.TASK_MEMORY_ROOT ? (0, import_node_path4.resolve)(parsed.TASK_MEMORY_ROOT) : (0, import_node_path4.resolve)(process.cwd(), "tmp", "task-memory"),
-    cindyIntegrationToken: parsed.CINDY_INTEGRATION_TOKEN
+    cindyIntegrationToken: parsed.CINDY_INTEGRATION_TOKEN,
+    cindyAccountAnchor: parsed.CINDY_ACCOUNT_ANCHOR,
+    cindyReceiptSecret: parsed.CINDY_RECEIPT_SECRET
   };
 }
 
@@ -167418,7 +167171,7 @@ function normalizeSqlitePath(value) {
     throw new TypeError("sqlitePath \u5FC5\u987B\u662F\u672C\u673A SQLite \u6587\u4EF6\u8DEF\u5F84\u3002");
   return value === ":memory:" ? value : (0, import_node_path5.resolve)(value);
 }
-function runtimeConfig({ host, port, sqlitePath, token }) {
+function runtimeConfig({ host, port, sqlitePath, token, accountAnchor, receiptSecret }) {
   let databaseUrl = sqlitePath === ":memory:" ? sqlitePath : `file:${sqlitePath}`;
   return loadConfig({
     NODE_ENV: "production",
@@ -167432,7 +167185,9 @@ function runtimeConfig({ host, port, sqlitePath, token }) {
     WORKSPACE_MODE: "reference_only",
     WORKSPACE_READ_ENABLED: "false",
     WORKSPACE_WRITE_ENABLED: "false",
-    CINDY_INTEGRATION_TOKEN: token
+    CINDY_INTEGRATION_TOKEN: token,
+    CINDY_ACCOUNT_ANCHOR: accountAnchor,
+    CINDY_RECEIPT_SECRET: receiptSecret
   });
 }
 async function canReachPmEndpoint(url2, token) {
@@ -167527,9 +167282,14 @@ async function startPmServer({
   host: requestedHost,
   sqlitePath: requestedSqlitePath,
   token: requestedToken,
+  accountAnchor: requestedAccountAnchor,
+  receiptSecret: requestedReceiptSecret,
   webRoot: requestedWebRoot
 } = {}) {
-  let host = normalizeHost(requestedHost), port = normalizePort(requestedPort), sqlitePath = normalizeSqlitePath(requestedSqlitePath), token = typeof requestedToken == "string" ? requestedToken : "", webRoot = (0, import_node_path5.resolve)(
+  let host = normalizeHost(requestedHost), port = normalizePort(requestedPort), sqlitePath = normalizeSqlitePath(requestedSqlitePath), token = typeof requestedToken == "string" ? requestedToken : "", accountAnchor = typeof requestedAccountAnchor == "string" ? requestedAccountAnchor : "", receiptSecret = typeof requestedReceiptSecret == "string" ? requestedReceiptSecret : "";
+  if (token.trim() && (!accountAnchor.trim() || !receiptSecret.trim()))
+    throw new Error("\u672C\u673A\u4EFB\u52A1\u5E93\u5DF2\u914D\u7F6E Bearer\uFF0C\u4F46\u7F3A\u5C11\u7A33\u5B9A\u8D26\u53F7\u951A\u70B9\u6216\u72EC\u7ACB receipt \u5BC6\u94A5\u3002");
+  let webRoot = (0, import_node_path5.resolve)(
     typeof requestedWebRoot == "string" && requestedWebRoot.trim() ? requestedWebRoot : DEFAULT_WEB_ROOT
   );
   if (!(0, import_node_fs4.existsSync)((0, import_node_path5.resolve)(webRoot, "index.html")))
@@ -167553,7 +167313,7 @@ async function startPmServer({
   sqlitePath !== ":memory:" && await (0, import_promises2.mkdir)((0, import_node_path5.dirname)(sqlitePath), { recursive: !0 });
   let database, app, statusBarProcess = null, stopOwnedRuntime;
   try {
-    let config2 = runtimeConfig({ host, port, sqlitePath, token });
+    let config2 = runtimeConfig({ host, port, sqlitePath, token, accountAnchor, receiptSecret });
     database = new AppDatabase(config2.database.sqlitePath);
     let service = new PmService(database, createCindyAdapters(config2), config2), stopInFlight = null, stopResult = null, restartInFlight = null, restartOwnedRuntime;
     stopOwnedRuntime = async ({ scheduleExit = !0 } = {}) => stopResult?.stopped ? { stopped: !1, alreadyStopped: !0 } : stopInFlight || (stopInFlight = (async () => {
@@ -167565,12 +167325,12 @@ async function startPmServer({
         error: `\u672C\u673A\u4EFB\u52A1\u5E93\u505C\u6B62\u672A\u5B8C\u5168\u5B8C\u6210\uFF1A${failures.join("\u3001")}\u3002`
       }, stopInFlight = null, stopResult) : (ownedRuntime?.app === app && (ownedRuntime = null), stopResult = { stopped: !0 }, scheduleExit && scheduleProcessExit(), stopResult);
     })(), stopInFlight);
-    let runtimeOptions = { port, host, sqlitePath, token, webRoot };
-    restartOwnedRuntime = async () => {
+    let runtimeOptions = { port, host, sqlitePath, token, accountAnchor, receiptSecret, webRoot };
+    restartOwnedRuntime = async (nextOptions = {}) => {
       if (restartInFlight) return restartInFlight;
       restartInFlight = (async () => {
         let stopped = await stopOwnedRuntime({ scheduleExit: !1 });
-        return stopped.stopped ? startPmServer(runtimeOptions) : stopped;
+        return stopped.stopped ? startPmServer({ ...runtimeOptions, ...nextOptions }) : stopped;
       })();
       try {
         return await restartInFlight;
@@ -167582,6 +167342,8 @@ async function startPmServer({
       webOrigin: serverUrl(host, port),
       webRoot,
       cindyIntegrationToken: token,
+      cindyIntegrationAccountAnchor: accountAnchor,
+      cindyReceiptSecret: receiptSecret,
       logger: !1,
       runtimeShutdown: async () => {
         let result = await stopOwnedRuntime();
