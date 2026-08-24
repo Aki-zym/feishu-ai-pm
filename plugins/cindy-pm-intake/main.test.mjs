@@ -134,6 +134,9 @@ test('scan_intake_window starts the fixed intake errand session and returns its 
   assert.match(errandCalls[0].task, /最多回读 4 小时/);
   assert.match(errandCalls[0].task, /empty_window/);
   assert.match(errandCalls[0].task, /共同对象、共同目标、共同交付物/);
+  assert.match(errandCalls[0].task, /已保存 snapshot 内仍由你.*完成语义分组/);
+  assert.match(errandCalls[0].task, /禁止用语义匹配扩大回读范围、全局拉取会话/);
+  assert.match(errandCalls[0].task, /产品服务端或第二套 Runtime.*不得另做语义聚类/);
   assert.match(errandCalls[0].task, /snapshot_receipts/);
   assert.match(errandCalls[0].task, /shared_context/);
   assert.match(errandCalls[0].task, /\[\{"action"/);
@@ -470,6 +473,39 @@ test('submit_pm_decisions posts receipts only and rejects update_task without CA
   const failure = sent.find((message) => message.callId === 'call-invalid-update');
   assert.equal(failure.ok, false);
   assert.match(failure.message, /task_key/);
+
+  const decisionPostsBeforeCapacityCheck = nodeCalls.filter((call) => call.params?.path?.endsWith('/decisions')).length;
+  onHostMessage({
+    type: 'tool-call',
+    tool: 'submit_pm_decisions',
+    callId: 'call-options-too-large',
+    args: {
+      decision_request_id: 'decision-options-too-large',
+      batch_id: 'batch-options-too-large',
+      window_id: 'window-options-too-large',
+      window_start: '2026-08-24T01:00:00.000Z',
+      window_end: '2026-08-24T01:10:00.000Z',
+      snapshot_receipts: ['o'.repeat(43)],
+      groups: [],
+      primary_dispositions: [{ disposition_ref: 'owner', source_receipt: 'o'.repeat(43), disposition: 'needs_owner', owner_decision_key: 'owner' }],
+      owner_decisions: [{
+        decision_key: 'owner',
+        reason: '需要主人选择。',
+        options: Array.from({ length: 4 }, (_, index) => ({
+          option_key: `large-${index}`,
+          action: 'create_candidate',
+          title: '题'.repeat(160),
+          describe: '描'.repeat(2000),
+          next_step: '步'.repeat(1000),
+        })),
+      }],
+    },
+  });
+  await waitFor(() => sent.some((message) => message.callId === 'call-options-too-large'));
+  const capacityFailure = sent.find((message) => message.callId === 'call-options-too-large');
+  assert.equal(capacityFailure.ok, false);
+  assert.match(capacityFailure.message, /聚合后超过 10000 字符/);
+  assert.equal(nodeCalls.filter((call) => call.params?.path?.endsWith('/decisions')).length, decisionPostsBeforeCapacityCheck);
 });
 
 test('update_pm_progress keeps progress oneshot separate from intake errand', async () => {

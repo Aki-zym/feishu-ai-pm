@@ -170,6 +170,7 @@
           "owner_decisions": {
             "type": "array",
             "maxItems": 100,
+            "description": "每个 decision 的 canonical stored options JSON 最多 10000 个 SQLite 文本字符；插件提交前会校验聚合容量。",
             "items": {
               "type": "object",
               "properties": {

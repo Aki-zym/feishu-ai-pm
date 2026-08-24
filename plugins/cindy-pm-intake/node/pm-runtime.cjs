@@ -149998,7 +149998,24 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
 }
 
 // apps/server/src/cindy-batch.ts
-var import_node_crypto4 = require("node:crypto"), cindyBatchKeyPattern = /^[A-Za-z0-9_-]{1,128}$/u, cindyGroupKeyPattern = /^[A-Za-z0-9_-]{1,64}$/u;
+var import_node_crypto4 = require("node:crypto"), CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH = 1e4, cindyBatchKeyPattern = /^[A-Za-z0-9_-]{1,128}$/u, cindyGroupKeyPattern = /^[A-Za-z0-9_-]{1,64}$/u;
+function projectCindyOwnerDecisionStoredOptions(options) {
+  return options.map((option) => ({
+    optionKey: option.option_key,
+    action: option.action,
+    title: option.title ?? (option.action === "append_candidate" ? "\u8FFD\u52A0\u5230\u5DF2\u6709\u5019\u9009" : null),
+    describe: option.describe ?? null,
+    nextStep: option.next_step ?? null,
+    candidateKey: option.action === "append_candidate" ? option.candidate_key ?? null : null
+  }));
+}
+function sqliteTextLength(value) {
+  return [...value].length;
+}
+function serializeCindyOwnerDecisionStoredOptions(options) {
+  let storedOptions = projectCindyOwnerDecisionStoredOptions(options), json2 = JSON.stringify(storedOptions);
+  return { storedOptions, json: json2, length: sqliteTextLength(json2) };
+}
 function canonicalize(value) {
   return Array.isArray(value) ? value.map(canonicalize) : value && typeof value == "object" ? Object.fromEntries(Object.entries(value).filter(([, child]) => child !== void 0).sort(([left], [right]) => left.localeCompare(right)).map(([key, child]) => [key, canonicalize(child)])) : value;
 }
@@ -154662,7 +154679,6 @@ function parseCindyOwnerDecisionOptions(value) {
 function projectCindyOwnerDecision(row, sourceCount) {
   return {
     decision_id: row.id,
-    batch_id: row.batch_id,
     status: row.status,
     version: row.version,
     reason_summary: row.reason_summary,
@@ -154675,13 +154691,22 @@ function projectCindyOwnerDecision(row, sourceCount) {
       available: option.action !== "append_candidate"
     })),
     source_count: sourceCount,
-    last_error: row.last_error,
+    last_attempt_failed: row.last_error !== null,
     resolution_action: row.resolution_action,
     resolved_candidate_id: row.resolved_candidate_id,
     created_at: row.created_at,
     updated_at: row.updated_at,
     resolved_at: row.resolved_at
   };
+}
+function loadProjectedCindyOwnerDecision(database, decisionId) {
+  let row = database.raw.prepare(
+    `SELECT decision.*,
+            (SELECT COUNT(*) FROM cindy_owner_decision_source AS source WHERE source.decision_id = decision.id) AS source_count
+       FROM cindy_owner_decision AS decision WHERE decision.id = ?`
+  ).get(decisionId);
+  if (!row) throw new CindySourceContractError("CONFLICT", "\u4E3B\u4EBA\u51B3\u5B9A\u72B6\u6001\u65E0\u6CD5\u8BFB\u53D6\u3002");
+  return projectCindyOwnerDecision(row, row.source_count);
 }
 var nowIso = () => (/* @__PURE__ */ new Date()).toISOString(), id = (prefix) => prefix + "_" + (0, import_node_crypto12.randomUUID)();
 function stableJson2(value) {
@@ -163816,7 +163841,12 @@ var PmService = class {
       ).get(auth.ownerScope, auth.accountAnchor, input.batch_id);
       if (replay) {
         if (replay.payload_hash !== payloadHash) throw new CindySourceContractError("CONFLICT", "batch_id \u5DF2\u7ED1\u5B9A\u5230\u4E0D\u540C canonical payload\u3002");
-        return { ...JSON.parse(replay.response_json), duplicate: !0 };
+        let stored = JSON.parse(replay.response_json);
+        return {
+          ...stored,
+          duplicate: !0,
+          owner_decisions: stored.owner_decisions.map((decision) => loadProjectedCindyOwnerDecision(this.database, decision.decision_id))
+        };
       }
       if (this.database.raw.prepare(
         `SELECT batch_id, payload_hash FROM cindy_batch
@@ -163901,24 +163931,26 @@ var PmService = class {
       }
       let ownerDecisionIdByKey = /* @__PURE__ */ new Map(), ownerDecisionDtos = [];
       for (let [decisionKey, decision] of ownerDecisionByKey) {
-        let dispositions = input.primary_dispositions.filter((item) => item.disposition === "needs_owner" && item.owner_decision_key === decisionKey).sort((left, right) => left.disposition_ref.localeCompare(right.disposition_ref)), sourceContents = dispositions.map((item) => sourceByRevision.get(revisionByReceipt.get(item.source_receipt).id)).map((source) => source.content), storedOptions = decision.options.map((option) => {
-          let candidateTitle = null;
-          if (option.action === "append_candidate") {
-            let candidate = this.database.raw.prepare(
-              "SELECT id, title FROM candidate_request WHERE id = ? AND deleted_at IS NULL AND state <> 'accepted'"
-            ).get(option.candidate_key);
-            if (!candidate) throw new CindySourceContractError("CONFLICT", "append_candidate \u610F\u56FE\u5BF9\u5E94\u5019\u9009\u4E0D\u53EF\u7528\u3002");
-            candidateTitle = safeCandidateNarrative(candidate.title, sourceContents, "\u5DF2\u6709\u5019\u9009", 160);
-          }
+        let dispositions = input.primary_dispositions.filter((item) => item.disposition === "needs_owner" && item.owner_decision_key === decisionKey).sort((left, right) => left.disposition_ref.localeCompare(right.disposition_ref)), sourceContents = dispositions.map((item) => sourceByRevision.get(revisionByReceipt.get(item.source_receipt).id)).map((source) => source.content), sanitizedOptions = decision.options.map((option) => {
+          if (option.action === "append_candidate" && !this.database.raw.prepare(
+            "SELECT id FROM candidate_request WHERE id = ? AND deleted_at IS NULL AND state <> 'accepted'"
+          ).get(option.candidate_key))
+            throw new CindySourceContractError("CONFLICT", "append_candidate \u610F\u56FE\u5BF9\u5E94\u5019\u9009\u4E0D\u53EF\u7528\u3002");
           return {
-            optionKey: option.option_key,
+            option_key: option.option_key,
             action: option.action,
-            title: option.title === void 0 ? candidateTitle : safeCandidateNarrative(option.title, sourceContents, option.action === "create_candidate" ? "\u5F85\u4E3B\u4EBA\u786E\u8BA4\u7684\u65B0\u5019\u9009" : "\u5DF2\u6709\u5019\u9009", 160),
-            describe: option.describe === void 0 ? null : safeCandidateNarrative(option.describe, sourceContents, "\u5019\u9009\u6458\u8981\u5F85\u4E3B\u4EBA\u786E\u8BA4\u3002", 2e3),
-            nextStep: option.next_step === void 0 ? null : safeCandidateNarrative(option.next_step, sourceContents, "\u4E0B\u4E00\u6B65\u5F85\u4E3B\u4EBA\u786E\u8BA4\u3002", 1e3),
-            candidateKey: option.action === "append_candidate" ? option.candidate_key : null
+            title: option.title === void 0 ? option.action === "append_candidate" ? "\u8FFD\u52A0\u5230\u5DF2\u6709\u5019\u9009" : void 0 : safeCandidateNarrative(option.title, sourceContents, option.action === "create_candidate" ? "\u5F85\u4E3B\u4EBA\u786E\u8BA4\u7684\u65B0\u5019\u9009" : "\u5DF2\u6709\u5019\u9009", 160),
+            describe: option.describe === void 0 ? void 0 : safeCandidateNarrative(option.describe, sourceContents, "\u5019\u9009\u6458\u8981\u5F85\u4E3B\u4EBA\u786E\u8BA4\u3002", 2e3),
+            next_step: option.next_step === void 0 ? void 0 : safeCandidateNarrative(option.next_step, sourceContents, "\u4E0B\u4E00\u6B65\u5F85\u4E3B\u4EBA\u786E\u8BA4\u3002", 1e3),
+            candidate_key: option.action === "append_candidate" ? option.candidate_key : void 0
           };
-        }), decisionId = id("cindy_owner_decision"), reasonSummary = safeCandidateNarrative(decision.reason, sourceContents, "\u8FD9\u7EC4\u6765\u6E90\u9700\u8981\u4E3B\u4EBA\u51B3\u5B9A\u5982\u4F55\u5904\u7406\u3002", 500);
+        }), serializedOptions = serializeCindyOwnerDecisionStoredOptions(sanitizedOptions);
+        if (serializedOptions.length > CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH)
+          throw new CindySourceContractError(
+            "INVALID_INPUT",
+            `owner decision options \u805A\u5408\u540E\u4E0D\u80FD\u8D85\u8FC7 ${CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH} \u4E2A SQLite \u6587\u672C\u5B57\u7B26\u3002`
+          );
+        let decisionId = id("cindy_owner_decision"), reasonSummary = safeCandidateNarrative(decision.reason, sourceContents, "\u8FD9\u7EC4\u6765\u6E90\u9700\u8981\u4E3B\u4EBA\u51B3\u5B9A\u5982\u4F55\u5904\u7406\u3002", 500);
         this.database.raw.prepare(
           `INSERT INTO cindy_owner_decision
             (id, owner_scope, account_anchor, batch_id, decision_key, reason_summary, options_json,
@@ -163931,7 +163963,7 @@ var PmService = class {
           input.batch_id,
           decisionKey,
           reasonSummary,
-          JSON.stringify(storedOptions),
+          serializedOptions.json,
           timestamp,
           timestamp
         ), dispositions.forEach((disposition, index) => {
@@ -164146,7 +164178,7 @@ var PmService = class {
         if (row.resolution_request_id === input.decision_request_id) {
           if (row.resolution_payload_hash !== payloadHash || !row.resolution_response_json)
             throw new CindySourceContractError("CONFLICT", "decision_request_id \u5DF2\u7ED1\u5B9A\u5230\u4E0D\u540C\u4E3B\u4EBA\u51B3\u5B9A payload\u3002");
-          return JSON.parse(row.resolution_response_json);
+          return loadProjectedCindyOwnerDecision(this.database, row.id);
         }
         if (row.status !== "pending") throw new CindyIntakeConflictError("\u4E3B\u4EBA\u51B3\u5B9A\u5DF2\u4E0D\u518D\u7B49\u5F85\u5904\u7406\u3002", row.version);
         if (row.version !== input.expected_version) throw new CindyIntakeConflictError("\u4E3B\u4EBA\u51B3\u5B9A\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002", row.version);
@@ -164260,7 +164292,7 @@ var PmService = class {
           row.id,
           row.version
         );
-        let resolved = this.database.raw.prepare("SELECT * FROM cindy_owner_decision WHERE id = ?").get(row.id), dto = projectCindyOwnerDecision(resolved, sourceRows.length);
+        let dto = loadProjectedCindyOwnerDecision(this.database, row.id);
         return this.database.raw.prepare(
           "UPDATE cindy_owner_decision SET resolution_response_json = ? WHERE id = ?"
         ).run(JSON.stringify(dto), row.id), dto;
@@ -164293,7 +164325,7 @@ var PmService = class {
       if (priorResolution) {
         if (priorResolution.id !== row.id || priorResolution.resolution_payload_hash !== payloadHash || !priorResolution.resolution_response_json)
           throw new CindySourceContractError("CONFLICT", "decision_request_id \u5DF2\u7ED1\u5B9A\u5230\u5176\u4ED6\u4E3B\u4EBA\u51B3\u5B9A\u6216 payload\u3002");
-        return JSON.parse(priorResolution.resolution_response_json);
+        return loadProjectedCindyOwnerDecision(this.database, row.id);
       }
       if (row.status !== "pending") throw new CindyIntakeConflictError("\u4E3B\u4EBA\u51B3\u5B9A\u5DF2\u4E0D\u518D\u7B49\u5F85\u5904\u7406\u3002", row.version);
       if (row.version !== input.expected_version) throw new CindyIntakeConflictError("\u4E3B\u4EBA\u51B3\u5B9A\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002", row.version);
@@ -164304,9 +164336,7 @@ var PmService = class {
                 last_error = NULL, updated_at = ?
           WHERE id = ? AND status = 'pending' AND version = ?`
       ).run(nextVersion, input.decision_request_id, payloadHash, timestamp, row.id, row.version).changes !== 1) throw new CindyIntakeConflictError("\u4E3B\u4EBA\u51B3\u5B9A\u5DF2\u53D8\u5316\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002");
-      let sourceCount = this.database.raw.prepare(
-        "SELECT COUNT(*) AS count FROM cindy_owner_decision_source WHERE decision_id = ?"
-      ).get(row.id).count, cancelled = this.database.raw.prepare("SELECT * FROM cindy_owner_decision WHERE id = ?").get(row.id), dto = projectCindyOwnerDecision(cancelled, sourceCount);
+      let dto = loadProjectedCindyOwnerDecision(this.database, row.id);
       return this.database.raw.prepare("UPDATE cindy_owner_decision SET resolution_response_json = ? WHERE id = ?").run(JSON.stringify(dto), row.id), dto;
     });
   }
@@ -167249,7 +167279,24 @@ async function buildApp(service, input = "http://localhost:5173") {
     }
   }), app.post("/api/integrations/cindy/decisions", async (request, reply) => {
     try {
-      let isoTimestamp = external_exports.string().datetime({ offset: !0 }), receipt = external_exports.string().min(32).max(200), body = external_exports.object({
+      let isoTimestamp = external_exports.string().datetime({ offset: !0 }), receipt = external_exports.string().min(32).max(200), ownerDecision = external_exports.object({
+        decision_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+        reason: external_exports.string().trim().min(1).max(500),
+        options: external_exports.array(external_exports.object({
+          option_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+          action: external_exports.enum(["skip", "create_candidate", "append_candidate"]),
+          title: external_exports.string().trim().min(1).max(160).optional(),
+          describe: external_exports.string().trim().min(1).max(2e3).optional(),
+          next_step: external_exports.string().trim().min(1).max(1e3).optional(),
+          candidate_key: external_exports.string().trim().min(1).max(200).optional()
+        }).strict()).min(1).max(10)
+      }).strict().superRefine((decision, context) => {
+        serializeCindyOwnerDecisionStoredOptions(decision.options).length > CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH && context.addIssue({
+          code: "custom",
+          path: ["options"],
+          message: `owner decision options \u805A\u5408\u540E\u4E0D\u80FD\u8D85\u8FC7 ${CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH} \u4E2A SQLite \u6587\u672C\u5B57\u7B26\u3002`
+        });
+      }), body = external_exports.object({
         decision_request_id: external_exports.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
         batch_id: external_exports.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
         window_id: external_exports.string().trim().min(1).max(200),
@@ -167280,18 +167327,7 @@ async function buildApp(service, input = "http://localhost:5173") {
           source_receipt: receipt,
           shared_group_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u)
         }).strict()).max(500).optional(),
-        owner_decisions: external_exports.array(external_exports.object({
-          decision_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
-          reason: external_exports.string().trim().min(1).max(500),
-          options: external_exports.array(external_exports.object({
-            option_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
-            action: external_exports.enum(["skip", "create_candidate", "append_candidate"]),
-            title: external_exports.string().trim().min(1).max(160).optional(),
-            describe: external_exports.string().trim().min(1).max(2e3).optional(),
-            next_step: external_exports.string().trim().min(1).max(1e3).optional(),
-            candidate_key: external_exports.string().trim().min(1).max(200).optional()
-          }).strict()).min(1).max(10)
-        }).strict()).max(100).optional()
+        owner_decisions: external_exports.array(ownerDecision).max(100).optional()
       }).strict().parse(request.body);
       return service.processCindyDecisions(cindyAuthContext(), body);
     } catch (error51) {

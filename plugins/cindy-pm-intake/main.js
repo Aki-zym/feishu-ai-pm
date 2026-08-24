@@ -5,6 +5,7 @@ const MAX_SOURCE_TEXT = 12000;
 const CINDY_MESSAGE_TYPES = ['text', 'post', 'image', 'file', 'audio', 'video', 'sticker', 'interactive', 'system', 'unknown'];
 const OWNER_REACTIONS = new Set(['OK', 'THUMBSUP', 'THUMBS_UP', 'APPROVE', 'APPROVED', 'DONE', 'CHECK_MARK', 'CHECKMARK']);
 const MAX_PROPOSAL_TEXT = 2000;
+const MAX_OWNER_DECISION_OPTIONS_JSON = 10000;
 const PROMPT_VERSION = 'cindy-dual-v1';
 const TASK_CANDIDATE_CHAR_BUDGET = 12000;
 const RECENT_TURN_TTL_MS = 10 * 60 * 1000;
@@ -16,6 +17,21 @@ const automaticInputsInFlight = new Set();
 
 function safeText(value, limit) {
   return typeof value === 'string' ? value.trim().slice(0, limit) : '';
+}
+
+function ownerDecisionStoredProjection(options) {
+  return options.map((option) => ({
+    optionKey: option.option_key,
+    action: option.action,
+    title: option.title ?? (option.action === 'append_candidate' ? '追加到已有候选' : null),
+    describe: option.describe ?? null,
+    nextStep: option.next_step ?? null,
+    candidateKey: option.action === 'append_candidate' ? option.candidate_key ?? null : null,
+  }));
+}
+
+function sqliteTextLength(value) {
+  return [...value].length;
 }
 
 async function settings() {
@@ -498,6 +514,9 @@ function validateDecisionBody(raw) {
       if (option.action !== 'append_candidate' && option.candidate_key !== undefined) throw new Error('只有 append_candidate option 可提供 candidate_key');
       return item;
     });
+    if (sqliteTextLength(JSON.stringify(ownerDecisionStoredProjection(options))) > MAX_OWNER_DECISION_OPTIONS_JSON) {
+      throw new Error(`owner_decisions[${index}].options 聚合后超过 ${MAX_OWNER_DECISION_OPTIONS_JSON} 字符`);
+    }
     return { decision_key: decisionKey, reason, options };
   });
   const ownerKeys = ownerDecisions.map((item) => item.decision_key);
@@ -530,7 +549,7 @@ function buildErrandTask(window) {
     '只有 save_pm_sources 成功后才调用 get_pm_tasks 获取当前任务快照。返回结果包含 items、candidates、cursors；items 是当前任务，candidates 是待确认候选，cursors 是各授权会话的读取游标。',
     '先整体理解本次已保存 snapshot，再按“共同对象、共同目标、共同交付物”形成零个、一个或多个 group，然后为每条 receipt 决定 primary disposition，最后生成字段。语义分组完全由你完成；同人、同群或时间接近只能作为辅助证据，不能单独决定分组。',
     '短确认、补充、负责人、排期、资料交接和收口句可作为同一 group 的 evidence，但不能单独造卡。优先用已有任务承接同一需求；只有明确独立对象和交付目标时才使用 create_candidate。003 不执行跨窗口候选追加；若可能追加到已有候选，只能放入 needs_owner 的 append_candidate 选项，保持等待主人决定。',
-    '有限回读使用飞书 MCP 的 im_read_messages：同 thread 或 reply 链最多 100 条、最多回读 4 小时；没有 thread/reply 时，只能在同一 chat 且已有明确主人证据后回读，最多 20 条且最长 60 分钟。超过边界的消息留到后续批次或标记 needs_owner；禁止语义聚类或全局拉取会话。',
+    '有限回读使用飞书 MCP 的 im_read_messages：同 thread 或 reply 链最多 100 条、最多回读 4 小时；没有 thread/reply 时，只能在同一 chat 且已有明确主人证据后回读，最多 20 条且最长 60 分钟。超过边界的消息留到后续批次或标记 needs_owner。已保存 snapshot 内仍由你按共同对象、目标和交付物完成语义分组；禁止用语义匹配扩大回读范围、全局拉取会话，产品服务端或第二套 Runtime 也不得另做语义聚类。',
     '只有主人本人发言、明确 @主人或主人白名单 reaction（OK、THUMBSUP、APPROVE、DONE、CHECK_MARK）可作为主人证据；非主人 reaction 和未知 reaction 忽略。主人证据只供相关性判断，不自动创建候选、完成任务、排期或承诺；普通闲聊应判为 skip。',
     '若本窗口没有消息，直接输出 JSON：{"status":"skipped","reason":"empty_window","proposals":[],"summary":"窗口无消息，跳过提交。"}；插件只推进空窗口游标，不伪造来源或决策批次。',
     '调用 submit_pm_decisions 时生成稳定 batch_id，并把本批全部 source_receipt 原样放入 snapshot_receipts。每条 receipt 必须恰有一个 primary_disposition：group、skip 或 needs_owner；group 必须绑定唯一 primary_group_key。每个 group 至少一条 primary receipt，并明确唯一 anchor_receipt；其余本组字段证据放入 field_evidence_receipts。',
