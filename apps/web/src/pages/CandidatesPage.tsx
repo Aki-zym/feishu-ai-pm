@@ -4,6 +4,12 @@ import { api, ApiRequestError } from '../api';
 import { AsyncState } from '../components/AsyncState';
 import { candidateStateText, formatDate } from '../format';
 import { beginResource, beginResourceMutation, beginResourceRequest, failureResource, isLatestResourceMutation, isLatestResourceRequest, loadingResource, mutationRefreshFailure, MUTATION_REFRESH_FAILURE_MESSAGE, successResource, type ResourceMutation, type ResourceState } from '../resource-state';
+
+export function ownerDecisionFailureMessage(kind: 'load' | 'resolve' | 'cancel', _reason?: unknown) {
+  if (kind === 'load') return '候选收件箱读取失败，请稍后重试。';
+  if (kind === 'resolve') return '主人决定执行失败，请刷新后重试。';
+  return '主人决定取消失败，请刷新后重试。';
+}
 import { externalLinkFeedbackMessage, requestExternalLinkOpen } from '../external-links';
 import type { Candidate, CandidateEvidenceBasis, CandidateMergeSource, CandidateSourceRole, CandidateState, CindyOwnerDecision, PendingOwnerAction, SourceFailure, Task } from '../types';
 
@@ -274,7 +280,7 @@ export default function CandidatesPage() {
       });
     return request.then(() => true).catch((reason: unknown) => {
       if (!controller.signal.aborted && isLatestResourceRequest(requestGenerationRef.current, requestIdentity)) {
-        setResource((current) => failureResource(current, reason instanceof Error ? reason.message : '候选收件箱读取失败。'));
+        setResource((current) => failureResource(current, ownerDecisionFailureMessage('load')));
         if (!options.silent) setError('候选收件箱读取失败，请查看上方状态并重试。');
       }
       return false;
@@ -339,8 +345,8 @@ export default function CandidatesPage() {
       setMessage(action === 'create_candidate' ? '已按主人选择建立候选。'
         : action === 'append_candidate' ? '已把这些来源追加到所选候选。' : '已按主人选择跳过这些来源。');
       await load({ silent: true });
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '主人决定执行失败，请刷新后重试。');
+    } catch {
+      setError(ownerDecisionFailureMessage('resolve'));
     } finally {
       setBusy('');
     }
@@ -357,8 +363,8 @@ export default function CandidatesPage() {
       });
       setMessage('已取消这次主人决定；来源会保留，之后可由 Cindy 重新判断。');
       await load({ silent: true });
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '主人决定取消失败，请刷新后重试。');
+    } catch {
+      setError(ownerDecisionFailureMessage('cancel'));
     } finally {
       setBusy('');
     }

@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
-import { OwnerDecisionInbox } from './CandidatesPage';
+import { OwnerDecisionInbox, ownerDecisionFailureMessage } from './CandidatesPage';
 import type { CindyOwnerDecision } from '../types';
 
 describe('owner decision private projection', () => {
@@ -49,5 +49,21 @@ describe('owner decision private projection', () => {
     expect(markup).not.toContain('确认跳过');
     expect(markup).not.toContain('建立候选</button>');
     expect(markup).not.toMatch(/CANARY_RESOLVED_CANDIDATE_ID|CANARY_BATCH_ID|CANARY_RAW_SQLITE_ERROR|CANARY_SOURCE_REVISION|CANARY_RECEIPT|CANARY_PROMPT|CANARY_REASONING|CANARY_SOURCE_BODY/u);
+  });
+
+  it('读取、执行和取消失败只使用固定文案，不传播 rejected error', () => {
+    const raw = new Error('CANARY_RAW_SQLITE_ERROR');
+    const messages = [
+      ownerDecisionFailureMessage('load', raw),
+      ownerDecisionFailureMessage('resolve', raw),
+      ownerDecisionFailureMessage('cancel', raw),
+    ];
+
+    expect(messages).toEqual([
+      '候选收件箱读取失败，请稍后重试。',
+      '主人决定执行失败，请刷新后重试。',
+      '主人决定取消失败，请刷新后重试。',
+    ]);
+    expect(messages.join(' ')).not.toContain('CANARY_RAW_SQLITE_ERROR');
   });
 });

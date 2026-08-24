@@ -286,10 +286,12 @@ function readableIntakeSummary(status, reason, proposals) {
   }
   const list = Array.isArray(proposals) ? proposals : [];
   const created = list.filter((proposal) => proposal.action === 'create_candidate').length;
+  const appended = list.filter((proposal) => proposal.action === 'append_candidate' && proposal.title).map((proposal) => proposal.title);
   const updated = list.filter((proposal) => proposal.action === 'update_task' && proposal.title).map((proposal) => proposal.title);
   const needsOwner = list.filter((proposal) => proposal.action === 'needs_owner').length;
   const parts = [];
   if (created) parts.push(`新建 ${created} 张候选`);
+  if (appended.length) parts.push(`已补充候选：${appended.join('、')}`);
   if (updated.length) parts.push(`已更新正式任务：${updated.join('、')}`);
   if (needsOwner) parts.push(`${needsOwner} 条需要主人确认`);
   return parts.length ? `${parts.join('；')}。` : '本次没有可写入的任务变化。';
@@ -465,13 +467,22 @@ function validateDecisionBody(raw) {
     for (const [key, limit] of [['task_key', 200], ['title', 160], ['describe', MAX_PROPOSAL_TEXT], ['next_step', 1000], ['reason', 500]]) {
       const value = safeText(group[key], limit); if (value) item[key] = value;
     }
+    const appendOnlyFields = ['append_request_id', 'candidate_key', 'expected_candidate_version', 'source_receipts', 'field_evidence'];
+    if (group.action === 'create_candidate'
+      && ['task_key', 'expected_version', ...appendOnlyFields].some((field) => group[field] !== undefined)) {
+      throw new Error(`groups[${index}] create_candidate 包含其他动作专属字段`);
+    }
+    if (group.action === 'update_task' && appendOnlyFields.some((field) => group[field] !== undefined)) {
+      throw new Error(`groups[${index}] update_task 包含 append_candidate 专属字段`);
+    }
+    if (group.action === 'append_candidate' && (group.task_key !== undefined || group.expected_version !== undefined)) {
+      throw new Error(`groups[${index}] append_candidate 不能声明 task_key 或 expected_version`);
+    }
     if (group.action === 'create_candidate' && !item.title) throw new Error(`groups[${index}] create_candidate 必须提供 title`);
     if (group.action === 'update_task') {
       if (!item.task_key || !Number.isInteger(group.expected_version) || group.expected_version < 1) throw new Error(`groups[${index}] update_task 必须提供 task_key 和 expected_version`);
       if (!item.title && !item.describe && !item.next_step) throw new Error(`groups[${index}] update_task 必须提供至少一个更新字段`);
       item.expected_version = group.expected_version;
-    } else if (group.action === 'create_candidate' && (group.task_key !== undefined || group.expected_version !== undefined || group.expected_candidate_version !== undefined)) {
-      throw new Error(`groups[${index}] create_candidate 不能声明 task CAS 字段`);
     } else if (group.action === 'append_candidate') {
       const appendRequestId = safeText(group.append_request_id, 128);
       const candidateKey = safeText(group.candidate_key, 200);
@@ -565,6 +576,7 @@ function validateDecisionBody(raw) {
     }
   }
 
+  const effectiveOwnerGroupKeys = new Set();
   const ownerDecisions = (raw.owner_decisions ?? []).map((decision, index) => {
     if (!decision || typeof decision !== 'object' || Array.isArray(decision)) throw new Error(`owner_decisions[${index}] 必须是对象`);
     const decisionKey = keyOf(decision.decision_key, `owner_decisions[${index}].decision_key`);
@@ -617,7 +629,8 @@ function validateDecisionBody(raw) {
       throw new Error(`owner_decisions[${index}].options 聚合后超过 ${MAX_OWNER_DECISION_OPTIONS_JSON} 字符`);
     }
     const groupKey = decision.group_key === undefined ? decisionKey : keyOf(decision.group_key, `owner_decisions[${index}].group_key`);
-    if (groupKeys.has(groupKey)) throw new Error(`owner_decisions[${index}].group_key 与已有 group 冲突`);
+    if (groupKeys.has(groupKey) || effectiveOwnerGroupKeys.has(groupKey)) throw new Error(`owner_decisions[${index}].group_key 冲突或重复`);
+    effectiveOwnerGroupKeys.add(groupKey);
     return { decision_key: decisionKey, group_key: groupKey, reason, options };
   });
   const ownerKeys = ownerDecisions.map((item) => item.decision_key);
@@ -659,7 +672,7 @@ function buildErrandTask(window) {
     'errand 线程不得直接调用或访问 /api/tasks；只可通过 save_pm_sources、get_pm_context 和 submit_pm_decisions 完成入库。本机服务按 task/candidate version 做 CAS；不得根据 query、时间、同人或同群自动选择候选。',
     '调用 submit_pm_decisions 一次提交完整 snapshot 的 batch/group/primary/shared_context 决策。',
     '本次工作不要调用 scan_intake_window，避免递归派发新的 errand。',
-    '提交成功后输出简短 JSON，包含 window_id、status、summary 和 proposals。proposals 必须是短列表，格式为 [{"action":"update_task|create_candidate|skip|needs_owner","title":"简短标题"}]；update_task 的 title 必须写正式任务标题，让主会话能看见已改动的正式任务；不要只输出提案数量，也不要复述大量消息正文。',
+    '提交成功后输出简短 JSON，包含 window_id、status、summary 和 proposals。proposals 必须是短列表，格式为 [{"action":"update_task|create_candidate|append_candidate|skip|needs_owner","title":"简短标题"}]；update_task 的 title 必须写正式任务标题，append_candidate 的 title 必须写被补充候选的安全标题，让主会话能看见已改动对象；不要只输出提案数量，也不要复述大量消息正文。',
   ].join('\n');
 }
 
@@ -1108,8 +1121,8 @@ async function handleToolCall(msg) {
     return;
   }
   if (msg.tool === 'submit_pm_decisions') {
-    await ensurePm();
     const body = validateDecisionBody(msg.args || {});
+    await ensurePm();
     const result = await pmRequest('POST', '/api/integrations/cindy/decisions', body);
     cindy.send({ type: 'tool-result', callId: msg.callId, ok: true, result });
     return;

@@ -144,6 +144,7 @@ test('scan_intake_window starts the fixed intake errand session and returns its 
   assert.match(errandCalls[0].task, /禁止用语义匹配扩大回读范围、全局拉取会话/);
   assert.match(errandCalls[0].task, /产品服务端或第二套 Runtime.*不得另做语义聚类/);
   assert.match(errandCalls[0].task, /同一对象、目标和交付物的跨窗口延续可用 append_candidate/);
+  assert.match(errandCalls[0].task, /update_task\|create_candidate\|append_candidate\|skip\|needs_owner/);
   assert.match(errandCalls[0].task, /query 只做标题和短摘要的确定性子串过滤，不代表语义匹配/);
   assert.match(errandCalls[0].task, /snapshot_receipts/);
   assert.match(errandCalls[0].task, /shared_context/);
@@ -323,12 +324,12 @@ test('scan result returns a readable short proposal list with action and title',
 
 test('scan result uses human language for candidates, formal task updates, and empty windows', async () => {
   const { onHostMessage, sent } = setup({
-    errandText: '{"status":"done","proposals":[{"action":"create_candidate","title":"新候选"},{"action":"update_task","title":"正式任务 A"},{"action":"update_task","title":"正式任务 B"}]}' ,
+    errandText: '{"status":"done","proposals":[{"action":"create_candidate","title":"新候选"},{"action":"append_candidate","title":"候选 A"},{"action":"update_task","title":"正式任务 A"},{"action":"update_task","title":"正式任务 B"}]}' ,
   });
   onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-readable', args: {} });
   await waitFor(() => sent.some((message) => message.callId === 'call-readable'));
   const result = sent.find((message) => message.callId === 'call-readable');
-  assert.equal(result.result.summary, '新建 1 张候选；已更新正式任务：正式任务 A、正式任务 B。');
+  assert.equal(result.result.summary, '新建 1 张候选；已补充候选：候选 A；已更新正式任务：正式任务 A、正式任务 B。');
 });
 
 test('ghost declares schedule support while retaining errand', () => {
@@ -587,6 +588,88 @@ test('submit_pm_decisions validates append candidate CAS, exact primary receipts
     assert.equal(result.ok, false);
     assert.match(result.message, item.pattern);
     assert.equal(nodeCalls.some((call) => call.params?.body?.decision_request_id === item.callId), false);
+  }
+});
+
+test('submit_pm_decisions rejects action-specific field mixing before any node call', async () => {
+  const receipt = 'z'.repeat(43);
+  const candidateKey = `cnd_${'y'.repeat(43)}`;
+  const base = {
+    decision_request_id: 'decision-exclusive-fields',
+    batch_id: 'batch-exclusive-fields',
+    window_id: 'window-exclusive-fields',
+    window_start: '2026-08-24T01:00:00.000Z',
+    window_end: '2026-08-24T01:10:00.000Z',
+    snapshot_receipts: [receipt],
+    primary_dispositions: [{ disposition_ref: 'one', source_receipt: receipt, disposition: 'group', primary_group_key: 'group' }],
+  };
+  const invalidGroups = [
+    {
+      group_key: 'group', action: 'append_candidate', anchor_receipt: receipt, field_evidence_receipts: [],
+      append_request_id: 'append-exclusive', candidate_key: candidateKey, expected_candidate_version: 1,
+      source_receipts: [receipt], task_key: 'task-injected', expected_version: 1,
+    },
+    {
+      group_key: 'group', action: 'create_candidate', anchor_receipt: receipt, field_evidence_receipts: [],
+      title: '新候选', append_request_id: 'append-injected',
+    },
+    {
+      group_key: 'group', action: 'update_task', anchor_receipt: receipt, field_evidence_receipts: [],
+      task_key: 'task-1', expected_version: 1, next_step: '继续', candidate_key: candidateKey,
+    },
+  ];
+  for (const [index, group] of invalidGroups.entries()) {
+    const { onHostMessage, nodeCalls, sent } = setup();
+    const callId = `exclusive-${index}`;
+    onHostMessage({ type: 'tool-call', tool: 'submit_pm_decisions', callId, args: { ...base, groups: [group] } });
+    await waitFor(() => sent.some((message) => message.callId === callId));
+    assert.equal(sent.find((message) => message.callId === callId).ok, false);
+    assert.equal(nodeCalls.length, 0);
+  }
+});
+
+test('submit_pm_decisions rejects default and explicit owner decision group-key collisions before any node call', async () => {
+  const receiptA = 'k'.repeat(43);
+  const receiptB = 'l'.repeat(43);
+  const base = {
+    decision_request_id: 'decision-effective-group-keys',
+    batch_id: 'batch-effective-group-keys',
+    window_id: 'window-effective-group-keys',
+    window_start: '2026-08-24T01:00:00.000Z',
+    window_end: '2026-08-24T01:10:00.000Z',
+    snapshot_receipts: [receiptA, receiptB],
+  };
+  const invalidBodies = [
+    {
+      ...base,
+      groups: [{ group_key: 'owner', action: 'create_candidate', anchor_receipt: receiptA, field_evidence_receipts: [], title: '已有组' }],
+      primary_dispositions: [
+        { disposition_ref: 'group', source_receipt: receiptA, disposition: 'group', primary_group_key: 'owner' },
+        { disposition_ref: 'owner', source_receipt: receiptB, disposition: 'needs_owner', owner_decision_key: 'owner' },
+      ],
+      owner_decisions: [{ decision_key: 'owner', reason: '默认 key 冲突。', options: [{ option_key: 'skip', action: 'skip' }] }],
+    },
+    {
+      ...base,
+      groups: [],
+      primary_dispositions: [
+        { disposition_ref: 'left', source_receipt: receiptA, disposition: 'needs_owner', owner_decision_key: 'left' },
+        { disposition_ref: 'right', source_receipt: receiptB, disposition: 'needs_owner', owner_decision_key: 'right' },
+      ],
+      owner_decisions: [
+        { decision_key: 'left', group_key: 'same', reason: '左。', options: [{ option_key: 'skip-left', action: 'skip' }] },
+        { decision_key: 'right', group_key: 'same', reason: '右。', options: [{ option_key: 'skip-right', action: 'skip' }] },
+      ],
+    },
+  ];
+
+  for (const [index, args] of invalidBodies.entries()) {
+    const { onHostMessage, nodeCalls, sent } = setup();
+    const callId = `effective-group-${index}`;
+    onHostMessage({ type: 'tool-call', tool: 'submit_pm_decisions', callId, args: { ...args, decision_request_id: `${args.decision_request_id}-${index}`, batch_id: `${args.batch_id}-${index}` } });
+    await waitFor(() => sent.some((message) => message.callId === callId));
+    assert.equal(sent.find((message) => message.callId === callId).ok, false);
+    assert.equal(nodeCalls.length, 0);
   }
 });
 
