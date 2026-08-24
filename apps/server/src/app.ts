@@ -9,6 +9,7 @@ import type { CandidateState, RiskLevel, TaskStatus } from './domain.js';
 import { AUDIT_REPLAY_INTENT, type ReplayCapabilityBinding } from './data04.js';
 import { CandidateVersionConflictError, CandidateVersionRequiredError, CindyIntakeConflictError, CindyIntakeValidationError, PrivacyAuthorizationError, ReplayAuthorizationError, type PmService } from './service.js';
 import {
+  CINDY_MESSAGE_TYPES,
   CINDY_SOURCE_KINDS,
   CINDY_SOURCE_PROVIDERS,
   CindySourceContractError,
@@ -343,8 +344,17 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
           source_kind: z.enum(CINDY_SOURCE_KINDS),
           stable_message_id: z.string().min(1).max(500),
           occurred_at: isoTimestamp,
-          conversation_key: z.string().trim().min(1).max(500).optional(),
-          sender_role: z.string().trim().min(1).max(120).optional(),
+          sender_id: z.string().min(1).max(500),
+          display_name: z.unknown().optional(),
+          chat_id: z.string().min(1).max(500),
+          thread_id: z.string().min(1).max(500).optional(),
+          mentioned_owner: z.boolean(),
+          sender_is_owner: z.boolean(),
+          message_type: z.enum(CINDY_MESSAGE_TYPES),
+          reactions: z.array(z.object({
+            type: z.string().min(1).max(80),
+            actor_is_owner: z.boolean(),
+          }).strict()).max(20).optional(),
           text: z.string().min(1).max(20_000),
           revision: z.object({
             modified_at: isoTimestamp.optional(),

@@ -5,10 +5,14 @@ import { canonicalRevisionHash } from './data04.js';
 export const CINDY_SOURCE_PROVIDERS = ['feishu', 'synthetic'] as const;
 export const CINDY_SOURCE_KINDS = ['im_message', 'im_thread_message', 'im_reaction_context', 'synthetic_message'] as const;
 export const CINDY_SOURCE_STATUSES = ['pending_decision', 'processed', 'retryable', 'skipped', 'legacy_read_only', 'superseded', 'revoked', 'invalid'] as const;
+export const CINDY_MESSAGE_TYPES = ['text', 'post', 'image', 'file', 'audio', 'video', 'sticker', 'interactive', 'system', 'unknown'] as const;
+export const CINDY_OWNER_REACTION_CATEGORIES = ['acknowledge', 'approve', 'done'] as const;
 
 export type CindySourceProvider = typeof CINDY_SOURCE_PROVIDERS[number];
 export type CindySourceKind = typeof CINDY_SOURCE_KINDS[number];
 export type CindySourceStatus = typeof CINDY_SOURCE_STATUSES[number];
+export type CindyMessageType = typeof CINDY_MESSAGE_TYPES[number];
+export type CindyOwnerReactionCategory = typeof CINDY_OWNER_REACTION_CATEGORIES[number];
 
 export type CindyAuthContext = {
   ownerScope: string;
@@ -34,8 +38,17 @@ export type CindySourceInput = {
   stable_message_id: string;
   occurred_at: string;
   text: string;
-  conversation_key?: string;
-  sender_role?: string;
+  sender_id: string;
+  display_name?: unknown;
+  chat_id: string;
+  thread_id?: string;
+  mentioned_owner: boolean;
+  sender_is_owner: boolean;
+  message_type: CindyMessageType;
+  reactions?: Array<{
+    type: string;
+    actor_is_owner: boolean;
+  }>;
   revision?: {
     modified_at?: string;
     sequence?: number;
@@ -88,6 +101,15 @@ type SourceRevisionRow = {
   receipt_nonce: string | null;
   receipt_digest: string | null;
   retry_count: number;
+  sender_ref: string | null;
+  display_name: string | null;
+  chat_ref: string | null;
+  thread_ref: string | null;
+  mentioned_owner: number | null;
+  sender_is_owner: number | null;
+  message_type: CindyMessageType | null;
+  owner_reacted: number | null;
+  owner_reaction_category: CindyOwnerReactionCategory | null;
 };
 
 type ReplayMapItem = Omit<CindySavedSource, 'source_receipt'> & { revision_id: string };
@@ -105,6 +127,18 @@ export class CindySourceContractError extends Error {
 
 const clientRefPattern = /^[A-Za-z0-9_-]{1,64}$/u;
 const requestIdPattern = /^[A-Za-z0-9_-]{1,128}$/u;
+const unsafeIdentityCharacterPattern = /[\p{Cc}\p{Cf}\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
+const bidiCharacterPattern = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
+const ownerReactionMap = new Map<string, CindyOwnerReactionCategory>([
+  ['OK', 'acknowledge'],
+  ['THUMBSUP', 'acknowledge'],
+  ['THUMBS_UP', 'acknowledge'],
+  ['APPROVE', 'approve'],
+  ['APPROVED', 'approve'],
+  ['DONE', 'done'],
+  ['CHECK_MARK', 'done'],
+  ['CHECKMARK', 'done'],
+]);
 
 function sha256(value: string) {
   return createHash('sha256').update(value, 'utf8').digest('hex');
@@ -122,6 +156,104 @@ function normalizedText(value: string, field: string, maxLength: number) {
   const normalized = value.normalize('NFKC').replace(/\r\n?/gu, '\n').trim();
   if (!normalized || normalized.length > maxLength) throw new CindySourceContractError('INVALID_INPUT', `${field} 为空或过长。`);
   return normalized;
+}
+
+function visiblePrefix(value: string, limit: number) {
+  const Segmenter = Intl.Segmenter;
+  if (Segmenter) {
+    return [...new Segmenter('zh-CN', { granularity: 'grapheme' }).segment(value)]
+      .slice(0, limit)
+      .map((part) => part.segment)
+      .join('');
+  }
+  return Array.from(value).slice(0, limit).join('');
+}
+
+export function sanitizeCindyDisplayName(value: unknown) {
+  if (typeof value !== 'string') return '需求方';
+  const cleaned = value.normalize('NFC')
+    .replace(bidiCharacterPattern, '')
+    .replace(/[\p{Cc}\p{Cf}]/gu, '')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  return cleaned ? visiblePrefix(cleaned, 80) || '需求方' : '需求方';
+}
+
+function normalizedTechnicalId(value: unknown, field: string, maxLength = 500) {
+  if (typeof value !== 'string') throw new CindySourceContractError('INVALID_INPUT', `${field} 必须是字符串。`);
+  const normalized = value.normalize('NFC').trim();
+  if (!normalized || normalized.length > maxLength || unsafeIdentityCharacterPattern.test(normalized)) {
+    throw new CindySourceContractError('INVALID_INPUT', `${field} 为空、过长或包含不安全字符。`);
+  }
+  return normalized;
+}
+
+function internalRef(auth: CindyAuthContext, kind: 'sender' | 'chat' | 'thread', rawId: string) {
+  return `cindy:${kind}:${sha256(`${kind}\u0000${auth.ownerScope}\u0000${auth.accountAnchor}\u0000${rawId}`)}`;
+}
+
+function normalizedOwnerReaction(reactions: CindySourceInput['reactions']) {
+  if (reactions === undefined) return { ownerReacted: false, category: null as CindyOwnerReactionCategory | null };
+  if (!Array.isArray(reactions) || reactions.length > 20) {
+    throw new CindySourceContractError('INVALID_INPUT', 'reactions 必须是最多 20 项的数组。');
+  }
+  const matched = new Set<CindyOwnerReactionCategory>();
+  for (const reaction of reactions) {
+    if (!reaction || typeof reaction !== 'object' || Array.isArray(reaction)) {
+      throw new CindySourceContractError('INVALID_INPUT', 'reaction 必须是对象。');
+    }
+    if (typeof reaction.actor_is_owner !== 'boolean') {
+      throw new CindySourceContractError('INVALID_INPUT', 'reaction.actor_is_owner 必须是布尔值。');
+    }
+    const type = normalizedText(reaction.type, 'reaction.type', 80).toUpperCase().replace(/[\s-]+/gu, '_');
+    const category = ownerReactionMap.get(type);
+    if (reaction.actor_is_owner && category) matched.add(category);
+  }
+  const category: CindyOwnerReactionCategory | null = matched.has('done')
+    ? 'done'
+    : matched.has('approve')
+      ? 'approve'
+      : matched.has('acknowledge') ? 'acknowledge' : null;
+  return { ownerReacted: category !== null, category };
+}
+
+type NormalizedCindySource = {
+  occurredAt: string;
+  occurredAtMs: number;
+  text: string;
+  senderRef: string;
+  displayName: string;
+  chatRef: string;
+  threadRef: string | null;
+  mentionedOwner: boolean;
+  senderIsOwner: boolean;
+  messageType: CindyMessageType;
+  ownerReacted: boolean;
+  ownerReactionCategory: CindyOwnerReactionCategory | null;
+  revision: ReturnType<typeof normalizedRevision>;
+};
+
+function normalizeSource(auth: CindyAuthContext, source: CindySourceInput): NormalizedCindySource {
+  const occurred = normalizedIso(source.occurred_at, `${source.client_ref}.occurred_at`);
+  const senderId = normalizedTechnicalId(source.sender_id, `${source.client_ref}.sender_id`);
+  const chatId = normalizedTechnicalId(source.chat_id, `${source.client_ref}.chat_id`);
+  const threadId = source.thread_id === undefined ? null : normalizedTechnicalId(source.thread_id, `${source.client_ref}.thread_id`);
+  const reaction = normalizedOwnerReaction(source.reactions);
+  return {
+    occurredAt: occurred.iso,
+    occurredAtMs: occurred.milliseconds,
+    text: normalizedText(source.text, `${source.client_ref}.text`, 20_000),
+    senderRef: internalRef(auth, 'sender', senderId),
+    displayName: sanitizeCindyDisplayName(source.display_name),
+    chatRef: internalRef(auth, 'chat', chatId),
+    threadRef: threadId ? internalRef(auth, 'thread', threadId) : null,
+    mentionedOwner: source.mentioned_owner,
+    senderIsOwner: source.sender_is_owner,
+    messageType: source.message_type,
+    ownerReacted: reaction.ownerReacted,
+    ownerReactionCategory: reaction.category,
+    revision: normalizedRevision(source),
+  };
 }
 
 function normalizedIso(value: string, field: string) {
@@ -217,6 +349,16 @@ function validateInput(input: CindySaveSourcesInput) {
     normalizedText(source.stable_message_id, `${source.client_ref}.stable_message_id`, 500);
     normalizedIso(source.occurred_at, `${source.client_ref}.occurred_at`);
     normalizedText(source.text, `${source.client_ref}.text`, 20_000);
+    normalizedTechnicalId(source.sender_id, `${source.client_ref}.sender_id`);
+    normalizedTechnicalId(source.chat_id, `${source.client_ref}.chat_id`);
+    if (source.thread_id !== undefined) normalizedTechnicalId(source.thread_id, `${source.client_ref}.thread_id`);
+    if (typeof source.mentioned_owner !== 'boolean' || typeof source.sender_is_owner !== 'boolean') {
+      throw new CindySourceContractError('INVALID_INPUT', `${source.client_ref} 的主人事实必须是布尔值。`);
+    }
+    if (!CINDY_MESSAGE_TYPES.includes(source.message_type)) {
+      throw new CindySourceContractError('INVALID_INPUT', `${source.client_ref}.message_type 无效。`);
+    }
+    normalizedOwnerReaction(source.reactions);
     normalizedRevision(source);
     if ((source.relations?.length ?? 0) > 20) throw new CindySourceContractError('INVALID_INPUT', `${source.client_ref}.relations 过多。`);
   }
@@ -255,12 +397,14 @@ function canonicalSaveRequest(input: CindySaveSourcesInput) {
         source_kind: source.source_kind,
         stable_message_id: normalizedText(source.stable_message_id, `${source.client_ref}.stable_message_id`, 500),
         occurred_at: normalizedIso(source.occurred_at, `${source.client_ref}.occurred_at`).iso,
-        conversation_key: source.conversation_key
-          ? normalizedText(source.conversation_key, `${source.client_ref}.conversation_key`, 500)
-          : null,
-        sender_role: source.sender_role
-          ? normalizedText(source.sender_role, `${source.client_ref}.sender_role`, 120)
-          : null,
+        sender_id: normalizedTechnicalId(source.sender_id, `${source.client_ref}.sender_id`),
+        display_name: sanitizeCindyDisplayName(source.display_name),
+        chat_id: normalizedTechnicalId(source.chat_id, `${source.client_ref}.chat_id`),
+        thread_id: source.thread_id === undefined ? null : normalizedTechnicalId(source.thread_id, `${source.client_ref}.thread_id`),
+        mentioned_owner: source.mentioned_owner,
+        sender_is_owner: source.sender_is_owner,
+        message_type: source.message_type,
+        owner_reaction: normalizedOwnerReaction(source.reactions),
         text: normalizedText(source.text, `${source.client_ref}.text`, 20_000),
         revision: revision.comparable ? {
           modified_at_ms: revision.modifiedAtMs,
@@ -317,6 +461,44 @@ export function resolveCindyDecisionReceipt(database: AppDatabase, auth: CindyAu
   return resolveReceiptRow(database, auth, receipt, true);
 }
 
+function assertRelationContext(
+  source: Pick<NormalizedCindySource, 'chatRef' | 'threadRef'>,
+  target: Pick<SourceRevisionRow, 'chat_ref' | 'thread_ref'> | Pick<NormalizedCindySource, 'chatRef' | 'threadRef'>,
+) {
+  const targetChatRef = 'chat_ref' in target ? target.chat_ref : target.chatRef;
+  const targetThreadRef = 'thread_ref' in target ? target.thread_ref : target.threadRef;
+  if (!targetChatRef || source.chatRef !== targetChatRef) {
+    throw new CindySourceContractError('INVALID_SOURCE_RECEIPT', '来源关系必须属于同一授权会话。');
+  }
+  if ((source.threadRef ?? null) !== (targetThreadRef ?? null)) {
+    throw new CindySourceContractError('INVALID_SOURCE_RECEIPT', '来源关系不能跨 thread。');
+  }
+}
+
+function validateContextBounds(input: CindySaveSourcesInput, normalizedByRef: Map<string, NormalizedCindySource>) {
+  const referenced = new Set(input.sources.flatMap((source) => (source.relations ?? []).flatMap((relation) => relation.client_ref ? [relation.client_ref] : [])));
+  const byChat = new Map<string, Array<{ source: CindySourceInput; normalized: NormalizedCindySource }>>();
+  for (const source of input.sources) {
+    const normalized = normalizedByRef.get(source.client_ref)!;
+    const group = byChat.get(normalized.chatRef) ?? [];
+    group.push({ source, normalized });
+    byChat.set(normalized.chatRef, group);
+  }
+  for (const group of byChat.values()) {
+    const structured = group.some(({ source, normalized }) => normalized.threadRef !== null || (source.relations?.length ?? 0) > 0 || referenced.has(source.client_ref));
+    const limit = structured ? 100 : 20;
+    const maximumSpan = structured ? 4 * 60 * 60 * 1000 : 60 * 60 * 1000;
+    if (group.length > limit) throw new CindySourceContractError('INVALID_INPUT', `单次上下文超过 ${limit} 条限制。`);
+    const times = group.map(({ normalized }) => normalized.occurredAtMs);
+    if (Math.max(...times) - Math.min(...times) > maximumSpan) {
+      throw new CindySourceContractError('INVALID_INPUT', structured ? 'thread/reply 上下文超过 4 小时限制。' : '无 thread/reply 上下文超过 60 分钟限制。');
+    }
+    if (!structured && !group.some(({ normalized }) => normalized.mentionedOwner || normalized.senderIsOwner || normalized.ownerReacted)) {
+      throw new CindySourceContractError('INVALID_INPUT', '无 thread/reply 上下文必须包含明确主人证据。');
+    }
+  }
+}
+
 function compareRevisionTuple(
   left: { modifiedAtMs: number | null; sequence: number | null },
   right: { modifiedAtMs: number | null; sequence: number | null },
@@ -337,6 +519,8 @@ export function saveCindySources(
 ): CindySaveSourcesResult {
   validateInput(input);
   const requestHash = sha256(stableJson(canonicalSaveRequest(input)));
+  const normalizedByRef = new Map(input.sources.map((source) => [source.client_ref, normalizeSource(auth, source)]));
+  validateContextBounds(input, normalizedByRef);
   return database.transaction(() => {
     const replay = database.raw.prepare(
       `SELECT request_hash, response_map_json FROM cindy_save_request
@@ -365,20 +549,29 @@ export function saveCindySources(
     const revisionByRef = new Map<string, SourceRevisionRow>();
     const outputByRef = new Map<string, CindySavedSource>();
     const replayItems = new Map<string, ReplayMapItem>();
+    const externalRelationTargets = new Map<string, SourceRevisionRow>();
+
+    for (const source of input.sources) {
+      const normalized = normalizedByRef.get(source.client_ref)!;
+      for (const relation of source.relations ?? []) {
+        if (relation.client_ref) {
+          assertRelationContext(normalized, normalizedByRef.get(relation.client_ref)!);
+        } else {
+          const receipt = relation.source_receipt!;
+          const target = externalRelationTargets.get(receipt) ?? resolveReceiptRow(database, auth, receipt);
+          assertRelationContext(normalized, target);
+          externalRelationTargets.set(receipt, target);
+        }
+      }
+    }
 
     for (const clientRef of topologicalClientRefs(input.sources)) {
       const source = byRef.get(clientRef)!;
-      const normalized = {
-        occurredAt: normalizedIso(source.occurred_at, `${clientRef}.occurred_at`).iso,
-        text: normalizedText(source.text, `${clientRef}.text`, 20_000),
-        conversationKey: source.conversation_key ? normalizedText(source.conversation_key, `${clientRef}.conversation_key`, 500) : null,
-        senderRole: source.sender_role ? normalizedText(source.sender_role, `${clientRef}.sender_role`, 120) : null,
-        revision: normalizedRevision(source),
-      };
+      const normalized = normalizedByRef.get(clientRef)!;
       const relationRows = (source.relations ?? []).map((relation) => {
         const target = relation.client_ref
           ? revisionByRef.get(relation.client_ref)
-          : resolveReceiptRow(database, auth, relation.source_receipt!);
+          : externalRelationTargets.get(relation.source_receipt!);
         if (!target) throw new CindySourceContractError('INVALID_INPUT', '批内关系引用未解析。');
         return { kind: relation.kind, targetRevisionId: target.id };
       }).sort((left, right) => `${left.kind}:${left.targetRevisionId}`.localeCompare(`${right.kind}:${right.targetRevisionId}`));
@@ -388,8 +581,15 @@ export function saveCindySources(
         stable_id_hash: identityHash(auth, source),
         occurred_at: normalized.occurredAt,
         text: normalized.text,
-        conversation_key: normalized.conversationKey,
-        sender_role: normalized.senderRole,
+        sender_ref: normalized.senderRef,
+        display_name: normalized.displayName,
+        chat_ref: normalized.chatRef,
+        thread_ref: normalized.threadRef,
+        mentioned_owner: normalized.mentionedOwner,
+        sender_is_owner: normalized.senderIsOwner,
+        message_type: normalized.messageType,
+        owner_reacted: normalized.ownerReacted,
+        owner_reaction_category: normalized.ownerReactionCategory,
         revision: {
           modified_at_ms: normalized.revision.modifiedAtMs,
           sequence: normalized.revision.sequence,
@@ -458,14 +658,18 @@ export function saveCindySources(
 
       const sourceEventId = identity?.source_event_id ?? `source_cindy_${randomUUID()}`;
       const sourceExternalId = `cindy:${stableIdHash}`;
-      const conversationId = `cindy:source:${sha256(normalized.conversationKey ?? stableIdHash)}`;
-      const senderId = `cindy:sender:${sha256(normalized.senderRole ?? 'unknown')}`;
+      const conversationId = normalized.chatRef;
+      const senderId = normalized.senderRef;
       const metadataJson = stableJson({
         accountAnchor: auth.accountAnchor,
         ownerScope: auth.ownerScope,
         provider: source.provider,
         sourceKind: source.source_kind,
         stableIdHash,
+        threadRef: normalized.threadRef,
+        senderIsOwner: normalized.senderIsOwner,
+        messageType: normalized.messageType,
+        ownerReactionCategory: normalized.ownerReactionCategory,
       });
       const generation = (current?.revision_number ?? 0) + 1;
       const revisionId = `source_revision_cindy_${randomUUID()}`;
@@ -481,9 +685,9 @@ export function saveCindySources(
         sourceType: 'manual',
         conversationId,
         senderId,
-        senderName: normalized.senderRole ?? 'Cindy 来源',
+        senderName: normalized.displayName,
         content: normalized.text,
-        ownerMentioned: 0,
+        ownerMentioned: normalized.mentionedOwner ? 1 : 0,
         sourceUrl: null,
         completeness: 'complete',
         discoveryReason: 'Cindy 已授权来源先保存。',
@@ -498,9 +702,9 @@ export function saveCindySources(
             (id, external_id, source_type, conversation_id, sender_id, sender_name, content, owner_mentioned,
              source_url, completeness, discovery_reason, metadata_json, occurred_at, captured_at,
              owner_scope, revision_generation, current_revision_id, ingest_state)
-           VALUES (?, ?, 'manual', ?, ?, ?, ?, 0, NULL, 'complete', ?, ?, ?, ?, ?, ?, ?, 'trusted_current')`,
+           VALUES (?, ?, 'manual', ?, ?, ?, ?, ?, NULL, 'complete', ?, ?, ?, ?, ?, ?, ?, 'trusted_current')`,
         ).run(
-          sourceEventId, sourceExternalId, conversationId, senderId, normalized.senderRole ?? 'Cindy 来源', normalized.text,
+          sourceEventId, sourceExternalId, conversationId, senderId, normalized.displayName, normalized.text, normalized.mentionedOwner ? 1 : 0,
           'Cindy 已授权来源先保存。', metadataJson, normalized.occurredAt, timestamp, auth.ownerScope, generation, revisionId,
         );
         identity = {
@@ -517,11 +721,11 @@ export function saveCindySources(
       } else {
         database.raw.prepare(
           `UPDATE source_event
-              SET content = ?, sender_id = ?, sender_name = ?, conversation_id = ?, metadata_json = ?, occurred_at = ?,
+              SET content = ?, sender_id = ?, sender_name = ?, owner_mentioned = ?, conversation_id = ?, metadata_json = ?, occurred_at = ?,
                   captured_at = ?, owner_scope = ?, revision_generation = ?, current_revision_id = ?, ingest_state = 'trusted_current'
             WHERE id = ?`,
         ).run(
-          normalized.text, senderId, normalized.senderRole ?? 'Cindy 来源', conversationId, metadataJson,
+          normalized.text, senderId, normalized.displayName, normalized.mentionedOwner ? 1 : 0, conversationId, metadataJson,
           normalized.occurredAt, timestamp, auth.ownerScope, generation, revisionId, sourceEventId,
         );
         if (current && current.processing_status !== 'legacy_read_only') {
@@ -538,14 +742,18 @@ export function saveCindySources(
            sender_id, sender_name, content, owner_mentioned, source_url, completeness, discovery_reason,
            metadata_json, occurred_at, captured_at, owner_scope, revision_hash, created_at,
            processing_status, trusted_payload_hash, provider_revision_modified_at_ms, provider_revision_sequence,
-           receipt_nonce, receipt_digest, retry_count)
-         VALUES (?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 0, NULL, 'complete', ?, ?, ?, ?, ?, ?, ?,
-                 'pending_decision', ?, ?, ?, ?, ?, 0)`,
+           receipt_nonce, receipt_digest, retry_count, sender_ref, display_name, chat_ref, thread_ref,
+           mentioned_owner, sender_is_owner, message_type, owner_reacted, owner_reaction_category)
+         VALUES (?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, NULL, 'complete', ?, ?, ?, ?, ?, ?, ?,
+                 'pending_decision', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         revisionId, sourceEventId, generation, wasExistingIdentity ? 'edit' : 'ingest', sourceExternalId,
-        conversationId, senderId, normalized.senderRole ?? 'Cindy 来源', normalized.text,
+        conversationId, senderId, normalized.displayName, normalized.text, normalized.mentionedOwner ? 1 : 0,
         'Cindy 已授权来源先保存。', metadataJson, normalized.occurredAt, timestamp, auth.ownerScope, revisionHash, timestamp,
         trustedPayloadHash, normalized.revision.modifiedAtMs, normalized.revision.sequence, nonce, digest,
+        normalized.senderRef, normalized.displayName, normalized.chatRef, normalized.threadRef,
+        normalized.mentionedOwner ? 1 : 0, normalized.senderIsOwner ? 1 : 0, normalized.messageType,
+        normalized.ownerReacted ? 1 : 0, normalized.ownerReactionCategory,
       );
       if (wasExistingIdentity) {
         database.raw.prepare(

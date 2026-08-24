@@ -256,6 +256,7 @@ export type SourceEvent = {
   completeness: string;
   occurred_at: string;
   summary_available: boolean;
+  display_name: string;
 };
 
 export type SourceVerification = {

@@ -17,7 +17,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { shanghaiDayWindow } from './shanghai-time.js';
 
-export const CURRENT_SCHEMA_VERSION = 9;
+export const CURRENT_SCHEMA_VERSION = 10;
 
 function registerData04SqlFunctions(database: DatabaseSync) {
   database.function('sha256', { deterministic: true }, (value: unknown) => createHash('sha256').update(String(value ?? '')).digest('hex'));
@@ -1770,7 +1770,7 @@ export type MigrationOperation =
 export interface MigrationDescriptor {
   version: number;
   name: string;
-  expectedPostSchemaIdentity: 'current-schema-v1' | 'current-schema-v2' | 'current-schema-v3' | 'current-schema-v4' | 'current-schema-v5' | 'current-schema-v6' | 'current-schema-v7' | 'current-schema-v8' | 'current-schema-v9';
+  expectedPostSchemaIdentity: 'current-schema-v1' | 'current-schema-v2' | 'current-schema-v3' | 'current-schema-v4' | 'current-schema-v5' | 'current-schema-v6' | 'current-schema-v7' | 'current-schema-v8' | 'current-schema-v9' | 'current-schema-v10';
   orderedOperations: readonly MigrationOperation[];
 }
 
@@ -3400,6 +3400,80 @@ export const CINDY_TRUSTED_SOURCE_MIGRATION_DESCRIPTOR = deepFreeze(Object.freez
 }) satisfies MigrationDescriptor);
 
 export const CINDY_TRUSTED_SOURCE_MIGRATION_CHECKSUM = migrationDescriptorChecksum(CINDY_TRUSTED_SOURCE_MIGRATION_DESCRIPTOR);
+
+/** Cindy owner-context v10: immutable, owner-isolated message facts. */
+const CINDY_OWNER_CONTEXT_MIGRATION_SQL = Object.freeze([
+  'ALTER TABLE source_event_revision ADD COLUMN sender_ref TEXT;',
+  "ALTER TABLE source_event_revision ADD COLUMN display_name TEXT CHECK (display_name IS NULL OR (length(display_name) BETWEEN 1 AND 320));",
+  'ALTER TABLE source_event_revision ADD COLUMN chat_ref TEXT;',
+  'ALTER TABLE source_event_revision ADD COLUMN thread_ref TEXT;',
+  'ALTER TABLE source_event_revision ADD COLUMN mentioned_owner INTEGER CHECK (mentioned_owner IS NULL OR mentioned_owner IN (0,1));',
+  'ALTER TABLE source_event_revision ADD COLUMN sender_is_owner INTEGER CHECK (sender_is_owner IS NULL OR sender_is_owner IN (0,1));',
+  "ALTER TABLE source_event_revision ADD COLUMN message_type TEXT CHECK (message_type IS NULL OR message_type IN ('text','post','image','file','audio','video','sticker','interactive','system','unknown'));",
+  'ALTER TABLE source_event_revision ADD COLUMN owner_reacted INTEGER CHECK (owner_reacted IS NULL OR owner_reacted IN (0,1));',
+  "ALTER TABLE source_event_revision ADD COLUMN owner_reaction_category TEXT CHECK (owner_reaction_category IS NULL OR owner_reaction_category IN ('acknowledge','approve','done'));",
+  `UPDATE source_event_revision
+      SET sender_ref = sender_id,
+          display_name = '需求方',
+          chat_ref = conversation_id,
+          thread_ref = NULL,
+          mentioned_owner = owner_mentioned,
+          sender_is_owner = 0,
+          message_type = 'unknown',
+          owner_reacted = 0,
+          owner_reaction_category = NULL
+    WHERE sender_ref IS NULL;`,
+  'CREATE INDEX idx_source_event_revision_cindy_context ON source_event_revision(owner_scope, chat_ref, thread_ref, occurred_at);',
+] as const);
+
+function cindyOwnerContextSchemaChecksum() {
+  const canonical = new DatabaseSync(':memory:');
+  try {
+    registerData04SqlFunctions(canonical);
+    executeMigrationOperations(canonical, { ...BASELINE_MIGRATION_DESCRIPTOR, checksum: BASELINE_MIGRATION_CHECKSUM }, {
+      databaseInstanceId: '00000000000000000000000000000000',
+      instanceCreatedAt: '2026-08-15T00:00:00.000Z',
+      appliedAt: '2026-08-15T00:00:00.000Z',
+      preexistingTables: [],
+    });
+    for (const statement of RELATION_CONSTRAINT_MIGRATION_SQL) if (!statement.startsWith('UPDATE ') && !statement.startsWith('INSERT ')) canonical.exec(statement);
+    for (const statement of RUNTIME_TOOL_IDEMPOTENCY_MIGRATION_SQL) canonical.exec(statement);
+    for (const statement of CANDIDATE_VERSION_MIGRATION_SQL) canonical.exec(statement);
+    for (const statement of PRIVACY_MIGRATION_SQL) if (!statement.startsWith('INSERT ')) canonical.exec(statement);
+    for (const statement of PRIVACY_FENCING_MIGRATION_SQL) canonical.exec(statement);
+    for (const statement of SOURCE_REVISION_MIGRATION_SQL) if (!statement.startsWith('INSERT ') && !statement.startsWith('UPDATE ')) canonical.exec(statement);
+    for (const statement of PROVIDER_RETRY_COOLDOWN_MIGRATION_SQL) canonical.exec(statement);
+    for (const statement of CINDY_TRUSTED_SOURCE_MIGRATION_SQL) if (!statement.startsWith('INSERT ')) canonical.exec(statement);
+    for (const statement of CINDY_OWNER_CONTEXT_MIGRATION_SQL) if (!statement.startsWith('UPDATE ')) canonical.exec(statement);
+    return schemaIdentityChecksum(captureSchemaIdentity(canonical));
+  } finally {
+    canonical.close();
+  }
+}
+
+export const CINDY_OWNER_CONTEXT_SCHEMA_CHECKSUM = cindyOwnerContextSchemaChecksum();
+export const CINDY_OWNER_CONTEXT_MIGRATION_DESCRIPTOR = deepFreeze(Object.freeze({
+  version: 10,
+  name: 'cindy-owner-context-facts',
+  expectedPostSchemaIdentity: 'current-schema-v10' as const,
+  orderedOperations: Object.freeze([
+    Object.freeze({ id: 'cindy-owner-context-schema' as const, kind: 'sql_batch' as const, statements: CINDY_OWNER_CONTEXT_MIGRATION_SQL }),
+    Object.freeze({
+      id: 'verify-post-schema' as const,
+      kind: 'assert_database' as const,
+      expectedSchemaIdentityChecksum: CINDY_OWNER_CONTEXT_SCHEMA_CHECKSUM,
+      checks: Object.freeze(['schema', 'foreign_keys', 'integrity'] as const),
+    }),
+    Object.freeze({
+      id: 'record-migration' as const,
+      kind: 'record_migration' as const,
+      ledgerTable: 'schema_migration' as const,
+      userVersion: 10,
+    }),
+  ]),
+}) satisfies MigrationDescriptor);
+
+export const CINDY_OWNER_CONTEXT_MIGRATION_CHECKSUM = migrationDescriptorChecksum(CINDY_OWNER_CONTEXT_MIGRATION_DESCRIPTOR);
 const MIGRATIONS = [
   {
     ...BASELINE_MIGRATION_DESCRIPTOR,
@@ -3437,13 +3511,17 @@ const MIGRATIONS = [
     ...CINDY_TRUSTED_SOURCE_MIGRATION_DESCRIPTOR,
     checksum: CINDY_TRUSTED_SOURCE_MIGRATION_CHECKSUM,
   },
+  {
+    ...CINDY_OWNER_CONTEXT_MIGRATION_DESCRIPTOR,
+    checksum: CINDY_OWNER_CONTEXT_MIGRATION_CHECKSUM,
+  },
 ] as const;
 
 function assertExecutableMigrationDescriptor(descriptor: MigrationDescriptor) {
   if (
     !Number.isInteger(descriptor.version)
     || descriptor.version < 1
-    || !['current-schema-v1', 'current-schema-v2', 'current-schema-v3', 'current-schema-v4', 'current-schema-v5', 'current-schema-v6', 'current-schema-v7', 'current-schema-v8', 'current-schema-v9'].includes(descriptor.expectedPostSchemaIdentity)
+    || !['current-schema-v1', 'current-schema-v2', 'current-schema-v3', 'current-schema-v4', 'current-schema-v5', 'current-schema-v6', 'current-schema-v7', 'current-schema-v8', 'current-schema-v9', 'current-schema-v10'].includes(descriptor.expectedPostSchemaIdentity)
     || descriptor.orderedOperations.length === 0
   ) {
     throw new DatabaseUpgradeError('migration', '数据库迁移描述符版本或负载无效；已拒绝推进版本。');

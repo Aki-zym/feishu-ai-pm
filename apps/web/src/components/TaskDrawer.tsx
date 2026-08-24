@@ -799,7 +799,7 @@ export default function TaskDrawer() {
                 task.sources.length ? task.sources.map((source) => {
                   const verifiedSource = verifiedSources[source.source_scope];
                   return <article className="source-message" key={source.source_scope}>
-                    <div className="source-meta"><span className="avatar avatar-small">?</span><strong>来源记录（正文默认隐藏）</strong><time>{formatFullDate(source.occurred_at)}</time></div>
+                    <div className="source-meta"><span className="avatar avatar-small">?</span><strong>{source.display_name} · 来源记录（正文默认隐藏）</strong><time>{formatFullDate(source.occurred_at)}</time></div>
                     <div className="source-message-summary">
                       <span>最小来源信息</span>
                       <p>{source.summary_available ? '已关联 AI 摘要；来源正文不会随默认响应返回。' : '尚未生成可展示摘要。'}</p>

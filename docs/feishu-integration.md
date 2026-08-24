@@ -42,6 +42,8 @@ Issue #15 增加单来源背景补扫接口：当已保存消息疑似缺少前�
 
 消息后续补充会保存到 `requirement_thread_source`，并按 `root_id`、`parent_id`、会话和参与人建立线程修订。需求方消息按原有安全门生成带版本和证据的 `task_update_proposal`；主人消息另生成 `owner_decision`，在高置信、唯一目标和版本一致时可直接维护私人任务状态、计划、等待原因与时间线，仍不会向外发消息。只有 `new_demand` 才增加候选，`update_existing` / `context_only` 会回到已有需求线程；无法唯一关联时进入待确认。两条路径都刷新 SQLite 真源和可重建任务记忆投影；任务目录不会改变真实工作目录。
 
+Cindy 入库读取消息时，sender、display name、chat/thread、mention、主人发送、message type、reply/thread 关系和 reaction 必须逐项来自当前已授权 MCP 回显，不能从正文或 Agent 自报 owner/account 推断。技术 ID 只在服务端映射成内部引用；主人 reaction 只接受 OK、THUMBSUP、APPROVE、DONE、CHECK_MARK 等明确白名单。有限回读固定为同 thread/reply 最多 100 条和 4 小时，或无关系时同 chat、已有主人证据后最多 20 条和 60 分钟；超出内容留到后续批次或 `needs_owner`。
+
 设置页先显示连接总览，再展示“选择要关注的个人和群聊”：现有 P2P 会自动发现但默认不关注，主人可逐个选择或点击“关注所有人”立即启用当前名单；以后新发现的人仍保持关闭。姓名搜索只辅助确认身份，不因搜索本身开始读取。群聊可按群名过滤并明确选择。页面不展示真实 `open_id/chat_id`。下方紧凑列表继续展示普通私聊、`@我`、日历、妙记和机器人补充入口的状态、权限范围、最近成功和最近错误；五类来源都保留独立同步。机器人补充群 ID、补漏开关和运行控制位于按需高级设置，与主人选择的群完全分开。
 
 外发消息在 M1 仅形成待确认的本地 `approval/outbox` 草稿和审计；当前没有发送执行路径。未来若接入发送适配器，必须另行定义主人确认门禁和对外范围；不能把 `ready/sent` schema 状态描述为当前可发送能力。

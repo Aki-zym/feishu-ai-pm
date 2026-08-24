@@ -18,6 +18,12 @@ export const minimalSourceDtoSchema = z.object({
 
 export type MinimalSourceDto = z.infer<typeof minimalSourceDtoSchema>;
 
+export const privateSourceDtoSchema = minimalSourceDtoSchema.extend({
+  display_name: z.string().min(1).max(320),
+}).strict();
+
+export type PrivateSourceDto = z.infer<typeof privateSourceDtoSchema>;
+
 const minimalCandidateAnalysisSchema = z.object({
   timeRange: z.object({
     status: z.string().max(40),
@@ -434,7 +440,7 @@ export const dashboardDtoSchema = z.object({
 }).strict();
 
 export const taskDetailDtoSchema = taskDtoSchema.extend({
-  sources: z.array(minimalSourceDtoSchema).max(500),
+  sources: z.array(privateSourceDtoSchema).max(500),
   events: z.array(taskEventDtoSchema).max(2_000),
   references: z.array(referenceBindingDtoSchema).max(500),
   approvals: z.array(approvalDtoSchema).max(500),

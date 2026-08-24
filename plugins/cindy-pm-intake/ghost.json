@@ -30,6 +30,7 @@
           "sources": {
             "type": "array",
             "minItems": 1,
+            "maxItems": 500,
             "items": {
               "type": "object",
               "properties": {
@@ -38,8 +39,26 @@
                 "source_kind": { "type": "string", "enum": ["im_message", "im_thread_message", "im_reaction_context", "synthetic_message"] },
                 "stable_message_id": { "type": "string", "minLength": 1, "maxLength": 500 },
                 "occurred_at": { "type": "string", "minLength": 1, "maxLength": 80 },
-                "conversation_key": { "type": "string", "maxLength": 500 },
-                "sender_role": { "type": "string", "maxLength": 120 },
+                "sender_id": { "type": "string", "minLength": 1, "maxLength": 500 },
+                "display_name": {},
+                "chat_id": { "type": "string", "minLength": 1, "maxLength": 500 },
+                "thread_id": { "type": "string", "minLength": 1, "maxLength": 500 },
+                "mentioned_owner": { "type": "boolean" },
+                "sender_is_owner": { "type": "boolean" },
+                "message_type": { "type": "string", "enum": ["text", "post", "image", "file", "audio", "video", "sticker", "interactive", "system", "unknown"] },
+                "reactions": {
+                  "type": "array",
+                  "maxItems": 20,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "type": { "type": "string", "minLength": 1, "maxLength": 80 },
+                      "actor_is_owner": { "type": "boolean" }
+                    },
+                    "required": ["type", "actor_is_owner"],
+                    "additionalProperties": false
+                  }
+                },
                 "text": { "type": "string", "minLength": 1, "maxLength": 20000 },
                 "revision": {
                   "type": "object",
@@ -64,7 +83,7 @@
                   }
                 }
               },
-              "required": ["client_ref", "provider", "source_kind", "stable_message_id", "occurred_at", "text"],
+              "required": ["client_ref", "provider", "source_kind", "stable_message_id", "occurred_at", "sender_id", "chat_id", "mentioned_owner", "sender_is_owner", "message_type", "text"],
               "additionalProperties": false
             }
           }

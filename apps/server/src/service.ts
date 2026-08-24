@@ -95,6 +95,7 @@ import {
 import {
   minimalCandidateDtoSchema,
   minimalSourceDtoSchema,
+  privateSourceDtoSchema,
   ownerInformationDtoSchema,
   sourceExcerpt,
   sourceScope,
@@ -106,7 +107,7 @@ import {
   taskDetailDtoSchema,
   taskDtoSchema,
   taskUpdateProposalDtoSchema,
-  type MinimalSourceDto,
+  type PrivateSourceDto,
   type SourceVerificationDto,
 } from './source-privacy.js';
 
@@ -11819,7 +11820,7 @@ export class PmService {
       // summary. Keep the public candidate DTO on a fixed role label; the
       // owner-controlled verification path is the only place that can expose
       // bounded source content.
-      proposer_name: '需求方',
+      proposer_name: this.cindyDisplayNameForSource(row.source_event_id),
       background: safeCandidateNarrative(row.background, sourceContents, '来源背景已保留，需主人主动核验。', 2_000),
       validation_question: safeCandidateNarrative(row.validation_question, sourceContents, '希望验证的问题已保留，需主人主动核验。', 1_000),
       describe: safeCandidateNarrative(row.describe, sourceContents, 'AI 摘要已生成；来源正文默认隐藏。', 2_000),
@@ -11861,6 +11862,21 @@ export class PmService {
       } : null,
       merge_group: safeMerge,
     });
+  }
+
+  private cindyDisplayNameForSource(sourceEventId: string) {
+    const row = this.database.raw.prepare(
+      `SELECT revision.display_name
+         FROM source_event AS source
+         JOIN cindy_source_identity AS identity
+           ON identity.source_event_id = source.id
+          AND identity.current_revision_id = source.current_revision_id
+          AND identity.state = 'active'
+         JOIN source_event_revision AS revision ON revision.id = source.current_revision_id
+        WHERE source.id = ?
+          AND source.ingest_state = 'trusted_current'`,
+    ).get(sourceEventId) as { display_name: string | null } | undefined;
+    return row?.display_name?.trim() || '需求方';
   }
 
   listPendingOwnerActions(limit = 20) {
@@ -14400,19 +14416,21 @@ export class PmService {
     }
     const sourceRows = this.database.raw
       .prepare(
-        `SELECT source_event.*, candidate_request.demand_unit_id,
+        `SELECT source_event.*, source_event_revision.display_name AS cindy_display_name, candidate_request.demand_unit_id,
                 candidate_request.title AS demand_unit_title,
                 candidate_request.describe AS demand_unit_describe
          FROM candidate_request
          JOIN source_demand_unit_source ON source_demand_unit_source.demand_unit_id = candidate_request.demand_unit_id
          JOIN source_event ON source_event.id = source_demand_unit_source.source_event_id
+         LEFT JOIN source_event_revision ON source_event_revision.id = source_event.current_revision_id
          WHERE candidate_request.accepted_task_id = ?
          UNION ALL
-         SELECT source_event.*, task_source_link.demand_unit_id,
+         SELECT source_event.*, source_event_revision.display_name AS cindy_display_name, task_source_link.demand_unit_id,
                 candidate_request.title AS demand_unit_title,
                 candidate_request.describe AS demand_unit_describe
          FROM task_source_link
          JOIN source_event ON source_event.id = task_source_link.source_event_id
+         LEFT JOIN source_event_revision ON source_event_revision.id = source_event.current_revision_id
          LEFT JOIN candidate_request
            ON candidate_request.demand_unit_id = task_source_link.demand_unit_id
          WHERE task_source_link.task_id = ?
@@ -14425,12 +14443,13 @@ export class PmService {
          ORDER BY occurred_at DESC`,
       )
       .all(taskId, taskId);
-    const sourceDtos: MinimalSourceDto[] = (sourceRows as Array<Record<string, unknown>>).map((row) => minimalSourceDtoSchema.parse({
+    const sourceDtos: PrivateSourceDto[] = (sourceRows as Array<Record<string, unknown>>).map((row) => privateSourceDtoSchema.parse({
       source_scope: sourceScope(taskId, String(row.id)),
       source_type: row.source_type,
       completeness: row.completeness,
       occurred_at: row.occurred_at,
       summary_available: Boolean(row.demand_unit_title || row.demand_unit_describe),
+      display_name: typeof row.cindy_display_name === 'string' && row.cindy_display_name.trim() ? row.cindy_display_name : '需求方',
     }));
     const events = this.database.raw
       .prepare('SELECT * FROM task_event WHERE task_id = ? ORDER BY occurred_at DESC, recorded_at DESC')

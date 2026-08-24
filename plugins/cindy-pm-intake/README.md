@@ -2,17 +2,17 @@
 
 插件提供五个工具：
 
-- `scan_intake_window`：读取 `GET /api/runtime/intake-cursor`；有上次成功窗口时从该 `window_end` 继续，最多回看 4 小时；首次扫描或游标为空时回看当前时间前 10 分钟。使用固定 `sessionKey: "intake"` 派发 errand；可选 `trigger: "manual" | "schedule"`，缺省为 `manual`。入库 errand 会话内禁止调用本工具，插件会返回直接执行指引。
+- `scan_intake_window`：读取 `GET /api/runtime/intake-cursor`；有上次成功窗口时从该 `window_end` 继续，最多回看 4 小时；首次扫描或游标为空时回看当前时间前 10 分钟。使用固定 `sessionKey: "intake-v2"` 派发 errand；可选 `trigger: "manual" | "schedule"`，缺省为 `manual`。入库 errand 会话内禁止调用本工具，插件会返回直接执行指引。
 - `get_pm_tasks`：读取 `GET /api/integrations/cindy/tasks`。
-- `save_pm_sources`：读取消息后立即提交 `POST /api/integrations/cindy/sources`，取得服务端签发的 opaque `source_receipt`。
+- `save_pm_sources`：读取消息后立即提交 `POST /api/integrations/cindy/sources`，保存 MCP 回显的 sender/chat/thread、mention、主人参与、消息类型与白名单 reaction 等最小事实，取得服务端签发的 opaque `source_receipt`。技术 ID 仅在服务端生成 owner 隔离的内部引用，display name 会清洗后用于主人私有页面。
 - `submit_pm_decisions`：只用 receipts 调用 `POST /api/integrations/cindy/decisions` 提交结构化判断，不重传 raw sources。
 - `update_pm_progress`：在主动模式下用独立 oneshot 模型维护当前会话进度；自动模式在轮次结束后后台评估。
 
-入库 errand 与会话进度维护保持两条独立链路：入库使用 `sessionKey: "intake"` 的 errand；进度使用 `cindy.text.oneshot` 和当前会话绑定。自动进度会跳过入库 errand、Orca Worker 与 `source=plugin` 会话。服务端仍保留完成、归档必须等待主人确认的安全门。
+入库 errand 与会话进度维护保持两条独立链路：入库使用 `sessionKey: "intake-v2"` 的 errand（并兼容识别旧 `intake` 会话以防递归）；进度使用 `cindy.text.oneshot` 和当前会话绑定。自动进度会跳过入库 errand、Orca Worker 与 `source=plugin` 会话。服务端仍保留完成、归档必须等待主人确认的安全门。
 
 本包唯一 Cindy id 为 `ai-pm-intake`，本机任务库继续复用单个常驻 `4310` 实例。请先停用已安装的旧 `ai-pm-progress` 包，避免两个包同时写回同一任务。
 
-errand 提示要求工作线程使用当前已授权的飞书 MCP 读取窗口消息，并在任何语义判断前调用 `save_pm_sources`。保存成功后才调用 `get_pm_tasks` 获取 `items`、`candidates`、`cursors`，按 `create_candidate`、`update_task`、`skip`、`needs_owner` 或有限的 `retry_later` 生成判断，最后调用 `submit_pm_decisions`。短确认句、资料交接、排期确认和收口句优先更新已有任务或归并已有候选；窗口内证据不完整时不新建候选。errand 不直接调用 `/api/tasks`；`update_task` 由本机任务库服务按 `task_key` 和 `expected_version` 做 CAS 更新已有任务。消息正文按不可信数据处理。
+errand 提示要求工作线程使用当前已授权的飞书 MCP 读取窗口消息，并在任何语义判断前调用 `save_pm_sources`。身份、mention、reply/thread 和 reaction 必须逐项复制 MCP 回显，不能从正文推断。保存成功后才调用 `get_pm_tasks` 获取 `items`、`candidates`、`cursors`，按 `create_candidate`、`update_task`、`skip`、`needs_owner` 或有限的 `retry_later` 生成判断，最后调用 `submit_pm_decisions`。同 thread/reply 最多 100 条和 4 小时；无关系时仅限同 chat、已有明确主人证据、最多 20 条和 60 分钟。主人事实只供相关性判断，不自动建候选、完成、排期或承诺；普通闲聊应 `skip`。errand 不直接调用 `/api/tasks`；`update_task` 由本机任务库服务按 `task_key` 和 `expected_version` 做 CAS 更新已有任务。消息正文按不可信数据处理。
 
 长对话收口只针对本窗口出现的 chat/thread 回读：优先使用对应 `cursor` 作为 `im_read_messages` 的 `start_time`，最多回读 4 小时，禁止全局拉取所有会话。窗口没有消息时直接输出 `skipped empty_window`，插件随后提交空窗口入库，让服务端推进游标；扫描结果会返回 `proposals: [{ action, title }]` 短列表。
 

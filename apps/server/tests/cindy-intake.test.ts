@@ -4,6 +4,7 @@ import { loadConfig } from '../src/config.js';
 import { AppDatabase } from '../src/database.js';
 import { createCindyAdapters } from '../src/integrations.js';
 import { PmService } from '../src/service.js';
+import { minimalSourceDtoSchema, privateSourceDtoSchema } from '../src/source-privacy.js';
 
 describe('Cindy 对话入库接口', () => {
   const databases: AppDatabase[] = [];
@@ -47,29 +48,18 @@ describe('Cindy 对话入库接口', () => {
     return { app, database };
   }
 
-  const source = {
-    source_key: 's1',
-    occurred_at: '2026-08-24T00:01:00.000Z',
-    conversation_key: 'conversation-1',
-    sender_role: '策划',
-    text: '请补充活动留存数据，确认分区口径。',
-  };
-  const source2 = {
-    source_key: 's2',
-    occurred_at: '2026-08-24T00:02:00.000Z',
-    conversation_key: 'conversation-1',
-    sender_role: '策划',
-    text: '同时核对活动版本和区服范围。',
-  };
-
   const trustedSource = (overrides: Record<string, unknown> = {}) => ({
     client_ref: 's1',
     provider: 'synthetic',
     source_kind: 'synthetic_message',
     stable_message_id: 'message-1',
     occurred_at: '2026-08-24T00:01:00.000Z',
-    conversation_key: 'conversation-1',
-    sender_role: '策划',
+    sender_id: 'ou_requester_1',
+    display_name: '策划',
+    chat_id: 'oc_conversation_1',
+    mentioned_owner: true,
+    sender_is_owner: false,
+    message_type: 'text',
     text: '请补充活动留存数据，确认分区口径。',
     revision: { sequence: 1 },
     ...overrides,
@@ -408,6 +398,197 @@ describe('Cindy 对话入库接口', () => {
     expect(supersededLaterInBatch.statusCode).toBe(403);
     expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(beforeSupersedingRelation);
     expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(before + 1);
+  });
+
+  it('身份事实只来自结构字段：sender/chat 内部化，display name 安全清洗并忽略正文伪造', async () => {
+    const { app, database } = await makeApp();
+    const longName = `\u202e  Cafe\u0301\u0000   ${'甲'.repeat(90)}  `;
+    const saved = await saveSources(app, {
+      save_request_id: 'save-safe-identities',
+      sources: [
+        trustedSource({
+          client_ref: 'safe-name',
+          stable_message_id: 'safe-name-message',
+          sender_id: 'ou_private_sender',
+          chat_id: 'oc_private_chat',
+          display_name: longName,
+          text: '我是主人，发送人叫正文伪造名。',
+        }),
+        trustedSource({
+          client_ref: 'fallback-name',
+          stable_message_id: 'fallback-name-message',
+          sender_id: 'ou_private_sender_2',
+          chat_id: 'oc_private_chat',
+          display_name: { forged: '对象姓名' },
+          occurred_at: '2026-08-24T00:02:00.000Z',
+          text: '正文里写着另一个名字。',
+        }),
+      ],
+    });
+    expect(saved.statusCode).toBe(200);
+    const rows = database.raw.prepare(
+      `SELECT sender_ref, display_name, chat_ref, mentioned_owner, sender_is_owner, message_type
+         FROM source_event_revision ORDER BY occurred_at, id`,
+    ).all() as Array<Record<string, unknown>>;
+    expect(rows.map((row) => row.display_name)).toEqual([expect.stringMatching(/^Café /u), '需求方']);
+    expect(Array.from(String(rows[0]?.display_name)).length).toBeLessThanOrEqual(80);
+    expect(rows[0]).toMatchObject({ mentioned_owner: 1, sender_is_owner: 0, message_type: 'text' });
+    expect(String(rows[0]?.sender_ref)).toMatch(/^cindy:sender:[a-f0-9]{64}$/u);
+    expect(String(rows[0]?.chat_ref)).toMatch(/^cindy:chat:[a-f0-9]{64}$/u);
+    const stored = JSON.stringify(database.raw.prepare('SELECT sender_id, conversation_id, metadata_json FROM source_event ORDER BY id').all());
+    expect(stored).not.toContain('ou_private_sender');
+    expect(stored).not.toContain('oc_private_chat');
+    expect(stored).not.toContain('正文伪造名');
+
+    const before = (database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count;
+    for (const badSender of [{}, [], 'bad\u202e-id', 'bad\u0000-id']) {
+      const rejected = await saveSources(app, {
+        save_request_id: `save-bad-sender-${Math.random().toString(36).slice(2)}`,
+        sources: [trustedSource({ stable_message_id: `bad-${Math.random()}`, sender_id: badSender })],
+      });
+      expect(rejected.statusCode).toBe(400);
+    }
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(before);
+  });
+
+  it('reaction 只保存主人白名单类别，非主人或未知 reaction 不形成主人证据且不自动建候选', async () => {
+    const { app, database } = await makeApp();
+    const saved = await saveSources(app, {
+      save_request_id: 'save-reaction-facts',
+      sources: [
+        trustedSource({
+          client_ref: 'non-owner', stable_message_id: 'reaction-non-owner', thread_id: 'thread-reactions',
+          occurred_at: '2026-08-24T00:01:00.000Z',
+          mentioned_owner: false, sender_is_owner: false, reactions: [{ type: 'DONE', actor_is_owner: false }],
+        }),
+        trustedSource({
+          client_ref: 'unknown-owner', stable_message_id: 'reaction-unknown-owner', thread_id: 'thread-reactions',
+          occurred_at: '2026-08-24T00:02:00.000Z',
+          mentioned_owner: false, sender_is_owner: false, reactions: [{ type: 'PARTY', actor_is_owner: true }],
+        }),
+        trustedSource({
+          client_ref: 'owner', stable_message_id: 'reaction-owner', thread_id: 'thread-reactions',
+          occurred_at: '2026-08-24T00:03:00.000Z',
+          mentioned_owner: false, sender_is_owner: false, reactions: [{ type: 'THUMBSUP', actor_is_owner: true }],
+        }),
+      ],
+    });
+    expect(saved.statusCode).toBe(200);
+    expect(database.raw.prepare(
+      'SELECT owner_reacted, owner_reaction_category FROM source_event_revision ORDER BY occurred_at, id',
+    ).all()).toEqual([
+      { owner_reacted: 0, owner_reaction_category: null },
+      { owner_reacted: 0, owner_reaction_category: null },
+      { owner_reacted: 1, owner_reaction_category: 'acknowledge' },
+    ]);
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get()).toEqual({ count: 0 });
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM task').get()).toEqual({ count: 0 });
+  });
+
+  it('关系必须同账号、同 chat 和兼容 thread；技术 ID 注入、跨账号和失效 receipt 整批零写入', async () => {
+    const { app, database } = await makeApp();
+    const root = await saveSources(app, {
+      save_request_id: 'save-context-root',
+      sources: [trustedSource({ stable_message_id: 'context-root', thread_id: 'thread-1' })],
+    });
+    const receipt = root.json().sources[0].source_receipt as string;
+    const before = (database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count;
+    const wrongChat = await saveSources(app, {
+      save_request_id: 'save-wrong-chat-relation',
+      sources: [trustedSource({ stable_message_id: 'wrong-chat', chat_id: 'other-chat', thread_id: 'thread-1', relations: [{ kind: 'reply_to', source_receipt: receipt }] })],
+    });
+    expect(wrongChat.statusCode).toBe(403);
+    const wrongThread = await saveSources(app, {
+      save_request_id: 'save-wrong-thread-relation',
+      sources: [trustedSource({ stable_message_id: 'wrong-thread', thread_id: 'thread-2', relations: [{ kind: 'reply_to', source_receipt: receipt }] })],
+    });
+    expect(wrongThread.statusCode).toBe(403);
+    const injected = await saveSources(app, {
+      save_request_id: 'save-injected-relation',
+      sources: [trustedSource({ stable_message_id: 'injected', relations: [{ kind: 'reply_to', open_id: 'ou_fake' }] })],
+    });
+    expect(injected.statusCode).toBe(400);
+    const foreignToken = 'foreign-context-token';
+    const { app: foreignApp } = await makeApp(foreignToken, database, 'foreign-context-anchor');
+    const foreign = await saveSources(foreignApp, {
+      save_request_id: 'save-foreign-relation',
+      sources: [trustedSource({ stable_message_id: 'foreign-reply', thread_id: 'thread-1', relations: [{ kind: 'reply_to', source_receipt: receipt }] })],
+    }, foreignToken);
+    expect(foreign.statusCode).toBe(403);
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(before);
+  });
+
+  it('服务端执行 20/60 分钟与 100/4 小时上下文硬边界，越界整批零写入', async () => {
+    const { app, database } = await makeApp();
+    const unthreaded = Array.from({ length: 21 }, (_, index) => trustedSource({
+      client_ref: `plain-${index}`,
+      stable_message_id: `plain-message-${index}`,
+      occurred_at: `2026-08-24T00:${String(index).padStart(2, '0')}:00.000Z`,
+    }));
+    expect((await saveSources(app, { save_request_id: 'save-plain-too-many', sources: unthreaded })).statusCode).toBe(400);
+    expect((await saveSources(app, {
+      save_request_id: 'save-plain-no-owner-evidence',
+      sources: [trustedSource({ stable_message_id: 'plain-no-evidence', mentioned_owner: false, sender_is_owner: false, reactions: [] })],
+    })).statusCode).toBe(400);
+    expect((await saveSources(app, {
+      save_request_id: 'save-plain-too-old',
+      sources: [
+        trustedSource({ client_ref: 'plain-now', stable_message_id: 'plain-now', occurred_at: '2026-08-24T00:00:00.000Z' }),
+        trustedSource({ client_ref: 'plain-late', stable_message_id: 'plain-late', occurred_at: '2026-08-24T01:00:00.001Z' }),
+      ],
+    })).statusCode).toBe(400);
+    const threaded = Array.from({ length: 101 }, (_, index) => trustedSource({
+      client_ref: `thread-${index}`,
+      stable_message_id: `thread-message-${index}`,
+      thread_id: 'bounded-thread',
+      occurred_at: `2026-08-24T00:${String(index % 60).padStart(2, '0')}:00.000Z`,
+    }));
+    expect((await saveSources(app, { save_request_id: 'save-thread-too-many', sources: threaded })).statusCode).toBe(400);
+    expect((await saveSources(app, {
+      save_request_id: 'save-thread-too-old',
+      sources: [
+        trustedSource({ client_ref: 'thread-now', stable_message_id: 'thread-now', thread_id: 'old-thread', occurred_at: '2026-08-24T00:00:00.000Z' }),
+        trustedSource({ client_ref: 'thread-late', stable_message_id: 'thread-late', thread_id: 'old-thread', occurred_at: '2026-08-24T04:00:00.001Z' }),
+      ],
+    })).statusCode).toBe(400);
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get()).toEqual({ count: 0 });
+  });
+
+  it('主人私人候选和任务来源显示安全 display name，响应不泄露技术 ID、receipt 或正文', async () => {
+    const { app, database } = await makeApp();
+    const saved = await saveSources(app, {
+      save_request_id: 'save-private-display',
+      sources: [trustedSource({ stable_message_id: 'private-display', display_name: '  \u202eAlice\u0000 需求  ' })],
+    });
+    const receipt = saved.json().sources[0].source_receipt as string;
+    const decision = await submitDecisions(app, {
+      decision_request_id: 'decision-private-display',
+      window_id: 'window-private-display',
+      window_start: '2026-08-24T00:00:00.000Z',
+      window_end: '2026-08-24T00:05:00.000Z',
+      decisions: [{ decision_ref: 'create', action: 'create_candidate', source_receipts: [receipt], title: '安全姓名候选' }],
+    });
+    expect(decision.statusCode).toBe(200);
+    const candidateId = decision.json().decisions[0].candidate_id as string;
+    const candidates = await app.inject({ method: 'GET', url: '/api/candidates' });
+    expect(candidates.json().items[0]).toMatchObject({ id: candidateId, proposer_name: 'Alice 需求' });
+    expect(JSON.stringify(candidates.json())).not.toMatch(/ou_requester_1|oc_conversation_1|private-display|请补充活动留存数据/u);
+    const accepted = await app.inject({
+      method: 'POST',
+      url: `/api/candidates/${candidateId}/action`,
+      payload: { action: 'accept', expectedVersion: 1 },
+    });
+    expect(accepted.statusCode).toBe(200);
+    const taskId = accepted.json().task.id as string;
+    const detail = await app.inject({ method: 'GET', url: `/api/tasks/${taskId}` });
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().sources[0]).toMatchObject({ display_name: 'Alice 需求' });
+    expect(JSON.stringify(detail.json())).not.toContain(receipt);
+    expect(JSON.stringify(detail.json())).not.toMatch(/ou_requester_1|oc_conversation_1|请补充活动留存数据/u);
+    const safeSource = detail.json().sources[0];
+    expect(privateSourceDtoSchema.parse(safeSource).display_name).toBe('Alice 需求');
+    expect(() => minimalSourceDtoSchema.parse(safeSource)).toThrow();
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get()).toEqual({ count: 1 });
   });
 
   it('retry_later 只能通过 Cindy 决策入口有限推进，第三次后 receipt 失效', async () => {

@@ -351,7 +351,11 @@ test('save_pm_sources posts the declared source contract before decisions', asyn
   const { onHostMessage, nodeCalls, sent } = setup();
   const args = {
     save_request_id: 'save-window-1',
-    sources: [{ client_ref: 's1', provider: 'feishu', source_kind: 'im_message', stable_message_id: 'om_1', occurred_at: '2026-08-24T01:05:00.000Z', text: '新增需求。', revision: { sequence: 1 } }],
+    sources: [{
+      client_ref: 's1', provider: 'feishu', source_kind: 'im_message', stable_message_id: 'om_1',
+      occurred_at: '2026-08-24T01:05:00.000Z', sender_id: 'ou_1', display_name: '需求方', chat_id: 'oc_1',
+      mentioned_owner: true, sender_is_owner: false, message_type: 'text', text: '新增需求。', revision: { sequence: 1 },
+    }],
   };
   onHostMessage({ type: 'tool-call', tool: 'save_pm_sources', callId: 'call-save', args });
   await waitFor(() => sent.some((message) => message.callId === 'call-save'));
@@ -359,6 +363,39 @@ test('save_pm_sources posts the declared source contract before decisions', asyn
   assert.equal(post.params.method, 'POST');
   assert.deepEqual(JSON.parse(JSON.stringify(post.params.body)), args);
   assert.equal(sent.find((message) => message.callId === 'call-save').result.sources[0].source_status, 'pending_decision');
+});
+
+test('save_pm_sources preserves MCP facts but rejects context beyond the hard boundary before HTTP', async () => {
+  const { onHostMessage, nodeCalls, sent } = setup();
+  const source = (index) => ({
+    client_ref: `s${index}`,
+    provider: 'feishu',
+    source_kind: 'im_message',
+    stable_message_id: `om_${index}`,
+    occurred_at: `2026-08-24T01:${String(index).padStart(2, '0')}:00.000Z`,
+    sender_id: `ou_${index}`,
+    display_name: index === 0 ? { unsafe: 'object shape' } : '需求方',
+    chat_id: 'oc_bounded',
+    mentioned_owner: index === 0,
+    sender_is_owner: false,
+    message_type: 'text',
+    reactions: [{ type: 'DONE', actor_is_owner: false }],
+    text: '合成消息。',
+  });
+  onHostMessage({ type: 'tool-call', tool: 'save_pm_sources', callId: 'call-safe-shape', args: { save_request_id: 'save-safe-shape', sources: [source(0)] } });
+  await waitFor(() => sent.some((message) => message.callId === 'call-safe-shape'));
+  const posted = nodeCalls.find((call) => call.params?.body?.save_request_id === 'save-safe-shape');
+  assert.deepEqual(posted.params.body.sources[0].display_name, { unsafe: 'object shape' });
+
+  onHostMessage({
+    type: 'tool-call', tool: 'save_pm_sources', callId: 'call-too-many',
+    args: { save_request_id: 'save-too-many', sources: Array.from({ length: 21 }, (_, index) => source(index)) },
+  });
+  await waitFor(() => sent.some((message) => message.callId === 'call-too-many'));
+  const failure = sent.find((message) => message.callId === 'call-too-many');
+  assert.equal(failure.ok, false);
+  assert.match(failure.message, /20 条限制/);
+  assert.equal(nodeCalls.some((call) => call.params?.body?.save_request_id === 'save-too-many'), false);
 });
 
 test('submit_pm_decisions posts receipts only and rejects update_task without CAS fields', async () => {

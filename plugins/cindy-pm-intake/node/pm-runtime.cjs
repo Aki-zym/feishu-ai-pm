@@ -145443,7 +145443,7 @@ function projectShanghaiCalendarPlan(startAt, endAt, fallbackAt = null) {
 }
 
 // apps/server/src/database.ts
-var CURRENT_SCHEMA_VERSION = 9;
+var CURRENT_SCHEMA_VERSION = 10;
 function registerData04SqlFunctions(database) {
   database.function("sha256", { deterministic: !0 }, (value) => (0, import_node_crypto2.createHash)("sha256").update(String(value ?? "")).digest("hex"));
 }
@@ -148184,7 +148184,72 @@ var CINDY_TRUSTED_SOURCE_SCHEMA_CHECKSUM = cindyTrustedSourceSchemaChecksum(), C
       userVersion: 9
     })
   ])
-})), CINDY_TRUSTED_SOURCE_MIGRATION_CHECKSUM = migrationDescriptorChecksum(CINDY_TRUSTED_SOURCE_MIGRATION_DESCRIPTOR), MIGRATIONS = [
+})), CINDY_TRUSTED_SOURCE_MIGRATION_CHECKSUM = migrationDescriptorChecksum(CINDY_TRUSTED_SOURCE_MIGRATION_DESCRIPTOR), CINDY_OWNER_CONTEXT_MIGRATION_SQL = Object.freeze([
+  "ALTER TABLE source_event_revision ADD COLUMN sender_ref TEXT;",
+  "ALTER TABLE source_event_revision ADD COLUMN display_name TEXT CHECK (display_name IS NULL OR (length(display_name) BETWEEN 1 AND 320));",
+  "ALTER TABLE source_event_revision ADD COLUMN chat_ref TEXT;",
+  "ALTER TABLE source_event_revision ADD COLUMN thread_ref TEXT;",
+  "ALTER TABLE source_event_revision ADD COLUMN mentioned_owner INTEGER CHECK (mentioned_owner IS NULL OR mentioned_owner IN (0,1));",
+  "ALTER TABLE source_event_revision ADD COLUMN sender_is_owner INTEGER CHECK (sender_is_owner IS NULL OR sender_is_owner IN (0,1));",
+  "ALTER TABLE source_event_revision ADD COLUMN message_type TEXT CHECK (message_type IS NULL OR message_type IN ('text','post','image','file','audio','video','sticker','interactive','system','unknown'));",
+  "ALTER TABLE source_event_revision ADD COLUMN owner_reacted INTEGER CHECK (owner_reacted IS NULL OR owner_reacted IN (0,1));",
+  "ALTER TABLE source_event_revision ADD COLUMN owner_reaction_category TEXT CHECK (owner_reaction_category IS NULL OR owner_reaction_category IN ('acknowledge','approve','done'));",
+  `UPDATE source_event_revision
+      SET sender_ref = sender_id,
+          display_name = '\u9700\u6C42\u65B9',
+          chat_ref = conversation_id,
+          thread_ref = NULL,
+          mentioned_owner = owner_mentioned,
+          sender_is_owner = 0,
+          message_type = 'unknown',
+          owner_reacted = 0,
+          owner_reaction_category = NULL
+    WHERE sender_ref IS NULL;`,
+  "CREATE INDEX idx_source_event_revision_cindy_context ON source_event_revision(owner_scope, chat_ref, thread_ref, occurred_at);"
+]);
+function cindyOwnerContextSchemaChecksum() {
+  let canonical = new import_node_sqlite.DatabaseSync(":memory:");
+  try {
+    registerData04SqlFunctions(canonical), executeMigrationOperations(canonical, { ...BASELINE_MIGRATION_DESCRIPTOR, checksum: BASELINE_MIGRATION_CHECKSUM }, {
+      databaseInstanceId: "00000000000000000000000000000000",
+      instanceCreatedAt: "2026-08-15T00:00:00.000Z",
+      appliedAt: "2026-08-15T00:00:00.000Z",
+      preexistingTables: []
+    });
+    for (let statement of RELATION_CONSTRAINT_MIGRATION_SQL) !statement.startsWith("UPDATE ") && !statement.startsWith("INSERT ") && canonical.exec(statement);
+    for (let statement of RUNTIME_TOOL_IDEMPOTENCY_MIGRATION_SQL) canonical.exec(statement);
+    for (let statement of CANDIDATE_VERSION_MIGRATION_SQL) canonical.exec(statement);
+    for (let statement of PRIVACY_MIGRATION_SQL) statement.startsWith("INSERT ") || canonical.exec(statement);
+    for (let statement of PRIVACY_FENCING_MIGRATION_SQL) canonical.exec(statement);
+    for (let statement of SOURCE_REVISION_MIGRATION_SQL) !statement.startsWith("INSERT ") && !statement.startsWith("UPDATE ") && canonical.exec(statement);
+    for (let statement of PROVIDER_RETRY_COOLDOWN_MIGRATION_SQL) canonical.exec(statement);
+    for (let statement of CINDY_TRUSTED_SOURCE_MIGRATION_SQL) statement.startsWith("INSERT ") || canonical.exec(statement);
+    for (let statement of CINDY_OWNER_CONTEXT_MIGRATION_SQL) statement.startsWith("UPDATE ") || canonical.exec(statement);
+    return schemaIdentityChecksum(captureSchemaIdentity(canonical));
+  } finally {
+    canonical.close();
+  }
+}
+var CINDY_OWNER_CONTEXT_SCHEMA_CHECKSUM = cindyOwnerContextSchemaChecksum(), CINDY_OWNER_CONTEXT_MIGRATION_DESCRIPTOR = deepFreeze(Object.freeze({
+  version: 10,
+  name: "cindy-owner-context-facts",
+  expectedPostSchemaIdentity: "current-schema-v10",
+  orderedOperations: Object.freeze([
+    Object.freeze({ id: "cindy-owner-context-schema", kind: "sql_batch", statements: CINDY_OWNER_CONTEXT_MIGRATION_SQL }),
+    Object.freeze({
+      id: "verify-post-schema",
+      kind: "assert_database",
+      expectedSchemaIdentityChecksum: CINDY_OWNER_CONTEXT_SCHEMA_CHECKSUM,
+      checks: Object.freeze(["schema", "foreign_keys", "integrity"])
+    }),
+    Object.freeze({
+      id: "record-migration",
+      kind: "record_migration",
+      ledgerTable: "schema_migration",
+      userVersion: 10
+    })
+  ])
+})), CINDY_OWNER_CONTEXT_MIGRATION_CHECKSUM = migrationDescriptorChecksum(CINDY_OWNER_CONTEXT_MIGRATION_DESCRIPTOR), MIGRATIONS = [
   {
     ...BASELINE_MIGRATION_DESCRIPTOR,
     checksum: BASELINE_MIGRATION_CHECKSUM
@@ -148220,10 +148285,14 @@ var CINDY_TRUSTED_SOURCE_SCHEMA_CHECKSUM = cindyTrustedSourceSchemaChecksum(), C
   {
     ...CINDY_TRUSTED_SOURCE_MIGRATION_DESCRIPTOR,
     checksum: CINDY_TRUSTED_SOURCE_MIGRATION_CHECKSUM
+  },
+  {
+    ...CINDY_OWNER_CONTEXT_MIGRATION_DESCRIPTOR,
+    checksum: CINDY_OWNER_CONTEXT_MIGRATION_CHECKSUM
   }
 ];
 function assertExecutableMigrationDescriptor(descriptor) {
-  if (!Number.isInteger(descriptor.version) || descriptor.version < 1 || !["current-schema-v1", "current-schema-v2", "current-schema-v3", "current-schema-v4", "current-schema-v5", "current-schema-v6", "current-schema-v7", "current-schema-v8", "current-schema-v9"].includes(descriptor.expectedPostSchemaIdentity) || descriptor.orderedOperations.length === 0)
+  if (!Number.isInteger(descriptor.version) || descriptor.version < 1 || !["current-schema-v1", "current-schema-v2", "current-schema-v3", "current-schema-v4", "current-schema-v5", "current-schema-v6", "current-schema-v7", "current-schema-v8", "current-schema-v9", "current-schema-v10"].includes(descriptor.expectedPostSchemaIdentity) || descriptor.orderedOperations.length === 0)
     throw new DatabaseUpgradeError("migration", "\u6570\u636E\u5E93\u8FC1\u79FB\u63CF\u8FF0\u7B26\u7248\u672C\u6216\u8D1F\u8F7D\u65E0\u6548\uFF1B\u5DF2\u62D2\u7EDD\u63A8\u8FDB\u7248\u672C\u3002");
   let operationIds = /* @__PURE__ */ new Set(), assertionCount = 0, recordCount = 0;
   for (let operation of descriptor.orderedOperations) {
@@ -149159,6 +149228,7 @@ var AppDatabase = class {
 // apps/server/src/cindy-source.ts
 var import_node_crypto3 = require("node:crypto");
 var CINDY_SOURCE_PROVIDERS = ["feishu", "synthetic"], CINDY_SOURCE_KINDS = ["im_message", "im_thread_message", "im_reaction_context", "synthetic_message"];
+var CINDY_MESSAGE_TYPES = ["text", "post", "image", "file", "audio", "video", "sticker", "interactive", "system", "unknown"];
 var CindySourceContractError = class extends Error {
   constructor(errorCode, message, statusCode = errorCode === "INVALID_INPUT" ? 400 : errorCode === "INVALID_SOURCE_RECEIPT" ? 403 : 409) {
     super(message);
@@ -149166,7 +149236,16 @@ var CindySourceContractError = class extends Error {
     this.statusCode = statusCode;
     this.name = "CindySourceContractError";
   }
-}, clientRefPattern = /^[A-Za-z0-9_-]{1,64}$/u, requestIdPattern = /^[A-Za-z0-9_-]{1,128}$/u;
+}, clientRefPattern = /^[A-Za-z0-9_-]{1,64}$/u, requestIdPattern = /^[A-Za-z0-9_-]{1,128}$/u, unsafeIdentityCharacterPattern = /[\p{Cc}\p{Cf}\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u, bidiCharacterPattern = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, ownerReactionMap = /* @__PURE__ */ new Map([
+  ["OK", "acknowledge"],
+  ["THUMBSUP", "acknowledge"],
+  ["THUMBS_UP", "acknowledge"],
+  ["APPROVE", "approve"],
+  ["APPROVED", "approve"],
+  ["DONE", "done"],
+  ["CHECK_MARK", "done"],
+  ["CHECKMARK", "done"]
+]);
 function sha256(value) {
   return (0, import_node_crypto3.createHash)("sha256").update(value, "utf8").digest("hex");
 }
@@ -149182,6 +149261,59 @@ function normalizedText(value, field, maxLength) {
 `).trim();
   if (!normalized || normalized.length > maxLength) throw new CindySourceContractError("INVALID_INPUT", `${field} \u4E3A\u7A7A\u6216\u8FC7\u957F\u3002`);
   return normalized;
+}
+function visiblePrefix(value, limit) {
+  let Segmenter = Intl.Segmenter;
+  return Segmenter ? [...new Segmenter("zh-CN", { granularity: "grapheme" }).segment(value)].slice(0, limit).map((part) => part.segment).join("") : Array.from(value).slice(0, limit).join("");
+}
+function sanitizeCindyDisplayName(value) {
+  if (typeof value != "string") return "\u9700\u6C42\u65B9";
+  let cleaned = value.normalize("NFC").replace(bidiCharacterPattern, "").replace(/[\p{Cc}\p{Cf}]/gu, "").replace(/\s+/gu, " ").trim();
+  return cleaned && visiblePrefix(cleaned, 80) || "\u9700\u6C42\u65B9";
+}
+function normalizedTechnicalId(value, field, maxLength = 500) {
+  if (typeof value != "string") throw new CindySourceContractError("INVALID_INPUT", `${field} \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\u3002`);
+  let normalized = value.normalize("NFC").trim();
+  if (!normalized || normalized.length > maxLength || unsafeIdentityCharacterPattern.test(normalized))
+    throw new CindySourceContractError("INVALID_INPUT", `${field} \u4E3A\u7A7A\u3001\u8FC7\u957F\u6216\u5305\u542B\u4E0D\u5B89\u5168\u5B57\u7B26\u3002`);
+  return normalized;
+}
+function internalRef(auth, kind, rawId) {
+  return `cindy:${kind}:${sha256(`${kind}\0${auth.ownerScope}\0${auth.accountAnchor}\0${rawId}`)}`;
+}
+function normalizedOwnerReaction(reactions) {
+  if (reactions === void 0) return { ownerReacted: !1, category: null };
+  if (!Array.isArray(reactions) || reactions.length > 20)
+    throw new CindySourceContractError("INVALID_INPUT", "reactions \u5FC5\u987B\u662F\u6700\u591A 20 \u9879\u7684\u6570\u7EC4\u3002");
+  let matched = /* @__PURE__ */ new Set();
+  for (let reaction of reactions) {
+    if (!reaction || typeof reaction != "object" || Array.isArray(reaction))
+      throw new CindySourceContractError("INVALID_INPUT", "reaction \u5FC5\u987B\u662F\u5BF9\u8C61\u3002");
+    if (typeof reaction.actor_is_owner != "boolean")
+      throw new CindySourceContractError("INVALID_INPUT", "reaction.actor_is_owner \u5FC5\u987B\u662F\u5E03\u5C14\u503C\u3002");
+    let type = normalizedText(reaction.type, "reaction.type", 80).toUpperCase().replace(/[\s-]+/gu, "_"), category2 = ownerReactionMap.get(type);
+    reaction.actor_is_owner && category2 && matched.add(category2);
+  }
+  let category = matched.has("done") ? "done" : matched.has("approve") ? "approve" : matched.has("acknowledge") ? "acknowledge" : null;
+  return { ownerReacted: category !== null, category };
+}
+function normalizeSource(auth, source) {
+  let occurred = normalizedIso(source.occurred_at, `${source.client_ref}.occurred_at`), senderId = normalizedTechnicalId(source.sender_id, `${source.client_ref}.sender_id`), chatId = normalizedTechnicalId(source.chat_id, `${source.client_ref}.chat_id`), threadId = source.thread_id === void 0 ? null : normalizedTechnicalId(source.thread_id, `${source.client_ref}.thread_id`), reaction = normalizedOwnerReaction(source.reactions);
+  return {
+    occurredAt: occurred.iso,
+    occurredAtMs: occurred.milliseconds,
+    text: normalizedText(source.text, `${source.client_ref}.text`, 2e4),
+    senderRef: internalRef(auth, "sender", senderId),
+    displayName: sanitizeCindyDisplayName(source.display_name),
+    chatRef: internalRef(auth, "chat", chatId),
+    threadRef: threadId ? internalRef(auth, "thread", threadId) : null,
+    mentionedOwner: source.mentioned_owner,
+    senderIsOwner: source.sender_is_owner,
+    messageType: source.message_type,
+    ownerReacted: reaction.ownerReacted,
+    ownerReactionCategory: reaction.category,
+    revision: normalizedRevision(source)
+  };
 }
 function normalizedIso(value, field) {
   let normalized = normalizedText(value, field, 80), milliseconds = Date.parse(normalized);
@@ -149245,7 +149377,11 @@ function validateInput(input) {
   for (let source of input.sources) {
     if (!clientRefPattern.test(source.client_ref) || refs.has(source.client_ref))
       throw new CindySourceContractError("INVALID_INPUT", "client_ref \u683C\u5F0F\u65E0\u6548\u6216\u5728\u8BF7\u6C42\u5185\u91CD\u590D\u3002");
-    if (refs.add(source.client_ref), assertProviderKind(source), normalizedText(source.stable_message_id, `${source.client_ref}.stable_message_id`, 500), normalizedIso(source.occurred_at, `${source.client_ref}.occurred_at`), normalizedText(source.text, `${source.client_ref}.text`, 2e4), normalizedRevision(source), (source.relations?.length ?? 0) > 20) throw new CindySourceContractError("INVALID_INPUT", `${source.client_ref}.relations \u8FC7\u591A\u3002`);
+    if (refs.add(source.client_ref), assertProviderKind(source), normalizedText(source.stable_message_id, `${source.client_ref}.stable_message_id`, 500), normalizedIso(source.occurred_at, `${source.client_ref}.occurred_at`), normalizedText(source.text, `${source.client_ref}.text`, 2e4), normalizedTechnicalId(source.sender_id, `${source.client_ref}.sender_id`), normalizedTechnicalId(source.chat_id, `${source.client_ref}.chat_id`), source.thread_id !== void 0 && normalizedTechnicalId(source.thread_id, `${source.client_ref}.thread_id`), typeof source.mentioned_owner != "boolean" || typeof source.sender_is_owner != "boolean")
+      throw new CindySourceContractError("INVALID_INPUT", `${source.client_ref} \u7684\u4E3B\u4EBA\u4E8B\u5B9E\u5FC5\u987B\u662F\u5E03\u5C14\u503C\u3002`);
+    if (!CINDY_MESSAGE_TYPES.includes(source.message_type))
+      throw new CindySourceContractError("INVALID_INPUT", `${source.client_ref}.message_type \u65E0\u6548\u3002`);
+    if (normalizedOwnerReaction(source.reactions), normalizedRevision(source), (source.relations?.length ?? 0) > 20) throw new CindySourceContractError("INVALID_INPUT", `${source.client_ref}.relations \u8FC7\u591A\u3002`);
   }
   for (let source of input.sources) {
     let relationKeys = /* @__PURE__ */ new Set();
@@ -149277,8 +149413,14 @@ function canonicalSaveRequest(input) {
         source_kind: source.source_kind,
         stable_message_id: normalizedText(source.stable_message_id, `${source.client_ref}.stable_message_id`, 500),
         occurred_at: normalizedIso(source.occurred_at, `${source.client_ref}.occurred_at`).iso,
-        conversation_key: source.conversation_key ? normalizedText(source.conversation_key, `${source.client_ref}.conversation_key`, 500) : null,
-        sender_role: source.sender_role ? normalizedText(source.sender_role, `${source.client_ref}.sender_role`, 120) : null,
+        sender_id: normalizedTechnicalId(source.sender_id, `${source.client_ref}.sender_id`),
+        display_name: sanitizeCindyDisplayName(source.display_name),
+        chat_id: normalizedTechnicalId(source.chat_id, `${source.client_ref}.chat_id`),
+        thread_id: source.thread_id === void 0 ? null : normalizedTechnicalId(source.thread_id, `${source.client_ref}.thread_id`),
+        mentioned_owner: source.mentioned_owner,
+        sender_is_owner: source.sender_is_owner,
+        message_type: source.message_type,
+        owner_reaction: normalizedOwnerReaction(source.reactions),
         text: normalizedText(source.text, `${source.client_ref}.text`, 2e4),
         revision: revision.comparable ? {
           modified_at_ms: revision.modifiedAtMs,
@@ -149324,6 +149466,29 @@ function resolveReceiptRow(database, auth, receipt, forDecision = !1) {
 function resolveCindyDecisionReceipt(database, auth, receipt) {
   return resolveReceiptRow(database, auth, receipt, !0);
 }
+function assertRelationContext(source, target) {
+  let targetChatRef = "chat_ref" in target ? target.chat_ref : target.chatRef, targetThreadRef = "thread_ref" in target ? target.thread_ref : target.threadRef;
+  if (!targetChatRef || source.chatRef !== targetChatRef)
+    throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "\u6765\u6E90\u5173\u7CFB\u5FC5\u987B\u5C5E\u4E8E\u540C\u4E00\u6388\u6743\u4F1A\u8BDD\u3002");
+  if ((source.threadRef ?? null) !== (targetThreadRef ?? null))
+    throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "\u6765\u6E90\u5173\u7CFB\u4E0D\u80FD\u8DE8 thread\u3002");
+}
+function validateContextBounds(input, normalizedByRef) {
+  let referenced = new Set(input.sources.flatMap((source) => (source.relations ?? []).flatMap((relation) => relation.client_ref ? [relation.client_ref] : []))), byChat = /* @__PURE__ */ new Map();
+  for (let source of input.sources) {
+    let normalized = normalizedByRef.get(source.client_ref), group = byChat.get(normalized.chatRef) ?? [];
+    group.push({ source, normalized }), byChat.set(normalized.chatRef, group);
+  }
+  for (let group of byChat.values()) {
+    let structured = group.some(({ source, normalized }) => normalized.threadRef !== null || (source.relations?.length ?? 0) > 0 || referenced.has(source.client_ref)), limit = structured ? 100 : 20, maximumSpan = structured ? 14400 * 1e3 : 3600 * 1e3;
+    if (group.length > limit) throw new CindySourceContractError("INVALID_INPUT", `\u5355\u6B21\u4E0A\u4E0B\u6587\u8D85\u8FC7 ${limit} \u6761\u9650\u5236\u3002`);
+    let times = group.map(({ normalized }) => normalized.occurredAtMs);
+    if (Math.max(...times) - Math.min(...times) > maximumSpan)
+      throw new CindySourceContractError("INVALID_INPUT", structured ? "thread/reply \u4E0A\u4E0B\u6587\u8D85\u8FC7 4 \u5C0F\u65F6\u9650\u5236\u3002" : "\u65E0 thread/reply \u4E0A\u4E0B\u6587\u8D85\u8FC7 60 \u5206\u949F\u9650\u5236\u3002");
+    if (!structured && !group.some(({ normalized }) => normalized.mentionedOwner || normalized.senderIsOwner || normalized.ownerReacted))
+      throw new CindySourceContractError("INVALID_INPUT", "\u65E0 thread/reply \u4E0A\u4E0B\u6587\u5FC5\u987B\u5305\u542B\u660E\u786E\u4E3B\u4EBA\u8BC1\u636E\u3002");
+  }
+}
 function compareRevisionTuple(left, right) {
   let leftModified = left.modifiedAtMs ?? -1, rightModified = right.modifiedAtMs ?? -1;
   if (leftModified !== rightModified) return leftModified < rightModified ? -1 : 1;
@@ -149332,8 +149497,8 @@ function compareRevisionTuple(left, right) {
 }
 function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date()) {
   validateInput(input);
-  let requestHash = sha256(stableJson(canonicalSaveRequest(input)));
-  return database.transaction(() => {
+  let requestHash = sha256(stableJson(canonicalSaveRequest(input))), normalizedByRef = new Map(input.sources.map((source) => [source.client_ref, normalizeSource(auth, source)]));
+  return validateContextBounds(input, normalizedByRef), database.transaction(() => {
     let replay = database.raw.prepare(
       `SELECT request_hash, response_map_json FROM cindy_save_request
         WHERE owner_scope = ? AND account_anchor = ? AND save_request_id = ?`
@@ -149351,16 +149516,20 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
       }).map(({ revision_id: _revisionId, ...item }) => item);
       return { save_request_id: input.save_request_id, duplicate: !0, sources: sources2 };
     }
-    let timestamp = now.toISOString(), byRef = new Map(input.sources.map((source) => [source.client_ref, source])), revisionByRef = /* @__PURE__ */ new Map(), outputByRef = /* @__PURE__ */ new Map(), replayItems = /* @__PURE__ */ new Map();
+    let timestamp = now.toISOString(), byRef = new Map(input.sources.map((source) => [source.client_ref, source])), revisionByRef = /* @__PURE__ */ new Map(), outputByRef = /* @__PURE__ */ new Map(), replayItems = /* @__PURE__ */ new Map(), externalRelationTargets = /* @__PURE__ */ new Map();
+    for (let source of input.sources) {
+      let normalized = normalizedByRef.get(source.client_ref);
+      for (let relation of source.relations ?? [])
+        if (relation.client_ref)
+          assertRelationContext(normalized, normalizedByRef.get(relation.client_ref));
+        else {
+          let receipt = relation.source_receipt, target = externalRelationTargets.get(receipt) ?? resolveReceiptRow(database, auth, receipt);
+          assertRelationContext(normalized, target), externalRelationTargets.set(receipt, target);
+        }
+    }
     for (let clientRef of topologicalClientRefs(input.sources)) {
-      let source = byRef.get(clientRef), normalized = {
-        occurredAt: normalizedIso(source.occurred_at, `${clientRef}.occurred_at`).iso,
-        text: normalizedText(source.text, `${clientRef}.text`, 2e4),
-        conversationKey: source.conversation_key ? normalizedText(source.conversation_key, `${clientRef}.conversation_key`, 500) : null,
-        senderRole: source.sender_role ? normalizedText(source.sender_role, `${clientRef}.sender_role`, 120) : null,
-        revision: normalizedRevision(source)
-      }, relationRows = (source.relations ?? []).map((relation) => {
-        let target = relation.client_ref ? revisionByRef.get(relation.client_ref) : resolveReceiptRow(database, auth, relation.source_receipt);
+      let source = byRef.get(clientRef), normalized = normalizedByRef.get(clientRef), relationRows = (source.relations ?? []).map((relation) => {
+        let target = relation.client_ref ? revisionByRef.get(relation.client_ref) : externalRelationTargets.get(relation.source_receipt);
         if (!target) throw new CindySourceContractError("INVALID_INPUT", "\u6279\u5185\u5173\u7CFB\u5F15\u7528\u672A\u89E3\u6790\u3002");
         return { kind: relation.kind, targetRevisionId: target.id };
       }).sort((left, right) => `${left.kind}:${left.targetRevisionId}`.localeCompare(`${right.kind}:${right.targetRevisionId}`)), trustedPayloadHash = sha256(stableJson({
@@ -149369,8 +149538,15 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
         stable_id_hash: identityHash(auth, source),
         occurred_at: normalized.occurredAt,
         text: normalized.text,
-        conversation_key: normalized.conversationKey,
-        sender_role: normalized.senderRole,
+        sender_ref: normalized.senderRef,
+        display_name: normalized.displayName,
+        chat_ref: normalized.chatRef,
+        thread_ref: normalized.threadRef,
+        mentioned_owner: normalized.mentionedOwner,
+        sender_is_owner: normalized.senderIsOwner,
+        message_type: normalized.messageType,
+        owner_reacted: normalized.ownerReacted,
+        owner_reaction_category: normalized.ownerReactionCategory,
         revision: {
           modified_at_ms: normalized.revision.modifiedAtMs,
           sequence: normalized.revision.sequence
@@ -149417,12 +149593,16 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
           if (comparison === 0) throw new CindySourceContractError("CONFLICT", "\u76F8\u540C provider revision \u5BF9\u5E94\u4E86\u4E0D\u540C canonical payload\u3002");
         }
       }
-      let sourceEventId = identity?.source_event_id ?? `source_cindy_${(0, import_node_crypto3.randomUUID)()}`, sourceExternalId = `cindy:${stableIdHash}`, conversationId = `cindy:source:${sha256(normalized.conversationKey ?? stableIdHash)}`, senderId = `cindy:sender:${sha256(normalized.senderRole ?? "unknown")}`, metadataJson = stableJson({
+      let sourceEventId = identity?.source_event_id ?? `source_cindy_${(0, import_node_crypto3.randomUUID)()}`, sourceExternalId = `cindy:${stableIdHash}`, conversationId = normalized.chatRef, senderId = normalized.senderRef, metadataJson = stableJson({
         accountAnchor: auth.accountAnchor,
         ownerScope: auth.ownerScope,
         provider: source.provider,
         sourceKind: source.source_kind,
-        stableIdHash
+        stableIdHash,
+        threadRef: normalized.threadRef,
+        senderIsOwner: normalized.senderIsOwner,
+        messageType: normalized.messageType,
+        ownerReactionCategory: normalized.ownerReactionCategory
       }), generation = (current?.revision_number ?? 0) + 1, revisionId = `source_revision_cindy_${(0, import_node_crypto3.randomUUID)()}`, nonce = (0, import_node_crypto3.randomBytes)(32).toString("base64url"), receipt = receiptForNonce(auth, nonce), digest = receiptDigest(receipt), revisionHash = canonicalRevisionHash({
         ownerScope: auth.ownerScope,
         sourceEventId,
@@ -149432,9 +149612,9 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
         sourceType: "manual",
         conversationId,
         senderId,
-        senderName: normalized.senderRole ?? "Cindy \u6765\u6E90",
+        senderName: normalized.displayName,
         content: normalized.text,
-        ownerMentioned: 0,
+        ownerMentioned: normalized.mentionedOwner ? 1 : 0,
         sourceUrl: null,
         completeness: "complete",
         discoveryReason: "Cindy \u5DF2\u6388\u6743\u6765\u6E90\u5148\u4FDD\u5B58\u3002",
@@ -149444,13 +149624,14 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
       });
       identity ? (database.raw.prepare(
         `UPDATE source_event
-              SET content = ?, sender_id = ?, sender_name = ?, conversation_id = ?, metadata_json = ?, occurred_at = ?,
+              SET content = ?, sender_id = ?, sender_name = ?, owner_mentioned = ?, conversation_id = ?, metadata_json = ?, occurred_at = ?,
                   captured_at = ?, owner_scope = ?, revision_generation = ?, current_revision_id = ?, ingest_state = 'trusted_current'
             WHERE id = ?`
       ).run(
         normalized.text,
         senderId,
-        normalized.senderRole ?? "Cindy \u6765\u6E90",
+        normalized.displayName,
+        normalized.mentionedOwner ? 1 : 0,
         conversationId,
         metadataJson,
         normalized.occurredAt,
@@ -149467,14 +149648,15 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
             (id, external_id, source_type, conversation_id, sender_id, sender_name, content, owner_mentioned,
              source_url, completeness, discovery_reason, metadata_json, occurred_at, captured_at,
              owner_scope, revision_generation, current_revision_id, ingest_state)
-           VALUES (?, ?, 'manual', ?, ?, ?, ?, 0, NULL, 'complete', ?, ?, ?, ?, ?, ?, ?, 'trusted_current')`
+           VALUES (?, ?, 'manual', ?, ?, ?, ?, ?, NULL, 'complete', ?, ?, ?, ?, ?, ?, ?, 'trusted_current')`
       ).run(
         sourceEventId,
         sourceExternalId,
         conversationId,
         senderId,
-        normalized.senderRole ?? "Cindy \u6765\u6E90",
+        normalized.displayName,
         normalized.text,
+        normalized.mentionedOwner ? 1 : 0,
         "Cindy \u5DF2\u6388\u6743\u6765\u6E90\u5148\u4FDD\u5B58\u3002",
         metadataJson,
         normalized.occurredAt,
@@ -149498,9 +149680,10 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
            sender_id, sender_name, content, owner_mentioned, source_url, completeness, discovery_reason,
            metadata_json, occurred_at, captured_at, owner_scope, revision_hash, created_at,
            processing_status, trusted_payload_hash, provider_revision_modified_at_ms, provider_revision_sequence,
-           receipt_nonce, receipt_digest, retry_count)
-         VALUES (?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 0, NULL, 'complete', ?, ?, ?, ?, ?, ?, ?,
-                 'pending_decision', ?, ?, ?, ?, ?, 0)`
+           receipt_nonce, receipt_digest, retry_count, sender_ref, display_name, chat_ref, thread_ref,
+           mentioned_owner, sender_is_owner, message_type, owner_reacted, owner_reaction_category)
+         VALUES (?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, NULL, 'complete', ?, ?, ?, ?, ?, ?, ?,
+                 'pending_decision', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         revisionId,
         sourceEventId,
@@ -149509,8 +149692,9 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
         sourceExternalId,
         conversationId,
         senderId,
-        normalized.senderRole ?? "Cindy \u6765\u6E90",
+        normalized.displayName,
         normalized.text,
+        normalized.mentionedOwner ? 1 : 0,
         "Cindy \u5DF2\u6388\u6743\u6765\u6E90\u5148\u4FDD\u5B58\u3002",
         metadataJson,
         normalized.occurredAt,
@@ -149522,7 +149706,16 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
         normalized.revision.modifiedAtMs,
         normalized.revision.sequence,
         nonce,
-        digest
+        digest,
+        normalized.senderRef,
+        normalized.displayName,
+        normalized.chatRef,
+        normalized.threadRef,
+        normalized.mentionedOwner ? 1 : 0,
+        normalized.senderIsOwner ? 1 : 0,
+        normalized.messageType,
+        normalized.ownerReacted ? 1 : 0,
+        normalized.ownerReactionCategory
       ), wasExistingIdentity ? database.raw.prepare(
         `UPDATE cindy_source_identity
               SET account_anchor = ?, current_revision_id = ?, state = 'active', updated_at = ?
@@ -153257,6 +153450,8 @@ var sourceScopeSchema = external_exports.string().regex(/^src_scope_[a-f0-9]{32}
   completeness: external_exports.enum(["complete", "partial", "limited"]),
   occurred_at: external_exports.string().datetime(),
   summary_available: external_exports.boolean()
+}).strict(), privateSourceDtoSchema = minimalSourceDtoSchema.extend({
+  display_name: external_exports.string().min(1).max(320)
 }).strict(), minimalCandidateAnalysisSchema = external_exports.object({
   timeRange: external_exports.object({
     status: external_exports.string().max(40),
@@ -153603,7 +153798,7 @@ var sourceScopeSchema = external_exports.string().regex(/^src_scope_[a-f0-9]{32}
   timezone: external_exports.literal("Asia/Shanghai"),
   dataMode: external_exports.enum(["local_mock", "configured"])
 }).strict(), taskDetailDtoSchema = taskDtoSchema.extend({
-  sources: external_exports.array(minimalSourceDtoSchema).max(500),
+  sources: external_exports.array(privateSourceDtoSchema).max(500),
   events: external_exports.array(taskEventDtoSchema).max(2e3),
   references: external_exports.array(referenceBindingDtoSchema).max(500),
   approvals: external_exports.array(approvalDtoSchema).max(500),
@@ -161757,7 +161952,7 @@ var PmService = class {
       // summary. Keep the public candidate DTO on a fixed role label; the
       // owner-controlled verification path is the only place that can expose
       // bounded source content.
-      proposer_name: "\u9700\u6C42\u65B9",
+      proposer_name: this.cindyDisplayNameForSource(row.source_event_id),
       background: safeCandidateNarrative(row.background, sourceContents, "\u6765\u6E90\u80CC\u666F\u5DF2\u4FDD\u7559\uFF0C\u9700\u4E3B\u4EBA\u4E3B\u52A8\u6838\u9A8C\u3002", 2e3),
       validation_question: safeCandidateNarrative(row.validation_question, sourceContents, "\u5E0C\u671B\u9A8C\u8BC1\u7684\u95EE\u9898\u5DF2\u4FDD\u7559\uFF0C\u9700\u4E3B\u4EBA\u4E3B\u52A8\u6838\u9A8C\u3002", 1e3),
       describe: safeCandidateNarrative(row.describe, sourceContents, "AI \u6458\u8981\u5DF2\u751F\u6210\uFF1B\u6765\u6E90\u6B63\u6587\u9ED8\u8BA4\u9690\u85CF\u3002", 2e3),
@@ -161795,6 +161990,19 @@ var PmService = class {
       } : null,
       merge_group: safeMerge
     });
+  }
+  cindyDisplayNameForSource(sourceEventId) {
+    return this.database.raw.prepare(
+      `SELECT revision.display_name
+         FROM source_event AS source
+         JOIN cindy_source_identity AS identity
+           ON identity.source_event_id = source.id
+          AND identity.current_revision_id = source.current_revision_id
+          AND identity.state = 'active'
+         JOIN source_event_revision AS revision ON revision.id = source.current_revision_id
+        WHERE source.id = ?
+          AND source.ingest_state = 'trusted_current'`
+    ).get(sourceEventId)?.display_name?.trim() || "\u9700\u6C42\u65B9";
   }
   listPendingOwnerActions(limit = 20) {
     return this.database.raw.prepare(
@@ -163682,19 +163890,21 @@ var PmService = class {
     if (!task)
       return null;
     let sourceRows = this.database.raw.prepare(
-      `SELECT source_event.*, candidate_request.demand_unit_id,
+      `SELECT source_event.*, source_event_revision.display_name AS cindy_display_name, candidate_request.demand_unit_id,
                 candidate_request.title AS demand_unit_title,
                 candidate_request.describe AS demand_unit_describe
          FROM candidate_request
          JOIN source_demand_unit_source ON source_demand_unit_source.demand_unit_id = candidate_request.demand_unit_id
          JOIN source_event ON source_event.id = source_demand_unit_source.source_event_id
+         LEFT JOIN source_event_revision ON source_event_revision.id = source_event.current_revision_id
          WHERE candidate_request.accepted_task_id = ?
          UNION ALL
-         SELECT source_event.*, task_source_link.demand_unit_id,
+         SELECT source_event.*, source_event_revision.display_name AS cindy_display_name, task_source_link.demand_unit_id,
                 candidate_request.title AS demand_unit_title,
                 candidate_request.describe AS demand_unit_describe
          FROM task_source_link
          JOIN source_event ON source_event.id = task_source_link.source_event_id
+         LEFT JOIN source_event_revision ON source_event_revision.id = source_event.current_revision_id
          LEFT JOIN candidate_request
            ON candidate_request.demand_unit_id = task_source_link.demand_unit_id
          WHERE task_source_link.task_id = ?
@@ -163705,12 +163915,13 @@ var PmService = class {
                AND source_demand_unit_source.source_event_id = task_source_link.source_event_id
            )
          ORDER BY occurred_at DESC`
-    ).all(taskId, taskId), sourceDtos = sourceRows.map((row) => minimalSourceDtoSchema.parse({
+    ).all(taskId, taskId), sourceDtos = sourceRows.map((row) => privateSourceDtoSchema.parse({
       source_scope: sourceScope(taskId, String(row.id)),
       source_type: row.source_type,
       completeness: row.completeness,
       occurred_at: row.occurred_at,
-      summary_available: !!(row.demand_unit_title || row.demand_unit_describe)
+      summary_available: !!(row.demand_unit_title || row.demand_unit_describe),
+      display_name: typeof row.cindy_display_name == "string" && row.cindy_display_name.trim() ? row.cindy_display_name : "\u9700\u6C42\u65B9"
     })), events = this.database.raw.prepare("SELECT * FROM task_event WHERE task_id = ? ORDER BY occurred_at DESC, recorded_at DESC").all(taskId), references = this.database.raw.prepare("SELECT * FROM reference_binding WHERE task_id = ? ORDER BY created_at DESC").all(taskId), approvals = this.database.raw.prepare("SELECT id, action_type, status, created_at, decided_at FROM approval WHERE task_id = ? ORDER BY created_at DESC").all(taskId).map(approvalDraftDto), outboxDrafts = this.database.raw.prepare(
       `SELECT outbox.id, outbox.approval_id, outbox.action_type, outbox.status, outbox.created_at
          FROM outbox
@@ -166377,8 +166588,17 @@ async function buildApp(service, input = "http://localhost:5173") {
           source_kind: external_exports.enum(CINDY_SOURCE_KINDS),
           stable_message_id: external_exports.string().min(1).max(500),
           occurred_at: isoTimestamp,
-          conversation_key: external_exports.string().trim().min(1).max(500).optional(),
-          sender_role: external_exports.string().trim().min(1).max(120).optional(),
+          sender_id: external_exports.string().min(1).max(500),
+          display_name: external_exports.unknown().optional(),
+          chat_id: external_exports.string().min(1).max(500),
+          thread_id: external_exports.string().min(1).max(500).optional(),
+          mentioned_owner: external_exports.boolean(),
+          sender_is_owner: external_exports.boolean(),
+          message_type: external_exports.enum(CINDY_MESSAGE_TYPES),
+          reactions: external_exports.array(external_exports.object({
+            type: external_exports.string().min(1).max(80),
+            actor_is_owner: external_exports.boolean()
+          }).strict()).max(20).optional(),
           text: external_exports.string().min(1).max(2e4),
           revision: external_exports.object({
             modified_at: isoTimestamp.optional(),
