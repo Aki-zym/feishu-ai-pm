@@ -396,6 +396,44 @@ test('save_pm_sources preserves MCP facts but rejects context beyond the hard bo
   assert.equal(failure.ok, false);
   assert.match(failure.message, /20 条限制/);
   assert.equal(nodeCalls.some((call) => call.params?.body?.save_request_id === 'save-too-many'), false);
+
+  onHostMessage({
+    type: 'tool-call', tool: 'save_pm_sources', callId: 'call-mixed-context',
+    args: {
+      save_request_id: 'save-mixed-context',
+      sources: [
+        { ...source(0), client_ref: 'threaded', stable_message_id: 'threaded', thread_id: 'thread-a' },
+        ...Array.from({ length: 21 }, (_, index) => ({ ...source(index), client_ref: `plain-${index}`, stable_message_id: `plain-${index}` })),
+      ],
+    },
+  });
+  await waitFor(() => sent.some((message) => message.callId === 'call-mixed-context'));
+  assert.match(sent.find((message) => message.callId === 'call-mixed-context').message, /20 条限制/);
+  assert.equal(nodeCalls.some((call) => call.params?.body?.save_request_id === 'save-mixed-context'), false);
+
+  const separateThreads = Array.from({ length: 120 }, (_, index) => ({
+    ...source(index % 60),
+    client_ref: `separate-${index}`,
+    stable_message_id: `separate-${index}`,
+    thread_id: index < 60 ? 'thread-a' : 'thread-b',
+  }));
+  onHostMessage({ type: 'tool-call', tool: 'save_pm_sources', callId: 'call-separate-threads', args: { save_request_id: 'save-separate-threads', sources: separateThreads } });
+  await waitFor(() => sent.some((message) => message.callId === 'call-separate-threads'));
+  assert.ok(nodeCalls.some((call) => call.params?.body?.save_request_id === 'save-separate-threads'));
+
+  onHostMessage({
+    type: 'tool-call', tool: 'save_pm_sources', callId: 'call-evidence-after-context',
+    args: {
+      save_request_id: 'save-evidence-after-context',
+      sources: [
+        { ...source(0), client_ref: 'before', stable_message_id: 'before', mentioned_owner: false },
+        { ...source(1), client_ref: 'evidence', stable_message_id: 'evidence', mentioned_owner: true },
+      ],
+    },
+  });
+  await waitFor(() => sent.some((message) => message.callId === 'call-evidence-after-context'));
+  assert.match(sent.find((message) => message.callId === 'call-evidence-after-context').message, /主人证据开始/);
+  assert.equal(nodeCalls.some((call) => call.params?.body?.save_request_id === 'save-evidence-after-context'), false);
 });
 
 test('submit_pm_decisions posts receipts only and rejects update_task without CAS fields', async () => {

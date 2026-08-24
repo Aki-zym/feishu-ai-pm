@@ -322,18 +322,52 @@ function validateSaveSourcesBody(raw) {
     return item;
   });
   for (const source of sources) for (const relation of source.relations || []) if (relation.client_ref && !refs.has(relation.client_ref)) throw new Error('关系引用了未知 client_ref');
+  const parent = new Map(sources.map((source) => [source.client_ref, source.client_ref]));
+  const find = (key) => {
+    const current = parent.get(key);
+    if (current === key) return key;
+    const root = find(current);
+    parent.set(key, root);
+    return root;
+  };
+  const union = (left, right) => {
+    const leftRoot = find(left);
+    const rightRoot = find(right);
+    if (leftRoot !== rightRoot) parent.set(rightRoot, leftRoot);
+  };
+  for (const source of sources) {
+    for (const relation of source.relations || []) if (relation.client_ref) union(source.client_ref, relation.client_ref);
+  }
+  const threadRoots = new Map();
+  for (const source of sources) {
+    if (!source.thread_id) continue;
+    const threadKey = `${source.chat_id}\u0000${source.thread_id}`;
+    const existing = threadRoots.get(threadKey);
+    if (existing) union(source.client_ref, existing);
+    else threadRoots.set(threadKey, source.client_ref);
+  }
   const referenced = new Set(sources.flatMap((source) => (source.relations || []).flatMap((relation) => relation.client_ref ? [relation.client_ref] : [])));
-  const chats = new Map();
-  for (const source of sources) chats.set(source.chat_id, [...(chats.get(source.chat_id) || []), source]);
-  for (const group of chats.values()) {
-    const structured = group.some((source) => source.thread_id || source.relations?.length || referenced.has(source.client_ref));
+  const groups = new Map();
+  for (const source of sources) {
+    const structured = Boolean(source.thread_id || source.relations?.length || referenced.has(source.client_ref));
+    const groupKey = structured ? `structured:${find(source.client_ref)}` : `plain:${source.chat_id}`;
+    const group = groups.get(groupKey) || { structured, sources: [] };
+    group.structured ||= structured;
+    group.sources.push(source);
+    groups.set(groupKey, group);
+  }
+  const hasOwnerReaction = (source) => (source.reactions || []).some((reaction) => reaction.actor_is_owner && OWNER_REACTIONS.has(reaction.type.toUpperCase().replace(/[\s-]+/gu, '_')));
+  for (const { structured, sources: group } of groups.values()) {
     const limit = structured ? 100 : 20;
     const span = structured ? 4 * 60 * 60 * 1000 : 60 * 60 * 1000;
     if (group.length > limit) throw new Error(`单次上下文超过 ${limit} 条限制`);
     const times = group.map((source) => Date.parse(source.occurred_at));
     if (Math.max(...times) - Math.min(...times) > span) throw new Error(structured ? 'thread/reply 上下文超过 4 小时限制' : '无 thread/reply 上下文超过 60 分钟限制');
-    const hasOwnerReaction = (source) => (source.reactions || []).some((reaction) => reaction.actor_is_owner && OWNER_REACTIONS.has(reaction.type.toUpperCase().replace(/[\s-]+/gu, '_')));
     if (!structured && !group.some((source) => source.mentioned_owner || source.sender_is_owner || hasOwnerReaction(source))) throw new Error('无 thread/reply 上下文必须包含明确主人证据');
+    if (!structured) {
+      const firstOwnerEvidenceAt = Math.min(...group.filter((source) => source.mentioned_owner || source.sender_is_owner || hasOwnerReaction(source)).map((source) => Date.parse(source.occurred_at)));
+      if (times.some((time) => time < firstOwnerEvidenceAt)) throw new Error('无 thread/reply 上下文只能从明确主人证据开始回读');
+    }
   }
   return { save_request_id: saveRequestId, sources };
 }

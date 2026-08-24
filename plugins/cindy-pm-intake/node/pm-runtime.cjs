@@ -149473,20 +149473,93 @@ function assertRelationContext(source, target) {
   if ((source.threadRef ?? null) !== (targetThreadRef ?? null))
     throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "\u6765\u6E90\u5173\u7CFB\u4E0D\u80FD\u8DE8 thread\u3002");
 }
-function validateContextBounds(input, normalizedByRef) {
-  let referenced = new Set(input.sources.flatMap((source) => (source.relations ?? []).flatMap((relation) => relation.client_ref ? [relation.client_ref] : []))), byChat = /* @__PURE__ */ new Map();
+function externalReceiptContext(database, auth, target) {
+  let rows = database.raw.prepare(
+    `WITH RECURSIVE chain(revision_id) AS (
+       SELECT ?
+       UNION
+       SELECT relation.target_revision_id
+         FROM cindy_source_relation AS relation
+         JOIN chain ON chain.revision_id = relation.source_revision_id
+     )
+     SELECT revision.*, identity.account_anchor AS identity_account_anchor,
+            identity.state AS identity_state, identity.current_revision_id AS identity_current_revision_id
+       FROM chain
+       JOIN source_event_revision AS revision ON revision.id = chain.revision_id
+       LEFT JOIN cindy_source_identity AS identity ON identity.source_event_id = revision.source_event_id`
+  ).all(target.id);
+  if (!rows.length || rows.some((row) => row.owner_scope !== auth.ownerScope || row.identity_account_anchor !== auth.accountAnchor || row.identity_state !== "active" || row.identity_current_revision_id !== row.id || !row.chat_ref || !Number.isFinite(Date.parse(row.occurred_at)) || ["superseded", "revoked", "invalid", "legacy_read_only"].includes(row.processing_status)))
+    throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "\u8DE8\u6279\u5173\u7CFB\u4E0A\u4E0B\u6587\u5305\u542B\u5931\u6548\u6216\u8DE8\u8D26\u53F7 revision\u3002");
+  return rows;
+}
+function validateContextBounds(input, normalizedByRef, externalContexts) {
+  let parent = /* @__PURE__ */ new Map(), ensure = (key) => {
+    parent.has(key) || parent.set(key, key);
+  }, find = (key) => {
+    ensure(key);
+    let current = parent.get(key);
+    if (current === key) return key;
+    let root = find(current);
+    return parent.set(key, root), root;
+  }, union2 = (left, right) => {
+    let leftRoot = find(left), rightRoot = find(right);
+    leftRoot !== rightRoot && parent.set(rightRoot, leftRoot);
+  }, batchKey = (clientRef) => `batch:${clientRef}`;
+  for (let source of input.sources) ensure(batchKey(source.client_ref));
+  for (let source of input.sources)
+    for (let relation of source.relations ?? [])
+      if (relation.client_ref && union2(batchKey(source.client_ref), batchKey(relation.client_ref)), relation.source_receipt) {
+        let targetRows = externalContexts.get(relation.source_receipt);
+        for (let row of targetRows)
+          ensure(`revision:${row.id}`), union2(batchKey(source.client_ref), `revision:${row.id}`);
+      }
+  let threadRoots = /* @__PURE__ */ new Map(), bindThread = (nodeKey, chatRef, threadRef) => {
+    if (!threadRef) return;
+    let threadKey = `${chatRef}\0${threadRef}`, existing = threadRoots.get(threadKey);
+    existing ? union2(nodeKey, existing) : threadRoots.set(threadKey, nodeKey);
+  };
   for (let source of input.sources) {
-    let normalized = normalizedByRef.get(source.client_ref), group = byChat.get(normalized.chatRef) ?? [];
-    group.push({ source, normalized }), byChat.set(normalized.chatRef, group);
+    let normalized = normalizedByRef.get(source.client_ref);
+    bindThread(batchKey(source.client_ref), normalized.chatRef, normalized.threadRef);
   }
-  for (let group of byChat.values()) {
-    let structured = group.some(({ source, normalized }) => normalized.threadRef !== null || (source.relations?.length ?? 0) > 0 || referenced.has(source.client_ref)), limit = structured ? 100 : 20, maximumSpan = structured ? 14400 * 1e3 : 3600 * 1e3;
-    if (group.length > limit) throw new CindySourceContractError("INVALID_INPUT", `\u5355\u6B21\u4E0A\u4E0B\u6587\u8D85\u8FC7 ${limit} \u6761\u9650\u5236\u3002`);
-    let times = group.map(({ normalized }) => normalized.occurredAtMs);
+  for (let rows of externalContexts.values())
+    for (let row of rows) bindThread(`revision:${row.id}`, row.chat_ref, row.thread_ref);
+  let referenced = new Set(input.sources.flatMap((source) => (source.relations ?? []).flatMap((relation) => relation.client_ref ? [relation.client_ref] : []))), groups = /* @__PURE__ */ new Map(), add = (groupKey, structured, fact) => {
+    let group = groups.get(groupKey) ?? { structured, facts: /* @__PURE__ */ new Map() };
+    group.structured ||= structured, group.facts.set(fact.key, fact), groups.set(groupKey, group);
+  };
+  for (let source of input.sources) {
+    let normalized = normalizedByRef.get(source.client_ref), structured = normalized.threadRef !== null || (source.relations?.length ?? 0) > 0 || referenced.has(source.client_ref), groupKey = structured ? `structured:${find(batchKey(source.client_ref))}` : `plain:${normalized.chatRef}`;
+    add(groupKey, structured, {
+      key: batchKey(source.client_ref),
+      chatRef: normalized.chatRef,
+      threadRef: normalized.threadRef,
+      occurredAtMs: normalized.occurredAtMs,
+      ownerEvidence: normalized.mentionedOwner || normalized.senderIsOwner || normalized.ownerReacted
+    });
+  }
+  for (let rows of externalContexts.values())
+    for (let row of rows)
+      add(`structured:${find(`revision:${row.id}`)}`, !0, {
+        key: `revision:${row.id}`,
+        chatRef: row.chat_ref,
+        threadRef: row.thread_ref,
+        occurredAtMs: Date.parse(row.occurred_at),
+        ownerEvidence: !!(row.mentioned_owner || row.sender_is_owner || row.owner_reacted)
+      });
+  for (let group of groups.values()) {
+    let facts = [...group.facts.values()], limit = group.structured ? 100 : 20, maximumSpan = group.structured ? 14400 * 1e3 : 3600 * 1e3;
+    if (facts.length > limit) throw new CindySourceContractError("INVALID_INPUT", `\u5355\u6B21\u4E0A\u4E0B\u6587\u8D85\u8FC7 ${limit} \u6761\u9650\u5236\u3002`);
+    let times = facts.map((fact) => fact.occurredAtMs);
     if (Math.max(...times) - Math.min(...times) > maximumSpan)
-      throw new CindySourceContractError("INVALID_INPUT", structured ? "thread/reply \u4E0A\u4E0B\u6587\u8D85\u8FC7 4 \u5C0F\u65F6\u9650\u5236\u3002" : "\u65E0 thread/reply \u4E0A\u4E0B\u6587\u8D85\u8FC7 60 \u5206\u949F\u9650\u5236\u3002");
-    if (!structured && !group.some(({ normalized }) => normalized.mentionedOwner || normalized.senderIsOwner || normalized.ownerReacted))
+      throw new CindySourceContractError("INVALID_INPUT", group.structured ? "thread/reply \u4E0A\u4E0B\u6587\u8D85\u8FC7 4 \u5C0F\u65F6\u9650\u5236\u3002" : "\u65E0 thread/reply \u4E0A\u4E0B\u6587\u8D85\u8FC7 60 \u5206\u949F\u9650\u5236\u3002");
+    if (!group.structured && !facts.some((fact) => fact.ownerEvidence))
       throw new CindySourceContractError("INVALID_INPUT", "\u65E0 thread/reply \u4E0A\u4E0B\u6587\u5FC5\u987B\u5305\u542B\u660E\u786E\u4E3B\u4EBA\u8BC1\u636E\u3002");
+    if (!group.structured) {
+      let firstOwnerEvidenceAt = Math.min(...facts.filter((fact) => fact.ownerEvidence).map((fact) => fact.occurredAtMs));
+      if (facts.some((fact) => fact.occurredAtMs < firstOwnerEvidenceAt))
+        throw new CindySourceContractError("INVALID_INPUT", "\u65E0 thread/reply \u4E0A\u4E0B\u6587\u53EA\u80FD\u4ECE\u660E\u786E\u4E3B\u4EBA\u8BC1\u636E\u5F00\u59CB\u56DE\u8BFB\u3002");
+    }
   }
 }
 function compareRevisionTuple(left, right) {
@@ -149498,7 +149571,7 @@ function compareRevisionTuple(left, right) {
 function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date()) {
   validateInput(input);
   let requestHash = sha256(stableJson(canonicalSaveRequest(input))), normalizedByRef = new Map(input.sources.map((source) => [source.client_ref, normalizeSource(auth, source)]));
-  return validateContextBounds(input, normalizedByRef), database.transaction(() => {
+  return database.transaction(() => {
     let replay = database.raw.prepare(
       `SELECT request_hash, response_map_json FROM cindy_save_request
         WHERE owner_scope = ? AND account_anchor = ? AND save_request_id = ?`
@@ -149516,7 +149589,7 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
       }).map(({ revision_id: _revisionId, ...item }) => item);
       return { save_request_id: input.save_request_id, duplicate: !0, sources: sources2 };
     }
-    let timestamp = now.toISOString(), byRef = new Map(input.sources.map((source) => [source.client_ref, source])), revisionByRef = /* @__PURE__ */ new Map(), outputByRef = /* @__PURE__ */ new Map(), replayItems = /* @__PURE__ */ new Map(), externalRelationTargets = /* @__PURE__ */ new Map();
+    let timestamp = now.toISOString(), byRef = new Map(input.sources.map((source) => [source.client_ref, source])), revisionByRef = /* @__PURE__ */ new Map(), outputByRef = /* @__PURE__ */ new Map(), replayItems = /* @__PURE__ */ new Map(), externalRelationTargets = /* @__PURE__ */ new Map(), externalContexts = /* @__PURE__ */ new Map();
     for (let source of input.sources) {
       let normalized = normalizedByRef.get(source.client_ref);
       for (let relation of source.relations ?? [])
@@ -149524,9 +149597,10 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
           assertRelationContext(normalized, normalizedByRef.get(relation.client_ref));
         else {
           let receipt = relation.source_receipt, target = externalRelationTargets.get(receipt) ?? resolveReceiptRow(database, auth, receipt);
-          assertRelationContext(normalized, target), externalRelationTargets.set(receipt, target);
+          assertRelationContext(normalized, target), externalRelationTargets.set(receipt, target), externalContexts.set(receipt, externalContexts.get(receipt) ?? externalReceiptContext(database, auth, target));
         }
     }
+    validateContextBounds(input, normalizedByRef, externalContexts);
     for (let clientRef of topologicalClientRefs(input.sources)) {
       let source = byRef.get(clientRef), normalized = normalizedByRef.get(clientRef), relationRows = (source.relations ?? []).map((relation) => {
         let target = relation.client_ref ? revisionByRef.get(relation.client_ref) : externalRelationTargets.get(relation.source_receipt);

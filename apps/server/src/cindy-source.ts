@@ -93,6 +93,7 @@ type SourceIdentityRow = {
 type SourceRevisionRow = {
   id: string;
   source_event_id: string;
+  owner_scope: string;
   revision_number: number;
   processing_status: CindySourceStatus;
   trusted_payload_hash: string | null;
@@ -101,6 +102,7 @@ type SourceRevisionRow = {
   receipt_nonce: string | null;
   receipt_digest: string | null;
   retry_count: number;
+  occurred_at: string;
   sender_ref: string | null;
   display_name: string | null;
   chat_ref: string | null;
@@ -475,26 +477,148 @@ function assertRelationContext(
   }
 }
 
-function validateContextBounds(input: CindySaveSourcesInput, normalizedByRef: Map<string, NormalizedCindySource>) {
-  const referenced = new Set(input.sources.flatMap((source) => (source.relations ?? []).flatMap((relation) => relation.client_ref ? [relation.client_ref] : [])));
-  const byChat = new Map<string, Array<{ source: CindySourceInput; normalized: NormalizedCindySource }>>();
+type ContextFact = {
+  key: string;
+  chatRef: string;
+  threadRef: string | null;
+  occurredAtMs: number;
+  ownerEvidence: boolean;
+};
+
+function externalReceiptContext(database: AppDatabase, auth: CindyAuthContext, target: SourceRevisionRow) {
+  const rows = database.raw.prepare(
+    `WITH RECURSIVE chain(revision_id) AS (
+       SELECT ?
+       UNION
+       SELECT relation.target_revision_id
+         FROM cindy_source_relation AS relation
+         JOIN chain ON chain.revision_id = relation.source_revision_id
+     )
+     SELECT revision.*, identity.account_anchor AS identity_account_anchor,
+            identity.state AS identity_state, identity.current_revision_id AS identity_current_revision_id
+       FROM chain
+       JOIN source_event_revision AS revision ON revision.id = chain.revision_id
+       LEFT JOIN cindy_source_identity AS identity ON identity.source_event_id = revision.source_event_id`,
+  ).all(target.id) as Array<SourceRevisionRow & {
+    identity_account_anchor: string | null;
+    identity_state: string | null;
+    identity_current_revision_id: string | null;
+  }>;
+  if (!rows.length || rows.some((row) => (
+    row.owner_scope !== auth.ownerScope
+    || row.identity_account_anchor !== auth.accountAnchor
+    || row.identity_state !== 'active'
+    || row.identity_current_revision_id !== row.id
+    || !row.chat_ref
+    || !Number.isFinite(Date.parse(row.occurred_at))
+    || ['superseded', 'revoked', 'invalid', 'legacy_read_only'].includes(row.processing_status)
+  ))) {
+    throw new CindySourceContractError('INVALID_SOURCE_RECEIPT', '跨批关系上下文包含失效或跨账号 revision。');
+  }
+  return rows;
+}
+
+function validateContextBounds(
+  input: CindySaveSourcesInput,
+  normalizedByRef: Map<string, NormalizedCindySource>,
+  externalContexts: Map<string, SourceRevisionRow[]>,
+) {
+  const parent = new Map<string, string>();
+  const ensure = (key: string) => { if (!parent.has(key)) parent.set(key, key); };
+  const find = (key: string): string => {
+    ensure(key);
+    const current = parent.get(key)!;
+    if (current === key) return key;
+    const root = find(current);
+    parent.set(key, root);
+    return root;
+  };
+  const union = (left: string, right: string) => {
+    const leftRoot = find(left);
+    const rightRoot = find(right);
+    if (leftRoot !== rightRoot) parent.set(rightRoot, leftRoot);
+  };
+
+  const batchKey = (clientRef: string) => `batch:${clientRef}`;
+  for (const source of input.sources) ensure(batchKey(source.client_ref));
+  for (const source of input.sources) {
+    for (const relation of source.relations ?? []) {
+      if (relation.client_ref) union(batchKey(source.client_ref), batchKey(relation.client_ref));
+      if (relation.source_receipt) {
+        const targetRows = externalContexts.get(relation.source_receipt)!;
+        for (const row of targetRows) {
+          ensure(`revision:${row.id}`);
+          union(batchKey(source.client_ref), `revision:${row.id}`);
+        }
+      }
+    }
+  }
+
+  const threadRoots = new Map<string, string>();
+  const bindThread = (nodeKey: string, chatRef: string, threadRef: string | null) => {
+    if (!threadRef) return;
+    const threadKey = `${chatRef}\u0000${threadRef}`;
+    const existing = threadRoots.get(threadKey);
+    if (existing) union(nodeKey, existing);
+    else threadRoots.set(threadKey, nodeKey);
+  };
   for (const source of input.sources) {
     const normalized = normalizedByRef.get(source.client_ref)!;
-    const group = byChat.get(normalized.chatRef) ?? [];
-    group.push({ source, normalized });
-    byChat.set(normalized.chatRef, group);
+    bindThread(batchKey(source.client_ref), normalized.chatRef, normalized.threadRef);
   }
-  for (const group of byChat.values()) {
-    const structured = group.some(({ source, normalized }) => normalized.threadRef !== null || (source.relations?.length ?? 0) > 0 || referenced.has(source.client_ref));
-    const limit = structured ? 100 : 20;
-    const maximumSpan = structured ? 4 * 60 * 60 * 1000 : 60 * 60 * 1000;
-    if (group.length > limit) throw new CindySourceContractError('INVALID_INPUT', `单次上下文超过 ${limit} 条限制。`);
-    const times = group.map(({ normalized }) => normalized.occurredAtMs);
-    if (Math.max(...times) - Math.min(...times) > maximumSpan) {
-      throw new CindySourceContractError('INVALID_INPUT', structured ? 'thread/reply 上下文超过 4 小时限制。' : '无 thread/reply 上下文超过 60 分钟限制。');
+  for (const rows of externalContexts.values()) {
+    for (const row of rows) bindThread(`revision:${row.id}`, row.chat_ref!, row.thread_ref);
+  }
+
+  const referenced = new Set(input.sources.flatMap((source) => (source.relations ?? []).flatMap((relation) => relation.client_ref ? [relation.client_ref] : [])));
+  const groups = new Map<string, { structured: boolean; facts: Map<string, ContextFact> }>();
+  const add = (groupKey: string, structured: boolean, fact: ContextFact) => {
+    const group = groups.get(groupKey) ?? { structured, facts: new Map<string, ContextFact>() };
+    group.structured ||= structured;
+    group.facts.set(fact.key, fact);
+    groups.set(groupKey, group);
+  };
+  for (const source of input.sources) {
+    const normalized = normalizedByRef.get(source.client_ref)!;
+    const structured = normalized.threadRef !== null || (source.relations?.length ?? 0) > 0 || referenced.has(source.client_ref);
+    const groupKey = structured ? `structured:${find(batchKey(source.client_ref))}` : `plain:${normalized.chatRef}`;
+    add(groupKey, structured, {
+      key: batchKey(source.client_ref),
+      chatRef: normalized.chatRef,
+      threadRef: normalized.threadRef,
+      occurredAtMs: normalized.occurredAtMs,
+      ownerEvidence: normalized.mentionedOwner || normalized.senderIsOwner || normalized.ownerReacted,
+    });
+  }
+  for (const rows of externalContexts.values()) {
+    for (const row of rows) {
+      add(`structured:${find(`revision:${row.id}`)}`, true, {
+        key: `revision:${row.id}`,
+        chatRef: row.chat_ref!,
+        threadRef: row.thread_ref,
+        occurredAtMs: Date.parse(row.occurred_at),
+        ownerEvidence: Boolean(row.mentioned_owner || row.sender_is_owner || row.owner_reacted),
+      });
     }
-    if (!structured && !group.some(({ normalized }) => normalized.mentionedOwner || normalized.senderIsOwner || normalized.ownerReacted)) {
+  }
+
+  for (const group of groups.values()) {
+    const facts = [...group.facts.values()];
+    const limit = group.structured ? 100 : 20;
+    const maximumSpan = group.structured ? 4 * 60 * 60 * 1000 : 60 * 60 * 1000;
+    if (facts.length > limit) throw new CindySourceContractError('INVALID_INPUT', `单次上下文超过 ${limit} 条限制。`);
+    const times = facts.map((fact) => fact.occurredAtMs);
+    if (Math.max(...times) - Math.min(...times) > maximumSpan) {
+      throw new CindySourceContractError('INVALID_INPUT', group.structured ? 'thread/reply 上下文超过 4 小时限制。' : '无 thread/reply 上下文超过 60 分钟限制。');
+    }
+    if (!group.structured && !facts.some((fact) => fact.ownerEvidence)) {
       throw new CindySourceContractError('INVALID_INPUT', '无 thread/reply 上下文必须包含明确主人证据。');
+    }
+    if (!group.structured) {
+      const firstOwnerEvidenceAt = Math.min(...facts.filter((fact) => fact.ownerEvidence).map((fact) => fact.occurredAtMs));
+      if (facts.some((fact) => fact.occurredAtMs < firstOwnerEvidenceAt)) {
+        throw new CindySourceContractError('INVALID_INPUT', '无 thread/reply 上下文只能从明确主人证据开始回读。');
+      }
     }
   }
 }
@@ -520,7 +644,6 @@ export function saveCindySources(
   validateInput(input);
   const requestHash = sha256(stableJson(canonicalSaveRequest(input)));
   const normalizedByRef = new Map(input.sources.map((source) => [source.client_ref, normalizeSource(auth, source)]));
-  validateContextBounds(input, normalizedByRef);
   return database.transaction(() => {
     const replay = database.raw.prepare(
       `SELECT request_hash, response_map_json FROM cindy_save_request
@@ -550,6 +673,7 @@ export function saveCindySources(
     const outputByRef = new Map<string, CindySavedSource>();
     const replayItems = new Map<string, ReplayMapItem>();
     const externalRelationTargets = new Map<string, SourceRevisionRow>();
+    const externalContexts = new Map<string, SourceRevisionRow[]>();
 
     for (const source of input.sources) {
       const normalized = normalizedByRef.get(source.client_ref)!;
@@ -561,9 +685,11 @@ export function saveCindySources(
           const target = externalRelationTargets.get(receipt) ?? resolveReceiptRow(database, auth, receipt);
           assertRelationContext(normalized, target);
           externalRelationTargets.set(receipt, target);
+          externalContexts.set(receipt, externalContexts.get(receipt) ?? externalReceiptContext(database, auth, target));
         }
       }
     }
+    validateContextBounds(input, normalizedByRef, externalContexts);
 
     for (const clientRef of topologicalClientRefs(input.sources)) {
       const source = byRef.get(clientRef)!;

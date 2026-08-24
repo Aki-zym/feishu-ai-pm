@@ -527,8 +527,22 @@ describe('Cindy 对话入库接口', () => {
     }));
     expect((await saveSources(app, { save_request_id: 'save-plain-too-many', sources: unthreaded })).statusCode).toBe(400);
     expect((await saveSources(app, {
+      save_request_id: 'save-thread-does-not-upgrade-plain',
+      sources: [
+        trustedSource({ client_ref: 'one-thread', stable_message_id: 'one-thread', thread_id: 'separate-thread' }),
+        ...unthreaded.map((item, index) => ({ ...item, client_ref: `mixed-${index}`, stable_message_id: `mixed-message-${index}` })),
+      ],
+    })).statusCode).toBe(400);
+    expect((await saveSources(app, {
       save_request_id: 'save-plain-no-owner-evidence',
       sources: [trustedSource({ stable_message_id: 'plain-no-evidence', mentioned_owner: false, sender_is_owner: false, reactions: [] })],
+    })).statusCode).toBe(400);
+    expect((await saveSources(app, {
+      save_request_id: 'save-plain-before-owner-evidence',
+      sources: [
+        trustedSource({ client_ref: 'before-evidence', stable_message_id: 'before-evidence', occurred_at: '2026-08-24T00:00:00.000Z', mentioned_owner: false, sender_is_owner: false, reactions: [] }),
+        trustedSource({ client_ref: 'owner-evidence', stable_message_id: 'owner-evidence', occurred_at: '2026-08-24T00:01:00.000Z' }),
+      ],
     })).statusCode).toBe(400);
     expect((await saveSources(app, {
       save_request_id: 'save-plain-too-old',
@@ -544,6 +558,25 @@ describe('Cindy 对话入库接口', () => {
       occurred_at: `2026-08-24T00:${String(index % 60).padStart(2, '0')}:00.000Z`,
     }));
     expect((await saveSources(app, { save_request_id: 'save-thread-too-many', sources: threaded })).statusCode).toBe(400);
+    const separateThreads = Array.from({ length: 120 }, (_, index) => trustedSource({
+      client_ref: `separate-${index}`,
+      stable_message_id: `separate-message-${index}`,
+      thread_id: index < 60 ? 'thread-a' : 'thread-b',
+      occurred_at: `2026-08-24T00:${String(index % 60).padStart(2, '0')}:00.000Z`,
+    }));
+    expect((await saveSources(app, { save_request_id: 'save-separate-threads', sources: separateThreads })).statusCode).toBe(200);
+    const crossBatchRoot = await saveSources(app, {
+      save_request_id: 'save-cross-batch-time-root',
+      sources: [trustedSource({ stable_message_id: 'cross-batch-time-root', thread_id: 'cross-batch-time', occurred_at: '2026-08-24T00:00:00.000Z' })],
+    });
+    expect(crossBatchRoot.statusCode).toBe(200);
+    expect((await saveSources(app, {
+      save_request_id: 'save-cross-batch-time-reply',
+      sources: [trustedSource({
+        stable_message_id: 'cross-batch-time-reply', thread_id: 'cross-batch-time', occurred_at: '2026-08-24T04:00:00.001Z',
+        relations: [{ kind: 'reply_to', source_receipt: crossBatchRoot.json().sources[0].source_receipt }],
+      })],
+    })).statusCode).toBe(400);
     expect((await saveSources(app, {
       save_request_id: 'save-thread-too-old',
       sources: [
@@ -551,7 +584,7 @@ describe('Cindy 对话入库接口', () => {
         trustedSource({ client_ref: 'thread-late', stable_message_id: 'thread-late', thread_id: 'old-thread', occurred_at: '2026-08-24T04:00:00.001Z' }),
       ],
     })).statusCode).toBe(400);
-    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get()).toEqual({ count: 0 });
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get()).toEqual({ count: 121 });
   });
 
   it('主人私人候选和任务来源显示安全 display name，响应不泄露技术 ID、receipt 或正文', async () => {
