@@ -105,6 +105,51 @@ describe('Cindy 对话入库接口', () => {
     expect(invalid.statusCode).toBe(400);
   });
 
+  it('入库窗口游标默认为空，仅允许 loopback，并且 PUT 只保留最晚时间', async () => {
+    const { app, database } = await makeApp();
+    const initial = await app.inject({ method: 'GET', url: '/api/runtime/intake-cursor', remoteAddress: '127.0.0.1' });
+    expect(initial.statusCode).toBe(200);
+    expect(initial.json()).toEqual({ window_end: null });
+
+    const first = await app.inject({
+      method: 'PUT',
+      url: '/api/runtime/intake-cursor',
+      remoteAddress: '127.0.0.1',
+      payload: { window_end: '2026-08-24T00:10:00.000Z' },
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toEqual({ window_end: '2026-08-24T00:10:00.000Z' });
+
+    const same = await app.inject({
+      method: 'PUT',
+      url: '/api/runtime/intake-cursor',
+      remoteAddress: '127.0.0.1',
+      payload: { window_end: '2026-08-24T00:10:00.000Z' },
+    });
+    expect(same.statusCode).toBe(409);
+    expect(same.json()).toMatchObject({ error: '入库窗口游标只允许向前推进。' });
+    const earlier = await app.inject({
+      method: 'PUT',
+      url: '/api/runtime/intake-cursor',
+      remoteAddress: '127.0.0.1',
+      payload: { window_end: '2026-08-24T00:09:00.000Z' },
+    });
+    expect(earlier.statusCode).toBe(409);
+    expect(earlier.json()).toMatchObject({ error: '入库窗口游标只允许向前推进。' });
+
+    const remoteGet = await app.inject({ method: 'GET', url: '/api/runtime/intake-cursor', remoteAddress: '203.0.113.10' });
+    expect(remoteGet.statusCode).toBe(403);
+    const remotePut = await app.inject({
+      method: 'PUT',
+      url: '/api/runtime/intake-cursor',
+      remoteAddress: '203.0.113.10',
+      payload: { window_end: '2026-08-24T00:11:00.000Z' },
+    });
+    expect(remotePut.statusCode).toBe(403);
+    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'intake_window_end'").get())
+      .toEqual({ value_json: '{"window_end":"2026-08-24T00:10:00.000Z"}' });
+  });
+
   it('任务快照包含 pending 候选和会话游标，无会话来源不生成 source 或游标', async () => {
     const { app, database } = await makeApp();
     const response = await app.inject({
@@ -131,6 +176,8 @@ describe('Cindy 对话入库接口', () => {
       },
     });
     expect(response.statusCode).toBe(200);
+    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'intake_window_end'").get())
+      .toEqual({ value_json: '{"window_end":"2026-08-24T00:10:00.000Z"}' });
 
     const snapshot = await app.inject({
       method: 'GET',
@@ -232,6 +279,25 @@ describe('Cindy 对话入库接口', () => {
     expect((database.raw.prepare('SELECT COUNT(*) AS count FROM task').get() as { count: number }).count).toBe(0);
     expect((database.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get() as { count: number }).count).toBe(0);
     expect((database.raw.prepare('SELECT COUNT(*) AS count FROM correction_event').get() as { count: number }).count).toBe(1);
+  });
+
+  it('成功提交空窗口时也推进 intake_window_end', async () => {
+    const { app, database } = await makeApp();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/intake',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        window_id: 'window-20260824-empty',
+        window_start: '2026-08-24T00:00:00.000Z',
+        window_end: '2026-08-24T00:10:00.000Z',
+        sources: [],
+        proposals: [],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'intake_window_end'").get())
+      .toEqual({ value_json: '{"window_end":"2026-08-24T00:10:00.000Z"}' });
   });
 
   it('update_task 使用 expected_version CAS，冲突时不写入来源或任务', async () => {

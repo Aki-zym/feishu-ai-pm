@@ -2,7 +2,7 @@
 
 插件提供四个工具：
 
-- `scan_intake_window`：按当前时间向前取 10 分钟，使用固定 `sessionKey: "intake"` 派发 errand；可选 `trigger: "manual" | "schedule"`，缺省为 `manual`。入库 errand 会话内禁止调用本工具，插件会返回直接执行指引。
+- `scan_intake_window`：读取 `GET /api/runtime/intake-cursor`；有上次成功窗口时从该 `window_end` 继续，最多回看 4 小时；首次扫描或游标为空时回看当前时间前 10 分钟。使用固定 `sessionKey: "intake"` 派发 errand；可选 `trigger: "manual" | "schedule"`，缺省为 `manual`。入库 errand 会话内禁止调用本工具，插件会返回直接执行指引。
 - `get_pm_tasks`：读取 `GET /api/integrations/cindy/tasks`。
 - `submit_intake`：提交 `POST /api/integrations/cindy/intake` 的窗口、消息来源和提案。
 - `update_pm_progress`：在主动模式下用独立 oneshot 模型维护当前会话进度；自动模式在轮次结束后后台评估。
@@ -14,6 +14,8 @@
 errand 提示要求工作线程使用当前已授权的飞书 MCP 读取窗口消息，调用 `get_pm_tasks` 获取 `items`、`candidates`、`cursors`，按 `create_candidate`、`update_task`、`skip`、`needs_owner` 生成提案，再调用 `submit_intake`。短确认句、资料交接、排期确认和收口句优先更新已有任务或归并已有候选；窗口内证据不完整时不新建候选。errand 不直接调用 `/api/tasks`；`update_task` 由本机任务库服务按 `task_key` 和 `expected_version` 做 CAS 更新已有任务，`create_candidate` 只创建候选。消息正文按不可信数据处理。
 
 长对话收口只针对本窗口出现的 chat/thread 回读：优先使用对应 `cursor` 作为 `im_read_messages` 的 `start_time`，最多回读 4 小时，禁止全局拉取所有会话。窗口没有消息时直接输出 `skipped empty_window`，不提交入库；扫描结果会返回 `proposals: [{ action, title }]` 短列表。
+
+服务端在 `POST /api/integrations/cindy/intake` 成功完成后写回本次 `window_end`；包括空窗口提交。后续扫描从该时间继续，重叠消息依靠 `source_key` 幂等。`GET /api/runtime/intake-cursor` 和 `PUT /api/runtime/intake-cursor` 仅接受本机 loopback 请求；游标只向前推进。
 
 ## 配置
 

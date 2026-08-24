@@ -259,6 +259,21 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
     if (!body.success) return reply.code(400).send({ error: '自动扫描开关需要布尔值 enabled。' });
     return service.updateAutoScanSettings(body.data.enabled);
   });
+  app.get('/api/runtime/intake-cursor', async (request, reply) => {
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: '入库窗口游标只接受本机请求。' });
+    return service.intakeWindowCursor();
+  });
+  app.put('/api/runtime/intake-cursor', async (request, reply) => {
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: '入库窗口游标只接受本机请求。' });
+    const body = z.object({ window_end: z.string().datetime({ offset: true }) }).strict().safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: '入库窗口游标需要有效的 window_end。' });
+    try {
+      return service.updateIntakeWindowCursor(body.data.window_end);
+    } catch (error) {
+      const status = error instanceof CindyIntakeConflictError ? 409 : 400;
+      return reply.code(status).send({ error: error instanceof Error ? error.message : '入库窗口游标更新失败。' });
+    }
+  });
   registerSeedIntakeRoute(app, service);
   app.get('/api/dashboard', async () => dashboardDtoSchema.parse(service.dashboard()));
   app.get('/api/calendar', async () => service.calendar());

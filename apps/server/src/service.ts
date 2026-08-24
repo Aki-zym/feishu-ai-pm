@@ -2869,6 +2869,49 @@ export class PmService {
     return this.autoScanSettings();
   }
 
+  intakeWindowCursor() {
+    const row = this.database.raw.prepare(
+      "SELECT value_json FROM app_setting WHERE key = 'intake_window_end'",
+    ).get() as { value_json: string } | undefined;
+    const value = parseMetadata(row?.value_json);
+    const windowEnd = typeof value.window_end === 'string' && Number.isFinite(Date.parse(value.window_end))
+      ? new Date(value.window_end).toISOString()
+      : null;
+    return { window_end: windowEnd };
+  }
+
+  updateIntakeWindowCursor(windowEnd: string) {
+    const next = new Date(windowEnd);
+    if (!Number.isFinite(next.getTime())) throw new CindyIntakeValidationError('window_end 不是有效时间。');
+    const nextIso = next.toISOString();
+    const current = this.intakeWindowCursor().window_end;
+    if (current && Date.parse(nextIso) <= Date.parse(current)) {
+      throw new CindyIntakeConflictError('入库窗口游标只允许向前推进。');
+    }
+    const timestamp = nowIso();
+    this.database.raw.prepare(
+      `INSERT INTO app_setting (key, value_json, updated_at) VALUES ('intake_window_end', ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+    ).run(JSON.stringify({ window_end: nextIso }), timestamp);
+    return { window_end: nextIso };
+  }
+
+  private advanceIntakeWindowCursorUnsafe(windowEnd: string, updatedAt: string) {
+    const next = new Date(windowEnd);
+    if (!Number.isFinite(next.getTime())) throw new CindyIntakeValidationError('window_end 不是有效时间。');
+    const nextIso = next.toISOString();
+    const row = this.database.raw.prepare(
+      "SELECT value_json FROM app_setting WHERE key = 'intake_window_end'",
+    ).get() as { value_json: string } | undefined;
+    const currentValue = parseMetadata(row?.value_json).window_end;
+    const currentTime = typeof currentValue === 'string' ? Date.parse(currentValue) : Number.NaN;
+    if (Number.isFinite(currentTime) && currentTime >= next.getTime()) return;
+    this.database.raw.prepare(
+      `INSERT INTO app_setting (key, value_json, updated_at) VALUES ('intake_window_end', ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+    ).run(JSON.stringify({ window_end: nextIso }), updatedAt);
+  }
+
   updateAutomationPolicy(mode: AutomationMode) {
     const timestamp = nowIso();
     this.database.raw.prepare(
@@ -14070,6 +14113,7 @@ export class PmService {
             SET cursor = ?, last_success_at = ?, updated_at = ?
           WHERE integration = 'cindy_intake' AND scope_key = ?`,
       ).run(JSON.stringify(storedResult), timestamp, timestamp, input.window_id);
+      this.advanceIntakeWindowCursorUnsafe(input.window_end, timestamp);
       for (const [conversationKey, occurredAt] of conversationCursors) {
         this.database.advanceCindyConversationCursor(conversationKey, occurredAt, timestamp);
       }

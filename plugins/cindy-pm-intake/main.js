@@ -1,4 +1,5 @@
 const INTAKE_WINDOW_MS = 10 * 60 * 1000;
+const MAX_INTAKE_LOOKBACK_MS = 4 * 60 * 60 * 1000;
 const MAX_WINDOW_ID = 200;
 const MAX_SOURCE_TEXT = 12000;
 const MAX_PROPOSAL_TEXT = 2000;
@@ -101,14 +102,22 @@ async function pmRequest(method, path, body) {
   return response.result;
 }
 
-function createWindow() {
-  const endMs = Date.now();
-  const startMs = endMs - INTAKE_WINDOW_MS;
+function createWindow(cursorEnd = null, endMs = Date.now()) {
+  const cursorMs = typeof cursorEnd === 'string' ? Date.parse(cursorEnd) : Number.NaN;
+  const maxLookbackStartMs = endMs - MAX_INTAKE_LOOKBACK_MS;
+  const startMs = Number.isFinite(cursorMs)
+    ? Math.max(Math.min(cursorMs, endMs), maxLookbackStartMs)
+    : endMs - INTAKE_WINDOW_MS;
   return {
     window_id: `intake-${startMs}-${endMs}`.slice(0, MAX_WINDOW_ID),
     window_start: new Date(startMs).toISOString(),
     window_end: new Date(endMs).toISOString(),
   };
+}
+
+async function intakeWindowCursor() {
+  const result = await pmRequest('GET', '/api/runtime/intake-cursor');
+  return result && typeof result.window_end === 'string' ? result.window_end : null;
 }
 
 function isIntakeSessionValue(value) {
@@ -776,17 +785,19 @@ async function handleToolCall(msg) {
     if (trigger !== 'manual' && trigger !== 'schedule') {
       throw new Error('scan_intake_window 的 trigger 只能是 manual 或 schedule');
     }
-    const window = createWindow();
+    const fallbackWindow = createWindow();
     if (isInsideIntakeErrand(msg.args)) {
       cindy.send({
         type: 'tool-result',
         callId: msg.callId,
         ok: true,
-        result: directIntakeInstruction(window, 'already_in_intake_errand'),
+        result: directIntakeInstruction(fallbackWindow, 'already_in_intake_errand'),
       });
       return;
     }
     await ensurePm();
+    const cursorEnd = await intakeWindowCursor();
+    const window = createWindow(cursorEnd);
     if (trigger === 'schedule') {
       const autoScan = await pmRequest('GET', '/api/runtime/auto-scan');
       if (autoScan && autoScan.enabled === false) {
@@ -833,15 +844,17 @@ async function handleToolCall(msg) {
       throw new Error(result?.message || '任务入库 errand 未完成');
     }
     const errand = parseErrandResult(result.text);
+    const status = errand?.status || result.status || 'done';
+    const reason = errand?.reason || null;
     cindy.send({
       type: 'tool-result',
       callId: msg.callId,
       ok: true,
       result: {
         ...window,
-        status: errand?.status || result.status || 'done',
-        reason: errand?.reason || null,
-        summary: readableIntakeSummary(errand?.status || result.status || 'done', errand?.reason || null, errand?.proposals || []),
+        status,
+        reason,
+        summary: readableIntakeSummary(status, reason, errand?.proposals || []),
         model_summary: errand?.summary || '',
         proposals: errand?.proposals || [],
         job_id: result.jobId || null,

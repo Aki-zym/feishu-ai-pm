@@ -19,7 +19,7 @@ function waitFor(predicate, timeoutMs = 1000) {
   });
 }
 
-function setup({ errandText = '{"accepted":true}', errandResponse = null, errandError = null, autoScanEnabled = false, progressMode = 'manual', progressEnabled = true, progressModelText = '{"decision":"no_update","reason":"无变化","evidence":[]}' } = {}) {
+function setup({ errandText = '{"accepted":true}', errandResponse = null, errandError = null, autoScanEnabled = false, intakeWindowEnd = null, progressMode = 'manual', progressEnabled = true, progressModelText = '{"decision":"no_update","reason":"无变化","evidence":[]}' } = {}) {
   let onHostMessage;
   const nodeCalls = [];
   const sent = [];
@@ -37,6 +37,9 @@ function setup({ errandText = '{"accepted":true}', errandResponse = null, errand
           ok: true,
           result: { enabled: autoScanEnabled },
         };
+        if (request.params.path === '/api/runtime/intake-cursor') {
+          return { ok: true, result: { window_end: intakeWindowEnd } };
+        }
         if (request.params.path.includes('/bindings/')) return {
           ok: true,
           result: { binding: null },
@@ -126,7 +129,33 @@ test('scan_intake_window starts the fixed intake errand session and returns its 
   assert.equal(result.result.status, 'skipped');
   assert.equal(result.result.reason, 'empty_window');
   assert.deepEqual(JSON.parse(JSON.stringify(result.result.proposals)), []);
+  const firstWindowDuration = Date.parse(result.result.window_end) - Date.parse(result.result.window_start);
+  assert.ok(firstWindowDuration >= 10 * 60 * 1000);
+  assert.ok(firstWindowDuration < 10 * 60 * 1000 + 2000);
   assert.equal(nodeCalls[0].method, 'pm/ensure');
+  assert.equal(nodeCalls.some((call) => call.params?.path === '/api/runtime/intake-cursor'), true);
+});
+
+test('scan_intake_window starts after the last successful intake window end', async () => {
+  const cursor = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const { onHostMessage, errandCalls, sent } = setup({ intakeWindowEnd: cursor });
+  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-cursor', args: {} });
+  await waitFor(() => sent.some((message) => message.callId === 'call-cursor'));
+  assert.equal(errandCalls.length, 1);
+  assert.equal(errandCalls[0].context.window_start, cursor);
+  assert.equal(errandCalls[0].context.window_end, sent.find((message) => message.callId === 'call-cursor').result.window_end);
+});
+
+test('scan_intake_window caps an old intake cursor at four hours before now', async () => {
+  const cursor = new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString();
+  const { onHostMessage, errandCalls, sent } = setup({ intakeWindowEnd: cursor });
+  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-old-cursor', args: {} });
+  await waitFor(() => sent.some((message) => message.callId === 'call-old-cursor'));
+  const result = sent.find((message) => message.callId === 'call-old-cursor');
+  const startMs = Date.parse(errandCalls[0].context.window_start);
+  const endMs = Date.parse(result.result.window_end);
+  assert.ok(endMs - startMs >= 4 * 60 * 60 * 1000);
+  assert.ok(endMs - startMs < 4 * 60 * 60 * 1000 + 2000);
 });
 
 test('schedule scan skips the errand when the product auto-scan switch is disabled', async () => {
@@ -242,7 +271,7 @@ test('scan result uses human language for candidates, formal task updates, and e
 });
 
 test('ghost declares schedule support while retaining errand', () => {
-  assert.equal(ghost.version, '0.3.1');
+  assert.equal(ghost.version, '0.3.2');
   assert.equal(ghost.id, 'ai-pm-intake');
   assert.equal(ghost.name, 'TooManyTasks');
   assert.equal(ghost.launch, 'resident');
