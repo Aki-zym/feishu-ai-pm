@@ -3679,7 +3679,7 @@ const CINDY_CANDIDATE_APPEND_MIGRATION_SQL = Object.freeze([
       REFERENCES cindy_batch(owner_scope, account_anchor, batch_id) ON DELETE CASCADE
   );`,
   `INSERT INTO __migration_v12_cindy_owner_decision
-    SELECT id, owner_scope, account_anchor, batch_id, decision_key, decision_key,
+    SELECT id, owner_scope, account_anchor, batch_id, decision_key, 'legacy:' || substr(id, -36),
            reason_summary, options_json, status, version, resolution_action,
            resolution_request_id, resolution_payload_hash, resolution_response_json,
            resolved_candidate_id, last_error, created_at, updated_at, resolved_at
@@ -3740,6 +3740,68 @@ const CINDY_CANDIDATE_APPEND_MIGRATION_SQL = Object.freeze([
     WHERE snapshot.primary_disposition = 'group'
       AND batch_group.action = 'create_candidate'
       AND batch_group.candidate_id IS NOT NULL;`,
+  `UPDATE cindy_owner_decision AS decision
+      SET options_json = (
+        SELECT json_group_array(json(
+          CASE WHEN json_extract(option.value, '$.action') = 'append_candidate'
+            THEN json_set(
+              option.value,
+              '$.candidateVersion', (
+                SELECT candidate.version
+                  FROM candidate_request AS candidate
+                 WHERE candidate.id = json_extract(option.value, '$.candidateKey')
+                   AND candidate.state IN ('pending','snoozed')
+                   AND candidate.deleted_at IS NULL
+                   AND candidate.accepted_task_id IS NULL
+                   AND candidate.merged_into_candidate_id IS NULL
+                   AND EXISTS (
+                     SELECT 1 FROM cindy_candidate_source_consumption AS consumed
+                      WHERE consumed.candidate_id = candidate.id
+                        AND consumed.owner_scope = decision.owner_scope
+                        AND consumed.account_anchor = decision.account_anchor
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM cindy_candidate_source_consumption AS foreign_consumed
+                      WHERE foreign_consumed.candidate_id = candidate.id
+                        AND (foreign_consumed.owner_scope <> decision.owner_scope
+                          OR foreign_consumed.account_anchor <> decision.account_anchor)
+                   )
+              ),
+              '$.fieldEvidenceSourceIndexes', json_patch(
+                json_patch(
+                  json_patch('{}', CASE WHEN json_extract(option.value, '$.title') IS NOT NULL
+                    THEN json_object('title', json(COALESCE((
+                      SELECT json_group_array(source_order) FROM (
+                        SELECT source_order FROM cindy_owner_decision_source
+                         WHERE decision_id = decision.id ORDER BY source_order
+                      )
+                    ), '[]'))) ELSE '{}' END),
+                  CASE WHEN json_extract(option.value, '$.describe') IS NOT NULL
+                    THEN json_object('describe', json(COALESCE((
+                      SELECT json_group_array(source_order) FROM (
+                        SELECT source_order FROM cindy_owner_decision_source
+                         WHERE decision_id = decision.id ORDER BY source_order
+                      )
+                    ), '[]'))) ELSE '{}' END
+                ),
+                CASE WHEN json_extract(option.value, '$.nextStep') IS NOT NULL
+                  THEN json_object('next_step', json(COALESCE((
+                    SELECT json_group_array(source_order) FROM (
+                      SELECT source_order FROM cindy_owner_decision_source
+                       WHERE decision_id = decision.id ORDER BY source_order
+                    )
+                  ), '[]'))) ELSE '{}' END
+              )
+            )
+            ELSE option.value END
+        ))
+          FROM json_each(decision.options_json) AS option
+      )
+    WHERE decision.status = 'pending'
+      AND EXISTS (
+        SELECT 1 FROM json_each(decision.options_json)
+         WHERE json_extract(value, '$.action') = 'append_candidate'
+      );`,
   'CREATE INDEX IF NOT EXISTS idx_cindy_batch_snapshot_revision ON cindy_batch_snapshot(source_revision_id, owner_scope, batch_id);',
   'CREATE INDEX IF NOT EXISTS idx_cindy_owner_decision_status ON cindy_owner_decision(owner_scope, status, updated_at DESC);',
   'CREATE INDEX IF NOT EXISTS idx_cindy_owner_decision_source_revision ON cindy_owner_decision_source(source_revision_id, decision_id);',

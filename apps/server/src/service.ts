@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, renameSync, statfsSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { z } from 'zod';
@@ -1412,7 +1412,9 @@ function projectCindyOwnerDecision(row: CindyOwnerDecisionRow, sourceCount: numb
       describe: option.describe,
       next_step: option.nextStep,
       available: option.action !== 'append_candidate'
-        || (typeof option.candidateKey === 'string' && Number.isInteger(option.candidateVersion) && option.candidateVersion! >= 1),
+        || (typeof option.candidateKey === 'string'
+          && Number.isInteger(option.candidateVersion) && option.candidateVersion! >= 1
+          && option.fieldEvidenceSourceIndexes !== null && option.fieldEvidenceSourceIndexes !== undefined),
     })),
     source_count: sourceCount,
     last_attempt_failed: row.last_error !== null,
@@ -1440,23 +1442,40 @@ function cindyConversationKey(auth: CindyAuthContext, chatRef: string, threadRef
 }
 
 function encodeCindyContextCursor(auth: CindyAuthContext, kind: 'task' | 'candidate', updatedAt: string, rowId: string) {
-  const payload = Buffer.from(JSON.stringify({ kind, updatedAt, rowId }), 'utf8').toString('base64url');
-  return `${payload}.${cindyOpaqueKey(auth, 'cursor', payload)}`;
+  const key = createHmac('sha256', auth.receiptSecret)
+    .update(`cindy-context-cursor-v1\u0000${auth.ownerScope}\u0000${auth.accountAnchor}`, 'utf8')
+    .digest();
+  const nonce = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, nonce);
+  cipher.setAAD(Buffer.from(`cindy-context-cursor-v1\u0000${kind}\u0000${auth.ownerScope}\u0000${auth.accountAnchor}`, 'utf8'));
+  const encrypted = Buffer.concat([
+    cipher.update(JSON.stringify({ updatedAt, rowId }), 'utf8'),
+    cipher.final(),
+  ]);
+  return `ctx1_${Buffer.concat([nonce, cipher.getAuthTag(), encrypted]).toString('base64url')}`;
 }
 
 function decodeCindyContextCursor(auth: CindyAuthContext, kind: 'task' | 'candidate', cursor: string | undefined) {
   if (!cursor) return null;
-  const [payload, signature, extra] = cursor.split('.');
-  if (!payload || !signature || extra !== undefined || signature !== cindyOpaqueKey(auth, 'cursor', payload)) {
-    throw new CindySourceContractError('INVALID_INPUT', '上下文 cursor 无效或不属于当前认证上下文。');
-  }
   try {
-    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as Record<string, unknown>;
-    if (parsed.kind !== kind || typeof parsed.updatedAt !== 'string' || !Number.isFinite(Date.parse(parsed.updatedAt))
+    if (!cursor.startsWith('ctx1_')) throw new Error('invalid cursor version');
+    const bytes = Buffer.from(cursor.slice(5), 'base64url');
+    if (bytes.length <= 28) throw new Error('invalid cursor length');
+    const key = createHmac('sha256', auth.receiptSecret)
+      .update(`cindy-context-cursor-v1\u0000${auth.ownerScope}\u0000${auth.accountAnchor}`, 'utf8')
+      .digest();
+    const decipher = createDecipheriv('aes-256-gcm', key, bytes.subarray(0, 12));
+    decipher.setAAD(Buffer.from(`cindy-context-cursor-v1\u0000${kind}\u0000${auth.ownerScope}\u0000${auth.accountAnchor}`, 'utf8'));
+    decipher.setAuthTag(bytes.subarray(12, 28));
+    const parsed = JSON.parse(Buffer.concat([
+      decipher.update(bytes.subarray(28)),
+      decipher.final(),
+    ]).toString('utf8')) as Record<string, unknown>;
+    if (typeof parsed.updatedAt !== 'string' || !Number.isFinite(Date.parse(parsed.updatedAt))
       || typeof parsed.rowId !== 'string' || !parsed.rowId) throw new Error('invalid cursor');
     return { updatedAt: parsed.updatedAt, rowId: parsed.rowId };
   } catch {
-    throw new CindySourceContractError('INVALID_INPUT', '上下文 cursor 无法解析。');
+    throw new CindySourceContractError('INVALID_INPUT', '上下文 cursor 无效或不属于当前认证上下文。');
   }
 }
 
@@ -1477,6 +1496,28 @@ function loadCindyCandidateByKey(database: AppDatabase, auth: CindyAuthContext, 
         )`,
   ).all(auth.ownerScope, auth.accountAnchor, auth.ownerScope, auth.accountAnchor) as CandidateRow[];
   return rows.find((candidate) => cindyCandidateKey(auth, candidate.id) === candidateKey);
+}
+
+function loadLegacyCindyCandidateByInternalId(database: AppDatabase, auth: CindyAuthContext, candidateId: string) {
+  if (!/^cand_[0-9a-f-]{36}$/iu.test(candidateId)) return undefined;
+  return database.raw.prepare(
+    `SELECT candidate.* FROM candidate_request AS candidate
+      WHERE candidate.id = ?
+        AND candidate.demand_unit_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM cindy_candidate_source_consumption AS consumed
+           WHERE consumed.candidate_id = candidate.id
+             AND consumed.owner_scope = ? AND consumed.account_anchor = ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM cindy_candidate_source_consumption AS foreign_consumed
+           WHERE foreign_consumed.candidate_id = candidate.id
+             AND (foreign_consumed.owner_scope <> ? OR foreign_consumed.account_anchor <> ?)
+        )
+        AND candidate.state IN ('pending','snoozed')
+        AND candidate.deleted_at IS NULL AND candidate.accepted_task_id IS NULL
+        AND candidate.merged_into_candidate_id IS NULL`,
+  ).get(candidateId, auth.ownerScope, auth.accountAnchor, auth.ownerScope, auth.accountAnchor) as CandidateRow | undefined;
 }
 
 function loadProjectedCindyOwnerDecision(database: AppDatabase, decisionId: string): CindyOwnerDecisionDto {
@@ -14105,6 +14146,7 @@ export class PmService {
     batchId: string;
     groupKey: string;
     candidateKey: string;
+    trustedLegacyCandidateId?: string;
     expectedCandidateVersion: number;
     sourceReceipts: string[];
     patch: { title?: string; describe?: string; next_step?: string };
@@ -14140,7 +14182,9 @@ export class PmService {
       return { ...(JSON.parse(replay.response_json) as CindyAppendResult), duplicate: true };
     }
 
-    const candidate = loadCindyCandidateByKey(this.database, auth, input.candidateKey);
+    const candidate = input.trustedLegacyCandidateId
+      ? loadLegacyCindyCandidateByInternalId(this.database, auth, input.trustedLegacyCandidateId)
+      : loadCindyCandidateByKey(this.database, auth, input.candidateKey);
     if (!candidate) throw new CindySourceContractError('INVALID_INPUT', '候选不存在或不属于当前认证上下文。', 403);
     if (!['pending', 'snoozed'].includes(candidate.state) || candidate.accepted_task_id || candidate.deleted_at || candidate.merged_into_candidate_id) {
       throw new CindyIntakeConflictError('候选当前不可追加。', candidate.version);
@@ -14268,7 +14312,7 @@ export class PmService {
     ).run(candidate.id, auth.ownerScope, auth.accountAnchor, input.batchId, input.groupKey);
     const response = {
       append_request_id: input.appendRequestId,
-      candidate_key: input.candidateKey,
+      candidate_key: cindyCandidateKey(auth, candidate.id),
       version: nextVersion,
       source_count: input.entries.length,
       updated_at: input.timestamp,
@@ -14424,13 +14468,20 @@ export class PmService {
       || [...ownerDecisionByKey.keys()].some((key) => !usedOwnerDecisionKeys.has(key))) {
       throw new CindySourceContractError('INVALID_INPUT', 'owner_decisions 必须与 needs_owner primary 精确对应。');
     }
-    for (const decision of ownerDecisionByKey.values()) {
+    const ownerDecisionEffectiveGroupKeys = new Map<string, string>();
+    const usedEffectiveGroupKeys = new Set<string>();
+    for (const [decisionKey, decision] of ownerDecisionByKey) {
+      const effectiveGroupKey = decision.group_key ?? decisionKey;
       const optionKeys = decision.options.map((option) => option.option_key);
       if (!decision.reason.trim() || !decision.options.length || new Set(optionKeys).size !== optionKeys.length
         || optionKeys.some((key) => !cindyGroupKeyPattern.test(key))
-        || (decision.group_key !== undefined && (!cindyGroupKeyPattern.test(decision.group_key) || groupByKey.has(decision.group_key)))) {
+        || !cindyGroupKeyPattern.test(effectiveGroupKey)
+        || groupByKey.has(effectiveGroupKey)
+        || usedEffectiveGroupKeys.has(effectiveGroupKey)) {
         throw new CindySourceContractError('INVALID_INPUT', 'owner decision 原因或选项无效。');
       }
+      ownerDecisionEffectiveGroupKeys.set(decisionKey, effectiveGroupKey);
+      usedEffectiveGroupKeys.add(effectiveGroupKey);
       const decisionReceipts = new Set(input.primary_dispositions
         .filter((item) => item.disposition === 'needs_owner' && item.owner_decision_key === decision.decision_key)
         .map((item) => item.source_receipt));
@@ -14599,7 +14650,7 @@ export class PmService {
              status, version, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?)`,
         ).run(decisionId, auth.ownerScope, auth.accountAnchor, input.batch_id, decisionKey,
-          decision.group_key ?? decisionKey, reasonSummary,
+          ownerDecisionEffectiveGroupKeys.get(decisionKey)!, reasonSummary,
           serializedOptions.json, timestamp, timestamp);
         dispositions.forEach((disposition, index) => {
           const revision = revisionByReceipt.get(disposition.source_receipt)!;
@@ -14969,25 +15020,26 @@ export class PmService {
           ).run(candidateId, auth.ownerScope, auth.accountAnchor, row.batch_id, row.group_key);
         } else if (input.action === 'append_candidate') {
           promoteDecisionSourcesToGroup('append_candidate');
-          const candidate = loadCindyCandidateByKey(this.database, auth, option.candidateKey ?? '');
-          if (!candidate || option.candidateVersion === null) {
+          const isLegacyV11Append = row.group_key.startsWith('legacy:')
+            && typeof option.candidateKey === 'string'
+            && /^cand_[0-9a-f-]{36}$/iu.test(option.candidateKey);
+          const candidate = isLegacyV11Append
+            ? loadLegacyCindyCandidateByInternalId(this.database, auth, option.candidateKey!)
+            : loadCindyCandidateByKey(this.database, auth, option.candidateKey ?? '');
+          if (!candidate || !Number.isInteger(option.candidateVersion) || option.candidateVersion! < 1
+            || option.fieldEvidenceSourceIndexes === null || option.fieldEvidenceSourceIndexes === undefined) {
             throw new CindySourceContractError('CONFLICT', '主人选择的候选已不可追加。');
           }
           candidateId = candidate.id;
           const patchFields = (['title', 'describe', 'next_step'] as const)
             .filter((field) => (field === 'next_step' ? option.nextStep : option[field]) !== null);
           const storedEvidence = option.fieldEvidenceSourceIndexes;
-          if (storedEvidence !== null && Object.keys(storedEvidence)
+          if (Object.keys(storedEvidence)
             .some((field) => !patchFields.includes(field as typeof patchFields[number]))) {
             throw new CindySourceContractError('CONFLICT', '主人决定中的字段 evidence 已损坏。');
           }
           const fieldEvidence = Object.fromEntries(patchFields.map((field) => {
-            // v11 append intents predate explicit per-field evidence. Preserve
-            // their prior implicit all-source meaning while every v12 option
-            // persists and replays the Agent-declared source indexes.
-            const indexes = storedEvidence === null
-              ? sourceReceipts.map((_, index) => index)
-              : storedEvidence[field];
+            const indexes = storedEvidence[field];
             if (!indexes?.length || new Set(indexes).size !== indexes.length
               || indexes.some((index) => !Number.isInteger(index) || index < 0 || index >= sourceReceipts.length)) {
               throw new CindySourceContractError('CONFLICT', '主人决定中的字段 evidence 已损坏。');
@@ -14999,7 +15051,8 @@ export class PmService {
             batchId: row.batch_id,
             groupKey: row.group_key,
             candidateKey: option.candidateKey ?? '',
-            expectedCandidateVersion: option.candidateVersion,
+            trustedLegacyCandidateId: isLegacyV11Append ? candidate.id : undefined,
+            expectedCandidateVersion: option.candidateVersion!,
             sourceReceipts,
             patch: {
               title: option.title ?? undefined,

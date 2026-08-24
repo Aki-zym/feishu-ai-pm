@@ -171,6 +171,45 @@ describe('Cindy grouped batch contract', () => {
     expect(database.raw.prepare("SELECT COUNT(*) AS count FROM source_event_revision WHERE processing_status = 'skipped'").get()).toEqual({ count: 1 });
   });
 
+  it('owner decision effective group_key 对默认冲突和同批重复均整批 400', async () => {
+    const { app, database } = await makeApp();
+    const [groupReceipt, ownerReceipt] = await save(app, [source(31), source(32)], 'save-effective-group-conflict') as [string, string];
+    const omittedConflict = await submit(app, batch([groupReceipt, ownerReceipt], {
+      decision_request_id: 'decision-effective-omitted',
+      batch_id: 'batch-effective-omitted',
+      groups: [{
+        group_key: 'owner-conflict', action: 'create_candidate', anchor_receipt: groupReceipt,
+        field_evidence_receipts: [], title: '已有 group',
+      }],
+      primary_dispositions: [
+        { disposition_ref: 'group', source_receipt: groupReceipt, disposition: 'group', primary_group_key: 'owner-conflict' },
+        { disposition_ref: 'owner', source_receipt: ownerReceipt, disposition: 'needs_owner', owner_decision_key: 'owner-conflict' },
+      ],
+      owner_decisions: [{
+        decision_key: 'owner-conflict', reason: '默认 effective key 与已有 group 冲突。',
+        options: [{ option_key: 'skip', action: 'skip' }],
+      }],
+    }));
+    expect(omittedConflict.statusCode).toBe(400);
+
+    const [leftReceipt, rightReceipt] = await save(app, [source(33), source(34)], 'save-effective-group-duplicate') as [string, string];
+    const duplicateEffective = await submit(app, batch([leftReceipt, rightReceipt], {
+      decision_request_id: 'decision-effective-duplicate',
+      batch_id: 'batch-effective-duplicate',
+      primary_dispositions: [
+        { disposition_ref: 'left', source_receipt: leftReceipt, disposition: 'needs_owner', owner_decision_key: 'left-owner' },
+        { disposition_ref: 'right', source_receipt: rightReceipt, disposition: 'needs_owner', owner_decision_key: 'right-owner' },
+      ],
+      owner_decisions: [
+        { decision_key: 'left-owner', group_key: 'same-effective', reason: '左侧。', options: [{ option_key: 'skip-left', action: 'skip' }] },
+        { decision_key: 'right-owner', group_key: 'same-effective', reason: '右侧。', options: [{ option_key: 'skip-right', action: 'skip' }] },
+      ],
+    }));
+    expect(duplicateEffective.statusCode).toBe(400);
+    expect(database.raw.prepare("SELECT COUNT(*) AS count FROM cindy_batch WHERE batch_id LIKE 'batch-effective-%'").get())
+      .toEqual({ count: 0 });
+  });
+
   it('shared_context 只记录批次关系，不进入 secondary 候选来源；规范化重放不重复', async () => {
     const { app, database } = await makeApp();
     const receipts = await save(app, [source(1), source(2), source(3)]);
@@ -515,6 +554,11 @@ describe('Cindy grouped batch contract', () => {
       payload: { decision_request_id: 'resolve-retry-failed', expected_version: 1, action: 'create_candidate', option_key: 'create' },
     });
     expect(failed.statusCode).toBe(409);
+    expect(failed.json()).toMatchObject({
+      error: '主人决定执行失败，请刷新后重试。',
+      error_code: 'CONFLICT',
+    });
+    expect(JSON.stringify(failed.json())).not.toMatch(/CANARY_INTERNAL_OWNER_ERROR|CANARY_RAW_SQLITE_ERROR/u);
     expect(database.raw.prepare('SELECT status, version, last_error FROM cindy_owner_decision WHERE id = ?').get(retryDecisionId))
       .toMatchObject({ status: 'pending', version: 1, last_error: expect.any(String) });
     const retryList = await app.inject({ method: 'GET', url: '/api/owner-decisions?status=all' });
@@ -541,6 +585,38 @@ describe('Cindy grouped batch contract', () => {
         JOIN candidate_request AS candidate ON candidate.demand_unit_id = source.demand_unit_id
        WHERE candidate.id = ?`,
     ).get(candidateId)).toEqual(existingCandidateSources);
+
+    const appendSourceRevision = database.raw.prepare(
+      'SELECT source_revision_id FROM cindy_owner_decision_source WHERE decision_id = ?',
+    ).get(appendDecision.decision_id) as { source_revision_id: string };
+    database.raw.prepare("UPDATE source_event_revision SET processing_status = 'invalid' WHERE id = ?").run(appendSourceRevision.source_revision_id);
+    database.raw.exec(`CREATE TRIGGER fail_owner_list BEFORE UPDATE ON cindy_owner_decision
+      WHEN NEW.status = 'superseded'
+      BEGIN SELECT RAISE(ABORT, 'CANARY_RAW_SQLITE_ERROR'); END;`);
+    const failedList = await app.inject({ method: 'GET', url: '/api/owner-decisions?status=all' });
+    expect(failedList.statusCode).toBe(409);
+    expect(failedList.json()).toEqual({
+      error: '主人决定读取失败，请稍后重试。',
+      error_code: 'OWNER_DECISION_UNAVAILABLE',
+    });
+    expect(JSON.stringify(failedList.json())).not.toContain('CANARY_RAW_SQLITE_ERROR');
+    database.raw.exec('DROP TRIGGER fail_owner_list;');
+    database.raw.prepare("UPDATE source_event_revision SET processing_status = 'pending_decision' WHERE id = ?").run(appendSourceRevision.source_revision_id);
+
+    database.raw.exec(`CREATE TRIGGER fail_owner_cancel BEFORE UPDATE ON cindy_owner_decision
+      WHEN NEW.status = 'cancelled' AND NEW.id = '${appendDecision.decision_id}'
+      BEGIN SELECT RAISE(ABORT, 'CANARY_RAW_SQLITE_ERROR'); END;`);
+    const failedCancel = await app.inject({
+      method: 'POST', url: `/api/owner-decisions/${appendDecision.decision_id}/cancel`,
+      payload: { decision_request_id: 'cancel-owner-canary', expected_version: appendDecision.version },
+    });
+    expect(failedCancel.statusCode).toBe(409);
+    expect(failedCancel.json()).toEqual({
+      error: '主人决定取消失败，请刷新后重试。',
+      error_code: 'OWNER_DECISION_UNAVAILABLE',
+    });
+    expect(JSON.stringify(failedCancel.json())).not.toContain('CANARY_RAW_SQLITE_ERROR');
+    database.raw.exec('DROP TRIGGER fail_owner_cancel;');
   });
 
   it('磁盘 SQLite 双连接确定性覆盖 revision 先胜与 batch 先胜两种写入顺序', async () => {

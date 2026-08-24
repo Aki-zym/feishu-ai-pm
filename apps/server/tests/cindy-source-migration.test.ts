@@ -19,9 +19,11 @@ import {
 import { createCindyAdapters } from '../src/integrations.js';
 import { PmService } from '../src/service.js';
 
+const migrationAccountAnchorMaterial = 'migration-test-account-anchor';
+const migrationReceiptSecret = 'migration-test-receipt-secret-0123456789abcdef0123456789abcdef';
 const migrationAuth = deriveCindyAuthContext({
-  accountAnchor: 'migration-test-account-anchor',
-  receiptSecret: 'migration-test-receipt-secret-0123456789abcdef0123456789abcdef',
+  accountAnchor: migrationAccountAnchorMaterial,
+  receiptSecret: migrationReceiptSecret,
 });
 
 function seedLegacyV8Source(database: AppDatabase) {
@@ -60,6 +62,18 @@ async function buildAppFromDisk(
   const config = loadConfig({ NODE_ENV: 'test', DATABASE_URL: `file:${path}` });
   const service = new PmService(database, createCindyAdapters(config), config);
   return buildApp(service, { serveWeb: false });
+}
+
+async function buildCurrentCindyApp(path: string) {
+  const database = new AppDatabase(path, false);
+  const config = loadConfig({ NODE_ENV: 'test', DATABASE_URL: `file:${path}` });
+  const app = await buildApp(new PmService(database, createCindyAdapters(config), config), {
+    serveWeb: false,
+    cindyIntegrationToken: migrationToken,
+    cindyIntegrationAccountAnchor: migrationAccountAnchorMaterial,
+    cindyReceiptSecret: migrationReceiptSecret,
+  });
+  return { app, database };
 }
 
 describe('Cindy trusted source migrations', () => {
@@ -301,4 +315,248 @@ describe('Cindy trusted source migrations', () => {
     expect(recovered.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'v11-marker'").get()).toEqual({ value_json: '{"ok":true}' });
     recovered.close();
   });
+
+  it('真实 v11 pending append 冲突 key 迁移为稳定 legacy key，并以显式 evidence 原子恢复', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cindy-v11-append-recovery-'));
+    roots.push(root);
+    const path = join(root, 'pm.sqlite');
+    const v11 = new AppDatabase(path, false, { targetSchemaVersionForTest: 11 });
+    const fixture = seedV11PendingAppend(v11, 1, { conflictingGroup: true });
+    v11.close();
+
+    const { app, database } = await buildCurrentCindyApp(path);
+    const migrated = database.raw.prepare(
+      'SELECT group_key, options_json FROM cindy_owner_decision WHERE id = ?',
+    ).get(fixture.decisionId) as { group_key: string; options_json: string };
+    expect(migrated.group_key).toBe('legacy:00000000-0000-0000-0000-000000000001');
+    expect(migrated.group_key).not.toBe(fixture.decisionKey);
+    expect(JSON.parse(migrated.options_json)[0]).toMatchObject({
+      candidateKey: fixture.candidateId,
+      candidateVersion: 1,
+      fieldEvidenceSourceIndexes: { title: [0] },
+    });
+    expect(database.raw.prepare(
+      `SELECT revision.processing_status, identity.id AS identity_id
+         FROM cindy_owner_decision_source AS decision_source
+         JOIN source_event_revision AS revision ON revision.id = decision_source.source_revision_id
+         LEFT JOIN cindy_source_identity AS identity ON identity.current_revision_id = revision.id
+          AND identity.owner_scope = ? AND identity.account_anchor = ? AND identity.state = 'active'
+        WHERE decision_source.decision_id = ?`,
+    ).get(migrationAuth.ownerScope, migrationAuth.accountAnchor, fixture.decisionId)).toEqual({
+      processing_status: 'pending_decision', identity_id: expect.any(String),
+    });
+    const listed = await app.inject({
+      method: 'GET', url: '/api/owner-decisions?status=pending',
+      headers: { authorization: `Bearer ${migrationToken}` },
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json().items[0].options[0]).toMatchObject({ action: 'append_candidate', available: true });
+    expect(JSON.stringify(listed.json())).not.toContain(fixture.candidateId);
+    const resolved = await app.inject({
+      method: 'POST', url: `/api/owner-decisions/${fixture.decisionId}/resolve`,
+      headers: { authorization: `Bearer ${migrationToken}` },
+      payload: {
+        decision_request_id: 'resolve-v11-append-01', expected_version: 1,
+        action: 'append_candidate', option_key: 'append', append_request_id: 'append-v11-01',
+      },
+    });
+    expect(resolved.statusCode).toBe(200);
+    expect(resolved.json()).toMatchObject({ status: 'resolved', resolution_action: 'append_candidate', version: 2 });
+    expect(database.raw.prepare('SELECT title, version FROM candidate_request WHERE id = ?').get(fixture.candidateId))
+      .toEqual({ title: '迁移后候选 01', version: 2 });
+    expect(database.raw.prepare(
+      "SELECT field_name, source_revision_id FROM cindy_append_field_evidence WHERE append_request_id = 'append-v11-01'",
+    ).all()).toEqual([{ field_name: 'title', source_revision_id: fixture.pendingRevisionId }]);
+    await app.close();
+    database.close();
+  });
+
+  it('真实 v11 pending append 对跨 owner、旧 revision 和候选版本变化保持 fail closed', async () => {
+    const foreignAuth = deriveCindyAuthContext({
+      accountAnchor: 'migration-foreign-account-anchor',
+      receiptSecret: 'migration-foreign-receipt-secret-0123456789abcdef',
+    });
+    const scenarios: Array<{
+      index: number;
+      seedOptions?: Parameters<typeof seedV11PendingAppend>[2];
+      mutate?: (database: AppDatabase, fixture: ReturnType<typeof seedV11PendingAppend>) => void;
+      expectedStatus: 'pending' | 'superseded';
+      expectedCode: number;
+    }> = [
+      { index: 2, seedOptions: { candidateAuth: foreignAuth }, expectedStatus: 'pending', expectedCode: 409 },
+      {
+        index: 3,
+        mutate: (database, fixture) => {
+          saveCindySources(database, migrationAuth, {
+            save_request_id: 'save-v11-pending-03-revision-2',
+            sources: [{
+              client_ref: 'pending-03-new', provider: 'synthetic', source_kind: 'synthetic_message',
+              stable_message_id: fixture.pendingStableId, occurred_at: '2026-08-24T03:03:00.000Z',
+              sender_id: 'pending-sender-03', display_name: '迁移需求方', chat_id: 'v11-chat-03',
+              thread_id: 'v11-thread-03', mentioned_owner: true, sender_is_owner: false,
+              message_type: 'text', text: '迁移追加 03 已编辑', revision: { sequence: 2 },
+            }],
+          });
+        },
+        expectedStatus: 'superseded', expectedCode: 409,
+      },
+      {
+        index: 4,
+        mutate: (database, fixture) => {
+          database.raw.prepare('UPDATE candidate_request SET version = version + 1 WHERE id = ?').run(fixture.candidateId);
+        },
+        expectedStatus: 'pending', expectedCode: 409,
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const root = mkdtempSync(join(tmpdir(), `cindy-v11-append-reject-${scenario.index}-`));
+      roots.push(root);
+      const path = join(root, 'pm.sqlite');
+      const v11 = new AppDatabase(path, false, { targetSchemaVersionForTest: 11 });
+      const fixture = seedV11PendingAppend(v11, scenario.index, scenario.seedOptions);
+      v11.close();
+      const migrated = new AppDatabase(path, false);
+      scenario.mutate?.(migrated, fixture);
+      migrated.close();
+      const { app, database } = await buildCurrentCindyApp(path);
+      const rejected = await app.inject({
+        method: 'POST', url: `/api/owner-decisions/${fixture.decisionId}/resolve`,
+        headers: { authorization: `Bearer ${migrationToken}` },
+        payload: {
+          decision_request_id: `resolve-v11-append-${scenario.index}`, expected_version: 1,
+          action: 'append_candidate', option_key: 'append', append_request_id: `append-v11-${scenario.index}`,
+        },
+      });
+      expect(rejected.statusCode).toBe(scenario.expectedCode);
+      expect(database.raw.prepare('SELECT status FROM cindy_owner_decision WHERE id = ?').get(fixture.decisionId))
+        .toEqual({ status: scenario.expectedStatus });
+      expect(database.raw.prepare('SELECT COUNT(*) AS count FROM cindy_append_request WHERE owner_decision_id = ?').get(fixture.decisionId))
+        .toEqual({ count: 0 });
+      expect(database.raw.prepare('SELECT processing_status FROM source_event_revision WHERE id = ?').get(fixture.pendingRevisionId))
+        .toMatchObject({ processing_status: scenario.expectedStatus === 'superseded' ? 'superseded' : 'pending_decision' });
+      await app.close();
+      database.close();
+    }
+  });
 });
+const migrationToken = 'migration-test-bearer-token';
+
+function seedV11PendingAppend(database: AppDatabase, index: number, options: {
+  candidateAuth?: typeof migrationAuth;
+  conflictingGroup?: boolean;
+} = {}) {
+  const candidateAuth = options.candidateAuth ?? migrationAuth;
+  const suffix = String(index).padStart(2, '0');
+  const timestamp = `2026-08-24T03:${suffix}:00.000Z`;
+  saveCindySources(database, candidateAuth, {
+    save_request_id: `save-v11-candidate-${suffix}`,
+    sources: [{
+      client_ref: `candidate-${suffix}`, provider: 'synthetic', source_kind: 'synthetic_message',
+      stable_message_id: `v11-candidate-message-${suffix}`, occurred_at: timestamp,
+      sender_id: `candidate-sender-${suffix}`, display_name: '迁移需求方', chat_id: `v11-chat-${suffix}`,
+      thread_id: `v11-thread-${suffix}`, mentioned_owner: true, sender_is_owner: false,
+      message_type: 'text', text: `旧候选 ${suffix}`, revision: { sequence: 1 },
+    }],
+  });
+  const candidateRevisionRow = database.raw.prepare(
+    `SELECT revision.id, revision.source_event_id, revision.revision_hash
+       FROM source_event_revision AS revision
+       JOIN source_event AS source ON source.id = revision.source_event_id
+      WHERE source.content = ?`,
+  ).get(`旧候选 ${suffix}`) as { id: string; source_event_id: string; revision_hash: string };
+  const candidateId = `cand_00000000-0000-0000-0000-0000000000${suffix}`;
+  const unitId = `unit-v11-${suffix}`;
+  database.raw.prepare(
+    `INSERT INTO source_demand_unit
+      (id, anchor_source_event_id, unit_key, unit_kind, state, classification_revision, ai_decision_id,
+       analysis_json, reason, created_at, updated_at)
+     VALUES (?, ?, ?, 'demand', 'ready', 'v11-fixture', NULL, '{}', 'v11 fixture', ?, ?)`,
+  ).run(unitId, candidateRevisionRow.source_event_id, `v11-unit-${suffix}`, timestamp, timestamp);
+  database.raw.prepare(
+    `INSERT INTO candidate_request
+      (id, source_event_id, demand_unit_id, title, proposer_name, background, validation_question, describe,
+       analysis_json, confidence, state, snoozed_until, accepted_task_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, '迁移需求方', '旧摘要', '继续确认', '旧摘要', '{}', 1, 'pending', NULL, NULL, ?, ?)`,
+  ).run(candidateId, candidateRevisionRow.source_event_id, unitId, `旧候选 ${suffix}`, timestamp, timestamp);
+  database.raw.prepare(
+    `INSERT INTO source_demand_unit_source
+      (demand_unit_id, source_event_id, source_key, source_role, sequence, created_at)
+     VALUES (?, ?, 'v11-anchor', 'anchor', 0, ?)`,
+  ).run(unitId, candidateRevisionRow.source_event_id, timestamp);
+  const createBatchId = `v11-create-${suffix}`;
+  database.raw.prepare(
+    `INSERT INTO cindy_batch
+      (owner_scope, account_anchor, batch_id, decision_request_id, payload_hash, snapshot_hash,
+       window_start, window_end, response_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?)`,
+  ).run(candidateAuth.ownerScope, candidateAuth.accountAnchor, createBatchId, `v11-create-request-${suffix}`,
+    'a'.repeat(64), 'b'.repeat(64), timestamp, timestamp, timestamp);
+  database.raw.prepare(
+    `INSERT INTO cindy_batch_group
+      (owner_scope, account_anchor, batch_id, group_key, action, anchor_revision_id, candidate_id, created_at)
+     VALUES (?, ?, ?, 'create', 'create_candidate', ?, ?, ?)`,
+  ).run(candidateAuth.ownerScope, candidateAuth.accountAnchor, createBatchId, candidateRevisionRow.id, candidateId, timestamp);
+  database.raw.prepare(
+    `INSERT INTO cindy_batch_snapshot
+      (owner_scope, account_anchor, batch_id, source_revision_id, revision_hash, disposition_ref,
+       primary_disposition, primary_group_key, created_at)
+     VALUES (?, ?, ?, ?, ?, 'create', 'group', 'create', ?)`,
+  ).run(candidateAuth.ownerScope, candidateAuth.accountAnchor, createBatchId, candidateRevisionRow.id, candidateRevisionRow.revision_hash, timestamp);
+  database.raw.prepare("UPDATE source_event_revision SET processing_status = 'processed' WHERE id = ?").run(candidateRevisionRow.id);
+
+  saveCindySources(database, migrationAuth, {
+    save_request_id: `save-v11-pending-${suffix}`,
+    sources: [{
+      client_ref: `pending-${suffix}`, provider: 'synthetic', source_kind: 'synthetic_message',
+      stable_message_id: `v11-pending-message-${suffix}`, occurred_at: timestamp,
+      sender_id: `pending-sender-${suffix}`, display_name: '迁移需求方', chat_id: `v11-chat-${suffix}`,
+      thread_id: `v11-thread-${suffix}`, mentioned_owner: true, sender_is_owner: false,
+      message_type: 'text', text: `迁移追加 ${suffix}`, revision: { sequence: 1 },
+    }],
+  });
+  const pendingRevision = database.raw.prepare(
+    `SELECT revision.id, revision.source_event_id, revision.revision_hash
+       FROM source_event_revision AS revision
+       JOIN source_event AS source ON source.id = revision.source_event_id
+      WHERE source.content = ?`,
+  ).get(`迁移追加 ${suffix}`) as { id: string; source_event_id: string; revision_hash: string };
+  const decisionBatchId = `v11-owner-${suffix}`;
+  const decisionKey = `owner-${suffix}`;
+  database.raw.prepare(
+    `INSERT INTO cindy_batch
+      (owner_scope, account_anchor, batch_id, decision_request_id, payload_hash, snapshot_hash,
+       window_start, window_end, response_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?)`,
+  ).run(migrationAuth.ownerScope, migrationAuth.accountAnchor, decisionBatchId, `v11-owner-request-${suffix}`,
+    'c'.repeat(64), 'd'.repeat(64), timestamp, timestamp, timestamp);
+  if (options.conflictingGroup) {
+    database.raw.prepare(
+      `INSERT INTO cindy_batch_group
+        (owner_scope, account_anchor, batch_id, group_key, action, anchor_revision_id, created_at)
+       VALUES (?, ?, ?, ?, 'create_candidate', ?, ?)`,
+    ).run(migrationAuth.ownerScope, migrationAuth.accountAnchor, decisionBatchId, decisionKey, pendingRevision.id, timestamp);
+  }
+  database.raw.prepare(
+    `INSERT INTO cindy_batch_snapshot
+      (owner_scope, account_anchor, batch_id, source_revision_id, revision_hash, disposition_ref,
+       primary_disposition, primary_group_key, created_at)
+     VALUES (?, ?, ?, ?, ?, 'owner', 'needs_owner', NULL, ?)`,
+  ).run(migrationAuth.ownerScope, migrationAuth.accountAnchor, decisionBatchId, pendingRevision.id, pendingRevision.revision_hash, timestamp);
+  const decisionId = `cindy_owner_decision_00000000-0000-0000-0000-0000000000${suffix}`;
+  database.raw.prepare(
+    `INSERT INTO cindy_owner_decision
+      (id, owner_scope, account_anchor, batch_id, decision_key, reason_summary, options_json,
+       status, version, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, '迁移 append 需要主人确认。', ?, 'pending', 1, ?, ?)`,
+  ).run(decisionId, migrationAuth.ownerScope, migrationAuth.accountAnchor, decisionBatchId, decisionKey,
+    JSON.stringify([{
+      optionKey: 'append', action: 'append_candidate', title: `迁移后候选 ${suffix}`,
+      describe: null, nextStep: null, candidateKey: candidateId,
+    }]), timestamp, timestamp);
+  database.raw.prepare(
+    `INSERT INTO cindy_owner_decision_source
+      (decision_id, source_revision_id, source_order, source_role) VALUES (?, ?, 0, 'anchor')`,
+  ).run(decisionId, pendingRevision.id);
+  return { candidateId, decisionId, decisionKey, pendingRevisionId: pendingRevision.id, pendingStableId: `v11-pending-message-${suffix}` };
+}

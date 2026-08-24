@@ -22,15 +22,15 @@ describe('Cindy candidate append contract', () => {
     for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
   });
 
-  async function makeApp(path = ':memory:') {
+  async function makeApp(path = ':memory:', auth: { token?: string; accountAnchor?: string; receiptSecret?: string } = {}) {
     const database = new AppDatabase(path, false);
     databases.push(database);
     const config = loadConfig({ NODE_ENV: 'test', DATABASE_URL: path === ':memory:' ? ':memory:' : `file:${path}` });
     const app = await buildApp(new PmService(database, createCindyAdapters(config), config), {
       serveWeb: false,
-      cindyIntegrationToken: token,
-      cindyIntegrationAccountAnchor: accountAnchor,
-      cindyReceiptSecret: receiptSecret,
+      cindyIntegrationToken: auth.token ?? token,
+      cindyIntegrationAccountAnchor: auth.accountAnchor ?? accountAnchor,
+      cindyReceiptSecret: auth.receiptSecret ?? receiptSecret,
     });
     apps.push(app);
     return { app, database };
@@ -369,7 +369,7 @@ describe('Cindy candidate append contract', () => {
   });
 
   it('get_pm_context 使用 owner scope、默认 20、cursor、确定性 query 与 receipts 派生会话过滤', async () => {
-    const { app } = await makeApp();
+    const { app, database } = await makeApp();
     const sources = Array.from({ length: 22 }, (_, index) => source(100 + index, `列表目标 ${String(index).padStart(2, '0')}`, index === 21 ? 'other-chat' : 'list-chat'));
     const receipts = await save(app, 'save-context-list', sources);
     const groups = receipts.map((receipt, index) => ({
@@ -390,12 +390,35 @@ describe('Cindy candidate append contract', () => {
     expect(first.statusCode).toBe(200);
     expect(first.json().candidates).toHaveLength(20);
     expect(first.json().next_candidate_cursor).toEqual(expect.any(String));
+    const internalIds = (database.raw.prepare('SELECT id FROM candidate_request').all() as Array<{ id: string }>).map((row) => row.id);
+    const serializedContext = JSON.stringify(first.json());
+    for (const internalId of internalIds) expect(serializedContext).not.toContain(internalId);
+    const cursorBytes = Buffer.from(String(first.json().next_candidate_cursor).slice(5), 'base64url').toString('utf8');
+    for (const internalId of internalIds) expect(cursorBytes).not.toContain(internalId);
     const second = await app.inject({
       method: 'POST', url: '/api/integrations/cindy/context', headers: { authorization: `Bearer ${token}` },
       payload: { candidate_cursor: first.json().next_candidate_cursor, candidate_limit: 50 },
     });
     expect(second.statusCode).toBe(200);
     expect(second.json().candidates).toHaveLength(2);
+    const candidateKeys = [...first.json().candidates, ...second.json().candidates]
+      .map((item: { candidate_key: string }) => item.candidate_key);
+    expect(new Set(candidateKeys).size).toBe(22);
+
+    const crossKind = await app.inject({
+      method: 'POST', url: '/api/integrations/cindy/context', headers: { authorization: `Bearer ${token}` },
+      payload: { task_cursor: first.json().next_candidate_cursor },
+    });
+    expect(crossKind.statusCode).toBe(400);
+    const foreign = await makeApp(':memory:', {
+      accountAnchor: 'foreign-context-account',
+      receiptSecret: 'foreign-context-receipt-secret-0123456789abcdef',
+    });
+    const crossOwner = await foreign.app.inject({
+      method: 'POST', url: '/api/integrations/cindy/context', headers: { authorization: `Bearer ${token}` },
+      payload: { candidate_cursor: first.json().next_candidate_cursor },
+    });
+    expect(crossOwner.statusCode).toBe(400);
     const queried = await app.inject({
       method: 'POST', url: '/api/integrations/cindy/context', headers: { authorization: `Bearer ${token}` }, payload: { query: '候选 07' },
     });

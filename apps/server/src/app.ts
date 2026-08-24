@@ -68,6 +68,19 @@ function candidateMutationError(error: unknown, fallback: string, current?: unkn
   }
   return { error: message, outcome: 'failure' as const };
 }
+
+function ownerDecisionHttpError(error: unknown, fallback: string) {
+  const payload: Record<string, unknown> = {
+    error: fallback,
+    error_code: error instanceof CindySourceContractError || error instanceof CindyIntakeConflictError
+      ? error.errorCode
+      : error instanceof z.ZodError ? 'INVALID_INPUT' : 'OWNER_DECISION_UNAVAILABLE',
+  };
+  if (error instanceof CindyIntakeConflictError && error.currentVersion !== null) {
+    payload.current_version = error.currentVersion;
+  }
+  return payload;
+}
 const risks = ['low', 'medium', 'high'] as const;
 
 export type BuildAppOptions = {
@@ -472,7 +485,21 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
           shared_group_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
         }).strict()).max(500).optional(),
         owner_decisions: z.array(ownerDecision).max(100).optional(),
-      }).strict().parse(request.body);
+      }).strict().superRefine((value, context) => {
+        const groupKeys = new Set(value.groups.map((group) => group.group_key));
+        const effectiveOwnerGroupKeys = new Set<string>();
+        for (const [index, decision] of (value.owner_decisions ?? []).entries()) {
+          const effectiveGroupKey = decision.group_key ?? decision.decision_key;
+          if (groupKeys.has(effectiveGroupKey) || effectiveOwnerGroupKeys.has(effectiveGroupKey)) {
+            context.addIssue({
+              code: 'custom',
+              path: ['owner_decisions', index, 'group_key'],
+              message: 'owner decision effective group_key 必须唯一且不得与已有 group 冲突。',
+            });
+          }
+          effectiveOwnerGroupKeys.add(effectiveGroupKey);
+        }
+      }).parse(request.body);
       return service.processCindyDecisions(cindyAuthContext(), body);
     } catch (error) {
       const status = error instanceof z.ZodError || error instanceof CindyIntakeValidationError ? 400
@@ -498,7 +525,7 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
       return service.listCindyOwnerDecisions(cindyAuthContext(), query.limit, query.status);
     } catch (error) {
       const status = error instanceof z.ZodError ? 400 : error instanceof CindySourceContractError ? error.statusCode : 409;
-      return reply.code(status).send({ error: error instanceof Error ? error.message : '主人决定读取失败。' });
+      return reply.code(status).send(ownerDecisionHttpError(error, '主人决定读取失败，请稍后重试。'));
     }
   });
   app.post('/api/owner-decisions/:decisionId/resolve', async (request, reply) => {
@@ -516,10 +543,7 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
       const status = error instanceof z.ZodError ? 400
         : error instanceof CindySourceContractError ? error.statusCode
           : error instanceof CindyIntakeConflictError ? 409 : 409;
-      const payload: Record<string, unknown> = { error: error instanceof Error ? error.message : '主人决定执行失败。' };
-      if (error instanceof CindyIntakeConflictError) payload.current_version = error.currentVersion;
-      if (error instanceof CindySourceContractError) payload.error_code = error.errorCode;
-      return reply.code(status).send(payload);
+      return reply.code(status).send(ownerDecisionHttpError(error, '主人决定执行失败，请刷新后重试。'));
     }
   });
   app.post('/api/owner-decisions/:decisionId/cancel', async (request, reply) => {
@@ -534,10 +558,7 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
       const status = error instanceof z.ZodError ? 400
         : error instanceof CindySourceContractError ? error.statusCode
           : error instanceof CindyIntakeConflictError ? 409 : 409;
-      const payload: Record<string, unknown> = { error: error instanceof Error ? error.message : '主人决定取消失败。' };
-      if (error instanceof CindyIntakeConflictError) payload.current_version = error.currentVersion;
-      if (error instanceof CindySourceContractError) payload.error_code = error.errorCode;
-      return reply.code(status).send(payload);
+      return reply.code(status).send(ownerDecisionHttpError(error, '主人决定取消失败，请刷新后重试。'));
     }
   });
   app.get('/api/owner-information', async () => service.ownerInformation());
