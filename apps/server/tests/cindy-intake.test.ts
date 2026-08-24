@@ -687,7 +687,7 @@ describe('Cindy 对话入库接口', () => {
       const detail = await app.inject({ method: 'GET', url: `/api/tasks/${accepted.json().task.id}` });
       expect(detail.statusCode).toBe(200);
       expect(privateSourceDtoSchema.parse(detail.json().sources[0]).display_name).toBe(expectedNames[index]);
-      expect(JSON.stringify(detail.json())).not.toContain(displayNames[index]);
+      expect(JSON.stringify(detail.json())).not.toMatch(/\[OBJECT\s+object\]|OU_Technical_Display_123|oc_technical_chat_456/iu);
     }
     const privateJson = JSON.stringify(candidates.json());
     expect(privateJson).not.toMatch(/\[OBJECT\s+object\]|OU_Technical_Display_123|oc_technical_chat_456/iu);
