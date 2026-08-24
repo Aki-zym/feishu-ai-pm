@@ -39,9 +39,17 @@ async function runBundle() {
   await execFileAsync(process.execPath, [bundleScript], { cwd: root, maxBuffer: 20 * 1024 * 1024 });
 }
 
+async function gitOutput(args) {
+  return (await execFileAsync('git', args, { cwd: root, maxBuffer: 20 * 1024 * 1024 })).stdout;
+}
+
+assert.equal(await gitOutput(['status', '--porcelain=v1', '--untracked-files=all']), '', 'bundle verification requires a clean committed HEAD');
 await runBundle();
 const first = await snapshot();
 await runBundle();
 const second = await snapshot();
 assert.deepEqual(second, first);
-console.log(`bundle reproducibility verified: ${first.size} generated files, LF-only text, identical hashes`);
+await gitOutput(['diff', '--exit-code']);
+await gitOutput(['diff', '--check']);
+assert.equal(await gitOutput(['status', '--porcelain=v1', '--untracked-files=all']), '', 'bundle generation changed the committed worktree');
+console.log(`bundle reproducibility verified against committed HEAD: ${first.size} generated files, LF-only text, identical hashes, clean worktree`);

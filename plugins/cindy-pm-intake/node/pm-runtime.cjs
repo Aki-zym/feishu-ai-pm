@@ -42927,7 +42927,7 @@ var require_extension = __commonJS({
 var require_websocket = __commonJS({
   "node_modules/ws/lib/websocket.js"(exports2, module2) {
     "use strict";
-    var EventEmitter = require("events"), https = require("https"), http = require("http"), net = require("net"), tls = require("tls"), { randomBytes: randomBytes2, createHash: createHash12 } = require("crypto"), { Duplex, Readable } = require("stream"), { URL: URL2 } = require("url"), PerMessageDeflate = require_permessage_deflate(), Receiver = require_receiver(), Sender = require_sender(), { isBlob } = require_validation3(), {
+    var EventEmitter = require("events"), https = require("https"), http = require("http"), net = require("net"), tls = require("tls"), { randomBytes: randomBytes3, createHash: createHash12 } = require("crypto"), { Duplex, Readable } = require("stream"), { URL: URL2 } = require("url"), PerMessageDeflate = require_permessage_deflate(), Receiver = require_receiver(), Sender = require_sender(), { isBlob } = require_validation3(), {
       BINARY_TYPES,
       CLOSE_TIMEOUT,
       EMPTY_BUFFER,
@@ -43313,7 +43313,7 @@ var require_websocket = __commonJS({
         emitErrorAndClose(websocket, err);
         return;
       }
-      let defaultPort = isSecure ? 443 : 80, key = randomBytes2(16).toString("base64"), request = isSecure ? https.request : http.request, protocolSet = /* @__PURE__ */ new Set(), perMessageDeflate;
+      let defaultPort = isSecure ? 443 : 80, key = randomBytes3(16).toString("base64"), request = isSecure ? https.request : http.request, protocolSet = /* @__PURE__ */ new Set(), perMessageDeflate;
       if (opts.createConnection = opts.createConnection || (isSecure ? tlsConnect : netConnect), opts.defaultPort = opts.defaultPort || defaultPort, opts.port = parsedUrl.port || defaultPort, opts.host = parsedUrl.hostname.startsWith("[") ? parsedUrl.hostname.slice(1, -1) : parsedUrl.hostname, opts.headers = {
         ...opts.headers,
         "Sec-WebSocket-Version": opts.protocolVersion,
@@ -148443,7 +148443,7 @@ var CINDY_GROUPED_BATCH_SCHEMA_CHECKSUM = cindyGroupedBatchSchemaChecksum(), CIN
       REFERENCES cindy_batch(owner_scope, account_anchor, batch_id) ON DELETE CASCADE
   );`,
   `INSERT INTO __migration_v12_cindy_owner_decision
-    SELECT id, owner_scope, account_anchor, batch_id, decision_key, decision_key,
+    SELECT id, owner_scope, account_anchor, batch_id, decision_key, 'legacy:' || substr(id, -36),
            reason_summary, options_json, status, version, resolution_action,
            resolution_request_id, resolution_payload_hash, resolution_response_json,
            resolved_candidate_id, last_error, created_at, updated_at, resolved_at
@@ -148504,6 +148504,68 @@ var CINDY_GROUPED_BATCH_SCHEMA_CHECKSUM = cindyGroupedBatchSchemaChecksum(), CIN
     WHERE snapshot.primary_disposition = 'group'
       AND batch_group.action = 'create_candidate'
       AND batch_group.candidate_id IS NOT NULL;`,
+  `UPDATE cindy_owner_decision AS decision
+      SET options_json = (
+        SELECT json_group_array(json(
+          CASE WHEN json_extract(option.value, '$.action') = 'append_candidate'
+            THEN json_set(
+              option.value,
+              '$.candidateVersion', (
+                SELECT candidate.version
+                  FROM candidate_request AS candidate
+                 WHERE candidate.id = json_extract(option.value, '$.candidateKey')
+                   AND candidate.state IN ('pending','snoozed')
+                   AND candidate.deleted_at IS NULL
+                   AND candidate.accepted_task_id IS NULL
+                   AND candidate.merged_into_candidate_id IS NULL
+                   AND EXISTS (
+                     SELECT 1 FROM cindy_candidate_source_consumption AS consumed
+                      WHERE consumed.candidate_id = candidate.id
+                        AND consumed.owner_scope = decision.owner_scope
+                        AND consumed.account_anchor = decision.account_anchor
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM cindy_candidate_source_consumption AS foreign_consumed
+                      WHERE foreign_consumed.candidate_id = candidate.id
+                        AND (foreign_consumed.owner_scope <> decision.owner_scope
+                          OR foreign_consumed.account_anchor <> decision.account_anchor)
+                   )
+              ),
+              '$.fieldEvidenceSourceIndexes', json_patch(
+                json_patch(
+                  json_patch('{}', CASE WHEN json_extract(option.value, '$.title') IS NOT NULL
+                    THEN json_object('title', json(COALESCE((
+                      SELECT json_group_array(source_order) FROM (
+                        SELECT source_order FROM cindy_owner_decision_source
+                         WHERE decision_id = decision.id ORDER BY source_order
+                      )
+                    ), '[]'))) ELSE '{}' END),
+                  CASE WHEN json_extract(option.value, '$.describe') IS NOT NULL
+                    THEN json_object('describe', json(COALESCE((
+                      SELECT json_group_array(source_order) FROM (
+                        SELECT source_order FROM cindy_owner_decision_source
+                         WHERE decision_id = decision.id ORDER BY source_order
+                      )
+                    ), '[]'))) ELSE '{}' END
+                ),
+                CASE WHEN json_extract(option.value, '$.nextStep') IS NOT NULL
+                  THEN json_object('next_step', json(COALESCE((
+                    SELECT json_group_array(source_order) FROM (
+                      SELECT source_order FROM cindy_owner_decision_source
+                       WHERE decision_id = decision.id ORDER BY source_order
+                    )
+                  ), '[]'))) ELSE '{}' END
+              )
+            )
+            ELSE option.value END
+        ))
+          FROM json_each(decision.options_json) AS option
+      )
+    WHERE decision.status = 'pending'
+      AND EXISTS (
+        SELECT 1 FROM json_each(decision.options_json)
+         WHERE json_extract(value, '$.action') = 'append_candidate'
+      );`,
   "CREATE INDEX IF NOT EXISTS idx_cindy_batch_snapshot_revision ON cindy_batch_snapshot(source_revision_id, owner_scope, batch_id);",
   "CREATE INDEX IF NOT EXISTS idx_cindy_owner_decision_status ON cindy_owner_decision(owner_scope, status, updated_at DESC);",
   "CREATE INDEX IF NOT EXISTS idx_cindy_owner_decision_source_revision ON cindy_owner_decision_source(source_revision_id, decision_id);",
@@ -154878,7 +154940,7 @@ function projectCindyOwnerDecision(row, sourceCount) {
       title: option.title,
       describe: option.describe,
       next_step: option.nextStep,
-      available: option.action !== "append_candidate" || typeof option.candidateKey == "string" && Number.isInteger(option.candidateVersion) && option.candidateVersion >= 1
+      available: option.action !== "append_candidate" || typeof option.candidateKey == "string" && Number.isInteger(option.candidateVersion) && option.candidateVersion >= 1 && option.fieldEvidenceSourceIndexes !== null && option.fieldEvidenceSourceIndexes !== void 0
     })),
     source_count: sourceCount,
     last_attempt_failed: row.last_error !== null,
@@ -154899,20 +154961,30 @@ function cindyConversationKey(auth, chatRef, threadRef) {
   return `cnv_${cindyOpaqueKey(auth, "conversation", `${chatRef}\0${threadRef ?? ""}`)}`;
 }
 function encodeCindyContextCursor(auth, kind, updatedAt, rowId) {
-  let payload = Buffer.from(JSON.stringify({ kind, updatedAt, rowId }), "utf8").toString("base64url");
-  return `${payload}.${cindyOpaqueKey(auth, "cursor", payload)}`;
+  let key = (0, import_node_crypto12.createHmac)("sha256", auth.receiptSecret).update(`cindy-context-cursor-v1\0${auth.ownerScope}\0${auth.accountAnchor}`, "utf8").digest(), nonce = (0, import_node_crypto12.randomBytes)(12), cipher = (0, import_node_crypto12.createCipheriv)("aes-256-gcm", key, nonce);
+  cipher.setAAD(Buffer.from(`cindy-context-cursor-v1\0${kind}\0${auth.ownerScope}\0${auth.accountAnchor}`, "utf8"));
+  let encrypted = Buffer.concat([
+    cipher.update(JSON.stringify({ updatedAt, rowId }), "utf8"),
+    cipher.final()
+  ]);
+  return `ctx1_${Buffer.concat([nonce, cipher.getAuthTag(), encrypted]).toString("base64url")}`;
 }
 function decodeCindyContextCursor(auth, kind, cursor) {
   if (!cursor) return null;
-  let [payload, signature, extra] = cursor.split(".");
-  if (!payload || !signature || extra !== void 0 || signature !== cindyOpaqueKey(auth, "cursor", payload))
-    throw new CindySourceContractError("INVALID_INPUT", "\u4E0A\u4E0B\u6587 cursor \u65E0\u6548\u6216\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8BA4\u8BC1\u4E0A\u4E0B\u6587\u3002");
   try {
-    let parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-    if (parsed.kind !== kind || typeof parsed.updatedAt != "string" || !Number.isFinite(Date.parse(parsed.updatedAt)) || typeof parsed.rowId != "string" || !parsed.rowId) throw new Error("invalid cursor");
+    if (!cursor.startsWith("ctx1_")) throw new Error("invalid cursor version");
+    let bytes = Buffer.from(cursor.slice(5), "base64url");
+    if (bytes.length <= 28) throw new Error("invalid cursor length");
+    let key = (0, import_node_crypto12.createHmac)("sha256", auth.receiptSecret).update(`cindy-context-cursor-v1\0${auth.ownerScope}\0${auth.accountAnchor}`, "utf8").digest(), decipher = (0, import_node_crypto12.createDecipheriv)("aes-256-gcm", key, bytes.subarray(0, 12));
+    decipher.setAAD(Buffer.from(`cindy-context-cursor-v1\0${kind}\0${auth.ownerScope}\0${auth.accountAnchor}`, "utf8")), decipher.setAuthTag(bytes.subarray(12, 28));
+    let parsed = JSON.parse(Buffer.concat([
+      decipher.update(bytes.subarray(28)),
+      decipher.final()
+    ]).toString("utf8"));
+    if (typeof parsed.updatedAt != "string" || !Number.isFinite(Date.parse(parsed.updatedAt)) || typeof parsed.rowId != "string" || !parsed.rowId) throw new Error("invalid cursor");
     return { updatedAt: parsed.updatedAt, rowId: parsed.rowId };
   } catch {
-    throw new CindySourceContractError("INVALID_INPUT", "\u4E0A\u4E0B\u6587 cursor \u65E0\u6CD5\u89E3\u6790\u3002");
+    throw new CindySourceContractError("INVALID_INPUT", "\u4E0A\u4E0B\u6587 cursor \u65E0\u6548\u6216\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8BA4\u8BC1\u4E0A\u4E0B\u6587\u3002");
   }
 }
 function loadCindyCandidateByKey(database, auth, candidateKey) {
@@ -154930,6 +155002,27 @@ function loadCindyCandidateByKey(database, auth, candidateKey) {
              AND (foreign_consumed.owner_scope <> ? OR foreign_consumed.account_anchor <> ?)
         )`
   ).all(auth.ownerScope, auth.accountAnchor, auth.ownerScope, auth.accountAnchor).find((candidate) => cindyCandidateKey(auth, candidate.id) === candidateKey) : void 0;
+}
+function loadLegacyCindyCandidateByInternalId(database, auth, candidateId) {
+  if (/^cand_[0-9a-f-]{36}$/iu.test(candidateId))
+    return database.raw.prepare(
+      `SELECT candidate.* FROM candidate_request AS candidate
+      WHERE candidate.id = ?
+        AND candidate.demand_unit_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM cindy_candidate_source_consumption AS consumed
+           WHERE consumed.candidate_id = candidate.id
+             AND consumed.owner_scope = ? AND consumed.account_anchor = ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM cindy_candidate_source_consumption AS foreign_consumed
+           WHERE foreign_consumed.candidate_id = candidate.id
+             AND (foreign_consumed.owner_scope <> ? OR foreign_consumed.account_anchor <> ?)
+        )
+        AND candidate.state IN ('pending','snoozed')
+        AND candidate.deleted_at IS NULL AND candidate.accepted_task_id IS NULL
+        AND candidate.merged_into_candidate_id IS NULL`
+    ).get(candidateId, auth.ownerScope, auth.accountAnchor, auth.ownerScope, auth.accountAnchor);
 }
 function loadProjectedCindyOwnerDecision(database, decisionId) {
   let row = database.raw.prepare(
@@ -164130,7 +164223,7 @@ ${summary}`.normalize("NFKC").toLocaleLowerCase("und").includes(normalizedQuery)
       if (replay.payload_hash !== payloadHash) throw new CindySourceContractError("CONFLICT", "append_request_id \u5DF2\u7ED1\u5B9A\u5230\u4E0D\u540C canonical payload\u3002");
       return { ...JSON.parse(replay.response_json), duplicate: !0 };
     }
-    let candidate = loadCindyCandidateByKey(this.database, auth, input.candidateKey);
+    let candidate = input.trustedLegacyCandidateId ? loadLegacyCindyCandidateByInternalId(this.database, auth, input.trustedLegacyCandidateId) : loadCindyCandidateByKey(this.database, auth, input.candidateKey);
     if (!candidate) throw new CindySourceContractError("INVALID_INPUT", "\u5019\u9009\u4E0D\u5B58\u5728\u6216\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8BA4\u8BC1\u4E0A\u4E0B\u6587\u3002", 403);
     if (!["pending", "snoozed"].includes(candidate.state) || candidate.accepted_task_id || candidate.deleted_at || candidate.merged_into_candidate_id)
       throw new CindyIntakeConflictError("\u5019\u9009\u5F53\u524D\u4E0D\u53EF\u8FFD\u52A0\u3002", candidate.version);
@@ -164268,7 +164361,7 @@ ${summary}`.normalize("NFKC").toLocaleLowerCase("und").includes(normalizedQuery)
     ).run(candidate.id, auth.ownerScope, auth.accountAnchor, input.batchId, input.groupKey);
     let response = {
       append_request_id: input.appendRequestId,
-      candidate_key: input.candidateKey,
+      candidate_key: cindyCandidateKey(auth, candidate.id),
       version: nextVersion,
       source_count: input.entries.length,
       updated_at: input.timestamp,
@@ -164365,10 +164458,12 @@ ${summary}`.normalize("NFKC").toLocaleLowerCase("und").includes(normalizedQuery)
     let usedOwnerDecisionKeys = new Set(input.primary_dispositions.filter((item) => item.disposition === "needs_owner").map((item) => item.owner_decision_key));
     if ([...usedOwnerDecisionKeys].some((key) => !ownerDecisionByKey.has(key)) || [...ownerDecisionByKey.keys()].some((key) => !usedOwnerDecisionKeys.has(key)))
       throw new CindySourceContractError("INVALID_INPUT", "owner_decisions \u5FC5\u987B\u4E0E needs_owner primary \u7CBE\u786E\u5BF9\u5E94\u3002");
-    for (let decision of ownerDecisionByKey.values()) {
-      let optionKeys = decision.options.map((option) => option.option_key);
-      if (!decision.reason.trim() || !decision.options.length || new Set(optionKeys).size !== optionKeys.length || optionKeys.some((key) => !cindyGroupKeyPattern.test(key)) || decision.group_key !== void 0 && (!cindyGroupKeyPattern.test(decision.group_key) || groupByKey.has(decision.group_key)))
+    let ownerDecisionEffectiveGroupKeys = /* @__PURE__ */ new Map(), usedEffectiveGroupKeys = /* @__PURE__ */ new Set();
+    for (let [decisionKey, decision] of ownerDecisionByKey) {
+      let effectiveGroupKey = decision.group_key ?? decisionKey, optionKeys = decision.options.map((option) => option.option_key);
+      if (!decision.reason.trim() || !decision.options.length || new Set(optionKeys).size !== optionKeys.length || optionKeys.some((key) => !cindyGroupKeyPattern.test(key)) || !cindyGroupKeyPattern.test(effectiveGroupKey) || groupByKey.has(effectiveGroupKey) || usedEffectiveGroupKeys.has(effectiveGroupKey))
         throw new CindySourceContractError("INVALID_INPUT", "owner decision \u539F\u56E0\u6216\u9009\u9879\u65E0\u6548\u3002");
+      ownerDecisionEffectiveGroupKeys.set(decisionKey, effectiveGroupKey), usedEffectiveGroupKeys.add(effectiveGroupKey);
       let decisionReceipts = new Set(input.primary_dispositions.filter((item) => item.disposition === "needs_owner" && item.owner_decision_key === decision.decision_key).map((item) => item.source_receipt));
       for (let option of decision.options) {
         if (option.action === "create_candidate" && !option.title?.trim())
@@ -164517,7 +164612,7 @@ ${summary}`.normalize("NFKC").toLocaleLowerCase("und").includes(normalizedQuery)
           auth.accountAnchor,
           input.batch_id,
           decisionKey,
-          decision.group_key ?? decisionKey,
+          ownerDecisionEffectiveGroupKeys.get(decisionKey),
           reasonSummary,
           serializedOptions.json,
           timestamp,
@@ -164881,15 +164976,15 @@ ${summary}`.normalize("NFKC").toLocaleLowerCase("und").includes(normalizedQuery)
           ).run(candidateId, auth.ownerScope, auth.accountAnchor, row.batch_id, row.group_key);
         } else if (input.action === "append_candidate") {
           promoteDecisionSourcesToGroup("append_candidate");
-          let candidate = loadCindyCandidateByKey(this.database, auth, option.candidateKey ?? "");
-          if (!candidate || option.candidateVersion === null)
+          let isLegacyV11Append = row.group_key.startsWith("legacy:") && typeof option.candidateKey == "string" && /^cand_[0-9a-f-]{36}$/iu.test(option.candidateKey), candidate = isLegacyV11Append ? loadLegacyCindyCandidateByInternalId(this.database, auth, option.candidateKey) : loadCindyCandidateByKey(this.database, auth, option.candidateKey ?? "");
+          if (!candidate || !Number.isInteger(option.candidateVersion) || option.candidateVersion < 1 || option.fieldEvidenceSourceIndexes === null || option.fieldEvidenceSourceIndexes === void 0)
             throw new CindySourceContractError("CONFLICT", "\u4E3B\u4EBA\u9009\u62E9\u7684\u5019\u9009\u5DF2\u4E0D\u53EF\u8FFD\u52A0\u3002");
           candidateId = candidate.id;
           let patchFields = ["title", "describe", "next_step"].filter((field) => (field === "next_step" ? option.nextStep : option[field]) !== null), storedEvidence = option.fieldEvidenceSourceIndexes;
-          if (storedEvidence !== null && Object.keys(storedEvidence).some((field) => !patchFields.includes(field)))
+          if (Object.keys(storedEvidence).some((field) => !patchFields.includes(field)))
             throw new CindySourceContractError("CONFLICT", "\u4E3B\u4EBA\u51B3\u5B9A\u4E2D\u7684\u5B57\u6BB5 evidence \u5DF2\u635F\u574F\u3002");
           let fieldEvidence = Object.fromEntries(patchFields.map((field) => {
-            let indexes = storedEvidence === null ? sourceReceipts.map((_, index) => index) : storedEvidence[field];
+            let indexes = storedEvidence[field];
             if (!indexes?.length || new Set(indexes).size !== indexes.length || indexes.some((index) => !Number.isInteger(index) || index < 0 || index >= sourceReceipts.length))
               throw new CindySourceContractError("CONFLICT", "\u4E3B\u4EBA\u51B3\u5B9A\u4E2D\u7684\u5B57\u6BB5 evidence \u5DF2\u635F\u574F\u3002");
             return [field, indexes.map((index) => sourceReceipts[index])];
@@ -164899,6 +164994,7 @@ ${summary}`.normalize("NFKC").toLocaleLowerCase("und").includes(normalizedQuery)
             batchId: row.batch_id,
             groupKey: row.group_key,
             candidateKey: option.candidateKey ?? "",
+            trustedLegacyCandidateId: isLegacyV11Append ? candidate.id : void 0,
             expectedCandidateVersion: option.candidateVersion,
             sourceReceipts,
             patch: {
@@ -167748,6 +167844,13 @@ function candidateMutationError(error51, fallback, current) {
   }
   return { error: message, outcome: "failure" };
 }
+function ownerDecisionHttpError(error51, fallback) {
+  let payload = {
+    error: fallback,
+    error_code: error51 instanceof CindySourceContractError || error51 instanceof CindyIntakeConflictError ? error51.errorCode : error51 instanceof external_exports.ZodError ? "INVALID_INPUT" : "OWNER_DECISION_UNAVAILABLE"
+  };
+  return error51 instanceof CindyIntakeConflictError && error51.currentVersion !== null && (payload.current_version = error51.currentVersion), payload;
+}
 var risks = ["low", "medium", "high"], PRIVACY_OWNER_ACTION_INTENT2 = "privacy.owner-action.v1", PRIVACY_DELETION_INTENT2 = "privacy.deletion.hard-delete.v1";
 function capabilityBinding(capability) {
   return {
@@ -168009,7 +168112,17 @@ async function buildApp(service, input = "http://localhost:5173") {
           shared_group_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u)
         }).strict()).max(500).optional(),
         owner_decisions: external_exports.array(ownerDecision).max(100).optional()
-      }).strict().parse(request.body);
+      }).strict().superRefine((value, context) => {
+        let groupKeys = new Set(value.groups.map((group) => group.group_key)), effectiveOwnerGroupKeys = /* @__PURE__ */ new Set();
+        for (let [index, decision] of (value.owner_decisions ?? []).entries()) {
+          let effectiveGroupKey = decision.group_key ?? decision.decision_key;
+          (groupKeys.has(effectiveGroupKey) || effectiveOwnerGroupKeys.has(effectiveGroupKey)) && context.addIssue({
+            code: "custom",
+            path: ["owner_decisions", index, "group_key"],
+            message: "owner decision effective group_key \u5FC5\u987B\u552F\u4E00\u4E14\u4E0D\u5F97\u4E0E\u5DF2\u6709 group \u51B2\u7A81\u3002"
+          }), effectiveOwnerGroupKeys.add(effectiveGroupKey);
+        }
+      }).parse(request.body);
       return service.processCindyDecisions(cindyAuthContext(), body);
     } catch (error51) {
       let status = error51 instanceof external_exports.ZodError || error51 instanceof CindyIntakeValidationError ? 400 : error51 instanceof CindySourceContractError ? error51.statusCode : (error51 instanceof CindyIntakeConflictError, 409), payload = {
@@ -168026,7 +168139,7 @@ async function buildApp(service, input = "http://localhost:5173") {
       return service.listCindyOwnerDecisions(cindyAuthContext(), query.limit, query.status);
     } catch (error51) {
       let status = error51 instanceof external_exports.ZodError ? 400 : error51 instanceof CindySourceContractError ? error51.statusCode : 409;
-      return reply.code(status).send({ error: error51 instanceof Error ? error51.message : "\u4E3B\u4EBA\u51B3\u5B9A\u8BFB\u53D6\u5931\u8D25\u3002" });
+      return reply.code(status).send(ownerDecisionHttpError(error51, "\u4E3B\u4EBA\u51B3\u5B9A\u8BFB\u53D6\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002"));
     }
   }), app.post("/api/owner-decisions/:decisionId/resolve", async (request, reply) => {
     try {
@@ -168039,8 +168152,8 @@ async function buildApp(service, input = "http://localhost:5173") {
       }).strict().parse(request.body);
       return service.resolveCindyOwnerDecision(cindyAuthContext(), params.decisionId, body);
     } catch (error51) {
-      let status = error51 instanceof external_exports.ZodError ? 400 : error51 instanceof CindySourceContractError ? error51.statusCode : (error51 instanceof CindyIntakeConflictError, 409), payload = { error: error51 instanceof Error ? error51.message : "\u4E3B\u4EBA\u51B3\u5B9A\u6267\u884C\u5931\u8D25\u3002" };
-      return error51 instanceof CindyIntakeConflictError && (payload.current_version = error51.currentVersion), error51 instanceof CindySourceContractError && (payload.error_code = error51.errorCode), reply.code(status).send(payload);
+      let status = error51 instanceof external_exports.ZodError ? 400 : error51 instanceof CindySourceContractError ? error51.statusCode : (error51 instanceof CindyIntakeConflictError, 409);
+      return reply.code(status).send(ownerDecisionHttpError(error51, "\u4E3B\u4EBA\u51B3\u5B9A\u6267\u884C\u5931\u8D25\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002"));
     }
   }), app.post("/api/owner-decisions/:decisionId/cancel", async (request, reply) => {
     try {
@@ -168050,8 +168163,8 @@ async function buildApp(service, input = "http://localhost:5173") {
       }).strict().parse(request.body);
       return service.cancelCindyOwnerDecision(cindyAuthContext(), params.decisionId, body);
     } catch (error51) {
-      let status = error51 instanceof external_exports.ZodError ? 400 : error51 instanceof CindySourceContractError ? error51.statusCode : (error51 instanceof CindyIntakeConflictError, 409), payload = { error: error51 instanceof Error ? error51.message : "\u4E3B\u4EBA\u51B3\u5B9A\u53D6\u6D88\u5931\u8D25\u3002" };
-      return error51 instanceof CindyIntakeConflictError && (payload.current_version = error51.currentVersion), error51 instanceof CindySourceContractError && (payload.error_code = error51.errorCode), reply.code(status).send(payload);
+      let status = error51 instanceof external_exports.ZodError ? 400 : error51 instanceof CindySourceContractError ? error51.statusCode : (error51 instanceof CindyIntakeConflictError, 409);
+      return reply.code(status).send(ownerDecisionHttpError(error51, "\u4E3B\u4EBA\u51B3\u5B9A\u53D6\u6D88\u5931\u8D25\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002"));
     }
   }), app.get("/api/owner-information", async () => service.ownerInformation()), app.get("/api/privacy/status", async () => service.privacyStatus()), app.post("/api/privacy/collection/stop", async (request, reply) => {
     let binding = requirePrivacyCapability(request, reply, options.desktopCapability, PRIVACY_OWNER_ACTION_INTENT2);

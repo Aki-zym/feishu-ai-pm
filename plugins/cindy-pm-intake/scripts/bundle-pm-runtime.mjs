@@ -2,7 +2,7 @@ import { cp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { extname, resolve } from 'node:path';
-import { build } from 'esbuild';
+import { build, version as esbuildVersion } from 'esbuild';
 
 const execFileAsync = promisify(execFile);
 const root = resolve(import.meta.dirname, '../../..');
@@ -13,6 +13,11 @@ const runtimeOutput = resolve(root, 'plugins', 'cindy-pm-intake', 'node', 'pm-ru
 const statusSource = resolve(root, 'plugins', 'cindy-pm-intake', 'node', 'macos-status', 'main.swift');
 const statusOutput = resolve(root, 'plugins', 'cindy-pm-intake', 'node', 'macos-status', 'TooManyTasksStatus');
 const textExtensions = new Set(['.html', '.js', '.css', '.json', '.map', '.txt', '.md', '.svg']);
+const pinnedEsbuildVersion = '0.25.9';
+
+if (esbuildVersion !== pinnedEsbuildVersion) {
+  throw new Error(`bundle requires esbuild ${pinnedEsbuildVersion}, received ${esbuildVersion}`);
+}
 
 const normalizeLf = (value) => value.replace(/\r+\n/g, '\n').replace(/\r/g, '\n');
 
@@ -60,3 +65,4 @@ if (process.platform === 'darwin') {
 
 console.log(`本机任务库运行时已生成：${runtimeOutput}`);
 console.log(`本机任务库网页资源已复制：${webTarget}`);
+console.log(`bundle esbuild version locked: ${esbuildVersion}`);
