@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
+import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -45,6 +46,68 @@ test('stop closes the owned Fastify listener and SQLite handle', async () => {
   assert.deepEqual(await runtime.stop(), { stopped: true });
   await assert.rejects(fetch(`${runtime.url}/`));
   assert.deepEqual(await runtime.stop(), { stopped: false, alreadyStopped: true });
+});
+
+test('status bar skips non-darwin and stop kills the spawned child', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cindy-pm-runtime-status-bar-'));
+  const previousPlatform = process.env.CINDY_PM_STATUS_PLATFORM;
+  const previousBinary = process.env.CINDY_PM_STATUS_BINARY;
+  const previousSpawn = globalThis.__CINDY_PM_STATUS_SPAWN;
+  const spawnCalls = [];
+  const killed = [];
+  process.env.CINDY_PM_STATUS_BINARY = join(import.meta.dirname, 'pm-runtime.cjs');
+  globalThis.__CINDY_PM_STATUS_SPAWN = (...args) => {
+    spawnCalls.push(args);
+    return {
+      once() {},
+      unref() {},
+      kill() { killed.push(args[0]); },
+    };
+  };
+  try {
+    process.env.CINDY_PM_STATUS_PLATFORM = 'linux';
+    const linuxRuntime = await startPmServer({
+      port: 0,
+      sqlitePath: join(root, 'linux.sqlite'),
+      token: 'test-token',
+    });
+    assert.equal(spawnCalls.length, 0);
+    await linuxRuntime.stop();
+
+    process.env.CINDY_PM_STATUS_PLATFORM = 'darwin';
+    process.env.CINDY_PM_STATUS_BINARY = join(root, 'missing-status-binary');
+    const missingBinaryRuntime = await startPmServer({
+      port: 0,
+      sqlitePath: join(root, 'missing-binary.sqlite'),
+      token: 'test-token',
+    });
+    assert.equal(spawnCalls.length, 0);
+    await missingBinaryRuntime.stop();
+
+    process.env.CINDY_PM_STATUS_BINARY = join(import.meta.dirname, 'pm-runtime.cjs');
+    const macRuntime = await startPmServer({
+      port: 0,
+      sqlitePath: join(root, 'mac.sqlite'),
+      token: 'test-token',
+    });
+    assert.equal(spawnCalls.length, 1);
+    assert.deepEqual(spawnCalls[0][1], [macRuntime.url]);
+    const restarted = await macRuntime.restart();
+    assert.equal(spawnCalls.length, 2);
+    assert.deepEqual(killed, [spawnCalls[0][0]]);
+    const shutdown = await fetch(`${restarted.url}/api/runtime/shutdown`, { method: 'POST' });
+    assert.equal(shutdown.status, 200);
+    await delay(100);
+    assert.deepEqual(killed, [spawnCalls[0][0], spawnCalls[1][0]]);
+    await restarted.stop();
+  } finally {
+    if (previousPlatform === undefined) delete process.env.CINDY_PM_STATUS_PLATFORM;
+    else process.env.CINDY_PM_STATUS_PLATFORM = previousPlatform;
+    if (previousBinary === undefined) delete process.env.CINDY_PM_STATUS_BINARY;
+    else process.env.CINDY_PM_STATUS_BINARY = previousBinary;
+    if (previousSpawn === undefined) delete globalThis.__CINDY_PM_STATUS_SPAWN;
+    else globalThis.__CINDY_PM_STATUS_SPAWN = previousSpawn;
+  }
 });
 
 test('foreign stop returns an explicit error and leaves the foreign listener alive', async () => {
@@ -148,6 +211,43 @@ test('auto-scan switch is available through the bundled runtime and persists in 
   } catch (error) {
     await runtime.stop();
     throw error;
+  }
+});
+
+test('resident runtime does not start the classifier recovery chain', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cindy-pm-runtime-no-classifier-'));
+  const sqlitePath = join(root, 'pm.sqlite');
+  const initial = await startPmServer({
+    port: 0,
+    sqlitePath,
+    token: 'test-token',
+  });
+  await initial.stop();
+
+  const seeded = new DatabaseSync(sqlitePath);
+  const now = new Date().toISOString();
+  seeded.prepare(
+    `INSERT INTO job
+      (id, job_type, payload_json, status, attempts, available_at, locked_until, lease_owner,
+       max_attempts, retryable, backoff_seconds, cancel_requested_at, idempotency_key,
+       source_event_id, thread_id, task_id, trace_id, last_error, result_json, created_at, updated_at)
+     VALUES (?, 'classify_source', '{}', 'queued', 0, ?, NULL, NULL, 3, 1, 30, NULL, NULL,
+             NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)`
+  ).run('classifier-chain-fixture', new Date(Date.now() - 60_000).toISOString(), now, now);
+  seeded.close();
+
+  const runtime = await startPmServer({
+    port: 0,
+    sqlitePath,
+    token: 'test-token',
+  });
+  try {
+    const check = new DatabaseSync(sqlitePath);
+    const row = check.prepare('SELECT status, attempts FROM job WHERE id = ?').get('classifier-chain-fixture');
+    check.close();
+    assert.deepEqual({ ...row }, { status: 'queued', attempts: 0 });
+  } finally {
+    await runtime.stop();
   }
 });
 

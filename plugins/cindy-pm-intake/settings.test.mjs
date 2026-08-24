@@ -121,6 +121,7 @@ test('settings explains the required discounted Luna route and manual save', () 
   assert.match(settingsHtml, /关闭只停止本产品自动流程/);
   assert.match(settingsHtml, /Cindy 自动化条目可能仍在/);
   assert.match(settingsHtml, /到点会空跑短路/);
+  assert.match(settingsHtml, /本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台/);
 });
 
 test('settings exposes active and automatic progress modes', async () => {

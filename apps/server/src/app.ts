@@ -355,15 +355,6 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
     const params = z.object({ sessionId: z.string().min(1).max(200) }).parse(request.params);
     return { binding: service.getCindySessionBinding(params.sessionId) };
   });
-  app.post('/api/integrations/cindy/bindings/:sessionId/confirm', async (request, reply) => {
-    try {
-      const params = z.object({ sessionId: z.string().min(1).max(200) }).parse(request.params);
-      const body = z.object({ taskId: z.string().min(1).max(200) }).parse(request.body);
-      return { binding: service.confirmCindySessionBinding(params.sessionId, body.taskId) };
-    } catch (error) {
-      return reply.code(error instanceof z.ZodError ? 400 : 409).send({ error: error instanceof Error ? error.message : '会话绑定确认失败。' });
-    }
-  });
   app.post('/api/integrations/cindy/turn-evaluations', async (request, reply) => {
     try {
       const body = z.object({

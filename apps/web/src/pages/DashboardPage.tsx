@@ -142,7 +142,7 @@ export default function DashboardPage() {
                   </Link>
                 ))}
               </div>
-            ) : <div className="empty-state">没有新的候选需求。</div>}
+            ) : <div className="empty-state">这里还没有候选需求。回到 Cindy 说「扫近10分钟」即可扫描已授权消息。</div>}
           </section>
           <section className="work-section">
             <div className="section-heading"><h2>今天推进 <span>({data.counts.today})</span></h2><Link to="/tasks">查看全部</Link></div>

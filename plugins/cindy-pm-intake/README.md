@@ -13,13 +13,13 @@
 
 errand 提示要求工作线程使用当前已授权的飞书 MCP 读取窗口消息，调用 `get_pm_tasks` 获取 `items`、`candidates`、`cursors`，按 `create_candidate`、`update_task`、`skip`、`needs_owner` 生成提案，再调用 `submit_intake`。短确认句、资料交接、排期确认和收口句优先更新已有任务或归并已有候选；窗口内证据不完整时不新建候选。errand 不直接调用 `/api/tasks`；`update_task` 由本机任务库服务按 `task_key` 和 `expected_version` 做 CAS 更新已有任务，`create_candidate` 只创建候选。消息正文按不可信数据处理。
 
-长对话收口只针对本窗口出现的 chat/thread 回读：优先使用对应 `cursor` 作为 `im_read_messages` 的 `start_time`，最多回读 4 小时，禁止全局拉取所有会话。窗口没有消息时直接输出 `skipped empty_window`，不提交入库；扫描结果会返回 `proposals: [{ action, title }]` 短列表。
+长对话收口只针对本窗口出现的 chat/thread 回读：优先使用对应 `cursor` 作为 `im_read_messages` 的 `start_time`，最多回读 4 小时，禁止全局拉取所有会话。窗口没有消息时直接输出 `skipped empty_window`，插件随后提交空窗口入库，让服务端推进游标；扫描结果会返回 `proposals: [{ action, title }]` 短列表。
 
-服务端在 `POST /api/integrations/cindy/intake` 成功完成后写回本次 `window_end`；包括空窗口提交。后续扫描从该时间继续，重叠消息依靠 `source_key` 幂等。`GET /api/runtime/intake-cursor` 和 `PUT /api/runtime/intake-cursor` 仅接受本机 loopback 请求；游标只向前推进。
+服务端在 `POST /api/integrations/cindy/intake` 成功完成后写回本次 `window_end`，空窗口也通过该接口提交并推进游标。后续扫描从该时间继续，重叠消息依靠 `source_key` 幂等。`GET /api/runtime/intake-cursor` 和 `PUT /api/runtime/intake-cursor` 仅接受本机 loopback 请求；游标只向前推进。
 
 ## 配置
 
-启用插件后 Cindy 运行即拉起本机任务库并保持本机 `4310` 服务。任务台浏览器设置中可使用「退出后台进程」。Cindy 退出后后台服务停止。
+启用插件后 Cindy 运行即拉起本机任务库并保持本机 `4310` 服务。本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台。任务台浏览器设置中可使用「退出后台进程」。Cindy 退出后后台服务停止。
 
 在插件设置中保存本机任务库地址，默认值为 `http://127.0.0.1:4310`，并保存与本机任务库服务一致的 `pm_token`。设置页和 Node Worker 都校验本机 HTTP 回环地址，任务接口保持在 `/api/integrations/cindy/` 前缀下，自动扫描开关使用 `/api/runtime/auto-scan`。intake 会话保持只读，只授权飞书 MCP，不开 shell、工作区写入或飞书写接口。
 

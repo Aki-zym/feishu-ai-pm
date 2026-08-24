@@ -25,6 +25,8 @@ function setup({ errandText = '{"accepted":true}', errandResponse = null, errand
   const sent = [];
   const errandCalls = [];
   const secretCalls = [];
+  const cursorWrites = [];
+  const intakePosts = [];
   const cindy = {
     onHostMessage(handler) { onHostMessage = handler; },
     node: {
@@ -38,6 +40,10 @@ function setup({ errandText = '{"accepted":true}', errandResponse = null, errand
           result: { enabled: autoScanEnabled },
         };
         if (request.params.path === '/api/runtime/intake-cursor') {
+          if (request.params.method === 'PUT') {
+            cursorWrites.push(request.params.body);
+            return { ok: true, result: { window_end: request.params.body.window_end } };
+          }
           return { ok: true, result: { window_end: intakeWindowEnd } };
         }
         if (request.params.path.includes('/bindings/')) return {
@@ -56,7 +62,10 @@ function setup({ errandText = '{"accepted":true}', errandResponse = null, errand
             cursors: [{ conversation_key: 'conversation-1', cursor: '2026-08-24T00:00:00.000Z' }],
           },
         };
-        if (request.params.path.endsWith('/intake')) return { ok: true, result: { accepted: true, intake_id: 'intake-1' } };
+        if (request.params.path.endsWith('/intake')) {
+          intakePosts.push(request.params.body);
+          return { ok: true, result: { accepted: true, intake_id: 'intake-1' } };
+        }
         throw new Error(`unexpected node request: ${JSON.stringify(request)}`);
       },
     },
@@ -94,11 +103,11 @@ function setup({ errandText = '{"accepted":true}', errandResponse = null, errand
     Number,
     Error,
   }), { filename: 'main.js' });
-  return { onHostMessage, nodeCalls, sent, errandCalls, secretCalls };
+  return { onHostMessage, nodeCalls, sent, errandCalls, secretCalls, cursorWrites, intakePosts };
 }
 
 test('scan_intake_window starts the fixed intake errand session and returns its result', async () => {
-  const { onHostMessage, nodeCalls, errandCalls, sent } = setup({
+  const { onHostMessage, nodeCalls, errandCalls, sent, cursorWrites, intakePosts } = setup({
     errandText: '{"status":"skipped","reason":"empty_window","summary":"窗口无消息，跳过提交。","proposals":[]}',
   });
   onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-scan', args: {} });
@@ -134,6 +143,14 @@ test('scan_intake_window starts the fixed intake errand session and returns its 
   assert.ok(firstWindowDuration < 10 * 60 * 1000 + 2000);
   assert.equal(nodeCalls[0].method, 'pm/ensure');
   assert.equal(nodeCalls.some((call) => call.params?.path === '/api/runtime/intake-cursor'), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(cursorWrites)), []);
+  assert.deepEqual(JSON.parse(JSON.stringify(intakePosts)), [{
+    window_id: result.result.window_id,
+    window_start: result.result.window_start,
+    window_end: result.result.window_end,
+    sources: [],
+    proposals: [],
+  }]);
 });
 
 test('scan_intake_window starts after the last successful intake window end', async () => {
@@ -246,7 +263,7 @@ test('get_pm_tasks exposes task items, pending candidates, and read cursors', as
 });
 
 test('scan result returns a readable short proposal list with action and title', async () => {
-  const { onHostMessage, sent } = setup({
+  const { onHostMessage, sent, cursorWrites } = setup({
     errandText: '{"status":"done","summary":"已更新已有任务。","proposals":[{"action":"update_task","title":"活动留存分析"},{"action":"skip","title":"礼貌确认"}]}',
   });
   onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-proposals', args: {} });
@@ -258,6 +275,7 @@ test('scan result returns a readable short proposal list with action and title',
   ]);
   assert.equal(result.result.summary, '已更新正式任务：活动留存分析。');
   assert.equal(result.result.model_summary, '已更新已有任务。');
+  assert.equal(cursorWrites.length, 0);
 });
 
 test('scan result uses human language for candidates, formal task updates, and empty windows', async () => {
@@ -271,9 +289,11 @@ test('scan result uses human language for candidates, formal task updates, and e
 });
 
 test('ghost declares schedule support while retaining errand', () => {
-  assert.equal(ghost.version, '0.3.2');
+  assert.equal(ghost.version, '0.3.3');
   assert.equal(ghost.id, 'ai-pm-intake');
   assert.equal(ghost.name, 'TooManyTasks');
+  assert.match(ghost.description, /本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台/);
+  assert.match(ghost.whenToUse, /本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台/);
   assert.equal(ghost.launch, 'resident');
   assert.deepEqual(Object.keys(ghost.agent).sort(), ['errand', 'schedule']);
   assert.equal(ghost.agent.errand, true);

@@ -371,6 +371,13 @@ describe('Cindy 对话入库接口', () => {
     makeTask(database);
     const noAuth = await app.inject({ method: 'GET', url: '/api/integrations/cindy/bindings/session-progress-1' });
     expect(noAuth.statusCode).toBe(401);
+    const removedConfirmRoute = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/bindings/session-progress-1/confirm',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { taskId: 'task-cindy-intake-1' },
+    });
+    expect(removedConfirmRoute.statusCode).toBe(404);
     const first = await app.inject({
       method: 'POST',
       url: '/api/integrations/cindy/turn-evaluations',

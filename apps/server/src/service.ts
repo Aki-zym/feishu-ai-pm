@@ -2889,11 +2889,15 @@ export class PmService {
       throw new CindyIntakeConflictError('入库窗口游标只允许向前推进。');
     }
     const timestamp = nowIso();
+    this.writeIntakeWindowCursorUnsafe(nextIso, timestamp);
+    return { window_end: nextIso };
+  }
+
+  private writeIntakeWindowCursorUnsafe(windowEnd: string, updatedAt: string) {
     this.database.raw.prepare(
       `INSERT INTO app_setting (key, value_json, updated_at) VALUES ('intake_window_end', ?, ?)
        ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
-    ).run(JSON.stringify({ window_end: nextIso }), timestamp);
-    return { window_end: nextIso };
+    ).run(JSON.stringify({ window_end: windowEnd }), updatedAt);
   }
 
   private advanceIntakeWindowCursorUnsafe(windowEnd: string, updatedAt: string) {
@@ -2906,10 +2910,7 @@ export class PmService {
     const currentValue = parseMetadata(row?.value_json).window_end;
     const currentTime = typeof currentValue === 'string' ? Date.parse(currentValue) : Number.NaN;
     if (Number.isFinite(currentTime) && currentTime >= next.getTime()) return;
-    this.database.raw.prepare(
-      `INSERT INTO app_setting (key, value_json, updated_at) VALUES ('intake_window_end', ?, ?)
-       ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
-    ).run(JSON.stringify({ window_end: nextIso }), updatedAt);
+    this.writeIntakeWindowCursorUnsafe(nextIso, updatedAt);
   }
 
   updateAutomationPolicy(mode: AutomationMode) {
@@ -13657,27 +13658,6 @@ export class PmService {
         autoUpdatePaused: Boolean(row.auto_update_paused),
       },
     };
-  }
-
-  confirmCindySessionBinding(sessionId: string, taskId: string) {
-    const task = this.getTask(taskId);
-    if (!task || task.record_state !== 'active' || task.deleted_at || task.status === 'archived') {
-      throw new Error('目标任务不存在或已不可绑定。');
-    }
-    const timestamp = nowIso();
-    this.database.raw.prepare(
-      `INSERT INTO cindy_session_task_binding
-        (session_id, task_id, confidence, binding_source, created_at, updated_at, invalidated_at)
-       VALUES (?, ?, 1, 'owner', ?, ?, NULL)
-       ON CONFLICT(session_id) DO UPDATE SET
-         task_id = excluded.task_id, confidence = 1, binding_source = 'owner',
-         updated_at = excluded.updated_at, invalidated_at = NULL`,
-    ).run(sessionId, taskId, timestamp, timestamp);
-    this.database.raw.prepare(
-      `UPDATE cindy_task_binding_suggestion SET state = 'confirmed', decided_at = ?
-       WHERE session_id = ? AND task_id = ? AND state = 'pending'`,
-    ).run(timestamp, sessionId, taskId);
-    return this.getCindySessionBinding(sessionId);
   }
 
   recordCindyTurnEvaluation(input: {

@@ -17,7 +17,6 @@ README、AGENTS 和本页不再复制当前测试数字、安装包 hash 或历�
 ## 按工作类型读取稳定合同
 
 - `implementation_brief.md`：实施项目解决什么问题。
-- `mvp_v1.md`：历史 M0a/M0b 首版范围，不是当前状态。
 - `architecture.md`：系统组成、数据真源和自动化边界。
 - `domain-contracts.md`：Issue #64 统一术语、数据权威、状态机、CAS/恢复、错误目录和 ADR supersession。
 - `security_and_privacy.md`：令牌、聊天原文、隐私生命周期、硬删除证明和 GitHub 安全要求。
@@ -33,7 +32,3 @@ README、AGENTS 和本页不再复制当前测试数字、安装包 hash 或历�
 - `decision-register.json`：DEC-01 机器事实源；由 `scripts/decision-register-check.mjs` 校验并生成 Markdown。
 - `product-rules/PROD-07-calendar-classification.json`：Issue #85 产品规则事实源；由 `scripts/prod-07-calendar-contract-check.mjs` 校验并生成 Markdown。本 Issue 不修改生产分类行为。
 - `adr/`：后续每项重要技术决定的记录位置。
-
-## 产品输入
-
-`product-input/` 保存设计项目已经评审的产品与技术资料。实施中如需改变产品行为，应新建 ADR 或产品变更记录，不能静默改写原始输入。

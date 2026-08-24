@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 
 import { buildApp } from '../../../apps/server/src/app.ts';
@@ -12,6 +13,7 @@ const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 4310;
 const INTEGRATION_PATH = '/api/integrations/cindy/tasks';
 const DEFAULT_WEB_ROOT = resolve(__dirname, '..', 'web-dist');
+const DEFAULT_STATUS_BAR_BINARY = resolve(__dirname, 'macos-status', 'TooManyTasksStatus');
 let ownedRuntime = null;
 
 function normalizePort(value) {
@@ -134,6 +136,40 @@ function noOpRestart(errorCode, message) {
   });
 }
 
+function statusBarBinaryPath() {
+  return typeof process.env.CINDY_PM_STATUS_BINARY === 'string' && process.env.CINDY_PM_STATUS_BINARY.trim()
+    ? resolve(process.env.CINDY_PM_STATUS_BINARY)
+    : DEFAULT_STATUS_BAR_BINARY;
+}
+
+function startStatusBar(url) {
+  const binaryPath = statusBarBinaryPath();
+  const runtimePlatform = process.env.NODE_ENV === 'test'
+    ? process.env.CINDY_PM_STATUS_PLATFORM || process.platform
+    : process.platform;
+  if (runtimePlatform !== 'darwin' || !existsSync(binaryPath)) return null;
+  try {
+    const spawnProcess = process.env.NODE_ENV === 'test' && typeof globalThis.__CINDY_PM_STATUS_SPAWN === 'function'
+      ? globalThis.__CINDY_PM_STATUS_SPAWN
+      : spawn;
+    const child = spawnProcess(binaryPath, [url], { stdio: 'ignore' });
+    child.once?.('error', () => undefined);
+    child.unref?.();
+    return child;
+  } catch {
+    return null;
+  }
+}
+
+function stopStatusBar(child) {
+  if (!child) return;
+  try {
+    child.kill();
+  } catch {
+    // The status item may have already exited during runtime shutdown.
+  }
+}
+
 function scheduleProcessExit() {
   if (process.env.NODE_ENV === 'test') return;
   setTimeout(() => process.exit(0), 150);
@@ -193,6 +229,7 @@ export async function startPmServer({
 
   let database;
   let app;
+  let statusBarProcess = null;
   let stopOwnedRuntime;
   try {
     const config = runtimeConfig({ host, port, sqlitePath, token });
@@ -206,6 +243,8 @@ export async function startPmServer({
       if (stopResult?.stopped) return { stopped: false, alreadyStopped: true };
       if (stopInFlight) return stopInFlight;
       stopInFlight = (async () => {
+        stopStatusBar(statusBarProcess);
+        statusBarProcess = null;
         const failures = await closeOwnedResources(app, database);
         if (failures.length) {
           stopResult = {
@@ -261,6 +300,7 @@ export async function startPmServer({
       alreadyRunning: false,
       foreign: false,
     };
+    statusBarProcess = startStatusBar(payload.url);
     ownedRuntime = {
       host,
       requestedPort: port,
@@ -268,6 +308,7 @@ export async function startPmServer({
       port: actualPort,
       app,
       database,
+      statusBarProcess,
       stop: stopOwnedRuntime,
       restart: restartOwnedRuntime,
     };
@@ -291,6 +332,8 @@ export async function startPmServer({
         noOpRestart('PM_FOREIGN_PROCESS', '本机任务库端口由外来进程占用，未执行重启。'),
       );
     }
+    stopStatusBar(statusBarProcess);
+    statusBarProcess = null;
     await closeOwnedResources(app, database);
     throw error;
   }

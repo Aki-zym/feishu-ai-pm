@@ -115,11 +115,6 @@ function createWindow(cursorEnd = null, endMs = Date.now()) {
   };
 }
 
-async function intakeWindowCursor() {
-  const result = await pmRequest('GET', '/api/runtime/intake-cursor');
-  return result && typeof result.window_end === 'string' ? result.window_end : null;
-}
-
 function isIntakeSessionValue(value) {
   return safeText(value, 120).toLowerCase() === 'intake';
 }
@@ -150,7 +145,6 @@ function isBusyErrandResult(result) {
     result?.code,
     result?.status,
     result?.message,
-    result?.errorCode,
     result?.errorMessage,
     result?.error,
     result?.error?.code,
@@ -171,7 +165,7 @@ function directIntakeInstruction(window, reason) {
     summary: reason === 'intake_errand_busy'
       ? '入库 errand 当前已占用，已跳过嵌套派发。'
       : '当前已在入库 errand 会话中，已跳过嵌套派发。',
-    next_action: '请直接使用当前已授权的飞书 MCP 读取本次 10 分钟窗口，调用 get_pm_tasks 获取 items、candidates、cursors，再调用 submit_intake 提交 sources 和 proposals；不要再次调用 scan_intake_window。',
+    next_action: '请直接使用当前已授权的飞书 MCP 读取本次扫描窗口，调用 get_pm_tasks 获取 items、candidates、cursors，再调用 submit_intake 提交 sources 和 proposals；不要再次调用 scan_intake_window。',
     proposals: [],
   };
 }
@@ -215,7 +209,7 @@ function parseErrandResult(text) {
 
 function readableIntakeSummary(status, reason, proposals) {
   if (reason === 'auto_scan_disabled') return '自动扫描已关闭，已跳过本次扫描。';
-  if (reason === 'empty_window' || status === 'skipped' && reason === 'empty_window') {
+  if (reason === 'empty_window') {
     return '近 10 分钟没有新消息，已跳过入库。';
   }
   const list = Array.isArray(proposals) ? proposals : [];
@@ -329,7 +323,7 @@ function buildErrandTask(window) {
     '读取消息后调用 get_pm_tasks 获取当前任务快照。返回结果包含 items、candidates、cursors；items 是当前任务，candidates 是待确认候选，cursors 是各授权会话的读取游标。',
     '优先用已有任务或已有候选承接同一需求。短确认、补充、排期确认、资料交接和收口句，先判断 update_task 或归并已有候选；窗口内缺少完整需求证据时不要新建候选卡。只有明确独立对象和交付目标时才使用 create_candidate。',
     '若窗口消息像长对话的收口，且该会话确实出现在本窗口，可针对对应 chat/thread 使用已返回的 cursor 作为 im_read_messages 的 start_time；cursor 不可用时最多回读 4 小时。只回读这个 chat/thread，禁止全局拉取所有会话几小时的消息。',
-    '若本窗口没有消息，不要调用 submit_intake；直接输出 JSON：{"status":"skipped","reason":"empty_window","proposals":[],"summary":"窗口无消息，跳过提交。"}。',
+    '若本窗口没有消息，直接输出 JSON：{"status":"skipped","reason":"empty_window","proposals":[],"summary":"窗口无消息，跳过提交。"}；插件会代提交空 sources 和空 proposals，让服务端记录本次成功窗口。',
     '把读取到的消息整理为 sources，把判断整理为 proposals；每个 proposal 必须引用 source_keys。只有 update_task 必须带已有任务的 task_key 和从任务快照读取的 expected_version；create_candidate、skip、needs_owner 不要求 version。',
     'errand 线程不得直接调用或访问 /api/tasks；只可通过 get_pm_tasks 读取快照，并通过 submit_intake 提交提案。本机任务库服务收到 update_task 后按 task_key 与 expected_version 执行 CAS 更新已有任务；create_candidate 只创建候选。',
     '调用 submit_intake 一次提交完整的窗口、sources 和 proposals。',
@@ -796,8 +790,8 @@ async function handleToolCall(msg) {
       return;
     }
     await ensurePm();
-    const cursorEnd = await intakeWindowCursor();
-    const window = createWindow(cursorEnd);
+    const cursor = await pmRequest('GET', '/api/runtime/intake-cursor');
+    const window = createWindow(cursor?.window_end ?? null);
     if (trigger === 'schedule') {
       const autoScan = await pmRequest('GET', '/api/runtime/auto-scan');
       if (autoScan && autoScan.enabled === false) {
@@ -846,6 +840,16 @@ async function handleToolCall(msg) {
     const errand = parseErrandResult(result.text);
     const status = errand?.status || result.status || 'done';
     const reason = errand?.reason || null;
+    let intakeResult = null;
+    if (reason === 'empty_window') {
+      intakeResult = await pmRequest('POST', '/api/integrations/cindy/intake', {
+        window_id: window.window_id,
+        window_start: window.window_start,
+        window_end: window.window_end,
+        sources: [],
+        proposals: [],
+      });
+    }
     cindy.send({
       type: 'tool-result',
       callId: msg.callId,
@@ -857,6 +861,7 @@ async function handleToolCall(msg) {
         summary: readableIntakeSummary(status, reason, errand?.proposals || []),
         model_summary: errand?.summary || '',
         proposals: errand?.proposals || [],
+        intake_result: intakeResult,
         job_id: result.jobId || null,
         session_id: result.sessionId || null,
         errand_text: safeText(result.text, 64000),
