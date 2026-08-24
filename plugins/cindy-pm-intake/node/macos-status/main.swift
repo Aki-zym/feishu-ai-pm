@@ -1,12 +1,16 @@
 import AppKit
+import Foundation
 
 final class StatusItemController: NSObject {
     private let taskBoardURL: URL
     private let statusItem: NSStatusItem
+    private let shutdownItem: NSMenuItem
+    private var shutdownInFlight = false
 
     init(taskBoardURL: URL) {
         self.taskBoardURL = taskBoardURL
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        self.shutdownItem = NSMenuItem()
         super.init()
 
         if let button = statusItem.button {
@@ -27,11 +31,40 @@ final class StatusItemController: NSObject {
         )
         openItem.target = self
         menu.addItem(openItem)
+
+        shutdownItem.title = "退出后台"
+        shutdownItem.action = #selector(shutdownRuntime(_:))
+        shutdownItem.keyEquivalent = ""
+        shutdownItem.target = self
+        menu.addItem(shutdownItem)
         statusItem.menu = menu
     }
 
     @objc private func openTaskBoard(_ sender: Any?) {
         NSWorkspace.shared.open(taskBoardURL)
+    }
+
+    @objc private func shutdownRuntime(_ sender: Any?) {
+        guard !shutdownInFlight else { return }
+        shutdownInFlight = true
+        shutdownItem.isEnabled = false
+
+        var request = URLRequest(url: taskBoardURL.appendingPathComponent("api/runtime/shutdown"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, _ in
+            let succeeded = (response as? HTTPURLResponse)?.statusCode == 200
+            OperationQueue.main.addOperation {
+                guard let self else { return }
+                if succeeded {
+                    NSApp.terminate(nil)
+                } else {
+                    self.shutdownInFlight = false
+                    self.shutdownItem.isEnabled = true
+                }
+            }
+        }.resume()
     }
 }
 

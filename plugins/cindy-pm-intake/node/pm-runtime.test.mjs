@@ -54,15 +54,22 @@ test('status bar skips non-darwin and stop kills the spawned child', async () =>
   const previousBinary = process.env.CINDY_PM_STATUS_BINARY;
   const previousSpawn = globalThis.__CINDY_PM_STATUS_SPAWN;
   const spawnCalls = [];
+  const statusProcesses = [];
   const killed = [];
   process.env.CINDY_PM_STATUS_BINARY = join(import.meta.dirname, 'pm-runtime.cjs');
   globalThis.__CINDY_PM_STATUS_SPAWN = (...args) => {
     spawnCalls.push(args);
-    return {
+    const child = {
+      exited: false,
       once() {},
       unref() {},
-      kill() { killed.push(args[0]); },
+      kill() {
+        this.exited = true;
+        killed.push(args[0]);
+      },
     };
+    statusProcesses.push(child);
+    return child;
   };
   try {
     process.env.CINDY_PM_STATUS_PLATFORM = 'linux';
@@ -95,10 +102,12 @@ test('status bar skips non-darwin and stop kills the spawned child', async () =>
     const restarted = await macRuntime.restart();
     assert.equal(spawnCalls.length, 2);
     assert.deepEqual(killed, [spawnCalls[0][0]]);
+    assert.equal(statusProcesses[0].exited, true);
     const shutdown = await fetch(`${restarted.url}/api/runtime/shutdown`, { method: 'POST' });
     assert.equal(shutdown.status, 200);
     await delay(100);
     assert.deepEqual(killed, [spawnCalls[0][0], spawnCalls[1][0]]);
+    assert.equal(statusProcesses[1].exited, true);
     await restarted.stop();
   } finally {
     if (previousPlatform === undefined) delete process.env.CINDY_PM_STATUS_PLATFORM;
