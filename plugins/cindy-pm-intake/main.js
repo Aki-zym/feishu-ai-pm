@@ -136,7 +136,8 @@ function createWindow(cursorEnd = null, endMs = Date.now()) {
 }
 
 function isIntakeSessionValue(value) {
-  return safeText(value, 120).toLowerCase() === 'intake';
+  const sessionKey = safeText(value, 120).toLowerCase();
+  return sessionKey === 'intake' || sessionKey === 'intake-v2';
 }
 
 function isInsideIntakeErrand(args) {
@@ -352,7 +353,9 @@ async function runErrand(window, callId) {
     task: buildErrandTask(window),
     context: window,
     title: 'TooManyTasks 近 10 分钟入库扫描',
-    sessionKey: 'intake',
+    // Version the errand session key so model-setting changes can take effect
+    // without reusing an older session that is pinned to a retired model.
+    sessionKey: 'intake-v2',
     mode: 'wait',
     ...(callId ? { callId } : {}),
   };
@@ -643,7 +646,7 @@ function isSkippedProgressSession(sessionId, input) {
   const source = safeText(input?.source ?? input?.session_source, 80).toLowerCase();
   const orcaRole = safeText(input?.orca_role ?? input?.orcaRole, 80).toLowerCase();
   const sessionKey = safeText(input?.session_key ?? input?.sessionKey, 120).toLowerCase();
-  return sessionKey === 'intake' || source === 'plugin' || orcaRole === 'worker' || (source === 'orca' && orcaRole !== 'lead');
+  return isIntakeSessionValue(sessionKey) || source === 'plugin' || orcaRole === 'worker' || (source === 'orca' && orcaRole !== 'lead');
 }
 
 async function updatePmProgress(msg) {

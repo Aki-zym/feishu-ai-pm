@@ -119,7 +119,7 @@ test('scan_intake_window starts the fixed intake errand session and returns its 
   onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-scan', args: {} });
   await waitFor(() => sent.some((message) => message.callId === 'call-scan'));
   assert.equal(errandCalls.length, 1);
-  assert.equal(errandCalls[0].sessionKey, 'intake');
+  assert.equal(errandCalls[0].sessionKey, 'intake-v2');
   assert.equal(errandCalls[0].mode, 'wait');
   assert.equal(errandCalls[0].callId, 'call-scan');
   assert.match(errandCalls[0].task, /get_pm_tasks/);
@@ -210,24 +210,27 @@ test('manual scan runs even when the product auto-scan switch is disabled', asyn
   assert.equal(nodeCalls.some((call) => call.params?.path === '/api/runtime/auto-scan'), false);
 });
 
-test('scan_intake_window skips nested dispatch inside the intake errand session', async () => {
-  const { onHostMessage, nodeCalls, errandCalls, sent } = setup();
-  onHostMessage({
-    type: 'tool-call',
-    tool: 'scan_intake_window',
-    callId: 'call-nested-intake',
-    args: { session_context: { session: { sessionKey: 'intake' } } },
-  });
-  await waitFor(() => sent.some((message) => message.callId === 'call-nested-intake'));
-  const result = sent.find((message) => message.callId === 'call-nested-intake');
-  assert.equal(errandCalls.length, 0);
-  assert.equal(nodeCalls.length, 0);
-  assert.equal(result.ok, true);
-  assert.equal(result.result.reason, 'already_in_intake_errand');
-  assert.match(result.result.next_action, /get_pm_tasks/);
-  assert.match(result.result.next_action, /save_pm_sources/);
-  assert.match(result.result.next_action, /submit_pm_decisions/);
-  assert.match(result.result.next_action, /不要再次调用 scan_intake_window/);
+test('scan_intake_window skips nested dispatch inside current and legacy intake errand sessions', async () => {
+  for (const sessionKey of ['intake', 'intake-v2']) {
+    const { onHostMessage, nodeCalls, errandCalls, sent } = setup();
+    const callId = `call-nested-${sessionKey}`;
+    onHostMessage({
+      type: 'tool-call',
+      tool: 'scan_intake_window',
+      callId,
+      args: { session_context: { session: { sessionKey } } },
+    });
+    await waitFor(() => sent.some((message) => message.callId === callId));
+    const result = sent.find((message) => message.callId === callId);
+    assert.equal(errandCalls.length, 0);
+    assert.equal(nodeCalls.length, 0);
+    assert.equal(result.ok, true);
+    assert.equal(result.result.reason, 'already_in_intake_errand');
+    assert.match(result.result.next_action, /get_pm_tasks/);
+    assert.match(result.result.next_action, /save_pm_sources/);
+    assert.match(result.result.next_action, /submit_pm_decisions/);
+    assert.match(result.result.next_action, /不要再次调用 scan_intake_window/);
+  }
 });
 
 test('scan_intake_window turns a BUSY errand response into direct intake instructions', async () => {
@@ -419,22 +422,25 @@ test('update_pm_progress keeps progress oneshot separate from intake errand', as
   assert.equal(nodeCalls.some((request) => request.params?.path?.endsWith('/turn-evaluations')), true);
 });
 
-test('automatic progress skips the intake errand session', async () => {
-  const { onHostMessage, nodeCalls, sent } = setup({ progressMode: 'automatic' });
-  onHostMessage({
-    type: 'event',
-    name: 'will-user-message',
-    hookId: 'hook-intake',
-    ts: Date.now(),
-    data: { sessionId: 'session-intake', sessionKey: 'intake', source: 'plugin', text: '入库 errand' },
-  });
-  onHostMessage({
-    type: 'event',
-    name: 'did-turn-end',
-    ts: Date.now(),
-    data: { sessionId: 'session-intake', sessionKey: 'intake', source: 'plugin', endReason: 'completed' },
-  });
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  assert.equal(nodeCalls.some((request) => request.method === 'cindy/read-completed-turn'), false);
-  assert.equal(sent.some((message) => message.type === 'cindy-request'), false);
+test('automatic progress skips current and legacy intake errand sessions by session key', async () => {
+  for (const sessionKey of ['intake', 'intake-v2']) {
+    const { onHostMessage, nodeCalls, sent } = setup({ progressMode: 'automatic' });
+    const sessionId = `session-${sessionKey}`;
+    onHostMessage({
+      type: 'event',
+      name: 'will-user-message',
+      hookId: `hook-${sessionKey}`,
+      ts: Date.now(),
+      data: { sessionId, sessionKey, source: 'user', text: '入库 errand' },
+    });
+    onHostMessage({
+      type: 'event',
+      name: 'did-turn-end',
+      ts: Date.now(),
+      data: { sessionId, sessionKey, source: 'user', endReason: 'completed' },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(nodeCalls.some((request) => request.method === 'cindy/read-completed-turn'), false);
+    assert.equal(sent.some((message) => message.type === 'cindy-request'), false);
+  }
 });
