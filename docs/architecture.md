@@ -94,7 +94,7 @@ schema v9 在既有 `source_event` / `source_event_revision` 之上增加稳定�
 
 旧 `source_event` 和 revision 迁移后默认 `legacy_read_only`，不会自动进入新决策。只有能够从历史 metadata 形成稳定 provider/source kind/message identity 的记录才建立只读身份映射；Cindy 重新读取后在原来源上追加新的 current revision 并签发 receipt。无法形成稳定身份的旧来源继续隔离。
 
-schema v10 在每个 current revision 上追加最小 owner-context：服务端使用认证 owner/account 与 MCP 回显的 sender/chat/thread 技术 ID 做域分离摘要，只保存内部引用；display name 使用 NFC、去除控制/Bidi、折叠空白和最多 80 个可见字符，非字符串或空值固定回退“需求方”。mention、sender-is-owner、message type 与 reaction 不从正文推断；reaction 只保留主人白名单类别 `acknowledge / approve / done`，非主人和未知 reaction 忽略。关系目标必须是同认证上下文、同 chat、兼容 thread 的 current receipt 或同批 `client_ref`。服务端只执行结构、scope、引用和上下文上限，不新增相关性分类器；相关/跳过/候选仍由 Cindy Agent 决定。
+schema v10 在每个 current revision 上追加最小 owner-context：服务端使用认证 owner/account 与 MCP 回显的 sender/chat/thread 技术 ID 做域分离摘要，只保存内部引用；display name 使用 NFC、去除控制/Bidi、折叠空白，按完整 grapheme 截到最多 80 个且不超过最严格下游的 160 UTF-16 单元。非字符串、空值、字符串化对象占位或 `ou_`/`oc_` 飞书技术 ID 固定回退“需求方”。mention、sender-is-owner、message type 与 reaction 不从正文推断；reaction 只保留主人白名单类别 `acknowledge / approve / done`，非主人和未知 reaction 忽略。关系目标必须是同认证上下文、同 chat、兼容 thread 的 current receipt 或同批 `client_ref`。服务端只执行结构、scope、引用和上下文上限，不新增相关性分类器；相关/跳过/候选仍由 Cindy Agent 决定。
 
 首期采用自有最小领域层，至少包含：
 
