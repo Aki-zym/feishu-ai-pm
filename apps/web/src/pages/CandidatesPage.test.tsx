@@ -5,6 +5,7 @@ import type { CindyOwnerDecision } from '../types';
 
 describe('owner decision private projection', () => {
   it('只渲染安全摘要，append 保持不可用且不显示技术字段或原始错误', () => {
+    const resolvedCandidateIdIsExcluded: 'resolved_candidate_id' extends keyof CindyOwnerDecision ? false : true = true;
     const decision = {
       decision_id: 'cindy_owner_decision_00000000-0000-0000-0000-000000000001',
       status: 'pending',
@@ -21,7 +22,7 @@ describe('owner decision private projection', () => {
       source_count: 1,
       last_attempt_failed: true,
       resolution_action: null,
-      resolved_candidate_id: null,
+      resolved_candidate_id: 'CANARY_RESOLVED_CANDIDATE_ID',
       created_at: '2026-08-24T00:00:00.000Z',
       updated_at: '2026-08-24T00:00:00.000Z',
       resolved_at: null,
@@ -41,10 +42,11 @@ describe('owner decision private projection', () => {
       onCancel={vi.fn()}
     />);
 
+    expect(resolvedCandidateIdIsExcluded).toBe(true);
     expect(markup).toContain('等待后续追加能力');
     expect(markup).toContain('上次执行未完成，请稍后重试。');
     expect(markup).not.toContain('确认跳过');
     expect(markup).not.toContain('建立候选</button>');
-    expect(markup).not.toMatch(/CANARY_BATCH_ID|CANARY_RAW_SQLITE_ERROR|CANARY_SOURCE_REVISION|CANARY_RECEIPT|CANARY_PROMPT|CANARY_REASONING|CANARY_SOURCE_BODY/u);
+    expect(markup).not.toMatch(/CANARY_RESOLVED_CANDIDATE_ID|CANARY_BATCH_ID|CANARY_RAW_SQLITE_ERROR|CANARY_SOURCE_REVISION|CANARY_RECEIPT|CANARY_PROMPT|CANARY_REASONING|CANARY_SOURCE_BODY/u);
   });
 });

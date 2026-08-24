@@ -79,7 +79,6 @@ export type CindyOwnerDecisionDto = {
   source_count: number;
   last_attempt_failed: boolean;
   resolution_action: 'skip' | 'create_candidate' | null;
-  resolved_candidate_id: string | null;
   created_at: string;
   updated_at: string;
   resolved_at: string | null;

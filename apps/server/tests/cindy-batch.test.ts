@@ -354,7 +354,7 @@ describe('Cindy grouped batch contract', () => {
     }));
     const candidateId = seeded.json().groups[0].candidate_id as string;
     const receipts = await save(app, [source(2, '需要主人判断 A'), source(3, '需要主人判断 B'), source(4, 'CANARY_PRIVATE_SOURCE_BODY'), source(5, '暂不处理')], 'save-owner-decisions');
-    const submitted = await submit(app, batch(receipts, {
+    const ownerPayload = batch(receipts, {
       decision_request_id: 'decision-owner-options', batch_id: 'batch-owner-options',
       primary_dispositions: [
         { disposition_ref: 'owner-create', source_receipt: receipts[0], disposition: 'needs_owner', owner_decision_key: 'owner-create' },
@@ -368,8 +368,11 @@ describe('Cindy grouped batch contract', () => {
         { decision_key: 'owner-append', reason: '是否追加？', options: [{ option_key: 'append', action: 'append_candidate', candidate_key: candidateId }] },
         { decision_key: 'owner-cancel', reason: '是否暂不处理？', options: [{ option_key: 'skip', action: 'skip' }] },
       ],
-    }));
+    });
+    const submitted = await submit(app, ownerPayload);
     expect(submitted.statusCode).toBe(200);
+    const firstBatchResponse = submitted.json();
+    expect(JSON.stringify(firstBatchResponse)).not.toMatch(/resolved_candidate_id/u);
     const list = await app.inject({ method: 'GET', url: '/api/owner-decisions?status=all' });
     expect(list.statusCode).toBe(200);
     expect(JSON.stringify(list.json())).not.toMatch(/batch_id|source_receipt|source_revision|synthetic-sender|batch-message|CANARY_PRIVATE_SOURCE_BODY|prompt|reasoning/u);
@@ -410,13 +413,19 @@ describe('Cindy grouped batch contract', () => {
     expect(created.statusCode).toBe(200);
     expect(created.json()).toMatchObject({ status: 'resolved', version: 2, resolution_action: 'create_candidate' });
     expect(created.json()).toMatchObject({ last_attempt_failed: false });
-    expect(JSON.stringify(created.json())).not.toMatch(/batch_id|last_error|source_revision|source_receipt|prompt|reasoning/u);
+    const resolvedInternalCandidate = database.raw.prepare(
+      'SELECT resolved_candidate_id FROM cindy_owner_decision WHERE id = ?',
+    ).get(createDecision.decision_id) as { resolved_candidate_id: string };
+    expect(resolvedInternalCandidate.resolved_candidate_id).toMatch(/^cand_/u);
+    expect(JSON.stringify(created.json())).not.toContain(resolvedInternalCandidate.resolved_candidate_id);
+    expect(JSON.stringify(created.json())).not.toMatch(/resolved_candidate_id|batch_id|last_error|source_revision|source_receipt|prompt|reasoning/u);
     const replay = await app.inject({
       method: 'POST', url: `/api/owner-decisions/${createDecision.decision_id}/resolve`,
       payload: { decision_request_id: 'resolve-create', expected_version: createDecision.version, action: 'create_candidate', option_key: 'create' },
     });
     expect(replay.statusCode).toBe(200);
     expect(replay.json()).toEqual(created.json());
+    expect(JSON.stringify(replay.json())).not.toContain(resolvedInternalCandidate.resolved_candidate_id);
     const reusedRequest = await app.inject({
       method: 'POST', url: `/api/owner-decisions/${skipDecision.decision_id}/resolve`,
       payload: { decision_request_id: 'resolve-create', expected_version: skipDecision.version, action: 'skip', option_key: 'skip' },
@@ -436,8 +445,35 @@ describe('Cindy grouped batch contract', () => {
     });
     expect(cancelled.statusCode).toBe(200);
     expect(cancelled.json()).toMatchObject({ status: 'cancelled', version: 2 });
+    expect(JSON.stringify(cancelled.json())).not.toMatch(/resolved_candidate_id|cand_/u);
     expect(database.raw.prepare("SELECT processing_status FROM source_event_revision WHERE id = (SELECT source_revision_id FROM cindy_owner_decision_source WHERE decision_id = ?)")
       .get(cancelDecision.decision_id)).toEqual({ processing_status: 'pending_decision' });
+
+    const listAfterActions = await app.inject({ method: 'GET', url: '/api/owner-decisions?status=all' });
+    expect(listAfterActions.statusCode).toBe(200);
+    expect(JSON.stringify(listAfterActions.json())).not.toContain(resolvedInternalCandidate.resolved_candidate_id);
+    expect(JSON.stringify(listAfterActions.json())).not.toMatch(/resolved_candidate_id/u);
+    const replayCandidateCount = database.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get();
+    const replayAuditCount = database.raw.prepare('SELECT COUNT(*) AS count FROM cindy_batch_snapshot').get();
+    const replayStatuses = database.raw.prepare(
+      `SELECT revision.id, revision.processing_status FROM source_event_revision AS revision
+        JOIN cindy_batch_snapshot AS source ON source.source_revision_id = revision.id
+       WHERE source.batch_id = ?
+       ORDER BY revision.id`,
+    ).all('batch-owner-options');
+    const batchReplay = await submit(app, ownerPayload);
+    expect(batchReplay.statusCode).toBe(200);
+    expect(batchReplay.json()).toEqual({ ...firstBatchResponse, duplicate: true });
+    expect(JSON.stringify(batchReplay.json())).not.toContain(resolvedInternalCandidate.resolved_candidate_id);
+    expect(JSON.stringify(batchReplay.json())).not.toMatch(/resolved_candidate_id/u);
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get()).toEqual(replayCandidateCount);
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM cindy_batch_snapshot').get()).toEqual(replayAuditCount);
+    expect(database.raw.prepare(
+      `SELECT revision.id, revision.processing_status FROM source_event_revision AS revision
+        JOIN cindy_batch_snapshot AS source ON source.source_revision_id = revision.id
+       WHERE source.batch_id = ?
+       ORDER BY revision.id`,
+    ).all('batch-owner-options')).toEqual(replayStatuses);
 
     const foreignToken = 'foreign-owner-decision-token';
     const { app: foreignApp } = await makeApp(database, foreignToken, 'foreign-owner-decision-account');

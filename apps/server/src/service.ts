@@ -1402,7 +1402,6 @@ function projectCindyOwnerDecision(row: CindyOwnerDecisionRow, sourceCount: numb
     source_count: sourceCount,
     last_attempt_failed: row.last_error !== null,
     resolution_action: row.resolution_action,
-    resolved_candidate_id: row.resolved_candidate_id,
     created_at: row.created_at,
     updated_at: row.updated_at,
     resolved_at: row.resolved_at,
@@ -14028,7 +14027,6 @@ export class PmService {
         return {
           ...stored,
           duplicate: true,
-          owner_decisions: stored.owner_decisions.map((decision) => loadProjectedCindyOwnerDecision(this.database, decision.decision_id)),
         };
       }
       const requestReplay = this.database.raw.prepare(

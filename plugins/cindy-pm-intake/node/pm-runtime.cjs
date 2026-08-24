@@ -154693,7 +154693,6 @@ function projectCindyOwnerDecision(row, sourceCount) {
     source_count: sourceCount,
     last_attempt_failed: row.last_error !== null,
     resolution_action: row.resolution_action,
-    resolved_candidate_id: row.resolved_candidate_id,
     created_at: row.created_at,
     updated_at: row.updated_at,
     resolved_at: row.resolved_at
@@ -163841,11 +163840,9 @@ var PmService = class {
       ).get(auth.ownerScope, auth.accountAnchor, input.batch_id);
       if (replay) {
         if (replay.payload_hash !== payloadHash) throw new CindySourceContractError("CONFLICT", "batch_id \u5DF2\u7ED1\u5B9A\u5230\u4E0D\u540C canonical payload\u3002");
-        let stored = JSON.parse(replay.response_json);
         return {
-          ...stored,
-          duplicate: !0,
-          owner_decisions: stored.owner_decisions.map((decision) => loadProjectedCindyOwnerDecision(this.database, decision.decision_id))
+          ...JSON.parse(replay.response_json),
+          duplicate: !0
         };
       }
       if (this.database.raw.prepare(
