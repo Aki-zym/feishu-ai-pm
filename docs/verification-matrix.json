@@ -4,7 +4,7 @@
   "product_snapshot": {
     "algorithm": "product-source-sha256-v1",
     "selector": "apps-workspace-default-include-v1",
-    "fingerprint": "4c4343a7c78c7bae595a6e5e8380ce617e5989876227e60250ae3782d6cfcacd",
+    "fingerprint": "82b039e9da8fd011f42c8d8baf237269830516640489c98e3f0a5785b3ca9b41",
     "file_count": 85,
     "snapshot_as_of": "2026-08-15",
     "equivalent_commit": null
@@ -112,9 +112,9 @@
       "evidence_status": "attained",
       "evidence_type": "synthetic_local_sqlite_service_plugin_renderer_contract",
       "scope": "synthetic_local_cindy_grouped_batch_contract",
-      "source_commit": "3abdfa29a478e6ed8db30e9dcea073b9c2249392",
+      "source_commit": "9b820ddd91a9dc6345bcd680db4031c50bd8e493",
       "record_commit": "local-20260824-003-pending",
-      "run_id": "local-20260824-003-grouped-batch-02",
+      "run_id": "local-20260824-003-grouped-batch-03",
       "run_at": "2026-08-24",
       "environment": "Windows local worktree; Node.js 24.19.0; in-memory and temporary-file SQLite; Fastify inject; bundled Cindy plugin runtime; synthetic data only",
       "command_or_scenario": "focused Cindy batch/intake/migration (34/34); npm test -w @ai-pm/server (43/43); npm run typecheck -w @ai-pm/server; npm test -w @ai-pm/web (51/51); npm run typecheck -w @ai-pm/web; node --test plugins/cindy-pm-intake/main.test.mjs plugins/cindy-pm-intake/settings.test.mjs plugins/cindy-pm-intake/node/worker.test.mjs plugins/cindy-pm-intake/node/pm-runtime.test.mjs plugins/cindy-pm-intake/node/pm-runtime.shutdown.test.mjs (46/46); node plugins/cindy-pm-intake/scripts/bundle-pm-runtime.mjs; git diff --check",
@@ -128,11 +128,11 @@
       "provenance": {
         "mode": "local_run",
         "base_commit": "not_applicable",
-        "head_commit": "3abdfa29a478e6ed8db30e9dcea073b9c2249392",
+        "head_commit": "9b820ddd91a9dc6345bcd680db4031c50bd8e493",
         "merge_ref": "not_applicable",
         "parents": [],
         "tree": "not_applicable",
-        "run_id": "local-20260824-003-grouped-batch-02",
+        "run_id": "local-20260824-003-grouped-batch-03",
         "job_id": "not_applicable",
         "environment": "Windows local worktree; Node.js 24.19.0; in-memory and temporary-file SQLite; Fastify inject; bundled Cindy plugin runtime; synthetic data only",
         "command": "focused Cindy batch/intake/migration (34/34); npm test -w @ai-pm/server (43/43); npm run typecheck -w @ai-pm/server; npm test -w @ai-pm/web (51/51); npm run typecheck -w @ai-pm/web; node --test plugins/cindy-pm-intake/main.test.mjs plugins/cindy-pm-intake/settings.test.mjs plugins/cindy-pm-intake/node/worker.test.mjs plugins/cindy-pm-intake/node/pm-runtime.test.mjs plugins/cindy-pm-intake/node/pm-runtime.shutdown.test.mjs (46/46); node plugins/cindy-pm-intake/scripts/bundle-pm-runtime.mjs; git diff --check"

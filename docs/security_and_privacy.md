@@ -1,5 +1,7 @@
 # 安全与隐私
 
+> 2026-08-24 follow-up：内部 `resolved_candidate_id` 只保留在 SQLite 审计/关联层，普通 owner-decision list、resolve、cancel 和 batch replay DTO 都不投影该字段。batch replay 仅返回首次持久化安全响应并标记 duplicate，实时状态只从 owner-decision 列表/动作读取。
+
 PRIV-001 v6 的 active claim 会阻止冲突主人状态推进；lease 过期只能经完整 identity/token/version/timestamp CAS reclaim，畸形时间戳和时钟回拨 fail-closed，provider call 前还要通过最终 heartbeat/token/status/version fence。
 
 > 2026-08-17 PRIV-001 schema-v6 amendment：v5 schema/descriptor/checksum 不改写。跨进程 stop/start/revoke/hard-delete 统一使用持久 operation claim/fencing token 与版本 CAS；backup cleanup intent 在破坏性删除前记录受管 artifact identity/path/hash，partial finalize 可枚举、验证并恢复。证据仅 synthetic/local，不代表真实 Feishu/provider 或 Windows L5/L6。
