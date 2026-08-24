@@ -344,7 +344,7 @@ describe('Cindy grouped batch contract', () => {
     expect(database.raw.prepare('SELECT version FROM task WHERE id = ?').get('task-batch-cas')).toEqual({ version: 2 });
   });
 
-  it('needs_owner 私有投影可安全解决、取消、失效和重试，append 意图保持 pending', async () => {
+  it('needs_owner 私有投影可安全解决、取消、失效和重试，append 错误动作不消费', async () => {
     const { app, database } = await makeApp();
     const seedReceipt = (await save(app, [source(1)], 'save-owner-seed'))[0]!;
     const seeded = await submit(app, batch([seedReceipt], {
@@ -353,6 +353,10 @@ describe('Cindy grouped batch contract', () => {
       primary_dispositions: [{ disposition_ref: 'seed', source_receipt: seedReceipt, disposition: 'group', primary_group_key: 'seed' }],
     }));
     const candidateId = seeded.json().groups[0].candidate_id as string;
+    const context = await app.inject({
+      method: 'POST', url: '/api/integrations/cindy/context', headers: { authorization: `Bearer ${token}` }, payload: {},
+    });
+    const candidateKey = context.json().candidates[0].candidate_key as string;
     const receipts = await save(app, [source(2, '需要主人判断 A'), source(3, '需要主人判断 B'), source(4, 'CANARY_PRIVATE_SOURCE_BODY'), source(5, '暂不处理')], 'save-owner-decisions');
     const ownerPayload = batch(receipts, {
       decision_request_id: 'decision-owner-options', batch_id: 'batch-owner-options',
@@ -365,7 +369,9 @@ describe('Cindy grouped batch contract', () => {
       owner_decisions: [
         { decision_key: 'owner-create', reason: '是否建立新候选？', options: [{ option_key: 'create', action: 'create_candidate', title: '主人确认的新候选' }] },
         { decision_key: 'owner-skip', reason: '是否跳过？', options: [{ option_key: 'skip', action: 'skip' }] },
-        { decision_key: 'owner-append', reason: '是否追加？', options: [{ option_key: 'append', action: 'append_candidate', candidate_key: candidateId }] },
+        { decision_key: 'owner-append', reason: '是否追加？', options: [{
+          option_key: 'append', action: 'append_candidate', candidate_key: candidateKey, candidate_version: 1,
+        }] },
         { decision_key: 'owner-cancel', reason: '是否暂不处理？', options: [{ option_key: 'skip', action: 'skip' }] },
       ],
     });
@@ -382,7 +388,7 @@ describe('Cindy grouped batch contract', () => {
     const skipDecision = byReason.get('是否跳过？') as { decision_id: string; version: number };
     const appendDecision = byReason.get('是否追加？') as { decision_id: string; version: number; options: Array<{ available: boolean }> };
     const cancelDecision = byReason.get('是否暂不处理？') as { decision_id: string; version: number };
-    expect(appendDecision.options[0]!.available).toBe(false);
+    expect(appendDecision.options[0]!.available).toBe(true);
     const existingCandidateSources = database.raw.prepare(
       `SELECT COUNT(*) AS count FROM source_demand_unit_source AS source
         JOIN candidate_request AS candidate ON candidate.demand_unit_id = source.demand_unit_id

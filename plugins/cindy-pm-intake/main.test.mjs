@@ -55,13 +55,19 @@ function setup({ errandText = '{"accepted":true}', errandResponse = null, errand
           ok: true,
           result: { duplicate: false, binding: null, proposal: null, suggestion: null },
         };
-        if (request.params.path.endsWith('/tasks')) return {
+        if (request.params.path.endsWith('/context')) return {
           ok: true,
           result: {
-            items: [{ id: 'task-1', version: 2 }],
-            candidates: [{ id: 'candidate-1', title: '待确认需求', version: 1 }],
-            cursors: [{ conversation_key: 'conversation-1', cursor: '2026-08-24T00:00:00.000Z' }],
+            tasks: [{ task_key: 'task-1', version: 2 }],
+            candidates: [{ candidate_key: `cnd_${'a'.repeat(43)}`, title: '待确认需求', version: 1 }],
+            next_task_cursor: 'task-cursor-value',
+            next_candidate_cursor: 'candidate-cursor-value',
+            conversation_key: 'cnv_safe',
           },
+        };
+        if (request.params.path.endsWith('/tasks')) return {
+          ok: true,
+          result: { items: [{ id: 'task-1', title: '正式任务', version: 2 }] },
         };
         if (request.params.path.endsWith('/sources')) {
           sourcePosts.push(request.params.body);
@@ -122,14 +128,14 @@ test('scan_intake_window starts the fixed intake errand session and returns its 
   assert.equal(errandCalls[0].sessionKey, 'intake-v2');
   assert.equal(errandCalls[0].mode, 'wait');
   assert.equal(errandCalls[0].callId, 'call-scan');
-  assert.match(errandCalls[0].task, /get_pm_tasks/);
-  assert.match(errandCalls[0].task, /items、candidates、cursors/);
+  assert.match(errandCalls[0].task, /get_pm_context/);
+  assert.match(errandCalls[0].task, /正式任务和可追加候选安全摘要、opaque candidate_key、version 与分页 cursor/);
   assert.match(errandCalls[0].task, /save_pm_sources/);
   assert.match(errandCalls[0].task, /submit_pm_decisions/);
   assert.match(errandCalls[0].task, /不可信数据/);
   assert.match(errandCalls[0].task, /\/api\/tasks/);
   assert.match(errandCalls[0].task, /CAS/);
-  assert.match(errandCalls[0].task, /create_candidate.*只创建候选/);
+  assert.match(errandCalls[0].task, /明确不同目标才 create_candidate/);
   assert.match(errandCalls[0].task, /im_read_messages/);
   assert.match(errandCalls[0].task, /最多回读 4 小时/);
   assert.match(errandCalls[0].task, /empty_window/);
@@ -137,6 +143,8 @@ test('scan_intake_window starts the fixed intake errand session and returns its 
   assert.match(errandCalls[0].task, /已保存 snapshot 内仍由你.*完成语义分组/);
   assert.match(errandCalls[0].task, /禁止用语义匹配扩大回读范围、全局拉取会话/);
   assert.match(errandCalls[0].task, /产品服务端或第二套 Runtime.*不得另做语义聚类/);
+  assert.match(errandCalls[0].task, /同一对象、目标和交付物的跨窗口延续可用 append_candidate/);
+  assert.match(errandCalls[0].task, /query 只做标题和短摘要的确定性子串过滤，不代表语义匹配/);
   assert.match(errandCalls[0].task, /snapshot_receipts/);
   assert.match(errandCalls[0].task, /shared_context/);
   assert.match(errandCalls[0].task, /\[\{"action"/);
@@ -226,7 +234,7 @@ test('scan_intake_window skips nested dispatch inside current and legacy intake 
     assert.equal(nodeCalls.length, 0);
     assert.equal(result.ok, true);
     assert.equal(result.result.reason, 'already_in_intake_errand');
-    assert.match(result.result.next_action, /get_pm_tasks/);
+    assert.match(result.result.next_action, /get_pm_context/);
     assert.match(result.result.next_action, /save_pm_sources/);
     assert.match(result.result.next_action, /submit_pm_decisions/);
     assert.match(result.result.next_action, /不要再次调用 scan_intake_window/);
@@ -262,15 +270,39 @@ test('scan_intake_window turns a thrown session-occupied error into direct intak
   assert.match(result.result.next_action, /submit_pm_decisions/);
 });
 
-test('get_pm_tasks exposes task items, pending candidates, and read cursors', async () => {
+test('get_pm_context exposes safe task and appendable candidate summaries with opaque cursors', async () => {
   const { onHostMessage, sent } = setup();
-  onHostMessage({ type: 'tool-call', tool: 'get_pm_tasks', callId: 'call-snapshot', args: {} });
+  onHostMessage({ type: 'tool-call', tool: 'get_pm_context', callId: 'call-snapshot', args: {} });
   await waitFor(() => sent.some((message) => message.callId === 'call-snapshot'));
   const result = sent.find((message) => message.callId === 'call-snapshot');
-  assert.deepEqual(Object.keys(result.result).sort(), ['candidates', 'cursors', 'items']);
-  assert.equal(result.result.items[0].id, 'task-1');
-  assert.equal(result.result.candidates[0].id, 'candidate-1');
-  assert.equal(result.result.cursors[0].conversation_key, 'conversation-1');
+  assert.deepEqual(Object.keys(result.result).sort(), ['candidates', 'conversation_key', 'next_candidate_cursor', 'next_task_cursor', 'tasks']);
+  assert.equal(result.result.tasks[0].task_key, 'task-1');
+  assert.match(result.result.candidates[0].candidate_key, /^cnd_[A-Za-z0-9_-]{43}$/u);
+  assert.equal(result.result.next_task_cursor, 'task-cursor-value');
+  assert.equal(result.result.next_candidate_cursor, 'candidate-cursor-value');
+  assert.equal(result.result.conversation_key, 'cnv_safe');
+});
+
+test('get_pm_context posts bounded deterministic filters and rejects technical identifiers before HTTP', async () => {
+  const { onHostMessage, nodeCalls, sent } = setup();
+  const args = {
+    task_limit: 50,
+    candidate_limit: 25,
+    task_cursor: 'task-cursor-value',
+    candidate_cursor: 'candidate-cursor-value',
+    query: '活动留存',
+    conversation_receipts: ['r'.repeat(43)],
+  };
+  onHostMessage({ type: 'tool-call', tool: 'get_pm_context', callId: 'call-context-filter', args });
+  await waitFor(() => sent.some((message) => message.callId === 'call-context-filter'));
+  const post = nodeCalls.find((call) => call.params?.path?.endsWith('/context'));
+  assert.equal(post.params.method, 'POST');
+  assert.deepEqual(JSON.parse(JSON.stringify(post.params.body)), args);
+
+  onHostMessage({ type: 'tool-call', tool: 'get_pm_context', callId: 'call-context-injected', args: { chat_id: 'oc_technical' } });
+  await waitFor(() => sent.some((message) => message.callId === 'call-context-injected'));
+  assert.equal(sent.find((message) => message.callId === 'call-context-injected').ok, false);
+  assert.equal(nodeCalls.filter((call) => call.params?.path?.endsWith('/context')).length, 1);
 });
 
 test('scan result returns a readable short proposal list with action and title', async () => {
@@ -300,7 +332,7 @@ test('scan result uses human language for candidates, formal task updates, and e
 });
 
 test('ghost declares schedule support while retaining errand', () => {
-  assert.equal(ghost.version, '0.6.0');
+  assert.equal(ghost.version, '0.7.0');
   assert.equal(ghost.id, 'ai-pm-intake');
   assert.equal(ghost.name, 'TooManyTasks');
   assert.match(ghost.description, /本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台/);
@@ -318,6 +350,8 @@ test('ghost declares schedule support while retaining errand', () => {
   assert.deepEqual(ghost.subscribe.hooks, ['will-user-message']);
   assert.ok(ghost.tools.some((tool) => tool.name === 'update_pm_progress'));
   assert.ok(ghost.tools.some((tool) => tool.name === 'save_pm_sources'));
+  assert.ok(ghost.tools.some((tool) => tool.name === 'get_pm_context'));
+  assert.equal(ghost.tools.some((tool) => tool.name === 'get_pm_tasks'), false);
   assert.ok(ghost.tools.some((tool) => tool.name === 'submit_pm_decisions'));
   assert.equal(ghost.tools.some((tool) => tool.name === 'submit_intake'), false);
   assert.deepEqual(ghost.node.secretBindings.map((binding) => binding.key), [
@@ -329,7 +363,7 @@ test('ghost declares schedule support while retaining errand', () => {
 
 test('main flow creates separate Bearer, account anchor and receipt secrets before ensuring the resident service', async () => {
   const { onHostMessage, nodeCalls, secretCalls, sent } = setup();
-  onHostMessage({ type: 'tool-call', tool: 'get_pm_tasks', callId: 'call-ensure', args: {} });
+  onHostMessage({ type: 'tool-call', tool: 'get_pm_context', callId: 'call-ensure', args: {} });
   await waitFor(() => sent.some((message) => message.callId === 'call-ensure'));
   assert.equal(secretCalls.length, 3);
   assert.deepEqual(secretCalls.map((call) => call.url), [
@@ -344,7 +378,7 @@ test('main flow creates separate Bearer, account anchor and receipt secrets befo
   assert.ok(saved[1].length >= 64);
   assert.ok(saved[2].length >= 64);
   assert.equal(nodeCalls[0].method, 'pm/ensure');
-  assert.equal(nodeCalls[1].params.path, '/api/integrations/cindy/tasks');
+  assert.equal(nodeCalls[1].params.path, '/api/integrations/cindy/context');
 });
 
 test('save_pm_sources posts the declared source contract before decisions', async () => {
@@ -506,6 +540,95 @@ test('submit_pm_decisions posts receipts only and rejects update_task without CA
   assert.equal(capacityFailure.ok, false);
   assert.match(capacityFailure.message, /聚合后超过 10000 字符/);
   assert.equal(nodeCalls.filter((call) => call.params?.path?.endsWith('/decisions')).length, decisionPostsBeforeCapacityCheck);
+});
+
+test('submit_pm_decisions validates append candidate CAS, exact primary receipts, and field evidence before HTTP', async () => {
+  const receiptA = 'a'.repeat(43);
+  const receiptB = 'b'.repeat(43);
+  const candidateKey = `cnd_${'c'.repeat(43)}`;
+  const valid = {
+    decision_request_id: 'decision-append-valid',
+    batch_id: 'batch-append-valid',
+    window_id: 'window-append-valid',
+    window_start: '2026-08-24T01:00:00.000Z',
+    window_end: '2026-08-24T01:10:00.000Z',
+    snapshot_receipts: [receiptA, receiptB],
+    groups: [{
+      group_key: 'append', action: 'append_candidate', anchor_receipt: receiptA,
+      field_evidence_receipts: [receiptB], append_request_id: 'append-valid',
+      candidate_key: candidateKey, expected_candidate_version: 3,
+      source_receipts: [receiptA, receiptB], title: '补充后的候选',
+      field_evidence: { title: [receiptA, receiptB] },
+    }],
+    primary_dispositions: [
+      { disposition_ref: 'a', source_receipt: receiptA, disposition: 'group', primary_group_key: 'append' },
+      { disposition_ref: 'b', source_receipt: receiptB, disposition: 'group', primary_group_key: 'append' },
+    ],
+  };
+  const { onHostMessage, nodeCalls, sent } = setup();
+  onHostMessage({ type: 'tool-call', tool: 'submit_pm_decisions', callId: 'append-valid', args: valid });
+  await waitFor(() => sent.some((message) => message.callId === 'append-valid'));
+  assert.equal(sent.find((message) => message.callId === 'append-valid').ok, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(nodeCalls.find((call) => call.params?.body?.decision_request_id === 'decision-append-valid').params.body)), valid);
+
+  const invalidCases = [
+    { callId: 'append-no-version', mutate: (args) => { delete args.groups[0].expected_candidate_version; }, pattern: /version|CAS|request/u },
+    { callId: 'append-no-evidence', mutate: (args) => { delete args.groups[0].field_evidence.title; }, pattern: /evidence/u },
+    { callId: 'append-cross-group', mutate: (args) => { args.groups[0].source_receipts = [receiptA]; }, pattern: /本 append group|精确等于 primary group/u },
+  ];
+  for (const item of invalidCases) {
+    const args = structuredClone(valid);
+    args.decision_request_id = item.callId;
+    args.batch_id = item.callId;
+    item.mutate(args);
+    onHostMessage({ type: 'tool-call', tool: 'submit_pm_decisions', callId: item.callId, args });
+    await waitFor(() => sent.some((message) => message.callId === item.callId));
+    const result = sent.find((message) => message.callId === item.callId);
+    assert.equal(result.ok, false);
+    assert.match(result.message, item.pattern);
+    assert.equal(nodeCalls.some((call) => call.params?.body?.decision_request_id === item.callId), false);
+  }
+});
+
+test('needs_owner append persists Agent-declared per-field evidence and rejects missing evidence before HTTP', async () => {
+  const receiptA = 'd'.repeat(43);
+  const receiptB = 'e'.repeat(43);
+  const candidateKey = `cnd_${'f'.repeat(43)}`;
+  const valid = {
+    decision_request_id: 'decision-owner-append-valid',
+    batch_id: 'batch-owner-append-valid',
+    window_id: 'window-owner-append-valid',
+    window_start: '2026-08-24T01:00:00.000Z',
+    window_end: '2026-08-24T01:10:00.000Z',
+    snapshot_receipts: [receiptA, receiptB],
+    groups: [],
+    primary_dispositions: [
+      { disposition_ref: 'owner-a', source_receipt: receiptA, disposition: 'needs_owner', owner_decision_key: 'owner' },
+      { disposition_ref: 'owner-b', source_receipt: receiptB, disposition: 'needs_owner', owner_decision_key: 'owner' },
+    ],
+    owner_decisions: [{
+      decision_key: 'owner', group_key: 'owner-group', reason: '需要主人选择。',
+      options: [{
+        option_key: 'append', action: 'append_candidate', candidate_key: candidateKey,
+        candidate_version: 2, title: '补充标题', describe: '补充摘要',
+        field_evidence: { title: [receiptA], describe: [receiptB] },
+      }],
+    }],
+  };
+  const { onHostMessage, nodeCalls, sent } = setup();
+  onHostMessage({ type: 'tool-call', tool: 'submit_pm_decisions', callId: 'owner-append-valid', args: valid });
+  await waitFor(() => sent.some((message) => message.callId === 'owner-append-valid'));
+  assert.equal(sent.find((message) => message.callId === 'owner-append-valid').ok, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(nodeCalls.find((call) => call.params?.body?.decision_request_id === valid.decision_request_id).params.body)), valid);
+
+  const invalid = structuredClone(valid);
+  invalid.decision_request_id = 'decision-owner-append-invalid';
+  invalid.batch_id = 'batch-owner-append-invalid';
+  delete invalid.owner_decisions[0].options[0].field_evidence.describe;
+  onHostMessage({ type: 'tool-call', tool: 'submit_pm_decisions', callId: 'owner-append-invalid', args: invalid });
+  await waitFor(() => sent.some((message) => message.callId === 'owner-append-invalid'));
+  assert.equal(sent.find((message) => message.callId === 'owner-append-invalid').ok, false);
+  assert.equal(nodeCalls.some((call) => call.params?.body?.decision_request_id === invalid.decision_request_id), false);
 });
 
 test('update_pm_progress keeps progress oneshot separate from intake errand', async () => {

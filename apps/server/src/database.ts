@@ -17,7 +17,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { shanghaiDayWindow } from './shanghai-time.js';
 
-export const CURRENT_SCHEMA_VERSION = 11;
+export const CURRENT_SCHEMA_VERSION = 12;
 
 function registerData04SqlFunctions(database: DatabaseSync) {
   database.function('sha256', { deterministic: true }, (value: unknown) => createHash('sha256').update(String(value ?? '')).digest('hex'));
@@ -1770,7 +1770,7 @@ export type MigrationOperation =
 export interface MigrationDescriptor {
   version: number;
   name: string;
-  expectedPostSchemaIdentity: 'current-schema-v1' | 'current-schema-v2' | 'current-schema-v3' | 'current-schema-v4' | 'current-schema-v5' | 'current-schema-v6' | 'current-schema-v7' | 'current-schema-v8' | 'current-schema-v9' | 'current-schema-v10' | 'current-schema-v11';
+  expectedPostSchemaIdentity: 'current-schema-v1' | 'current-schema-v2' | 'current-schema-v3' | 'current-schema-v4' | 'current-schema-v5' | 'current-schema-v6' | 'current-schema-v7' | 'current-schema-v8' | 'current-schema-v9' | 'current-schema-v10' | 'current-schema-v11' | 'current-schema-v12';
   orderedOperations: readonly MigrationOperation[];
 }
 
@@ -3630,6 +3630,176 @@ export const CINDY_GROUPED_BATCH_MIGRATION_DESCRIPTOR = deepFreeze(Object.freeze
 }) satisfies MigrationDescriptor);
 
 export const CINDY_GROUPED_BATCH_MIGRATION_CHECKSUM = migrationDescriptorChecksum(CINDY_GROUPED_BATCH_MIGRATION_DESCRIPTOR);
+
+/** Cindy candidate append v12: opaque candidate context and atomic primary-source consumption. */
+const CINDY_CANDIDATE_APPEND_MIGRATION_SQL = Object.freeze([
+  `CREATE TABLE __migration_v12_cindy_batch_group (
+    owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    group_key TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('create_candidate','append_candidate','update_task')),
+    anchor_revision_id TEXT NOT NULL REFERENCES source_event_revision(id) ON DELETE RESTRICT,
+    candidate_id TEXT REFERENCES candidate_request(id) ON DELETE SET NULL,
+    task_id TEXT REFERENCES task(id) ON DELETE SET NULL,
+    task_version INTEGER CHECK (task_version IS NULL OR task_version >= 1),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(owner_scope, account_anchor, batch_id, group_key),
+    FOREIGN KEY(owner_scope, account_anchor, batch_id)
+      REFERENCES cindy_batch(owner_scope, account_anchor, batch_id) ON DELETE CASCADE
+  );`,
+  `INSERT INTO __migration_v12_cindy_batch_group
+    SELECT owner_scope, account_anchor, batch_id, group_key, action, anchor_revision_id,
+           candidate_id, task_id, task_version, created_at
+      FROM cindy_batch_group;`,
+  'DROP TABLE cindy_batch_group;',
+  'ALTER TABLE __migration_v12_cindy_batch_group RENAME TO cindy_batch_group;',
+  `CREATE TABLE __migration_v12_cindy_owner_decision (
+    id TEXT PRIMARY KEY,
+    owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    decision_key TEXT NOT NULL,
+    group_key TEXT NOT NULL,
+    reason_summary TEXT NOT NULL CHECK (length(reason_summary) BETWEEN 1 AND 500),
+    options_json TEXT NOT NULL CHECK (length(options_json) <= 10000),
+    status TEXT NOT NULL CHECK (status IN ('pending','resolved','superseded','cancelled')),
+    version INTEGER NOT NULL CHECK (version >= 1),
+    resolution_action TEXT CHECK (resolution_action IS NULL OR resolution_action IN ('skip','create_candidate','append_candidate')),
+    resolution_request_id TEXT,
+    resolution_payload_hash TEXT CHECK (resolution_payload_hash IS NULL OR length(resolution_payload_hash) = 64),
+    resolution_response_json TEXT,
+    resolved_candidate_id TEXT REFERENCES candidate_request(id) ON DELETE SET NULL,
+    last_error TEXT CHECK (last_error IS NULL OR length(last_error) <= 240),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    resolved_at TEXT,
+    UNIQUE(owner_scope, account_anchor, batch_id, decision_key),
+    FOREIGN KEY(owner_scope, account_anchor, batch_id)
+      REFERENCES cindy_batch(owner_scope, account_anchor, batch_id) ON DELETE CASCADE
+  );`,
+  `INSERT INTO __migration_v12_cindy_owner_decision
+    SELECT id, owner_scope, account_anchor, batch_id, decision_key, decision_key,
+           reason_summary, options_json, status, version, resolution_action,
+           resolution_request_id, resolution_payload_hash, resolution_response_json,
+           resolved_candidate_id, last_error, created_at, updated_at, resolved_at
+      FROM cindy_owner_decision;`,
+  'DROP TABLE cindy_owner_decision;',
+  'ALTER TABLE __migration_v12_cindy_owner_decision RENAME TO cindy_owner_decision;',
+  `CREATE TABLE cindy_append_request (
+    owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
+    append_request_id TEXT NOT NULL,
+    payload_hash TEXT NOT NULL CHECK (length(payload_hash) = 64),
+    candidate_id TEXT NOT NULL REFERENCES candidate_request(id) ON DELETE RESTRICT,
+    batch_id TEXT NOT NULL,
+    group_key TEXT NOT NULL,
+    owner_decision_id TEXT REFERENCES cindy_owner_decision(id) ON DELETE SET NULL,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(owner_scope, account_anchor, append_request_id),
+    FOREIGN KEY(owner_scope, account_anchor, batch_id, group_key)
+      REFERENCES cindy_batch_group(owner_scope, account_anchor, batch_id, group_key) ON DELETE RESTRICT
+  );`,
+  `CREATE TABLE cindy_candidate_source_consumption (
+    owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
+    source_revision_id TEXT NOT NULL REFERENCES source_event_revision(id) ON DELETE RESTRICT,
+    candidate_id TEXT NOT NULL REFERENCES candidate_request(id) ON DELETE RESTRICT,
+    batch_id TEXT NOT NULL,
+    group_key TEXT NOT NULL,
+    append_request_id TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(owner_scope, account_anchor, source_revision_id),
+    FOREIGN KEY(owner_scope, account_anchor, batch_id, group_key)
+      REFERENCES cindy_batch_group(owner_scope, account_anchor, batch_id, group_key) ON DELETE RESTRICT,
+    FOREIGN KEY(owner_scope, account_anchor, append_request_id)
+      REFERENCES cindy_append_request(owner_scope, account_anchor, append_request_id) ON DELETE RESTRICT
+  );`,
+  `CREATE TABLE cindy_append_field_evidence (
+    owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
+    append_request_id TEXT NOT NULL,
+    field_name TEXT NOT NULL CHECK (field_name IN ('title','describe','next_step')),
+    source_revision_id TEXT NOT NULL REFERENCES source_event_revision(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(owner_scope, account_anchor, append_request_id, field_name, source_revision_id),
+    FOREIGN KEY(owner_scope, account_anchor, append_request_id)
+      REFERENCES cindy_append_request(owner_scope, account_anchor, append_request_id) ON DELETE CASCADE
+  );`,
+  `INSERT INTO cindy_candidate_source_consumption
+    (owner_scope, account_anchor, source_revision_id, candidate_id, batch_id, group_key, append_request_id, created_at)
+   SELECT snapshot.owner_scope, snapshot.account_anchor, snapshot.source_revision_id,
+          batch_group.candidate_id, snapshot.batch_id, snapshot.primary_group_key, NULL, snapshot.created_at
+     FROM cindy_batch_snapshot AS snapshot
+     JOIN cindy_batch_group AS batch_group
+       ON batch_group.owner_scope = snapshot.owner_scope
+      AND batch_group.account_anchor = snapshot.account_anchor
+      AND batch_group.batch_id = snapshot.batch_id
+      AND batch_group.group_key = snapshot.primary_group_key
+    WHERE snapshot.primary_disposition = 'group'
+      AND batch_group.action = 'create_candidate'
+      AND batch_group.candidate_id IS NOT NULL;`,
+  'CREATE INDEX IF NOT EXISTS idx_cindy_batch_snapshot_revision ON cindy_batch_snapshot(source_revision_id, owner_scope, batch_id);',
+  'CREATE INDEX IF NOT EXISTS idx_cindy_owner_decision_status ON cindy_owner_decision(owner_scope, status, updated_at DESC);',
+  'CREATE INDEX IF NOT EXISTS idx_cindy_owner_decision_source_revision ON cindy_owner_decision_source(source_revision_id, decision_id);',
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_cindy_owner_decision_resolution_request
+     ON cindy_owner_decision(owner_scope, account_anchor, resolution_request_id)
+     WHERE resolution_request_id IS NOT NULL;`,
+  'CREATE INDEX idx_cindy_append_candidate ON cindy_append_request(owner_scope, account_anchor, candidate_id, created_at DESC);',
+  'CREATE INDEX idx_cindy_consumption_candidate ON cindy_candidate_source_consumption(owner_scope, account_anchor, candidate_id, created_at);',
+] as const);
+
+function cindyCandidateAppendSchemaChecksum() {
+  const canonical = new DatabaseSync(':memory:');
+  try {
+    registerData04SqlFunctions(canonical);
+    executeMigrationOperations(canonical, { ...BASELINE_MIGRATION_DESCRIPTOR, checksum: BASELINE_MIGRATION_CHECKSUM }, {
+      databaseInstanceId: '00000000000000000000000000000000',
+      instanceCreatedAt: '2026-08-15T00:00:00.000Z',
+      appliedAt: '2026-08-15T00:00:00.000Z',
+      preexistingTables: [],
+    });
+    for (const statement of RELATION_CONSTRAINT_MIGRATION_SQL) if (!statement.startsWith('UPDATE ') && !statement.startsWith('INSERT ')) canonical.exec(statement);
+    for (const statement of RUNTIME_TOOL_IDEMPOTENCY_MIGRATION_SQL) canonical.exec(statement);
+    for (const statement of CANDIDATE_VERSION_MIGRATION_SQL) canonical.exec(statement);
+    for (const statement of PRIVACY_MIGRATION_SQL) if (!statement.startsWith('INSERT ')) canonical.exec(statement);
+    for (const statement of PRIVACY_FENCING_MIGRATION_SQL) canonical.exec(statement);
+    for (const statement of SOURCE_REVISION_MIGRATION_SQL) if (!statement.startsWith('INSERT ') && !statement.startsWith('UPDATE ')) canonical.exec(statement);
+    for (const statement of PROVIDER_RETRY_COOLDOWN_MIGRATION_SQL) canonical.exec(statement);
+    for (const statement of CINDY_TRUSTED_SOURCE_MIGRATION_SQL) if (!statement.startsWith('INSERT ')) canonical.exec(statement);
+    for (const statement of CINDY_OWNER_CONTEXT_MIGRATION_SQL) if (!statement.startsWith('UPDATE ')) canonical.exec(statement);
+    for (const statement of CINDY_GROUPED_BATCH_MIGRATION_SQL) canonical.exec(statement);
+    for (const statement of CINDY_CANDIDATE_APPEND_MIGRATION_SQL) canonical.exec(statement);
+    return schemaIdentityChecksum(captureSchemaIdentity(canonical));
+  } finally {
+    canonical.close();
+  }
+}
+
+export const CINDY_CANDIDATE_APPEND_SCHEMA_CHECKSUM = cindyCandidateAppendSchemaChecksum();
+export const CINDY_CANDIDATE_APPEND_MIGRATION_DESCRIPTOR = deepFreeze(Object.freeze({
+  version: 12,
+  name: 'cindy-candidate-append',
+  expectedPostSchemaIdentity: 'current-schema-v12' as const,
+  orderedOperations: Object.freeze([
+    Object.freeze({ id: 'cindy-candidate-append-schema' as const, kind: 'sql_batch' as const, statements: CINDY_CANDIDATE_APPEND_MIGRATION_SQL }),
+    Object.freeze({
+      id: 'verify-post-schema' as const,
+      kind: 'assert_database' as const,
+      expectedSchemaIdentityChecksum: CINDY_CANDIDATE_APPEND_SCHEMA_CHECKSUM,
+      checks: Object.freeze(['schema', 'foreign_keys', 'integrity'] as const),
+    }),
+    Object.freeze({
+      id: 'record-migration' as const,
+      kind: 'record_migration' as const,
+      ledgerTable: 'schema_migration' as const,
+      userVersion: 12,
+    }),
+  ]),
+}) satisfies MigrationDescriptor);
+
+export const CINDY_CANDIDATE_APPEND_MIGRATION_CHECKSUM = migrationDescriptorChecksum(CINDY_CANDIDATE_APPEND_MIGRATION_DESCRIPTOR);
 const MIGRATIONS = [
   {
     ...BASELINE_MIGRATION_DESCRIPTOR,
@@ -3675,13 +3845,17 @@ const MIGRATIONS = [
     ...CINDY_GROUPED_BATCH_MIGRATION_DESCRIPTOR,
     checksum: CINDY_GROUPED_BATCH_MIGRATION_CHECKSUM,
   },
+  {
+    ...CINDY_CANDIDATE_APPEND_MIGRATION_DESCRIPTOR,
+    checksum: CINDY_CANDIDATE_APPEND_MIGRATION_CHECKSUM,
+  },
 ] as const;
 
 function assertExecutableMigrationDescriptor(descriptor: MigrationDescriptor) {
   if (
     !Number.isInteger(descriptor.version)
     || descriptor.version < 1
-    || !['current-schema-v1', 'current-schema-v2', 'current-schema-v3', 'current-schema-v4', 'current-schema-v5', 'current-schema-v6', 'current-schema-v7', 'current-schema-v8', 'current-schema-v9', 'current-schema-v10', 'current-schema-v11'].includes(descriptor.expectedPostSchemaIdentity)
+    || !['current-schema-v1', 'current-schema-v2', 'current-schema-v3', 'current-schema-v4', 'current-schema-v5', 'current-schema-v6', 'current-schema-v7', 'current-schema-v8', 'current-schema-v9', 'current-schema-v10', 'current-schema-v11', 'current-schema-v12'].includes(descriptor.expectedPostSchemaIdentity)
     || descriptor.orderedOperations.length === 0
   ) {
     throw new DatabaseUpgradeError('migration', '数据库迁移描述符版本或负载无效；已拒绝推进版本。');

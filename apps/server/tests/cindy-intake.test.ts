@@ -124,7 +124,7 @@ describe('Cindy 对话入库接口', () => {
     });
   }
 
-  it('Cindy 任务接口要求 Bearer，并且只返回活动未归档任务', async () => {
+  it('Cindy 上下文接口要求 Bearer，并且不返回未绑定当前 owner 的旧任务', async () => {
     const { app, database } = await makeApp();
     makeTask(database);
     makeTask(database, 'task-cindy-intake-archived');
@@ -138,10 +138,10 @@ describe('Cindy 对话入库接口', () => {
       headers: { authorization: `Bearer ${token}` },
     });
     expect(response.statusCode).toBe(200);
-    expect(response.json().items).toEqual([
-      expect.objectContaining({ id: 'task-cindy-intake-1', status: 'planned', version: 1 }),
-    ]);
-    expect(response.json().items.some((item: { id: string }) => item.id === 'task-cindy-intake-archived')).toBe(false);
+    expect(response.json().tasks).toEqual([]);
+    expect(response.json().candidates).toEqual([]);
+    expect(response.json().next_task_cursor).toBeNull();
+    expect(response.json().next_candidate_cursor).toBeNull();
   });
 
   it('配置 Bearer 时缺少稳定账号锚点或独立 receipt 密钥会拒绝启动', async () => {

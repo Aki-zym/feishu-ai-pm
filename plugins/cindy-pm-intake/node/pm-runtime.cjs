@@ -145443,7 +145443,7 @@ function projectShanghaiCalendarPlan(startAt, endAt, fallbackAt = null) {
 }
 
 // apps/server/src/database.ts
-var CURRENT_SCHEMA_VERSION = 11;
+var CURRENT_SCHEMA_VERSION = 12;
 function registerData04SqlFunctions(database) {
   database.function("sha256", { deterministic: !0 }, (value) => (0, import_node_crypto2.createHash)("sha256").update(String(value ?? "")).digest("hex"));
 }
@@ -148396,7 +148396,168 @@ var CINDY_GROUPED_BATCH_SCHEMA_CHECKSUM = cindyGroupedBatchSchemaChecksum(), CIN
       userVersion: 11
     })
   ])
-})), CINDY_GROUPED_BATCH_MIGRATION_CHECKSUM = migrationDescriptorChecksum(CINDY_GROUPED_BATCH_MIGRATION_DESCRIPTOR), MIGRATIONS = [
+})), CINDY_GROUPED_BATCH_MIGRATION_CHECKSUM = migrationDescriptorChecksum(CINDY_GROUPED_BATCH_MIGRATION_DESCRIPTOR), CINDY_CANDIDATE_APPEND_MIGRATION_SQL = Object.freeze([
+  `CREATE TABLE __migration_v12_cindy_batch_group (
+    owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    group_key TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('create_candidate','append_candidate','update_task')),
+    anchor_revision_id TEXT NOT NULL REFERENCES source_event_revision(id) ON DELETE RESTRICT,
+    candidate_id TEXT REFERENCES candidate_request(id) ON DELETE SET NULL,
+    task_id TEXT REFERENCES task(id) ON DELETE SET NULL,
+    task_version INTEGER CHECK (task_version IS NULL OR task_version >= 1),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(owner_scope, account_anchor, batch_id, group_key),
+    FOREIGN KEY(owner_scope, account_anchor, batch_id)
+      REFERENCES cindy_batch(owner_scope, account_anchor, batch_id) ON DELETE CASCADE
+  );`,
+  `INSERT INTO __migration_v12_cindy_batch_group
+    SELECT owner_scope, account_anchor, batch_id, group_key, action, anchor_revision_id,
+           candidate_id, task_id, task_version, created_at
+      FROM cindy_batch_group;`,
+  "DROP TABLE cindy_batch_group;",
+  "ALTER TABLE __migration_v12_cindy_batch_group RENAME TO cindy_batch_group;",
+  `CREATE TABLE __migration_v12_cindy_owner_decision (
+    id TEXT PRIMARY KEY,
+    owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    decision_key TEXT NOT NULL,
+    group_key TEXT NOT NULL,
+    reason_summary TEXT NOT NULL CHECK (length(reason_summary) BETWEEN 1 AND 500),
+    options_json TEXT NOT NULL CHECK (length(options_json) <= 10000),
+    status TEXT NOT NULL CHECK (status IN ('pending','resolved','superseded','cancelled')),
+    version INTEGER NOT NULL CHECK (version >= 1),
+    resolution_action TEXT CHECK (resolution_action IS NULL OR resolution_action IN ('skip','create_candidate','append_candidate')),
+    resolution_request_id TEXT,
+    resolution_payload_hash TEXT CHECK (resolution_payload_hash IS NULL OR length(resolution_payload_hash) = 64),
+    resolution_response_json TEXT,
+    resolved_candidate_id TEXT REFERENCES candidate_request(id) ON DELETE SET NULL,
+    last_error TEXT CHECK (last_error IS NULL OR length(last_error) <= 240),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    resolved_at TEXT,
+    UNIQUE(owner_scope, account_anchor, batch_id, decision_key),
+    FOREIGN KEY(owner_scope, account_anchor, batch_id)
+      REFERENCES cindy_batch(owner_scope, account_anchor, batch_id) ON DELETE CASCADE
+  );`,
+  `INSERT INTO __migration_v12_cindy_owner_decision
+    SELECT id, owner_scope, account_anchor, batch_id, decision_key, decision_key,
+           reason_summary, options_json, status, version, resolution_action,
+           resolution_request_id, resolution_payload_hash, resolution_response_json,
+           resolved_candidate_id, last_error, created_at, updated_at, resolved_at
+      FROM cindy_owner_decision;`,
+  "DROP TABLE cindy_owner_decision;",
+  "ALTER TABLE __migration_v12_cindy_owner_decision RENAME TO cindy_owner_decision;",
+  `CREATE TABLE cindy_append_request (
+    owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
+    append_request_id TEXT NOT NULL,
+    payload_hash TEXT NOT NULL CHECK (length(payload_hash) = 64),
+    candidate_id TEXT NOT NULL REFERENCES candidate_request(id) ON DELETE RESTRICT,
+    batch_id TEXT NOT NULL,
+    group_key TEXT NOT NULL,
+    owner_decision_id TEXT REFERENCES cindy_owner_decision(id) ON DELETE SET NULL,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(owner_scope, account_anchor, append_request_id),
+    FOREIGN KEY(owner_scope, account_anchor, batch_id, group_key)
+      REFERENCES cindy_batch_group(owner_scope, account_anchor, batch_id, group_key) ON DELETE RESTRICT
+  );`,
+  `CREATE TABLE cindy_candidate_source_consumption (
+    owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
+    source_revision_id TEXT NOT NULL REFERENCES source_event_revision(id) ON DELETE RESTRICT,
+    candidate_id TEXT NOT NULL REFERENCES candidate_request(id) ON DELETE RESTRICT,
+    batch_id TEXT NOT NULL,
+    group_key TEXT NOT NULL,
+    append_request_id TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(owner_scope, account_anchor, source_revision_id),
+    FOREIGN KEY(owner_scope, account_anchor, batch_id, group_key)
+      REFERENCES cindy_batch_group(owner_scope, account_anchor, batch_id, group_key) ON DELETE RESTRICT,
+    FOREIGN KEY(owner_scope, account_anchor, append_request_id)
+      REFERENCES cindy_append_request(owner_scope, account_anchor, append_request_id) ON DELETE RESTRICT
+  );`,
+  `CREATE TABLE cindy_append_field_evidence (
+    owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
+    append_request_id TEXT NOT NULL,
+    field_name TEXT NOT NULL CHECK (field_name IN ('title','describe','next_step')),
+    source_revision_id TEXT NOT NULL REFERENCES source_event_revision(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(owner_scope, account_anchor, append_request_id, field_name, source_revision_id),
+    FOREIGN KEY(owner_scope, account_anchor, append_request_id)
+      REFERENCES cindy_append_request(owner_scope, account_anchor, append_request_id) ON DELETE CASCADE
+  );`,
+  `INSERT INTO cindy_candidate_source_consumption
+    (owner_scope, account_anchor, source_revision_id, candidate_id, batch_id, group_key, append_request_id, created_at)
+   SELECT snapshot.owner_scope, snapshot.account_anchor, snapshot.source_revision_id,
+          batch_group.candidate_id, snapshot.batch_id, snapshot.primary_group_key, NULL, snapshot.created_at
+     FROM cindy_batch_snapshot AS snapshot
+     JOIN cindy_batch_group AS batch_group
+       ON batch_group.owner_scope = snapshot.owner_scope
+      AND batch_group.account_anchor = snapshot.account_anchor
+      AND batch_group.batch_id = snapshot.batch_id
+      AND batch_group.group_key = snapshot.primary_group_key
+    WHERE snapshot.primary_disposition = 'group'
+      AND batch_group.action = 'create_candidate'
+      AND batch_group.candidate_id IS NOT NULL;`,
+  "CREATE INDEX IF NOT EXISTS idx_cindy_batch_snapshot_revision ON cindy_batch_snapshot(source_revision_id, owner_scope, batch_id);",
+  "CREATE INDEX IF NOT EXISTS idx_cindy_owner_decision_status ON cindy_owner_decision(owner_scope, status, updated_at DESC);",
+  "CREATE INDEX IF NOT EXISTS idx_cindy_owner_decision_source_revision ON cindy_owner_decision_source(source_revision_id, decision_id);",
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_cindy_owner_decision_resolution_request
+     ON cindy_owner_decision(owner_scope, account_anchor, resolution_request_id)
+     WHERE resolution_request_id IS NOT NULL;`,
+  "CREATE INDEX idx_cindy_append_candidate ON cindy_append_request(owner_scope, account_anchor, candidate_id, created_at DESC);",
+  "CREATE INDEX idx_cindy_consumption_candidate ON cindy_candidate_source_consumption(owner_scope, account_anchor, candidate_id, created_at);"
+]);
+function cindyCandidateAppendSchemaChecksum() {
+  let canonical = new import_node_sqlite.DatabaseSync(":memory:");
+  try {
+    registerData04SqlFunctions(canonical), executeMigrationOperations(canonical, { ...BASELINE_MIGRATION_DESCRIPTOR, checksum: BASELINE_MIGRATION_CHECKSUM }, {
+      databaseInstanceId: "00000000000000000000000000000000",
+      instanceCreatedAt: "2026-08-15T00:00:00.000Z",
+      appliedAt: "2026-08-15T00:00:00.000Z",
+      preexistingTables: []
+    });
+    for (let statement of RELATION_CONSTRAINT_MIGRATION_SQL) !statement.startsWith("UPDATE ") && !statement.startsWith("INSERT ") && canonical.exec(statement);
+    for (let statement of RUNTIME_TOOL_IDEMPOTENCY_MIGRATION_SQL) canonical.exec(statement);
+    for (let statement of CANDIDATE_VERSION_MIGRATION_SQL) canonical.exec(statement);
+    for (let statement of PRIVACY_MIGRATION_SQL) statement.startsWith("INSERT ") || canonical.exec(statement);
+    for (let statement of PRIVACY_FENCING_MIGRATION_SQL) canonical.exec(statement);
+    for (let statement of SOURCE_REVISION_MIGRATION_SQL) !statement.startsWith("INSERT ") && !statement.startsWith("UPDATE ") && canonical.exec(statement);
+    for (let statement of PROVIDER_RETRY_COOLDOWN_MIGRATION_SQL) canonical.exec(statement);
+    for (let statement of CINDY_TRUSTED_SOURCE_MIGRATION_SQL) statement.startsWith("INSERT ") || canonical.exec(statement);
+    for (let statement of CINDY_OWNER_CONTEXT_MIGRATION_SQL) statement.startsWith("UPDATE ") || canonical.exec(statement);
+    for (let statement of CINDY_GROUPED_BATCH_MIGRATION_SQL) canonical.exec(statement);
+    for (let statement of CINDY_CANDIDATE_APPEND_MIGRATION_SQL) canonical.exec(statement);
+    return schemaIdentityChecksum(captureSchemaIdentity(canonical));
+  } finally {
+    canonical.close();
+  }
+}
+var CINDY_CANDIDATE_APPEND_SCHEMA_CHECKSUM = cindyCandidateAppendSchemaChecksum(), CINDY_CANDIDATE_APPEND_MIGRATION_DESCRIPTOR = deepFreeze(Object.freeze({
+  version: 12,
+  name: "cindy-candidate-append",
+  expectedPostSchemaIdentity: "current-schema-v12",
+  orderedOperations: Object.freeze([
+    Object.freeze({ id: "cindy-candidate-append-schema", kind: "sql_batch", statements: CINDY_CANDIDATE_APPEND_MIGRATION_SQL }),
+    Object.freeze({
+      id: "verify-post-schema",
+      kind: "assert_database",
+      expectedSchemaIdentityChecksum: CINDY_CANDIDATE_APPEND_SCHEMA_CHECKSUM,
+      checks: Object.freeze(["schema", "foreign_keys", "integrity"])
+    }),
+    Object.freeze({
+      id: "record-migration",
+      kind: "record_migration",
+      ledgerTable: "schema_migration",
+      userVersion: 12
+    })
+  ])
+})), CINDY_CANDIDATE_APPEND_MIGRATION_CHECKSUM = migrationDescriptorChecksum(CINDY_CANDIDATE_APPEND_MIGRATION_DESCRIPTOR), MIGRATIONS = [
   {
     ...BASELINE_MIGRATION_DESCRIPTOR,
     checksum: BASELINE_MIGRATION_CHECKSUM
@@ -148440,10 +148601,14 @@ var CINDY_GROUPED_BATCH_SCHEMA_CHECKSUM = cindyGroupedBatchSchemaChecksum(), CIN
   {
     ...CINDY_GROUPED_BATCH_MIGRATION_DESCRIPTOR,
     checksum: CINDY_GROUPED_BATCH_MIGRATION_CHECKSUM
+  },
+  {
+    ...CINDY_CANDIDATE_APPEND_MIGRATION_DESCRIPTOR,
+    checksum: CINDY_CANDIDATE_APPEND_MIGRATION_CHECKSUM
   }
 ];
 function assertExecutableMigrationDescriptor(descriptor) {
-  if (!Number.isInteger(descriptor.version) || descriptor.version < 1 || !["current-schema-v1", "current-schema-v2", "current-schema-v3", "current-schema-v4", "current-schema-v5", "current-schema-v6", "current-schema-v7", "current-schema-v8", "current-schema-v9", "current-schema-v10", "current-schema-v11"].includes(descriptor.expectedPostSchemaIdentity) || descriptor.orderedOperations.length === 0)
+  if (!Number.isInteger(descriptor.version) || descriptor.version < 1 || !["current-schema-v1", "current-schema-v2", "current-schema-v3", "current-schema-v4", "current-schema-v5", "current-schema-v6", "current-schema-v7", "current-schema-v8", "current-schema-v9", "current-schema-v10", "current-schema-v11", "current-schema-v12"].includes(descriptor.expectedPostSchemaIdentity) || descriptor.orderedOperations.length === 0)
     throw new DatabaseUpgradeError("migration", "\u6570\u636E\u5E93\u8FC1\u79FB\u63CF\u8FF0\u7B26\u7248\u672C\u6216\u8D1F\u8F7D\u65E0\u6548\uFF1B\u5DF2\u62D2\u7EDD\u63A8\u8FDB\u7248\u672C\u3002");
   let operationIds = /* @__PURE__ */ new Set(), assertionCount = 0, recordCount = 0;
   for (let operation of descriptor.orderedOperations) {
@@ -149591,11 +149756,20 @@ function revisionResult(row) {
   let result = { generation: row.revision_number };
   return row.provider_revision_modified_at_ms !== null && (result.modified_at = new Date(row.provider_revision_modified_at_ms).toISOString()), row.provider_revision_sequence !== null && (result.sequence = row.provider_revision_sequence), result;
 }
-function sourceReceipt(auth, row) {
+function issueCindySourceReceipt(auth, row) {
   if (!row.receipt_nonce || !row.receipt_digest) throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "\u6765\u6E90\u6CA1\u6709\u53EF\u7528 receipt\u3002");
   let receipt = receiptForNonce(auth, row.receipt_nonce);
   if (receiptDigest(receipt) !== row.receipt_digest) throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "\u6765\u6E90 receipt \u65E0\u6CD5\u901A\u8FC7\u5F53\u524D\u8BA4\u8BC1\u4E0A\u4E0B\u6587\u9A8C\u8BC1\u3002");
   return receipt;
+}
+function issueCindySourceReceiptForRevision(database, auth, revisionId) {
+  let row = database.raw.prepare(
+    `SELECT revision.* FROM source_event_revision AS revision
+      JOIN cindy_source_identity AS identity ON identity.current_revision_id = revision.id
+     WHERE revision.id = ? AND identity.owner_scope = ? AND identity.account_anchor = ? AND identity.state = 'active'`
+  ).get(revisionId, auth.ownerScope, auth.accountAnchor);
+  if (!row) throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "\u6765\u6E90 revision \u5DF2\u53D8\u5316\u6216\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8BA4\u8BC1\u4E0A\u4E0B\u6587\u3002");
+  return issueCindySourceReceipt(auth, row);
 }
 function resolveReceiptRow(database, auth, receipt, forDecision = !1) {
   if (typeof receipt != "string" || receipt.length < 32 || receipt.length > 200)
@@ -149621,6 +149795,9 @@ function resolveReceiptRow(database, auth, receipt, forDecision = !1) {
 }
 function resolveCindyDecisionReceipt(database, auth, receipt) {
   return resolveReceiptRow(database, auth, receipt, !0);
+}
+function resolveCindyCurrentReceipt(database, auth, receipt) {
+  return resolveReceiptRow(database, auth, receipt, !1);
 }
 function assertRelationContext(source, target) {
   let targetChatRef = "chat_ref" in target ? target.chat_ref : target.chatRef, targetThreadRef = "thread_ref" in target ? target.thread_ref : target.threadRef;
@@ -149736,7 +149913,7 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
           `SELECT current_revision_id, state FROM cindy_source_identity
             WHERE owner_scope = ? AND account_anchor = ? AND source_event_id = ?`
         ).get(auth.ownerScope, auth.accountAnchor, row.source_event_id), sourceStatus = identity?.state === "active" && identity.current_revision_id === row.id ? row.processing_status : "superseded";
-        return { ...item, source_status: sourceStatus, source_receipt: sourceReceipt(auth, row) };
+        return { ...item, source_status: sourceStatus, source_receipt: issueCindySourceReceipt(auth, row) };
       }).map(({ revision_id: _revisionId, ...item }) => item);
       return { save_request_id: input.save_request_id, duplicate: !0, sources: sources2 };
     }
@@ -149798,7 +149975,7 @@ function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date(
           throw normalized.revision.comparable ? new CindySourceContractError("CONFLICT", "\u76F8\u540C provider revision \u5BF9\u5E94\u4E86\u4E0D\u540C canonical payload\u3002") : new CindySourceContractError("SOURCE_REVISION_AMBIGUOUS", "\u6765\u6E90\u6CA1\u6709\u53EF\u6BD4\u8F83 revision\uFF0C\u5F02\u5185\u5BB9\u66F4\u65B0\u5DF2\u5B89\u5168\u62D2\u7EDD\u3002");
         let status = identity?.current_revision_id === exact.id ? exact.processing_status : "superseded", saved2 = {
           client_ref: clientRef,
-          source_receipt: sourceReceipt(auth, exact),
+          source_receipt: issueCindySourceReceipt(auth, exact),
           source_status: status,
           revision: revisionResult(exact)
         };
@@ -150003,10 +150180,12 @@ function projectCindyOwnerDecisionStoredOptions(options) {
   return options.map((option) => ({
     optionKey: option.option_key,
     action: option.action,
-    title: option.title ?? (option.action === "append_candidate" ? "\u8FFD\u52A0\u5230\u5DF2\u6709\u5019\u9009" : null),
+    title: option.title ?? null,
     describe: option.describe ?? null,
     nextStep: option.next_step ?? null,
-    candidateKey: option.action === "append_candidate" ? option.candidate_key ?? null : null
+    candidateKey: option.action === "append_candidate" ? option.candidate_key ?? null : null,
+    candidateVersion: option.action === "append_candidate" ? option.candidate_version ?? null : null,
+    fieldEvidenceSourceIndexes: option.action === "append_candidate" ? option.field_evidence_source_indexes ?? null : null
   }));
 }
 function sqliteTextLength(value) {
@@ -150023,12 +150202,20 @@ function canonicalCindyBatchInput(input) {
   return canonicalize({
     ...input,
     snapshot_receipts: [...input.snapshot_receipts].sort(),
-    groups: [...input.groups].map((group) => ({ ...group, field_evidence_receipts: [...group.field_evidence_receipts].sort() })).sort((left, right) => left.group_key.localeCompare(right.group_key)),
+    groups: [...input.groups].map((group) => ({
+      ...group,
+      field_evidence_receipts: [...group.field_evidence_receipts].sort(),
+      source_receipts: group.source_receipts ? [...group.source_receipts].sort() : void 0,
+      field_evidence: group.field_evidence ? Object.fromEntries(Object.entries(group.field_evidence).sort(([left], [right]) => left.localeCompare(right)).map(([field, receipts]) => [field, [...receipts ?? []].sort()])) : void 0
+    })).sort((left, right) => left.group_key.localeCompare(right.group_key)),
     primary_dispositions: [...input.primary_dispositions].sort((left, right) => left.disposition_ref.localeCompare(right.disposition_ref)),
     shared_context: [...input.shared_context ?? []].sort((left, right) => left.source_receipt.localeCompare(right.source_receipt) || left.shared_group_key.localeCompare(right.shared_group_key)),
     owner_decisions: [...input.owner_decisions ?? []].map((decision) => ({
       ...decision,
-      options: [...decision.options].sort((left, right) => left.option_key.localeCompare(right.option_key))
+      options: [...decision.options].map((option) => ({
+        ...option,
+        field_evidence: option.field_evidence ? Object.fromEntries(Object.entries(option.field_evidence).sort(([left], [right]) => left.localeCompare(right)).map(([field, receipts]) => [field, [...receipts ?? []].sort()])) : void 0
+      })).sort((left, right) => left.option_key.localeCompare(right.option_key))
     })).sort((left, right) => left.decision_key.localeCompare(right.decision_key))
   });
 }
@@ -150041,6 +150228,9 @@ function hashCindyBatchSnapshot(entries) {
   return (0, import_node_crypto4.createHash)("sha256").update(canonical).digest("hex");
 }
 function hashCindyOwnerDecisionResolution(value) {
+  return (0, import_node_crypto4.createHash)("sha256").update(JSON.stringify(canonicalize(value))).digest("hex");
+}
+function hashCindyAppendRequest(value) {
   return (0, import_node_crypto4.createHash)("sha256").update(JSON.stringify(canonicalize(value))).digest("hex");
 }
 
@@ -154688,7 +154878,7 @@ function projectCindyOwnerDecision(row, sourceCount) {
       title: option.title,
       describe: option.describe,
       next_step: option.nextStep,
-      available: option.action !== "append_candidate"
+      available: option.action !== "append_candidate" || typeof option.candidateKey == "string" && Number.isInteger(option.candidateVersion) && option.candidateVersion >= 1
     })),
     source_count: sourceCount,
     last_attempt_failed: row.last_error !== null,
@@ -154697,6 +154887,49 @@ function projectCindyOwnerDecision(row, sourceCount) {
     updated_at: row.updated_at,
     resolved_at: row.resolved_at
   };
+}
+var cindyCandidateKeyPattern = /^cnd_[A-Za-z0-9_-]{43}$/u;
+function cindyOpaqueKey(auth, kind, value) {
+  return (0, import_node_crypto12.createHmac)("sha256", auth.receiptSecret).update(`${kind}\0${auth.ownerScope}\0${auth.accountAnchor}\0${value}`, "utf8").digest("base64url");
+}
+function cindyCandidateKey(auth, candidateId) {
+  return `cnd_${cindyOpaqueKey(auth, "candidate", candidateId)}`;
+}
+function cindyConversationKey(auth, chatRef, threadRef) {
+  return `cnv_${cindyOpaqueKey(auth, "conversation", `${chatRef}\0${threadRef ?? ""}`)}`;
+}
+function encodeCindyContextCursor(auth, kind, updatedAt, rowId) {
+  let payload = Buffer.from(JSON.stringify({ kind, updatedAt, rowId }), "utf8").toString("base64url");
+  return `${payload}.${cindyOpaqueKey(auth, "cursor", payload)}`;
+}
+function decodeCindyContextCursor(auth, kind, cursor) {
+  if (!cursor) return null;
+  let [payload, signature, extra] = cursor.split(".");
+  if (!payload || !signature || extra !== void 0 || signature !== cindyOpaqueKey(auth, "cursor", payload))
+    throw new CindySourceContractError("INVALID_INPUT", "\u4E0A\u4E0B\u6587 cursor \u65E0\u6548\u6216\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8BA4\u8BC1\u4E0A\u4E0B\u6587\u3002");
+  try {
+    let parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (parsed.kind !== kind || typeof parsed.updatedAt != "string" || !Number.isFinite(Date.parse(parsed.updatedAt)) || typeof parsed.rowId != "string" || !parsed.rowId) throw new Error("invalid cursor");
+    return { updatedAt: parsed.updatedAt, rowId: parsed.rowId };
+  } catch {
+    throw new CindySourceContractError("INVALID_INPUT", "\u4E0A\u4E0B\u6587 cursor \u65E0\u6CD5\u89E3\u6790\u3002");
+  }
+}
+function loadCindyCandidateByKey(database, auth, candidateKey) {
+  return cindyCandidateKeyPattern.test(candidateKey) ? database.raw.prepare(
+    `SELECT candidate.* FROM candidate_request AS candidate
+      WHERE candidate.demand_unit_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM cindy_candidate_source_consumption AS consumed
+           WHERE consumed.candidate_id = candidate.id
+             AND consumed.owner_scope = ? AND consumed.account_anchor = ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM cindy_candidate_source_consumption AS foreign_consumed
+           WHERE foreign_consumed.candidate_id = candidate.id
+             AND (foreign_consumed.owner_scope <> ? OR foreign_consumed.account_anchor <> ?)
+        )`
+  ).all(auth.ownerScope, auth.accountAnchor, auth.ownerScope, auth.accountAnchor).find((candidate) => cindyCandidateKey(auth, candidate.id) === candidateKey) : void 0;
 }
 function loadProjectedCindyOwnerDecision(database, decisionId) {
   let row = database.raw.prepare(
@@ -163750,6 +163983,302 @@ var PmService = class {
       updated_at: candidate.updated_at
     }));
   }
+  getCindyContext(auth, input = {}) {
+    let taskLimit = Math.max(1, Math.min(50, Math.trunc(input.task_limit ?? 20))), candidateLimit = Math.max(1, Math.min(50, Math.trunc(input.candidate_limit ?? 20))), query = (input.query ?? "").normalize("NFKC").trim();
+    if (query.length > 160) throw new CindySourceContractError("INVALID_INPUT", "\u4E0A\u4E0B\u6587 query \u4E0D\u80FD\u8D85\u8FC7 160 \u4E2A\u5B57\u7B26\u3002");
+    let taskCursor = decodeCindyContextCursor(auth, "task", input.task_cursor), candidateCursor = decodeCindyContextCursor(auth, "candidate", input.candidate_cursor), receiptValues = input.conversation_receipts ?? [];
+    if (receiptValues.length > 100 || new Set(receiptValues).size !== receiptValues.length)
+      throw new CindySourceContractError("INVALID_INPUT", "conversation_receipts \u4E0D\u53EF\u91CD\u590D\u4E14\u6700\u591A 100 \u6761\u3002");
+    let conversation = null;
+    if (receiptValues.length) {
+      let contexts = receiptValues.map((receipt) => resolveCindyCurrentReceipt(this.database, auth, receipt));
+      if (contexts.some((revision) => !revision.chat_ref))
+        throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "conversation filter \u7684\u6765\u6E90\u7F3A\u5C11\u53EF\u4FE1\u4F1A\u8BDD\u4E8B\u5B9E\u3002");
+      let distinct = new Map(contexts.map((revision) => [
+        `${revision.chat_ref}\0${revision.thread_ref ?? ""}`,
+        { chatRef: revision.chat_ref, threadRef: revision.thread_ref }
+      ]));
+      if (distinct.size !== 1) throw new CindySourceContractError("INVALID_INPUT", "conversation filter \u5FC5\u987B\u7531\u540C\u4E00\u53EF\u4FE1\u4F1A\u8BDD\u7684\u5F53\u524D receipts \u6D3E\u751F\u3002");
+      let selected = [...distinct.values()][0];
+      conversation = { ...selected, key: cindyConversationKey(auth, selected.chatRef, selected.threadRef) };
+    }
+    let taskRows = this.database.raw.prepare(
+      `SELECT task.id, task.title, task.describe, task.status, task.next_step, task.waiting_reason,
+              task.version, task.updated_at
+         FROM task
+        WHERE task.record_state = 'active' AND task.deleted_at IS NULL AND task.status <> 'archived'
+          AND (
+            EXISTS (
+              SELECT 1 FROM cindy_batch_group AS batch_group
+               WHERE batch_group.task_id = task.id
+                 AND batch_group.owner_scope = ? AND batch_group.account_anchor = ?
+            )
+            OR EXISTS (
+              SELECT 1 FROM task_source_link AS link
+              JOIN cindy_source_identity AS identity ON identity.source_event_id = link.source_event_id
+               WHERE link.task_id = task.id AND identity.owner_scope = ? AND identity.account_anchor = ?
+                 AND identity.state = 'active'
+            )
+            OR EXISTS (
+              SELECT 1 FROM candidate_request AS candidate
+              JOIN cindy_candidate_source_consumption AS consumed ON consumed.candidate_id = candidate.id
+               WHERE candidate.accepted_task_id = task.id
+                 AND consumed.owner_scope = ? AND consumed.account_anchor = ?
+            )
+          )
+        ORDER BY task.updated_at DESC, task.id ASC`
+    ).all(auth.ownerScope, auth.accountAnchor, auth.ownerScope, auth.accountAnchor, auth.ownerScope, auth.accountAnchor), candidateRows = this.database.raw.prepare(
+      `SELECT candidate.id, candidate.title, candidate.describe, candidate.validation_question,
+              candidate.state, candidate.version, candidate.updated_at
+         FROM candidate_request AS candidate
+         JOIN source_demand_unit AS demand_unit ON demand_unit.id = candidate.demand_unit_id
+        WHERE candidate.state IN ('pending','snoozed')
+          AND candidate.accepted_task_id IS NULL AND candidate.deleted_at IS NULL
+          AND candidate.merged_into_candidate_id IS NULL AND demand_unit.state <> 'superseded'
+          AND EXISTS (
+            SELECT 1 FROM cindy_candidate_source_consumption AS consumed
+             WHERE consumed.candidate_id = candidate.id
+               AND consumed.owner_scope = ? AND consumed.account_anchor = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM cindy_candidate_source_consumption AS foreign_consumed
+             WHERE foreign_consumed.candidate_id = candidate.id
+               AND (foreign_consumed.owner_scope <> ? OR foreign_consumed.account_anchor <> ?)
+          )
+        ORDER BY candidate.updated_at DESC, candidate.id ASC`
+    ).all(auth.ownerScope, auth.accountAnchor, auth.ownerScope, auth.accountAnchor), normalizedQuery = query.toLocaleLowerCase("und"), matchesQuery = (title, summary) => !normalizedQuery || `${title}
+${summary}`.normalize("NFKC").toLocaleLowerCase("und").includes(normalizedQuery), afterCursor = (updatedAt, rowId, cursor) => !cursor || updatedAt < cursor.updatedAt || updatedAt === cursor.updatedAt && rowId > cursor.rowId, taskConversationMatches = (taskId) => !conversation || !!this.database.raw.prepare(
+      `SELECT 1 FROM (
+         SELECT revision.chat_ref, revision.thread_ref
+           FROM task_source_link AS link
+           JOIN cindy_source_identity AS identity ON identity.source_event_id = link.source_event_id
+           JOIN source_event_revision AS revision ON revision.id = identity.current_revision_id
+          WHERE link.task_id = ? AND identity.owner_scope = ? AND identity.account_anchor = ? AND identity.state = 'active'
+         UNION ALL
+         SELECT revision.chat_ref, revision.thread_ref
+           FROM cindy_batch_group AS batch_group
+           JOIN cindy_batch_snapshot AS snapshot
+             ON snapshot.owner_scope = batch_group.owner_scope AND snapshot.account_anchor = batch_group.account_anchor
+            AND snapshot.batch_id = batch_group.batch_id AND snapshot.primary_group_key = batch_group.group_key
+           JOIN source_event_revision AS revision ON revision.id = snapshot.source_revision_id
+          WHERE batch_group.task_id = ? AND batch_group.owner_scope = ? AND batch_group.account_anchor = ?
+       ) WHERE chat_ref = ? AND ((? IS NULL AND thread_ref IS NULL) OR thread_ref = ?) LIMIT 1`
+    ).get(
+      taskId,
+      auth.ownerScope,
+      auth.accountAnchor,
+      taskId,
+      auth.ownerScope,
+      auth.accountAnchor,
+      conversation.chatRef,
+      conversation.threadRef,
+      conversation.threadRef
+    ), candidateConversationMatches = (candidateId) => !conversation || !!this.database.raw.prepare(
+      `SELECT 1 FROM cindy_candidate_source_consumption AS consumed
+       JOIN source_event_revision AS revision ON revision.id = consumed.source_revision_id
+       WHERE consumed.candidate_id = ? AND consumed.owner_scope = ? AND consumed.account_anchor = ?
+         AND revision.chat_ref = ? AND ((? IS NULL AND revision.thread_ref IS NULL) OR revision.thread_ref = ?) LIMIT 1`
+    ).get(candidateId, auth.ownerScope, auth.accountAnchor, conversation.chatRef, conversation.threadRef, conversation.threadRef), safeTasks = taskRows.map((row) => ({
+      row,
+      item: {
+        task_key: row.id,
+        title: safeCandidateNarrative(row.title, [], "\u6B63\u5F0F\u4EFB\u52A1", 160),
+        summary: safeCandidateNarrative(row.describe, [], "\u4EFB\u52A1\u6458\u8981\u5DF2\u4FDD\u7559\u3002", 240),
+        status: row.status,
+        next_step: safeCandidateNarrative(row.next_step, [], "", 240),
+        version: row.version,
+        updated_at: row.updated_at,
+        ...conversation ? { conversation_key: conversation.key } : {}
+      }
+    })).filter(({ row, item }) => afterCursor(row.updated_at, row.id, taskCursor) && taskConversationMatches(row.id) && matchesQuery(item.title, item.summary)), safeCandidates = candidateRows.map((row) => ({
+      row,
+      item: {
+        candidate_key: cindyCandidateKey(auth, row.id),
+        title: safeCandidateNarrative(row.title, [], "\u5F85\u786E\u8BA4\u5019\u9009", 160),
+        summary: safeCandidateNarrative(row.describe, [], "\u5019\u9009\u6458\u8981\u5DF2\u4FDD\u7559\u3002", 240),
+        next_step: safeCandidateNarrative(row.validation_question, [], "", 240),
+        status: row.state,
+        version: row.version,
+        updated_at: row.updated_at,
+        ...conversation ? { conversation_key: conversation.key } : {}
+      }
+    })).filter(({ row, item }) => afterCursor(row.updated_at, row.id, candidateCursor) && candidateConversationMatches(row.id) && matchesQuery(item.title, item.summary));
+    return {
+      tasks: safeTasks.slice(0, taskLimit).map(({ item }) => item),
+      candidates: safeCandidates.slice(0, candidateLimit).map(({ item }) => item),
+      next_task_cursor: safeTasks.length > taskLimit ? encodeCindyContextCursor(auth, "task", safeTasks[taskLimit - 1].row.updated_at, safeTasks[taskLimit - 1].row.id) : null,
+      next_candidate_cursor: safeCandidates.length > candidateLimit ? encodeCindyContextCursor(auth, "candidate", safeCandidates[candidateLimit - 1].row.updated_at, safeCandidates[candidateLimit - 1].row.id) : null,
+      conversation_key: conversation?.key ?? null
+    };
+  }
+  appendCindyCandidateInTransaction(auth, input) {
+    let canonicalPayload = {
+      append_request_id: input.appendRequestId,
+      batch_id: input.batchId,
+      group_key: input.groupKey,
+      candidate_key: input.candidateKey,
+      expected_candidate_version: input.expectedCandidateVersion,
+      source_receipts: [...input.sourceReceipts].sort(),
+      patch: input.patch,
+      field_evidence: Object.fromEntries(Object.entries(input.fieldEvidence).sort(([left], [right]) => left.localeCompare(right)).map(([field, receipts]) => [field, [...receipts ?? []].sort()])),
+      owner_decision_id: input.ownerDecisionId ?? null
+    }, payloadHash = hashCindyAppendRequest(canonicalPayload), replay = this.database.raw.prepare(
+      `SELECT payload_hash, response_json FROM cindy_append_request
+        WHERE owner_scope = ? AND account_anchor = ? AND append_request_id = ?`
+    ).get(auth.ownerScope, auth.accountAnchor, input.appendRequestId);
+    if (replay) {
+      if (replay.payload_hash !== payloadHash) throw new CindySourceContractError("CONFLICT", "append_request_id \u5DF2\u7ED1\u5B9A\u5230\u4E0D\u540C canonical payload\u3002");
+      return { ...JSON.parse(replay.response_json), duplicate: !0 };
+    }
+    let candidate = loadCindyCandidateByKey(this.database, auth, input.candidateKey);
+    if (!candidate) throw new CindySourceContractError("INVALID_INPUT", "\u5019\u9009\u4E0D\u5B58\u5728\u6216\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8BA4\u8BC1\u4E0A\u4E0B\u6587\u3002", 403);
+    if (!["pending", "snoozed"].includes(candidate.state) || candidate.accepted_task_id || candidate.deleted_at || candidate.merged_into_candidate_id)
+      throw new CindyIntakeConflictError("\u5019\u9009\u5F53\u524D\u4E0D\u53EF\u8FFD\u52A0\u3002", candidate.version);
+    if (candidate.version !== input.expectedCandidateVersion)
+      throw new CindyIntakeConflictError(CANDIDATE_VERSION_CONFLICT_MESSAGE, candidate.version);
+    let batchGroup = this.database.raw.prepare(
+      `SELECT action FROM cindy_batch_group
+        WHERE owner_scope = ? AND account_anchor = ? AND batch_id = ? AND group_key = ?`
+    ).get(auth.ownerScope, auth.accountAnchor, input.batchId, input.groupKey);
+    if (!batchGroup || batchGroup.action !== "append_candidate")
+      throw new CindySourceContractError("CONFLICT", "append request \u672A\u7ED1\u5B9A\u5F53\u524D\u8BA4\u8BC1\u4E0A\u4E0B\u6587\u5185\u7684 append group\u3002");
+    let receiptByValue = new Map(input.entries.map((entry) => [entry.receipt, entry]));
+    if (receiptByValue.size !== input.sourceReceipts.length || input.sourceReceipts.some((receipt) => !receiptByValue.has(receipt)))
+      throw new CindySourceContractError("INVALID_INPUT", "append source receipts \u4E0E\u5DF2\u9A8C\u8BC1 revision \u4E0D\u4E00\u81F4\u3002");
+    for (let entry of input.entries) {
+      let snapshot = this.database.raw.prepare(
+        `SELECT primary_disposition, primary_group_key
+           FROM cindy_batch_snapshot
+          WHERE owner_scope = ? AND account_anchor = ? AND batch_id = ? AND source_revision_id = ?`
+      ).get(auth.ownerScope, auth.accountAnchor, input.batchId, entry.revision.id);
+      if (!snapshot || snapshot.primary_disposition !== "group" || snapshot.primary_group_key !== input.groupKey || !["pending_decision", "retryable"].includes(entry.revision.processing_status))
+        throw new CindySourceContractError("CONFLICT", "append \u53EA\u80FD\u6D88\u8D39\u5F53\u524D batch/group \u7684\u672A\u5904\u7406 primary receipts\u3002");
+      if (this.database.raw.prepare(
+        `SELECT 1 FROM cindy_candidate_source_consumption
+          WHERE owner_scope = ? AND account_anchor = ? AND source_revision_id = ?`
+      ).get(auth.ownerScope, auth.accountAnchor, entry.revision.id))
+        throw new CindySourceContractError("CONFLICT", "\u6765\u6E90\u5DF2\u88AB primary candidate \u6D88\u8D39\u3002");
+      if (this.database.raw.prepare(
+        "SELECT 1 FROM source_demand_unit_source WHERE demand_unit_id = ? AND source_event_id = ?"
+      ).get(candidate.demand_unit_id, entry.source.id))
+        throw new CindySourceContractError("CONFLICT", "\u6765\u6E90\u5DF2\u5C5E\u4E8E\u5F53\u524D\u5019\u9009\uFF0C\u4E0D\u80FD\u91CD\u590D\u8FFD\u52A0\u3002");
+    }
+    let fields = ["title", "describe", "next_step"];
+    for (let field of fields) {
+      let receipts = input.fieldEvidence[field] ?? [];
+      if (input.patch[field] === void 0 != (receipts.length === 0) || new Set(receipts).size !== receipts.length || receipts.some((receipt) => !receiptByValue.has(receipt)))
+        throw new CindySourceContractError("INVALID_INPUT", "append \u5B57\u6BB5 patch \u4E0E evidence receipts \u4E0D\u5339\u914D\u3002");
+    }
+    let sourceContents = input.entries.map((entry) => entry.source.content), nextTitle = input.patch.title === void 0 ? candidate.title : safeCandidateNarrative(input.patch.title, sourceContents, candidate.title, 160), nextDescribe = input.patch.describe === void 0 ? candidate.describe : safeCandidateNarrative(input.patch.describe, sourceContents, candidate.describe, 2e3), nextStep = input.patch.next_step === void 0 ? candidate.validation_question : safeCandidateNarrative(input.patch.next_step, sourceContents, candidate.validation_question, 1e3), nextVersion = candidate.version + 1, before = {
+      title: candidate.title,
+      describe: candidate.describe,
+      next_step: candidate.validation_question,
+      version: candidate.version
+    };
+    if (this.database.raw.prepare(
+      `UPDATE candidate_request
+          SET title = ?, background = ?, validation_question = ?, describe = ?, updated_at = ?, version = ?
+        WHERE id = ? AND version = ? AND state IN ('pending','snoozed')
+          AND accepted_task_id IS NULL AND deleted_at IS NULL AND merged_into_candidate_id IS NULL`
+    ).run(nextTitle, nextDescribe, nextStep, nextDescribe, input.timestamp, nextVersion, candidate.id, candidate.version).changes !== 1) {
+      let current = this.database.raw.prepare("SELECT version FROM candidate_request WHERE id = ?").get(candidate.id);
+      throw new CindyIntakeConflictError(CANDIDATE_VERSION_CONFLICT_MESSAGE, current?.version ?? null);
+    }
+    this.database.raw.prepare(
+      `INSERT INTO cindy_append_request
+        (owner_scope, account_anchor, append_request_id, payload_hash, candidate_id, batch_id, group_key,
+         owner_decision_id, response_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?)`
+    ).run(
+      auth.ownerScope,
+      auth.accountAnchor,
+      input.appendRequestId,
+      payloadHash,
+      candidate.id,
+      input.batchId,
+      input.groupKey,
+      input.ownerDecisionId ?? null,
+      input.timestamp
+    );
+    let nextSequence = this.database.raw.prepare(
+      "SELECT COALESCE(MAX(sequence), -1) + 1 AS sequence FROM source_demand_unit_source WHERE demand_unit_id = ?"
+    ).get(candidate.demand_unit_id).sequence;
+    input.entries.forEach((entry, index) => {
+      if (this.database.raw.prepare(
+        `INSERT INTO source_demand_unit_source
+          (demand_unit_id, source_event_id, source_key, source_role, sequence, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(
+        candidate.demand_unit_id,
+        entry.source.id,
+        `append:${input.appendRequestId}:${index + 1}`,
+        index === 0 ? "anchor" : "evidence",
+        nextSequence + index,
+        input.timestamp
+      ), this.database.raw.prepare(
+        `INSERT INTO cindy_candidate_source_consumption
+          (owner_scope, account_anchor, source_revision_id, candidate_id, batch_id, group_key, append_request_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        auth.ownerScope,
+        auth.accountAnchor,
+        entry.revision.id,
+        candidate.id,
+        input.batchId,
+        input.groupKey,
+        input.appendRequestId,
+        input.timestamp
+      ), this.database.raw.prepare(
+        `UPDATE source_event_revision SET processing_status = 'processed'
+          WHERE id = ? AND processing_status IN ('pending_decision','retryable')`
+      ).run(entry.revision.id).changes !== 1) throw new CindySourceContractError("CONFLICT", "\u6765\u6E90\u72B6\u6001\u5DF2\u53D8\u5316\uFF1Bappend \u4E1A\u52A1\u5199\u5165\u5DF2\u56DE\u6EDA\u3002");
+    });
+    for (let field of fields)
+      for (let receipt of input.fieldEvidence[field] ?? [])
+        this.database.raw.prepare(
+          `INSERT INTO cindy_append_field_evidence
+            (owner_scope, account_anchor, append_request_id, field_name, source_revision_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        ).run(
+          auth.ownerScope,
+          auth.accountAnchor,
+          input.appendRequestId,
+          field,
+          receiptByValue.get(receipt).revision.id,
+          input.timestamp
+        );
+    let after = { title: nextTitle, describe: nextDescribe, next_step: nextStep, version: nextVersion };
+    this.database.raw.prepare(
+      `INSERT INTO correction_event
+        (id, task_id, candidate_id, source_event_id, correction_type, before_json, after_json,
+         created_at, idempotency_key, note)
+       VALUES (?, NULL, ?, ?, 'cindy_append_candidate', ?, ?, ?, ?, ?)`
+    ).run(
+      id("correction"),
+      candidate.id,
+      input.entries[0].source.id,
+      JSON.stringify(before),
+      JSON.stringify(after),
+      input.timestamp,
+      `cindy-append:${input.appendRequestId}`,
+      "Cindy \u5C06\u65B0\u7684\u53EF\u4FE1 primary group \u8FFD\u52A0\u5230\u5DF2\u6709\u5019\u9009\u3002"
+    ), this.database.raw.prepare(
+      `UPDATE cindy_batch_group SET candidate_id = ?
+        WHERE owner_scope = ? AND account_anchor = ? AND batch_id = ? AND group_key = ?`
+    ).run(candidate.id, auth.ownerScope, auth.accountAnchor, input.batchId, input.groupKey);
+    let response = {
+      append_request_id: input.appendRequestId,
+      candidate_key: input.candidateKey,
+      version: nextVersion,
+      source_count: input.entries.length,
+      updated_at: input.timestamp,
+      duplicate: !1
+    };
+    return this.database.raw.prepare(
+      `UPDATE cindy_append_request SET response_json = ?
+        WHERE owner_scope = ? AND account_anchor = ? AND append_request_id = ?`
+    ).run(JSON.stringify(response), auth.ownerScope, auth.accountAnchor, input.appendRequestId), response;
+  }
   listCindyConversationCursors() {
     return this.database.listCindyConversationCursors();
   }
@@ -163778,10 +164307,18 @@ var PmService = class {
           throw new CindySourceContractError("INVALID_INPUT", "update_task group \u5FC5\u987B\u63D0\u4F9B task_key \u548C\u6B63\u6574\u6570 expected_version\u3002");
         if (group.title === void 0 && group.describe === void 0 && group.next_step === void 0)
           throw new CindySourceContractError("INVALID_INPUT", "update_task group \u81F3\u5C11\u9700\u8981 title\u3001describe \u6216 next_step\u3002");
-      } else {
+      } else if (group.action === "create_candidate") {
         if (!group.title?.trim()) throw new CindySourceContractError("INVALID_INPUT", "create_candidate group \u5FC5\u987B\u63D0\u4F9B\u7531 Agent \u751F\u6210\u7684 title\u3002");
-        if (group.task_key !== void 0 || group.expected_version !== void 0)
+        if (group.task_key !== void 0 || group.expected_version !== void 0 || group.expected_candidate_version !== void 0)
           throw new CindySourceContractError("INVALID_INPUT", "create_candidate group \u4E0D\u80FD\u58F0\u660E task CAS \u5B57\u6BB5\u3002");
+      } else {
+        if (!group.append_request_id || !cindyBatchKeyPattern.test(group.append_request_id) || !group.candidate_key || !cindyCandidateKeyPattern.test(group.candidate_key) || !Number.isInteger(group.expected_candidate_version) || group.expected_candidate_version < 1 || !group.source_receipts?.length || new Set(group.source_receipts).size !== group.source_receipts.length)
+          throw new CindySourceContractError("INVALID_INPUT", "append_candidate group \u7F3A\u5C11\u6709\u6548 request\u3001candidate\u3001version \u6216 source receipts\u3002");
+        if (group.task_key !== void 0 || group.expected_version !== void 0)
+          throw new CindySourceContractError("INVALID_INPUT", "append_candidate \u4E0D\u80FD\u58F0\u660E task\u3002");
+        let patchFields = ["title", "describe", "next_step"].filter((field) => group[field] !== void 0);
+        if (Object.keys(group.field_evidence ?? {}).some((field) => !patchFields.includes(field)) || patchFields.some((field) => !group.field_evidence?.[field]?.length))
+          throw new CindySourceContractError("INVALID_INPUT", "append_candidate \u6BCF\u4E2A patch \u5B57\u6BB5\u5FC5\u987B\u4E14\u53EA\u80FD\u58F0\u660E\u672C\u7EC4 evidence receipts\u3002");
       }
     }
     let dispositionRefs = input.primary_dispositions.map((item) => item.disposition_ref), dispositionReceipts = input.primary_dispositions.map((item) => item.source_receipt);
@@ -163805,6 +164342,14 @@ var PmService = class {
       let primaryReceipts = input.primary_dispositions.filter((item) => item.disposition === "group" && item.primary_group_key === group.group_key).map((item) => item.source_receipt), allowed = /* @__PURE__ */ new Set([group.anchor_receipt, ...group.field_evidence_receipts]);
       if (!primaryReceipts.length || !primaryReceipts.includes(group.anchor_receipt) || primaryReceipts.some((receipt) => !allowed.has(receipt)) || group.field_evidence_receipts.some((receipt) => primaryByReceipt.get(receipt)?.primary_group_key !== group.group_key))
         throw new CindySourceContractError("INVALID_INPUT", "group \u53EA\u80FD\u4F7F\u7528\u672C\u7EC4 primary receipt \u4F5C\u4E3A anchor/\u5B57\u6BB5 evidence\uFF0C\u4E14\u81F3\u5C11\u6709\u4E00\u4E2A anchor\u3002");
+      if (group.action === "append_candidate") {
+        let declared = [...group.source_receipts].sort(), assigned = [...primaryReceipts].sort();
+        if (JSON.stringify(declared) !== JSON.stringify(assigned))
+          throw new CindySourceContractError("INVALID_INPUT", "append_candidate source_receipts \u5FC5\u987B\u7CBE\u786E\u7B49\u4E8E\u5F53\u524D primary group\u3002");
+        for (let receipts of Object.values(group.field_evidence ?? {}))
+          if (!receipts || new Set(receipts).size !== receipts.length || receipts.some((receipt) => !primaryReceipts.includes(receipt)))
+            throw new CindySourceContractError("INVALID_INPUT", "append_candidate \u5B57\u6BB5 evidence \u53EA\u80FD\u5F15\u7528\u5F53\u524D primary group receipt\u3002");
+      }
     }
     let sharedRelations = input.shared_context ?? [], sharedKeys = sharedRelations.map((item) => `${item.source_receipt}\0${item.shared_group_key}`);
     if (new Set(sharedKeys).size !== sharedKeys.length)
@@ -163822,15 +164367,25 @@ var PmService = class {
       throw new CindySourceContractError("INVALID_INPUT", "owner_decisions \u5FC5\u987B\u4E0E needs_owner primary \u7CBE\u786E\u5BF9\u5E94\u3002");
     for (let decision of ownerDecisionByKey.values()) {
       let optionKeys = decision.options.map((option) => option.option_key);
-      if (!decision.reason.trim() || !decision.options.length || new Set(optionKeys).size !== optionKeys.length || optionKeys.some((key) => !cindyGroupKeyPattern.test(key)))
+      if (!decision.reason.trim() || !decision.options.length || new Set(optionKeys).size !== optionKeys.length || optionKeys.some((key) => !cindyGroupKeyPattern.test(key)) || decision.group_key !== void 0 && (!cindyGroupKeyPattern.test(decision.group_key) || groupByKey.has(decision.group_key)))
         throw new CindySourceContractError("INVALID_INPUT", "owner decision \u539F\u56E0\u6216\u9009\u9879\u65E0\u6548\u3002");
+      let decisionReceipts = new Set(input.primary_dispositions.filter((item) => item.disposition === "needs_owner" && item.owner_decision_key === decision.decision_key).map((item) => item.source_receipt));
       for (let option of decision.options) {
         if (option.action === "create_candidate" && !option.title?.trim())
           throw new CindySourceContractError("INVALID_INPUT", "create_candidate \u9009\u9879\u5FC5\u987B\u63D0\u4F9B\u7531 Agent \u751F\u6210\u7684 title\u3002");
-        if (option.action === "append_candidate" && !option.candidate_key)
-          throw new CindySourceContractError("INVALID_INPUT", "append_candidate \u610F\u56FE\u5FC5\u987B\u7ED1\u5B9A\u5019\u9009\uFF0C\u4F46 003 \u4E0D\u4F1A\u6267\u884C\u8BE5\u52A8\u4F5C\u3002");
-        if (option.action !== "append_candidate" && option.candidate_key !== void 0)
-          throw new CindySourceContractError("INVALID_INPUT", "\u53EA\u6709 append_candidate \u610F\u56FE\u53EF\u4EE5\u7ED1\u5B9A\u5019\u9009\u3002");
+        if (option.action === "append_candidate" && (!option.candidate_key || !cindyCandidateKeyPattern.test(option.candidate_key) || !Number.isInteger(option.candidate_version) || option.candidate_version < 1))
+          throw new CindySourceContractError("INVALID_INPUT", "append_candidate \u610F\u56FE\u5FC5\u987B\u7ED1\u5B9A opaque candidate key \u548C\u5019\u9009\u7248\u672C\u3002");
+        if (option.action !== "append_candidate" && (option.candidate_key !== void 0 || option.candidate_version !== void 0))
+          throw new CindySourceContractError("INVALID_INPUT", "\u53EA\u6709 append_candidate \u610F\u56FE\u53EF\u4EE5\u7ED1\u5B9A\u5019\u9009\u548C\u7248\u672C\u3002");
+        let patchFields = ["title", "describe", "next_step"].filter((field) => option[field] !== void 0), evidenceFields = Object.keys(option.field_evidence ?? {});
+        if (option.action === "append_candidate") {
+          if (evidenceFields.some((field) => !patchFields.includes(field)) || patchFields.some((field) => !option.field_evidence?.[field]?.length))
+            throw new CindySourceContractError("INVALID_INPUT", "append_candidate \u9009\u9879\u6BCF\u4E2A patch \u5B57\u6BB5\u5FC5\u987B\u58F0\u660E evidence receipts\u3002");
+          for (let receipts of Object.values(option.field_evidence ?? {}))
+            if (!receipts || new Set(receipts).size !== receipts.length || receipts.some((receipt) => !decisionReceipts.has(receipt)))
+              throw new CindySourceContractError("INVALID_INPUT", "append_candidate \u9009\u9879 evidence \u53EA\u80FD\u5F15\u7528\u5F53\u524D needs_owner group\u3002");
+        } else if (option.field_evidence !== void 0)
+          throw new CindySourceContractError("INVALID_INPUT", "\u53EA\u6709 append_candidate \u9009\u9879\u53EF\u4EE5\u58F0\u660E\u5B57\u6BB5 evidence\u3002");
       }
     }
     let payloadHash = hashCindyBatchInput(input), updatedTaskIds = /* @__PURE__ */ new Set(), result = this.database.transaction(() => {
@@ -163928,18 +164483,21 @@ var PmService = class {
       }
       let ownerDecisionIdByKey = /* @__PURE__ */ new Map(), ownerDecisionDtos = [];
       for (let [decisionKey, decision] of ownerDecisionByKey) {
-        let dispositions = input.primary_dispositions.filter((item) => item.disposition === "needs_owner" && item.owner_decision_key === decisionKey).sort((left, right) => left.disposition_ref.localeCompare(right.disposition_ref)), sourceContents = dispositions.map((item) => sourceByRevision.get(revisionByReceipt.get(item.source_receipt).id)).map((source) => source.content), sanitizedOptions = decision.options.map((option) => {
-          if (option.action === "append_candidate" && !this.database.raw.prepare(
-            "SELECT id FROM candidate_request WHERE id = ? AND deleted_at IS NULL AND state <> 'accepted'"
-          ).get(option.candidate_key))
-            throw new CindySourceContractError("CONFLICT", "append_candidate \u610F\u56FE\u5BF9\u5E94\u5019\u9009\u4E0D\u53EF\u7528\u3002");
+        let dispositions = input.primary_dispositions.filter((item) => item.disposition === "needs_owner" && item.owner_decision_key === decisionKey).sort((left, right) => left.disposition_ref.localeCompare(right.disposition_ref)), sourceIndexByReceipt = new Map(dispositions.map((item, index) => [item.source_receipt, index])), sourceContents = dispositions.map((item) => sourceByRevision.get(revisionByReceipt.get(item.source_receipt).id)).map((source) => source.content), sanitizedOptions = decision.options.map((option) => {
+          if (option.action === "append_candidate") {
+            let candidate = loadCindyCandidateByKey(this.database, auth, option.candidate_key);
+            if (!candidate || candidate.version !== option.candidate_version || !["pending", "snoozed"].includes(candidate.state) || candidate.accepted_task_id || candidate.deleted_at || candidate.merged_into_candidate_id)
+              throw new CindySourceContractError("CONFLICT", "append_candidate \u610F\u56FE\u5BF9\u5E94\u5019\u9009\u6216\u7248\u672C\u4E0D\u53EF\u7528\u3002");
+          }
           return {
             option_key: option.option_key,
             action: option.action,
             title: option.title === void 0 ? option.action === "append_candidate" ? "\u8FFD\u52A0\u5230\u5DF2\u6709\u5019\u9009" : void 0 : safeCandidateNarrative(option.title, sourceContents, option.action === "create_candidate" ? "\u5F85\u4E3B\u4EBA\u786E\u8BA4\u7684\u65B0\u5019\u9009" : "\u5DF2\u6709\u5019\u9009", 160),
             describe: option.describe === void 0 ? void 0 : safeCandidateNarrative(option.describe, sourceContents, "\u5019\u9009\u6458\u8981\u5F85\u4E3B\u4EBA\u786E\u8BA4\u3002", 2e3),
             next_step: option.next_step === void 0 ? void 0 : safeCandidateNarrative(option.next_step, sourceContents, "\u4E0B\u4E00\u6B65\u5F85\u4E3B\u4EBA\u786E\u8BA4\u3002", 1e3),
-            candidate_key: option.action === "append_candidate" ? option.candidate_key : void 0
+            candidate_key: option.action === "append_candidate" ? option.candidate_key : void 0,
+            candidate_version: option.action === "append_candidate" ? option.candidate_version : void 0,
+            field_evidence_source_indexes: option.action === "append_candidate" ? Object.fromEntries(Object.entries(option.field_evidence ?? {}).map(([field, receipts]) => [field, receipts.map((receipt) => sourceIndexByReceipt.get(receipt)).sort((left, right) => left - right)])) : void 0
           };
         }), serializedOptions = serializeCindyOwnerDecisionStoredOptions(sanitizedOptions);
         if (serializedOptions.length > CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH)
@@ -163950,15 +164508,16 @@ var PmService = class {
         let decisionId = id("cindy_owner_decision"), reasonSummary = safeCandidateNarrative(decision.reason, sourceContents, "\u8FD9\u7EC4\u6765\u6E90\u9700\u8981\u4E3B\u4EBA\u51B3\u5B9A\u5982\u4F55\u5904\u7406\u3002", 500);
         this.database.raw.prepare(
           `INSERT INTO cindy_owner_decision
-            (id, owner_scope, account_anchor, batch_id, decision_key, reason_summary, options_json,
+            (id, owner_scope, account_anchor, batch_id, decision_key, group_key, reason_summary, options_json,
              status, version, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?)`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?)`
         ).run(
           decisionId,
           auth.ownerScope,
           auth.accountAnchor,
           input.batch_id,
           decisionKey,
+          decision.group_key ?? decisionKey,
           reasonSummary,
           serializedOptions.json,
           timestamp,
@@ -163990,7 +164549,7 @@ var PmService = class {
         ));
       }, groupResults = [];
       for (let group of input.groups) {
-        let primaryReceipts = input.primary_dispositions.filter((item) => item.disposition === "group" && item.primary_group_key === group.group_key).map((item) => item.source_receipt), revisions = [group.anchor_receipt, ...primaryReceipts.filter((receipt) => receipt !== group.anchor_receipt)].map((receipt) => revisionByReceipt.get(receipt)), sources = revisions.map((revision) => sourceByRevision.get(revision.id)), anchor = sources[0];
+        let primaryReceipts = input.primary_dispositions.filter((item) => item.disposition === "group" && item.primary_group_key === group.group_key).map((item) => item.source_receipt), orderedReceipts = [group.anchor_receipt, ...primaryReceipts.filter((receipt) => receipt !== group.anchor_receipt)], revisions = orderedReceipts.map((receipt) => revisionByReceipt.get(receipt)), sources = revisions.map((revision) => sourceByRevision.get(revision.id)), anchor = sources[0];
         if (group.action === "create_candidate") {
           let sourceContents = sources.map((source) => source.content), title = safeCandidateNarrative(group.title, sourceContents, "\u5F85\u4E3B\u4EBA\u786E\u8BA4\u7684\u65B0\u5019\u9009", 160), describe3 = safeCandidateNarrative(group.describe, sourceContents, "\u5019\u9009\u6458\u8981\u5F85\u4E3B\u4EBA\u786E\u8BA4\u3002", 2e3), nextStep = safeCandidateNarrative(group.next_step, sourceContents, "\u4E0B\u4E00\u6B65\u5F85\u4E3B\u4EBA\u786E\u8BA4\u3002", 1e3), safeReason = safeCandidateNarrative(group.reason, sourceContents, "Cindy \u6574\u6279\u5206\u7EC4\u51B3\u7B56\u3002", 500), candidateId = id("cand"), demandUnitId = id("unit"), analysisJson = JSON.stringify({
             origin: "cindy_grouped_batch",
@@ -164030,10 +164589,44 @@ var PmService = class {
             analysisJson,
             timestamp,
             timestamp
-          ), attachCandidateSources(demandUnitId, sources), this.database.raw.prepare(
+          ), attachCandidateSources(demandUnitId, sources), revisions.forEach((revision) => this.database.raw.prepare(
+            `INSERT INTO cindy_candidate_source_consumption
+              (owner_scope, account_anchor, source_revision_id, candidate_id, batch_id, group_key, append_request_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`
+          ).run(auth.ownerScope, auth.accountAnchor, revision.id, candidateId, input.batch_id, group.group_key, timestamp)), this.database.raw.prepare(
             `UPDATE cindy_batch_group SET candidate_id = ?
               WHERE owner_scope = ? AND account_anchor = ? AND batch_id = ? AND group_key = ?`
-          ).run(candidateId, auth.ownerScope, auth.accountAnchor, input.batch_id, group.group_key), groupResults.push({ group_key: group.group_key, action: group.action, source_status: "processed", candidate_id: candidateId });
+          ).run(candidateId, auth.ownerScope, auth.accountAnchor, input.batch_id, group.group_key), groupResults.push({
+            group_key: group.group_key,
+            action: group.action,
+            source_status: "processed",
+            candidate_id: candidateId,
+            candidate_key: cindyCandidateKey(auth, candidateId)
+          });
+        } else if (group.action === "append_candidate") {
+          let append = this.appendCindyCandidateInTransaction(auth, {
+            appendRequestId: group.append_request_id,
+            batchId: input.batch_id,
+            groupKey: group.group_key,
+            candidateKey: group.candidate_key,
+            expectedCandidateVersion: group.expected_candidate_version,
+            sourceReceipts: group.source_receipts,
+            patch: { title: group.title, describe: group.describe, next_step: group.next_step },
+            fieldEvidence: group.field_evidence ?? {},
+            timestamp,
+            entries: orderedReceipts.map((receipt, index) => ({
+              receipt,
+              revision: revisions[index],
+              source: sources[index]
+            }))
+          });
+          groupResults.push({
+            group_key: group.group_key,
+            action: group.action,
+            source_status: "processed",
+            candidate_key: String(append.candidate_key),
+            version: Number(append.version)
+          });
         } else {
           let task = this.getTask(group.task_key);
           if (!task) throw new CindyIntakeConflictError("update_task \u5BF9\u5E94\u7684\u4EFB\u52A1\u4E0D\u5B58\u5728\u3002");
@@ -164081,7 +164674,7 @@ var PmService = class {
               WHERE owner_scope = ? AND account_anchor = ? AND batch_id = ? AND group_key = ?`
           ).run(task.id, nextVersion, auth.ownerScope, auth.accountAnchor, input.batch_id, group.group_key), updatedTaskIds.add(task.id), groupResults.push({ group_key: group.group_key, action: group.action, source_status: "processed", task_key: task.id, version: nextVersion });
         }
-        for (let revision of revisions)
+        for (let revision of group.action === "append_candidate" ? [] : revisions)
           if (this.database.raw.prepare(
             `UPDATE source_event_revision SET processing_status = 'processed'
               WHERE id = ? AND processing_status IN ('pending_decision','retryable')`
@@ -164163,7 +164756,7 @@ var PmService = class {
     ).all(auth.ownerScope, auth.accountAnchor, boundedLimit).map((row) => projectCindyOwnerDecision(row, row.source_count)) };
   }
   resolveCindyOwnerDecision(auth, decisionId, input) {
-    if (!/^cindy_owner_decision_[0-9a-f-]{36}$/iu.test(decisionId) || !cindyBatchKeyPattern.test(input.decision_request_id) || !Number.isInteger(input.expected_version) || input.expected_version < 1)
+    if (!/^cindy_owner_decision_[0-9a-f-]{36}$/iu.test(decisionId) || !cindyBatchKeyPattern.test(input.decision_request_id) || !Number.isInteger(input.expected_version) || input.expected_version < 1 || input.action === "append_candidate" != !!input.append_request_id || input.append_request_id !== void 0 && !cindyBatchKeyPattern.test(input.append_request_id))
       throw new CindySourceContractError("INVALID_INPUT", "\u4E3B\u4EBA\u51B3\u5B9A\u6807\u8BC6\u3001\u8BF7\u6C42\u6807\u8BC6\u6216 version \u65E0\u6548\u3002");
     let payloadHash = hashCindyOwnerDecisionResolution(input), supersededVersion = null;
     try {
@@ -164215,8 +164808,22 @@ var PmService = class {
         let options = parseCindyOwnerDecisionOptions(row.options_json), option = input.option_key ? options.find((item) => item.optionKey === input.option_key) : void 0;
         if (!option || option.action !== input.action)
           throw new CindySourceContractError("INVALID_INPUT", "\u4E3B\u4EBA\u51B3\u5B9A\u5FC5\u987B\u9009\u62E9\u4E0E\u52A8\u4F5C\u4E00\u81F4\u7684\u53EF\u7528\u9009\u9879\u3002");
-        let timestamp = nowIso(), candidateId = null;
+        let timestamp = nowIso(), candidateId = null, sourceReceipts = sourceRows.map((source) => issueCindySourceReceiptForRevision(this.database, auth, source.revision_id)), promoteDecisionSourcesToGroup = (action) => {
+          this.database.raw.prepare(
+            `INSERT INTO cindy_batch_group
+              (owner_scope, account_anchor, batch_id, group_key, action, anchor_revision_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`
+          ).run(auth.ownerScope, auth.accountAnchor, row.batch_id, row.group_key, action, sourceRows[0].revision_id, timestamp);
+          for (let source of sourceRows)
+            if (this.database.raw.prepare(
+              `UPDATE cindy_batch_snapshot
+                  SET primary_disposition = 'group', primary_group_key = ?
+                WHERE owner_scope = ? AND account_anchor = ? AND batch_id = ? AND source_revision_id = ?
+                  AND primary_disposition = 'needs_owner' AND primary_group_key IS NULL`
+            ).run(row.group_key, auth.ownerScope, auth.accountAnchor, row.batch_id, source.revision_id).changes !== 1) throw new CindySourceContractError("CONFLICT", "\u4E3B\u4EBA\u51B3\u5B9A\u6765\u6E90\u5DF2\u4E0D\u518D\u5C5E\u4E8E\u539F pending group\u3002");
+        };
         if (input.action === "create_candidate") {
+          promoteDecisionSourcesToGroup("create_candidate");
           let anchor = sourceRows[0];
           candidateId = id("cand");
           let demandUnitId = id("unit"), title = option.title ?? "\u5F85\u4E3B\u4EBA\u786E\u8BA4\u7684\u65B0\u5019\u9009", describe3 = option.describe ?? "\u5019\u9009\u6458\u8981\u5F85\u4E3B\u4EBA\u786E\u8BA4\u3002", nextStep = option.nextStep ?? "\u4E0B\u4E00\u6B65\u5F85\u4E3B\u4EBA\u786E\u8BA4\u3002", analysisJson = JSON.stringify({ origin: "cindy_owner_decision", decisionId: row.id, nextStep });
@@ -164264,9 +164871,56 @@ var PmService = class {
             index === 0 ? "anchor" : "evidence",
             index,
             timestamp
-          ));
+          )), sourceRows.forEach((source) => this.database.raw.prepare(
+            `INSERT INTO cindy_candidate_source_consumption
+              (owner_scope, account_anchor, source_revision_id, candidate_id, batch_id, group_key, append_request_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`
+          ).run(auth.ownerScope, auth.accountAnchor, source.revision_id, candidateId, row.batch_id, row.group_key, timestamp)), this.database.raw.prepare(
+            `UPDATE cindy_batch_group SET candidate_id = ?
+              WHERE owner_scope = ? AND account_anchor = ? AND batch_id = ? AND group_key = ?`
+          ).run(candidateId, auth.ownerScope, auth.accountAnchor, row.batch_id, row.group_key);
+        } else if (input.action === "append_candidate") {
+          promoteDecisionSourcesToGroup("append_candidate");
+          let candidate = loadCindyCandidateByKey(this.database, auth, option.candidateKey ?? "");
+          if (!candidate || option.candidateVersion === null)
+            throw new CindySourceContractError("CONFLICT", "\u4E3B\u4EBA\u9009\u62E9\u7684\u5019\u9009\u5DF2\u4E0D\u53EF\u8FFD\u52A0\u3002");
+          candidateId = candidate.id;
+          let patchFields = ["title", "describe", "next_step"].filter((field) => (field === "next_step" ? option.nextStep : option[field]) !== null), storedEvidence = option.fieldEvidenceSourceIndexes;
+          if (storedEvidence !== null && Object.keys(storedEvidence).some((field) => !patchFields.includes(field)))
+            throw new CindySourceContractError("CONFLICT", "\u4E3B\u4EBA\u51B3\u5B9A\u4E2D\u7684\u5B57\u6BB5 evidence \u5DF2\u635F\u574F\u3002");
+          let fieldEvidence = Object.fromEntries(patchFields.map((field) => {
+            let indexes = storedEvidence === null ? sourceReceipts.map((_, index) => index) : storedEvidence[field];
+            if (!indexes?.length || new Set(indexes).size !== indexes.length || indexes.some((index) => !Number.isInteger(index) || index < 0 || index >= sourceReceipts.length))
+              throw new CindySourceContractError("CONFLICT", "\u4E3B\u4EBA\u51B3\u5B9A\u4E2D\u7684\u5B57\u6BB5 evidence \u5DF2\u635F\u574F\u3002");
+            return [field, indexes.map((index) => sourceReceipts[index])];
+          }));
+          this.appendCindyCandidateInTransaction(auth, {
+            appendRequestId: input.append_request_id,
+            batchId: row.batch_id,
+            groupKey: row.group_key,
+            candidateKey: option.candidateKey ?? "",
+            expectedCandidateVersion: option.candidateVersion,
+            sourceReceipts,
+            patch: {
+              title: option.title ?? void 0,
+              describe: option.describe ?? void 0,
+              next_step: option.nextStep ?? void 0
+            },
+            fieldEvidence,
+            ownerDecisionId: row.id,
+            timestamp,
+            entries: sourceRows.map((source, index) => ({
+              receipt: sourceReceipts[index],
+              revision: {
+                id: source.revision_id,
+                source_event_id: source.source_event_id,
+                processing_status: source.processing_status
+              },
+              source: { id: source.source_event_id, content: source.content }
+            }))
+          });
         }
-        for (let source of sourceRows)
+        for (let source of input.action === "append_candidate" ? [] : sourceRows)
           if (this.database.raw.prepare(
             `UPDATE source_event_revision SET processing_status = ?
               WHERE id = ? AND processing_status IN ('pending_decision','retryable')`
@@ -167192,11 +167846,25 @@ async function buildApp(service, input = "http://localhost:5173") {
   }), app.delete("/api/logs", async (request) => {
     let query = external_exports.object({ includeCorrections: external_exports.coerce.boolean().default(!1) }).parse(request.query);
     return service.clearLogs(query.includeCorrections);
-  }), app.post("/api/diagnostics/cleanup", async () => service.cleanupLogs()), app.get("/api/integrations/cindy/tasks", async () => ({
-    items: service.listCindyTasks(),
-    candidates: service.listCindyCandidates(),
-    cursors: service.listCindyConversationCursors()
-  })), app.get("/api/integrations/cindy/bindings/:sessionId", async (request) => {
+  }), app.post("/api/diagnostics/cleanup", async () => service.cleanupLogs()), app.get("/api/integrations/cindy/tasks", async () => service.getCindyContext(cindyAuthContext(), {})), app.post("/api/integrations/cindy/context", async (request, reply) => {
+    try {
+      let body = external_exports.object({
+        task_limit: external_exports.number().int().min(1).max(50).optional(),
+        candidate_limit: external_exports.number().int().min(1).max(50).optional(),
+        task_cursor: external_exports.string().min(16).max(1e3).optional(),
+        candidate_cursor: external_exports.string().min(16).max(1e3).optional(),
+        query: external_exports.string().max(160).optional(),
+        conversation_receipts: external_exports.array(external_exports.string().min(32).max(200)).max(100).optional()
+      }).strict().parse(request.body ?? {});
+      return service.getCindyContext(cindyAuthContext(), body);
+    } catch (error51) {
+      let status = error51 instanceof external_exports.ZodError ? 400 : error51 instanceof CindySourceContractError ? error51.statusCode : 409;
+      return reply.code(status).send({
+        error: error51 instanceof Error ? error51.message : "Cindy \u4E0A\u4E0B\u6587\u8BFB\u53D6\u5931\u8D25\u3002",
+        error_code: error51 instanceof CindySourceContractError ? error51.errorCode : "CONFLICT"
+      });
+    }
+  }), app.get("/api/integrations/cindy/bindings/:sessionId", async (request) => {
     let params = external_exports.object({ sessionId: external_exports.string().min(1).max(200) }).parse(request.params);
     return { binding: service.getCindySessionBinding(params.sessionId) };
   }), app.post("/api/integrations/cindy/turn-evaluations", async (request, reply) => {
@@ -167278,6 +167946,7 @@ async function buildApp(service, input = "http://localhost:5173") {
     try {
       let isoTimestamp = external_exports.string().datetime({ offset: !0 }), receipt = external_exports.string().min(32).max(200), ownerDecision = external_exports.object({
         decision_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+        group_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u).optional(),
         reason: external_exports.string().trim().min(1).max(500),
         options: external_exports.array(external_exports.object({
           option_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
@@ -167285,7 +167954,13 @@ async function buildApp(service, input = "http://localhost:5173") {
           title: external_exports.string().trim().min(1).max(160).optional(),
           describe: external_exports.string().trim().min(1).max(2e3).optional(),
           next_step: external_exports.string().trim().min(1).max(1e3).optional(),
-          candidate_key: external_exports.string().trim().min(1).max(200).optional()
+          candidate_key: external_exports.string().trim().min(1).max(200).optional(),
+          candidate_version: external_exports.number().int().positive().optional(),
+          field_evidence: external_exports.object({
+            title: external_exports.array(receipt).min(1).max(100).optional(),
+            describe: external_exports.array(receipt).min(1).max(100).optional(),
+            next_step: external_exports.array(receipt).min(1).max(100).optional()
+          }).strict().optional()
         }).strict()).min(1).max(10)
       }).strict().superRefine((decision, context) => {
         serializeCindyOwnerDecisionStoredOptions(decision.options).length > CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH && context.addIssue({
@@ -167302,15 +167977,24 @@ async function buildApp(service, input = "http://localhost:5173") {
         snapshot_receipts: external_exports.array(receipt).min(1).max(100),
         groups: external_exports.array(external_exports.object({
           group_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
-          action: external_exports.enum(["create_candidate", "update_task"]),
+          action: external_exports.enum(["create_candidate", "append_candidate", "update_task"]),
           anchor_receipt: receipt,
           field_evidence_receipts: external_exports.array(receipt).max(99),
           task_key: external_exports.string().trim().min(1).max(200).optional(),
           expected_version: external_exports.number().int().positive().optional(),
+          expected_candidate_version: external_exports.number().int().positive().optional(),
           title: external_exports.string().trim().min(1).max(160).optional(),
           describe: external_exports.string().trim().min(1).max(2e3).optional(),
           next_step: external_exports.string().trim().min(1).max(1e3).optional(),
-          reason: external_exports.string().trim().max(500).optional()
+          reason: external_exports.string().trim().max(500).optional(),
+          append_request_id: external_exports.string().regex(/^[A-Za-z0-9_-]{1,128}$/u).optional(),
+          candidate_key: external_exports.string().regex(/^cnd_[A-Za-z0-9_-]{43}$/u).optional(),
+          source_receipts: external_exports.array(receipt).min(1).max(100).optional(),
+          field_evidence: external_exports.object({
+            title: external_exports.array(receipt).min(1).max(100).optional(),
+            describe: external_exports.array(receipt).min(1).max(100).optional(),
+            next_step: external_exports.array(receipt).min(1).max(100).optional()
+          }).strict().optional()
         }).strict()).max(100),
         primary_dispositions: external_exports.array(external_exports.object({
           disposition_ref: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
@@ -167349,8 +168033,9 @@ async function buildApp(service, input = "http://localhost:5173") {
       let params = external_exports.object({ decisionId: external_exports.string().min(1).max(200) }).parse(request.params), body = external_exports.object({
         decision_request_id: external_exports.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
         expected_version: external_exports.number().int().positive(),
-        action: external_exports.enum(["skip", "create_candidate"]),
-        option_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u)
+        action: external_exports.enum(["skip", "create_candidate", "append_candidate"]),
+        option_key: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+        append_request_id: external_exports.string().regex(/^[A-Za-z0-9_-]{1,128}$/u).optional()
       }).strict().parse(request.body);
       return service.resolveCindyOwnerDecision(cindyAuthContext(), params.decisionId, body);
     } catch (error51) {

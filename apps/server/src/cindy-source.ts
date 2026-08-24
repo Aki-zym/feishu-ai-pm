@@ -437,11 +437,21 @@ function revisionResult(row: SourceRevisionRow) {
   return result;
 }
 
-function sourceReceipt(auth: CindyAuthContext, row: SourceRevisionRow) {
+export function issueCindySourceReceipt(auth: CindyAuthContext, row: SourceRevisionRow) {
   if (!row.receipt_nonce || !row.receipt_digest) throw new CindySourceContractError('INVALID_SOURCE_RECEIPT', '来源没有可用 receipt。');
   const receipt = receiptForNonce(auth, row.receipt_nonce);
   if (receiptDigest(receipt) !== row.receipt_digest) throw new CindySourceContractError('INVALID_SOURCE_RECEIPT', '来源 receipt 无法通过当前认证上下文验证。');
   return receipt;
+}
+
+export function issueCindySourceReceiptForRevision(database: AppDatabase, auth: CindyAuthContext, revisionId: string) {
+  const row = database.raw.prepare(
+    `SELECT revision.* FROM source_event_revision AS revision
+      JOIN cindy_source_identity AS identity ON identity.current_revision_id = revision.id
+     WHERE revision.id = ? AND identity.owner_scope = ? AND identity.account_anchor = ? AND identity.state = 'active'`,
+  ).get(revisionId, auth.ownerScope, auth.accountAnchor) as SourceRevisionRow | undefined;
+  if (!row) throw new CindySourceContractError('INVALID_SOURCE_RECEIPT', '来源 revision 已变化或不属于当前认证上下文。');
+  return issueCindySourceReceipt(auth, row);
 }
 
 function resolveReceiptRow(database: AppDatabase, auth: CindyAuthContext, receipt: string, forDecision = false) {
@@ -473,6 +483,10 @@ function resolveReceiptRow(database: AppDatabase, auth: CindyAuthContext, receip
 
 export function resolveCindyDecisionReceipt(database: AppDatabase, auth: CindyAuthContext, receipt: string) {
   return resolveReceiptRow(database, auth, receipt, true);
+}
+
+export function resolveCindyCurrentReceipt(database: AppDatabase, auth: CindyAuthContext, receipt: string) {
+  return resolveReceiptRow(database, auth, receipt, false);
 }
 
 function assertRelationContext(
@@ -668,7 +682,7 @@ export function saveCindySources(
         const sourceStatus = identity?.state === 'active' && identity.current_revision_id === row.id
           ? row.processing_status
           : 'superseded';
-        return { ...item, source_status: sourceStatus, source_receipt: sourceReceipt(auth, row) };
+        return { ...item, source_status: sourceStatus, source_receipt: issueCindySourceReceipt(auth, row) };
       }).map(({ revision_id: _revisionId, ...item }) => item);
       return { save_request_id: input.save_request_id, duplicate: true, sources };
     }
@@ -760,7 +774,7 @@ export function saveCindySources(
         const status = identity?.current_revision_id === exact.id ? exact.processing_status : 'superseded';
         const saved = {
           client_ref: clientRef,
-          source_receipt: sourceReceipt(auth, exact),
+          source_receipt: issueCindySourceReceipt(auth, exact),
           source_status: status as CindySourceStatus,
           revision: revisionResult(exact),
         };

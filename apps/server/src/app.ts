@@ -297,11 +297,26 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
     return service.clearLogs(query.includeCorrections);
   });
   app.post('/api/diagnostics/cleanup', async () => service.cleanupLogs());
-  app.get('/api/integrations/cindy/tasks', async () => ({
-    items: service.listCindyTasks(),
-    candidates: service.listCindyCandidates(),
-    cursors: service.listCindyConversationCursors(),
-  }));
+  app.get('/api/integrations/cindy/tasks', async () => service.getCindyContext(cindyAuthContext(), {}));
+  app.post('/api/integrations/cindy/context', async (request, reply) => {
+    try {
+      const body = z.object({
+        task_limit: z.number().int().min(1).max(50).optional(),
+        candidate_limit: z.number().int().min(1).max(50).optional(),
+        task_cursor: z.string().min(16).max(1000).optional(),
+        candidate_cursor: z.string().min(16).max(1000).optional(),
+        query: z.string().max(160).optional(),
+        conversation_receipts: z.array(z.string().min(32).max(200)).max(100).optional(),
+      }).strict().parse(request.body ?? {});
+      return service.getCindyContext(cindyAuthContext(), body);
+    } catch (error) {
+      const status = error instanceof z.ZodError ? 400 : error instanceof CindySourceContractError ? error.statusCode : 409;
+      return reply.code(status).send({
+        error: error instanceof Error ? error.message : 'Cindy 上下文读取失败。',
+        error_code: error instanceof CindySourceContractError ? error.errorCode : 'CONFLICT',
+      });
+    }
+  });
   app.get('/api/integrations/cindy/bindings/:sessionId', async (request) => {
     const params = z.object({ sessionId: z.string().min(1).max(200) }).parse(request.params);
     return { binding: service.getCindySessionBinding(params.sessionId) };
@@ -390,6 +405,7 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
       const receipt = z.string().min(32).max(200);
       const ownerDecision = z.object({
         decision_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+        group_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u).optional(),
         reason: z.string().trim().min(1).max(500),
         options: z.array(z.object({
           option_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
@@ -398,6 +414,12 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
           describe: z.string().trim().min(1).max(2_000).optional(),
           next_step: z.string().trim().min(1).max(1_000).optional(),
           candidate_key: z.string().trim().min(1).max(200).optional(),
+          candidate_version: z.number().int().positive().optional(),
+          field_evidence: z.object({
+            title: z.array(receipt).min(1).max(100).optional(),
+            describe: z.array(receipt).min(1).max(100).optional(),
+            next_step: z.array(receipt).min(1).max(100).optional(),
+          }).strict().optional(),
         }).strict()).min(1).max(10),
       }).strict().superRefine((decision, context) => {
         const projection = serializeCindyOwnerDecisionStoredOptions(decision.options);
@@ -418,15 +440,24 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
         snapshot_receipts: z.array(receipt).min(1).max(100),
         groups: z.array(z.object({
           group_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
-          action: z.enum(['create_candidate', 'update_task']),
+          action: z.enum(['create_candidate', 'append_candidate', 'update_task']),
           anchor_receipt: receipt,
           field_evidence_receipts: z.array(receipt).max(99),
           task_key: z.string().trim().min(1).max(200).optional(),
           expected_version: z.number().int().positive().optional(),
+          expected_candidate_version: z.number().int().positive().optional(),
           title: z.string().trim().min(1).max(160).optional(),
           describe: z.string().trim().min(1).max(2_000).optional(),
           next_step: z.string().trim().min(1).max(1_000).optional(),
           reason: z.string().trim().max(500).optional(),
+          append_request_id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u).optional(),
+          candidate_key: z.string().regex(/^cnd_[A-Za-z0-9_-]{43}$/u).optional(),
+          source_receipts: z.array(receipt).min(1).max(100).optional(),
+          field_evidence: z.object({
+            title: z.array(receipt).min(1).max(100).optional(),
+            describe: z.array(receipt).min(1).max(100).optional(),
+            next_step: z.array(receipt).min(1).max(100).optional(),
+          }).strict().optional(),
         }).strict()).max(100),
         primary_dispositions: z.array(z.object({
           disposition_ref: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
@@ -476,8 +507,9 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
       const body = z.object({
         decision_request_id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
         expected_version: z.number().int().positive(),
-        action: z.enum(['skip', 'create_candidate']),
+        action: z.enum(['skip', 'create_candidate', 'append_candidate']),
         option_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+        append_request_id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u).optional(),
       }).strict().parse(request.body);
       return service.resolveCindyOwnerDecision(cindyAuthContext(), params.decisionId, body);
     } catch (error) {

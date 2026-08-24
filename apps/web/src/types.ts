@@ -302,7 +302,7 @@ export type CindyOwnerDecision = {
   }>;
   source_count: number;
   last_attempt_failed: boolean;
-  resolution_action: 'skip' | 'create_candidate' | null;
+  resolution_action: 'skip' | 'create_candidate' | 'append_candidate' | null;
   created_at: string;
   updated_at: string;
   resolved_at: string | null;

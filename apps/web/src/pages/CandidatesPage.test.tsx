@@ -4,7 +4,7 @@ import { OwnerDecisionInbox } from './CandidatesPage';
 import type { CindyOwnerDecision } from '../types';
 
 describe('owner decision private projection', () => {
-  it('只渲染安全摘要，append 保持不可用且不显示技术字段或原始错误', () => {
+  it('只渲染安全摘要，append 可由主人确认且不显示技术字段或原始错误', () => {
     const resolvedCandidateIdIsExcluded: 'resolved_candidate_id' extends keyof CindyOwnerDecision ? false : true = true;
     const decision = {
       decision_id: 'cindy_owner_decision_00000000-0000-0000-0000-000000000001',
@@ -17,7 +17,7 @@ describe('owner decision private projection', () => {
         title: '追加到已有候选',
         describe: null,
         next_step: null,
-        available: false,
+        available: true,
       }],
       source_count: 1,
       last_attempt_failed: true,
@@ -43,7 +43,8 @@ describe('owner decision private projection', () => {
     />);
 
     expect(resolvedCandidateIdIsExcluded).toBe(true);
-    expect(markup).toContain('等待后续追加能力');
+    expect(markup).toContain('追加到已有候选');
+    expect(markup).toContain('追加到候选</button>');
     expect(markup).toContain('上次执行未完成，请稍后重试。');
     expect(markup).not.toContain('确认跳过');
     expect(markup).not.toContain('建立候选</button>');

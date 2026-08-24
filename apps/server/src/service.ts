@@ -1,4 +1,4 @@
-import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, renameSync, statfsSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { z } from 'zod';
@@ -42,6 +42,8 @@ import {
 import type { ReturnTypeOfAdapters } from './types.js';
 import {
   CindySourceContractError,
+  issueCindySourceReceiptForRevision,
+  resolveCindyCurrentReceipt,
   resolveCindyDecisionReceipt,
   saveCindySources,
   type CindyAuthContext,
@@ -53,11 +55,13 @@ import {
   cindyGroupKeyPattern,
   hashCindyBatchInput,
   hashCindyBatchSnapshot,
+  hashCindyAppendRequest,
   hashCindyOwnerDecisionResolution,
   serializeCindyOwnerDecisionStoredOptions,
   type CancelCindyOwnerDecisionInput,
   type CindyBatchInput,
   type CindyBatchResult,
+  type CindyContextInput,
   type CindyOwnerDecisionDto,
   type CindyOwnerDecisionOptionInput,
   type CindyOwnerDecisionStoredOption,
@@ -1344,11 +1348,12 @@ type CindyOwnerDecisionRow = {
   account_anchor: string;
   batch_id: string;
   decision_key: string;
+  group_key: string;
   reason_summary: string;
   options_json: string;
   status: 'pending' | 'resolved' | 'superseded' | 'cancelled';
   version: number;
-  resolution_action: 'skip' | 'create_candidate' | null;
+  resolution_action: 'skip' | 'create_candidate' | 'append_candidate' | null;
   resolution_request_id: string | null;
   resolution_payload_hash: string | null;
   resolution_response_json: string | null;
@@ -1369,6 +1374,15 @@ type CindyOwnerDecisionSourceRow = {
   source_order: number;
   source_role: 'anchor' | 'evidence';
   current_identity_id: string | null;
+};
+
+type CindyAppendResult = {
+  append_request_id: string;
+  candidate_key: string;
+  version: number;
+  source_count: number;
+  updated_at: string;
+  duplicate: boolean;
 };
 
 function parseCindyOwnerDecisionOptions(value: string): CindyOwnerDecisionStoredOption[] {
@@ -1397,7 +1411,8 @@ function projectCindyOwnerDecision(row: CindyOwnerDecisionRow, sourceCount: numb
       title: option.title,
       describe: option.describe,
       next_step: option.nextStep,
-      available: option.action !== 'append_candidate',
+      available: option.action !== 'append_candidate'
+        || (typeof option.candidateKey === 'string' && Number.isInteger(option.candidateVersion) && option.candidateVersion! >= 1),
     })),
     source_count: sourceCount,
     last_attempt_failed: row.last_error !== null,
@@ -1406,6 +1421,62 @@ function projectCindyOwnerDecision(row: CindyOwnerDecisionRow, sourceCount: numb
     updated_at: row.updated_at,
     resolved_at: row.resolved_at,
   };
+}
+
+const cindyCandidateKeyPattern = /^cnd_[A-Za-z0-9_-]{43}$/u;
+
+function cindyOpaqueKey(auth: CindyAuthContext, kind: 'candidate' | 'conversation' | 'cursor', value: string) {
+  return createHmac('sha256', auth.receiptSecret)
+    .update(`${kind}\u0000${auth.ownerScope}\u0000${auth.accountAnchor}\u0000${value}`, 'utf8')
+    .digest('base64url');
+}
+
+function cindyCandidateKey(auth: CindyAuthContext, candidateId: string) {
+  return `cnd_${cindyOpaqueKey(auth, 'candidate', candidateId)}`;
+}
+
+function cindyConversationKey(auth: CindyAuthContext, chatRef: string, threadRef: string | null) {
+  return `cnv_${cindyOpaqueKey(auth, 'conversation', `${chatRef}\u0000${threadRef ?? ''}`)}`;
+}
+
+function encodeCindyContextCursor(auth: CindyAuthContext, kind: 'task' | 'candidate', updatedAt: string, rowId: string) {
+  const payload = Buffer.from(JSON.stringify({ kind, updatedAt, rowId }), 'utf8').toString('base64url');
+  return `${payload}.${cindyOpaqueKey(auth, 'cursor', payload)}`;
+}
+
+function decodeCindyContextCursor(auth: CindyAuthContext, kind: 'task' | 'candidate', cursor: string | undefined) {
+  if (!cursor) return null;
+  const [payload, signature, extra] = cursor.split('.');
+  if (!payload || !signature || extra !== undefined || signature !== cindyOpaqueKey(auth, 'cursor', payload)) {
+    throw new CindySourceContractError('INVALID_INPUT', '上下文 cursor 无效或不属于当前认证上下文。');
+  }
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as Record<string, unknown>;
+    if (parsed.kind !== kind || typeof parsed.updatedAt !== 'string' || !Number.isFinite(Date.parse(parsed.updatedAt))
+      || typeof parsed.rowId !== 'string' || !parsed.rowId) throw new Error('invalid cursor');
+    return { updatedAt: parsed.updatedAt, rowId: parsed.rowId };
+  } catch {
+    throw new CindySourceContractError('INVALID_INPUT', '上下文 cursor 无法解析。');
+  }
+}
+
+function loadCindyCandidateByKey(database: AppDatabase, auth: CindyAuthContext, candidateKey: string) {
+  if (!cindyCandidateKeyPattern.test(candidateKey)) return undefined;
+  const rows = database.raw.prepare(
+    `SELECT candidate.* FROM candidate_request AS candidate
+      WHERE candidate.demand_unit_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM cindy_candidate_source_consumption AS consumed
+           WHERE consumed.candidate_id = candidate.id
+             AND consumed.owner_scope = ? AND consumed.account_anchor = ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM cindy_candidate_source_consumption AS foreign_consumed
+           WHERE foreign_consumed.candidate_id = candidate.id
+             AND (foreign_consumed.owner_scope <> ? OR foreign_consumed.account_anchor <> ?)
+        )`,
+  ).all(auth.ownerScope, auth.accountAnchor, auth.ownerScope, auth.accountAnchor) as CandidateRow[];
+  return rows.find((candidate) => cindyCandidateKey(auth, candidate.id) === candidateKey);
 }
 
 function loadProjectedCindyOwnerDecision(database: AppDatabase, decisionId: string): CindyOwnerDecisionDto {
@@ -13881,6 +13952,335 @@ export class PmService {
     }));
   }
 
+  getCindyContext(auth: CindyAuthContext, input: CindyContextInput = {}) {
+    const taskLimit = Math.max(1, Math.min(50, Math.trunc(input.task_limit ?? 20)));
+    const candidateLimit = Math.max(1, Math.min(50, Math.trunc(input.candidate_limit ?? 20)));
+    const query = (input.query ?? '').normalize('NFKC').trim();
+    if (query.length > 160) throw new CindySourceContractError('INVALID_INPUT', '上下文 query 不能超过 160 个字符。');
+    const taskCursor = decodeCindyContextCursor(auth, 'task', input.task_cursor);
+    const candidateCursor = decodeCindyContextCursor(auth, 'candidate', input.candidate_cursor);
+    const receiptValues = input.conversation_receipts ?? [];
+    if (receiptValues.length > 100 || new Set(receiptValues).size !== receiptValues.length) {
+      throw new CindySourceContractError('INVALID_INPUT', 'conversation_receipts 不可重复且最多 100 条。');
+    }
+    let conversation: { chatRef: string; threadRef: string | null; key: string } | null = null;
+    if (receiptValues.length) {
+      const contexts = receiptValues.map((receipt) => resolveCindyCurrentReceipt(this.database, auth, receipt));
+      if (contexts.some((revision) => !revision.chat_ref)) {
+        throw new CindySourceContractError('INVALID_SOURCE_RECEIPT', 'conversation filter 的来源缺少可信会话事实。');
+      }
+      const distinct = new Map(contexts.map((revision) => [
+        `${revision.chat_ref}\u0000${revision.thread_ref ?? ''}`,
+        { chatRef: revision.chat_ref!, threadRef: revision.thread_ref },
+      ]));
+      if (distinct.size !== 1) throw new CindySourceContractError('INVALID_INPUT', 'conversation filter 必须由同一可信会话的当前 receipts 派生。');
+      const selected = [...distinct.values()][0]!;
+      conversation = { ...selected, key: cindyConversationKey(auth, selected.chatRef, selected.threadRef) };
+    }
+
+    const taskRows = this.database.raw.prepare(
+      `SELECT task.id, task.title, task.describe, task.status, task.next_step, task.waiting_reason,
+              task.version, task.updated_at
+         FROM task
+        WHERE task.record_state = 'active' AND task.deleted_at IS NULL AND task.status <> 'archived'
+          AND (
+            EXISTS (
+              SELECT 1 FROM cindy_batch_group AS batch_group
+               WHERE batch_group.task_id = task.id
+                 AND batch_group.owner_scope = ? AND batch_group.account_anchor = ?
+            )
+            OR EXISTS (
+              SELECT 1 FROM task_source_link AS link
+              JOIN cindy_source_identity AS identity ON identity.source_event_id = link.source_event_id
+               WHERE link.task_id = task.id AND identity.owner_scope = ? AND identity.account_anchor = ?
+                 AND identity.state = 'active'
+            )
+            OR EXISTS (
+              SELECT 1 FROM candidate_request AS candidate
+              JOIN cindy_candidate_source_consumption AS consumed ON consumed.candidate_id = candidate.id
+               WHERE candidate.accepted_task_id = task.id
+                 AND consumed.owner_scope = ? AND consumed.account_anchor = ?
+            )
+          )
+        ORDER BY task.updated_at DESC, task.id ASC`,
+    ).all(auth.ownerScope, auth.accountAnchor, auth.ownerScope, auth.accountAnchor, auth.ownerScope, auth.accountAnchor) as Array<{
+      id: string; title: string; describe: string; status: TaskStatus; next_step: string; waiting_reason: string | null;
+      version: number; updated_at: string;
+    }>;
+    const candidateRows = this.database.raw.prepare(
+      `SELECT candidate.id, candidate.title, candidate.describe, candidate.validation_question,
+              candidate.state, candidate.version, candidate.updated_at
+         FROM candidate_request AS candidate
+         JOIN source_demand_unit AS demand_unit ON demand_unit.id = candidate.demand_unit_id
+        WHERE candidate.state IN ('pending','snoozed')
+          AND candidate.accepted_task_id IS NULL AND candidate.deleted_at IS NULL
+          AND candidate.merged_into_candidate_id IS NULL AND demand_unit.state <> 'superseded'
+          AND EXISTS (
+            SELECT 1 FROM cindy_candidate_source_consumption AS consumed
+             WHERE consumed.candidate_id = candidate.id
+               AND consumed.owner_scope = ? AND consumed.account_anchor = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM cindy_candidate_source_consumption AS foreign_consumed
+             WHERE foreign_consumed.candidate_id = candidate.id
+               AND (foreign_consumed.owner_scope <> ? OR foreign_consumed.account_anchor <> ?)
+          )
+        ORDER BY candidate.updated_at DESC, candidate.id ASC`,
+    ).all(auth.ownerScope, auth.accountAnchor, auth.ownerScope, auth.accountAnchor) as Array<{
+      id: string; title: string; describe: string; validation_question: string; state: CandidateState;
+      version: number; updated_at: string;
+    }>;
+
+    const normalizedQuery = query.toLocaleLowerCase('und');
+    const matchesQuery = (title: string, summary: string) => !normalizedQuery
+      || `${title}\n${summary}`.normalize('NFKC').toLocaleLowerCase('und').includes(normalizedQuery);
+    const afterCursor = (updatedAt: string, rowId: string, cursor: { updatedAt: string; rowId: string } | null) => !cursor
+      || updatedAt < cursor.updatedAt || (updatedAt === cursor.updatedAt && rowId > cursor.rowId);
+    const taskConversationMatches = (taskId: string) => !conversation || Boolean(this.database.raw.prepare(
+      `SELECT 1 FROM (
+         SELECT revision.chat_ref, revision.thread_ref
+           FROM task_source_link AS link
+           JOIN cindy_source_identity AS identity ON identity.source_event_id = link.source_event_id
+           JOIN source_event_revision AS revision ON revision.id = identity.current_revision_id
+          WHERE link.task_id = ? AND identity.owner_scope = ? AND identity.account_anchor = ? AND identity.state = 'active'
+         UNION ALL
+         SELECT revision.chat_ref, revision.thread_ref
+           FROM cindy_batch_group AS batch_group
+           JOIN cindy_batch_snapshot AS snapshot
+             ON snapshot.owner_scope = batch_group.owner_scope AND snapshot.account_anchor = batch_group.account_anchor
+            AND snapshot.batch_id = batch_group.batch_id AND snapshot.primary_group_key = batch_group.group_key
+           JOIN source_event_revision AS revision ON revision.id = snapshot.source_revision_id
+          WHERE batch_group.task_id = ? AND batch_group.owner_scope = ? AND batch_group.account_anchor = ?
+       ) WHERE chat_ref = ? AND ((? IS NULL AND thread_ref IS NULL) OR thread_ref = ?) LIMIT 1`,
+    ).get(taskId, auth.ownerScope, auth.accountAnchor, taskId, auth.ownerScope, auth.accountAnchor,
+      conversation.chatRef, conversation.threadRef, conversation.threadRef));
+    const candidateConversationMatches = (candidateId: string) => !conversation || Boolean(this.database.raw.prepare(
+      `SELECT 1 FROM cindy_candidate_source_consumption AS consumed
+       JOIN source_event_revision AS revision ON revision.id = consumed.source_revision_id
+       WHERE consumed.candidate_id = ? AND consumed.owner_scope = ? AND consumed.account_anchor = ?
+         AND revision.chat_ref = ? AND ((? IS NULL AND revision.thread_ref IS NULL) OR revision.thread_ref = ?) LIMIT 1`,
+    ).get(candidateId, auth.ownerScope, auth.accountAnchor, conversation.chatRef, conversation.threadRef, conversation.threadRef));
+
+    const safeTasks = taskRows.map((row) => ({
+      row,
+      item: {
+        task_key: row.id,
+        title: safeCandidateNarrative(row.title, [], '正式任务', 160),
+        summary: safeCandidateNarrative(row.describe, [], '任务摘要已保留。', 240),
+        status: row.status,
+        next_step: safeCandidateNarrative(row.next_step, [], '', 240),
+        version: row.version,
+        updated_at: row.updated_at,
+        ...(conversation ? { conversation_key: conversation.key } : {}),
+      },
+    })).filter(({ row, item }) => afterCursor(row.updated_at, row.id, taskCursor)
+      && taskConversationMatches(row.id) && matchesQuery(item.title, item.summary));
+    const safeCandidates = candidateRows.map((row) => ({
+      row,
+      item: {
+        candidate_key: cindyCandidateKey(auth, row.id),
+        title: safeCandidateNarrative(row.title, [], '待确认候选', 160),
+        summary: safeCandidateNarrative(row.describe, [], '候选摘要已保留。', 240),
+        next_step: safeCandidateNarrative(row.validation_question, [], '', 240),
+        status: row.state,
+        version: row.version,
+        updated_at: row.updated_at,
+        ...(conversation ? { conversation_key: conversation.key } : {}),
+      },
+    })).filter(({ row, item }) => afterCursor(row.updated_at, row.id, candidateCursor)
+      && candidateConversationMatches(row.id) && matchesQuery(item.title, item.summary));
+    return {
+      tasks: safeTasks.slice(0, taskLimit).map(({ item }) => item),
+      candidates: safeCandidates.slice(0, candidateLimit).map(({ item }) => item),
+      next_task_cursor: safeTasks.length > taskLimit
+        ? encodeCindyContextCursor(auth, 'task', safeTasks[taskLimit - 1]!.row.updated_at, safeTasks[taskLimit - 1]!.row.id) : null,
+      next_candidate_cursor: safeCandidates.length > candidateLimit
+        ? encodeCindyContextCursor(auth, 'candidate', safeCandidates[candidateLimit - 1]!.row.updated_at, safeCandidates[candidateLimit - 1]!.row.id) : null,
+      conversation_key: conversation?.key ?? null,
+    };
+  }
+
+  private appendCindyCandidateInTransaction(auth: CindyAuthContext, input: {
+    appendRequestId: string;
+    batchId: string;
+    groupKey: string;
+    candidateKey: string;
+    expectedCandidateVersion: number;
+    sourceReceipts: string[];
+    patch: { title?: string; describe?: string; next_step?: string };
+    fieldEvidence: Partial<Record<'title' | 'describe' | 'next_step', string[]>>;
+    ownerDecisionId?: string;
+    timestamp: string;
+    entries: Array<{
+      receipt: string;
+      revision: { id: string; source_event_id: string; processing_status: string };
+      source: Pick<SourceEventRow, 'id' | 'content'>;
+    }>;
+  }): CindyAppendResult {
+    const canonicalPayload = {
+      append_request_id: input.appendRequestId,
+      batch_id: input.batchId,
+      group_key: input.groupKey,
+      candidate_key: input.candidateKey,
+      expected_candidate_version: input.expectedCandidateVersion,
+      source_receipts: [...input.sourceReceipts].sort(),
+      patch: input.patch,
+      field_evidence: Object.fromEntries(Object.entries(input.fieldEvidence)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([field, receipts]) => [field, [...(receipts ?? [])].sort()])),
+      owner_decision_id: input.ownerDecisionId ?? null,
+    };
+    const payloadHash = hashCindyAppendRequest(canonicalPayload);
+    const replay = this.database.raw.prepare(
+      `SELECT payload_hash, response_json FROM cindy_append_request
+        WHERE owner_scope = ? AND account_anchor = ? AND append_request_id = ?`,
+    ).get(auth.ownerScope, auth.accountAnchor, input.appendRequestId) as { payload_hash: string; response_json: string } | undefined;
+    if (replay) {
+      if (replay.payload_hash !== payloadHash) throw new CindySourceContractError('CONFLICT', 'append_request_id 已绑定到不同 canonical payload。');
+      return { ...(JSON.parse(replay.response_json) as CindyAppendResult), duplicate: true };
+    }
+
+    const candidate = loadCindyCandidateByKey(this.database, auth, input.candidateKey);
+    if (!candidate) throw new CindySourceContractError('INVALID_INPUT', '候选不存在或不属于当前认证上下文。', 403);
+    if (!['pending', 'snoozed'].includes(candidate.state) || candidate.accepted_task_id || candidate.deleted_at || candidate.merged_into_candidate_id) {
+      throw new CindyIntakeConflictError('候选当前不可追加。', candidate.version);
+    }
+    if (candidate.version !== input.expectedCandidateVersion) {
+      throw new CindyIntakeConflictError(CANDIDATE_VERSION_CONFLICT_MESSAGE, candidate.version);
+    }
+    const batchGroup = this.database.raw.prepare(
+      `SELECT action FROM cindy_batch_group
+        WHERE owner_scope = ? AND account_anchor = ? AND batch_id = ? AND group_key = ?`,
+    ).get(auth.ownerScope, auth.accountAnchor, input.batchId, input.groupKey) as { action: string } | undefined;
+    if (!batchGroup || batchGroup.action !== 'append_candidate') {
+      throw new CindySourceContractError('CONFLICT', 'append request 未绑定当前认证上下文内的 append group。');
+    }
+    const receiptByValue = new Map(input.entries.map((entry) => [entry.receipt, entry]));
+    if (receiptByValue.size !== input.sourceReceipts.length || input.sourceReceipts.some((receipt) => !receiptByValue.has(receipt))) {
+      throw new CindySourceContractError('INVALID_INPUT', 'append source receipts 与已验证 revision 不一致。');
+    }
+    for (const entry of input.entries) {
+      const snapshot = this.database.raw.prepare(
+        `SELECT primary_disposition, primary_group_key
+           FROM cindy_batch_snapshot
+          WHERE owner_scope = ? AND account_anchor = ? AND batch_id = ? AND source_revision_id = ?`,
+      ).get(auth.ownerScope, auth.accountAnchor, input.batchId, entry.revision.id) as {
+        primary_disposition: string; primary_group_key: string | null;
+      } | undefined;
+      if (!snapshot || snapshot.primary_disposition !== 'group' || snapshot.primary_group_key !== input.groupKey
+        || !['pending_decision', 'retryable'].includes(entry.revision.processing_status)) {
+        throw new CindySourceContractError('CONFLICT', 'append 只能消费当前 batch/group 的未处理 primary receipts。');
+      }
+      if (this.database.raw.prepare(
+        `SELECT 1 FROM cindy_candidate_source_consumption
+          WHERE owner_scope = ? AND account_anchor = ? AND source_revision_id = ?`,
+      ).get(auth.ownerScope, auth.accountAnchor, entry.revision.id)) {
+        throw new CindySourceContractError('CONFLICT', '来源已被 primary candidate 消费。');
+      }
+      if (this.database.raw.prepare(
+        'SELECT 1 FROM source_demand_unit_source WHERE demand_unit_id = ? AND source_event_id = ?',
+      ).get(candidate.demand_unit_id, entry.source.id)) {
+        throw new CindySourceContractError('CONFLICT', '来源已属于当前候选，不能重复追加。');
+      }
+    }
+    const fields = ['title', 'describe', 'next_step'] as const;
+    for (const field of fields) {
+      const receipts = input.fieldEvidence[field] ?? [];
+      if ((input.patch[field] === undefined) !== (receipts.length === 0)
+        || new Set(receipts).size !== receipts.length || receipts.some((receipt) => !receiptByValue.has(receipt))) {
+        throw new CindySourceContractError('INVALID_INPUT', 'append 字段 patch 与 evidence receipts 不匹配。');
+      }
+    }
+    const sourceContents = input.entries.map((entry) => entry.source.content);
+    const nextTitle = input.patch.title === undefined
+      ? candidate.title : safeCandidateNarrative(input.patch.title, sourceContents, candidate.title, 160);
+    const nextDescribe = input.patch.describe === undefined
+      ? candidate.describe : safeCandidateNarrative(input.patch.describe, sourceContents, candidate.describe, 2_000);
+    const nextStep = input.patch.next_step === undefined
+      ? candidate.validation_question : safeCandidateNarrative(input.patch.next_step, sourceContents, candidate.validation_question, 1_000);
+    const nextVersion = candidate.version + 1;
+    const before = {
+      title: candidate.title,
+      describe: candidate.describe,
+      next_step: candidate.validation_question,
+      version: candidate.version,
+    };
+    const updated = this.database.raw.prepare(
+      `UPDATE candidate_request
+          SET title = ?, background = ?, validation_question = ?, describe = ?, updated_at = ?, version = ?
+        WHERE id = ? AND version = ? AND state IN ('pending','snoozed')
+          AND accepted_task_id IS NULL AND deleted_at IS NULL AND merged_into_candidate_id IS NULL`,
+    ).run(nextTitle, nextDescribe, nextStep, nextDescribe, input.timestamp, nextVersion, candidate.id, candidate.version);
+    if (updated.changes !== 1) {
+      const current = this.database.raw.prepare('SELECT version FROM candidate_request WHERE id = ?').get(candidate.id) as { version: number } | undefined;
+      throw new CindyIntakeConflictError(CANDIDATE_VERSION_CONFLICT_MESSAGE, current?.version ?? null);
+    }
+    this.database.raw.prepare(
+      `INSERT INTO cindy_append_request
+        (owner_scope, account_anchor, append_request_id, payload_hash, candidate_id, batch_id, group_key,
+         owner_decision_id, response_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?)`,
+    ).run(auth.ownerScope, auth.accountAnchor, input.appendRequestId, payloadHash, candidate.id, input.batchId,
+      input.groupKey, input.ownerDecisionId ?? null, input.timestamp);
+    const nextSequence = (this.database.raw.prepare(
+      'SELECT COALESCE(MAX(sequence), -1) + 1 AS sequence FROM source_demand_unit_source WHERE demand_unit_id = ?',
+    ).get(candidate.demand_unit_id) as { sequence: number }).sequence;
+    input.entries.forEach((entry, index) => {
+      this.database.raw.prepare(
+        `INSERT INTO source_demand_unit_source
+          (demand_unit_id, source_event_id, source_key, source_role, sequence, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(candidate.demand_unit_id, entry.source.id, `append:${input.appendRequestId}:${index + 1}`,
+        index === 0 ? 'anchor' : 'evidence', nextSequence + index, input.timestamp);
+      this.database.raw.prepare(
+        `INSERT INTO cindy_candidate_source_consumption
+          (owner_scope, account_anchor, source_revision_id, candidate_id, batch_id, group_key, append_request_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(auth.ownerScope, auth.accountAnchor, entry.revision.id, candidate.id, input.batchId, input.groupKey,
+        input.appendRequestId, input.timestamp);
+      const changed = this.database.raw.prepare(
+        `UPDATE source_event_revision SET processing_status = 'processed'
+          WHERE id = ? AND processing_status IN ('pending_decision','retryable')`,
+      ).run(entry.revision.id);
+      if (changed.changes !== 1) throw new CindySourceContractError('CONFLICT', '来源状态已变化；append 业务写入已回滚。');
+    });
+    for (const field of fields) {
+      for (const receipt of input.fieldEvidence[field] ?? []) {
+        this.database.raw.prepare(
+          `INSERT INTO cindy_append_field_evidence
+            (owner_scope, account_anchor, append_request_id, field_name, source_revision_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        ).run(auth.ownerScope, auth.accountAnchor, input.appendRequestId, field,
+          receiptByValue.get(receipt)!.revision.id, input.timestamp);
+      }
+    }
+    const after = { title: nextTitle, describe: nextDescribe, next_step: nextStep, version: nextVersion };
+    this.database.raw.prepare(
+      `INSERT INTO correction_event
+        (id, task_id, candidate_id, source_event_id, correction_type, before_json, after_json,
+         created_at, idempotency_key, note)
+       VALUES (?, NULL, ?, ?, 'cindy_append_candidate', ?, ?, ?, ?, ?)`,
+    ).run(id('correction'), candidate.id, input.entries[0]!.source.id, JSON.stringify(before), JSON.stringify(after),
+      input.timestamp, `cindy-append:${input.appendRequestId}`, 'Cindy 将新的可信 primary group 追加到已有候选。');
+    this.database.raw.prepare(
+      `UPDATE cindy_batch_group SET candidate_id = ?
+        WHERE owner_scope = ? AND account_anchor = ? AND batch_id = ? AND group_key = ?`,
+    ).run(candidate.id, auth.ownerScope, auth.accountAnchor, input.batchId, input.groupKey);
+    const response = {
+      append_request_id: input.appendRequestId,
+      candidate_key: input.candidateKey,
+      version: nextVersion,
+      source_count: input.entries.length,
+      updated_at: input.timestamp,
+      duplicate: false,
+    };
+    this.database.raw.prepare(
+      `UPDATE cindy_append_request SET response_json = ?
+        WHERE owner_scope = ? AND account_anchor = ? AND append_request_id = ?`,
+    ).run(JSON.stringify(response), auth.ownerScope, auth.accountAnchor, input.appendRequestId);
+    return response;
+  }
+
   listCindyConversationCursors() {
     return this.database.listCindyConversationCursors();
   }
@@ -13924,10 +14324,26 @@ export class PmService {
         if (group.title === undefined && group.describe === undefined && group.next_step === undefined) {
           throw new CindySourceContractError('INVALID_INPUT', 'update_task group 至少需要 title、describe 或 next_step。');
         }
-      } else {
+      } else if (group.action === 'create_candidate') {
         if (!group.title?.trim()) throw new CindySourceContractError('INVALID_INPUT', 'create_candidate group 必须提供由 Agent 生成的 title。');
-        if (group.task_key !== undefined || group.expected_version !== undefined) {
+        if (group.task_key !== undefined || group.expected_version !== undefined || group.expected_candidate_version !== undefined) {
           throw new CindySourceContractError('INVALID_INPUT', 'create_candidate group 不能声明 task CAS 字段。');
+        }
+      } else {
+        if (!group.append_request_id || !cindyBatchKeyPattern.test(group.append_request_id)
+          || !group.candidate_key || !cindyCandidateKeyPattern.test(group.candidate_key)
+          || !Number.isInteger(group.expected_candidate_version) || group.expected_candidate_version! < 1
+          || !group.source_receipts?.length || new Set(group.source_receipts).size !== group.source_receipts.length) {
+          throw new CindySourceContractError('INVALID_INPUT', 'append_candidate group 缺少有效 request、candidate、version 或 source receipts。');
+        }
+        if (group.task_key !== undefined || group.expected_version !== undefined) {
+          throw new CindySourceContractError('INVALID_INPUT', 'append_candidate 不能声明 task。');
+        }
+        const patchFields = (['title', 'describe', 'next_step'] as const).filter((field) => group[field] !== undefined);
+        const evidenceFields = Object.keys(group.field_evidence ?? {});
+        if (evidenceFields.some((field) => !patchFields.includes(field as typeof patchFields[number]))
+          || patchFields.some((field) => !(group.field_evidence?.[field]?.length))) {
+          throw new CindySourceContractError('INVALID_INPUT', 'append_candidate 每个 patch 字段必须且只能声明本组 evidence receipts。');
         }
       }
     }
@@ -13967,6 +14383,19 @@ export class PmService {
         || group.field_evidence_receipts.some((receipt) => primaryByReceipt.get(receipt)?.primary_group_key !== group.group_key)) {
         throw new CindySourceContractError('INVALID_INPUT', 'group 只能使用本组 primary receipt 作为 anchor/字段 evidence，且至少有一个 anchor。');
       }
+      if (group.action === 'append_candidate') {
+        const declared = [...group.source_receipts!].sort();
+        const assigned = [...primaryReceipts].sort();
+        if (JSON.stringify(declared) !== JSON.stringify(assigned)) {
+          throw new CindySourceContractError('INVALID_INPUT', 'append_candidate source_receipts 必须精确等于当前 primary group。');
+        }
+        for (const receipts of Object.values(group.field_evidence ?? {})) {
+          if (!receipts || new Set(receipts).size !== receipts.length
+            || receipts.some((receipt) => !primaryReceipts.includes(receipt))) {
+            throw new CindySourceContractError('INVALID_INPUT', 'append_candidate 字段 evidence 只能引用当前 primary group receipt。');
+          }
+        }
+      }
     }
     const sharedRelations = input.shared_context ?? [];
     const sharedKeys = sharedRelations.map((item) => `${item.source_receipt}\0${item.shared_group_key}`);
@@ -13998,18 +14427,38 @@ export class PmService {
     for (const decision of ownerDecisionByKey.values()) {
       const optionKeys = decision.options.map((option) => option.option_key);
       if (!decision.reason.trim() || !decision.options.length || new Set(optionKeys).size !== optionKeys.length
-        || optionKeys.some((key) => !cindyGroupKeyPattern.test(key))) {
+        || optionKeys.some((key) => !cindyGroupKeyPattern.test(key))
+        || (decision.group_key !== undefined && (!cindyGroupKeyPattern.test(decision.group_key) || groupByKey.has(decision.group_key)))) {
         throw new CindySourceContractError('INVALID_INPUT', 'owner decision 原因或选项无效。');
       }
+      const decisionReceipts = new Set(input.primary_dispositions
+        .filter((item) => item.disposition === 'needs_owner' && item.owner_decision_key === decision.decision_key)
+        .map((item) => item.source_receipt));
       for (const option of decision.options) {
         if (option.action === 'create_candidate' && !option.title?.trim()) {
           throw new CindySourceContractError('INVALID_INPUT', 'create_candidate 选项必须提供由 Agent 生成的 title。');
         }
-        if (option.action === 'append_candidate' && !option.candidate_key) {
-          throw new CindySourceContractError('INVALID_INPUT', 'append_candidate 意图必须绑定候选，但 003 不会执行该动作。');
+        if (option.action === 'append_candidate' && (!option.candidate_key || !cindyCandidateKeyPattern.test(option.candidate_key)
+          || !Number.isInteger(option.candidate_version) || option.candidate_version! < 1)) {
+          throw new CindySourceContractError('INVALID_INPUT', 'append_candidate 意图必须绑定 opaque candidate key 和候选版本。');
         }
-        if (option.action !== 'append_candidate' && option.candidate_key !== undefined) {
-          throw new CindySourceContractError('INVALID_INPUT', '只有 append_candidate 意图可以绑定候选。');
+        if (option.action !== 'append_candidate' && (option.candidate_key !== undefined || option.candidate_version !== undefined)) {
+          throw new CindySourceContractError('INVALID_INPUT', '只有 append_candidate 意图可以绑定候选和版本。');
+        }
+        const patchFields = (['title', 'describe', 'next_step'] as const).filter((field) => option[field] !== undefined);
+        const evidenceFields = Object.keys(option.field_evidence ?? {});
+        if (option.action === 'append_candidate') {
+          if (evidenceFields.some((field) => !patchFields.includes(field as typeof patchFields[number]))
+            || patchFields.some((field) => !(option.field_evidence?.[field]?.length))) {
+            throw new CindySourceContractError('INVALID_INPUT', 'append_candidate 选项每个 patch 字段必须声明 evidence receipts。');
+          }
+          for (const receipts of Object.values(option.field_evidence ?? {})) {
+            if (!receipts || new Set(receipts).size !== receipts.length || receipts.some((receipt) => !decisionReceipts.has(receipt))) {
+              throw new CindySourceContractError('INVALID_INPUT', 'append_candidate 选项 evidence 只能引用当前 needs_owner group。');
+            }
+          }
+        } else if (option.field_evidence !== undefined) {
+          throw new CindySourceContractError('INVALID_INPUT', '只有 append_candidate 选项可以声明字段 evidence。');
         }
       }
     }
@@ -14107,14 +14556,17 @@ export class PmService {
         const dispositions = input.primary_dispositions
           .filter((item) => item.disposition === 'needs_owner' && item.owner_decision_key === decisionKey)
           .sort((left, right) => left.disposition_ref.localeCompare(right.disposition_ref));
+        const sourceIndexByReceipt = new Map(dispositions.map((item, index) => [item.source_receipt, index]));
         const sources = dispositions.map((item) => sourceByRevision.get(revisionByReceipt.get(item.source_receipt)!.id)!);
         const sourceContents = sources.map((source) => source.content);
         const sanitizedOptions: CindyOwnerDecisionOptionInput[] = decision.options.map((option: CindyOwnerDecisionOptionInput) => {
           if (option.action === 'append_candidate') {
-            const candidate = this.database.raw.prepare(
-              `SELECT id FROM candidate_request WHERE id = ? AND deleted_at IS NULL AND state <> 'accepted'`,
-            ).get(option.candidate_key!) as { id: string } | undefined;
-            if (!candidate) throw new CindySourceContractError('CONFLICT', 'append_candidate 意图对应候选不可用。');
+            const candidate = loadCindyCandidateByKey(this.database, auth, option.candidate_key!);
+            if (!candidate || candidate.version !== option.candidate_version
+              || !['pending', 'snoozed'].includes(candidate.state) || candidate.accepted_task_id
+              || candidate.deleted_at || candidate.merged_into_candidate_id) {
+              throw new CindySourceContractError('CONFLICT', 'append_candidate 意图对应候选或版本不可用。');
+            }
           }
           return {
             option_key: option.option_key,
@@ -14125,6 +14577,11 @@ export class PmService {
             describe: option.describe === undefined ? undefined : safeCandidateNarrative(option.describe, sourceContents, '候选摘要待主人确认。', 2_000),
             next_step: option.next_step === undefined ? undefined : safeCandidateNarrative(option.next_step, sourceContents, '下一步待主人确认。', 1_000),
             candidate_key: option.action === 'append_candidate' ? option.candidate_key! : undefined,
+            candidate_version: option.action === 'append_candidate' ? option.candidate_version! : undefined,
+            field_evidence_source_indexes: option.action === 'append_candidate'
+              ? Object.fromEntries(Object.entries(option.field_evidence ?? {})
+                .map(([field, receipts]) => [field, receipts!.map((receipt) => sourceIndexByReceipt.get(receipt)!).sort((left, right) => left - right)]))
+              : undefined,
           };
         });
         const serializedOptions = serializeCindyOwnerDecisionStoredOptions(sanitizedOptions);
@@ -14138,10 +14595,11 @@ export class PmService {
         const reasonSummary = safeCandidateNarrative(decision.reason, sourceContents, '这组来源需要主人决定如何处理。', 500);
         this.database.raw.prepare(
           `INSERT INTO cindy_owner_decision
-            (id, owner_scope, account_anchor, batch_id, decision_key, reason_summary, options_json,
+            (id, owner_scope, account_anchor, batch_id, decision_key, group_key, reason_summary, options_json,
              status, version, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?)`,
-        ).run(decisionId, auth.ownerScope, auth.accountAnchor, input.batch_id, decisionKey, reasonSummary,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?)`,
+        ).run(decisionId, auth.ownerScope, auth.accountAnchor, input.batch_id, decisionKey,
+          decision.group_key ?? decisionKey, reasonSummary,
           serializedOptions.json, timestamp, timestamp);
         dispositions.forEach((disposition, index) => {
           const revision = revisionByReceipt.get(disposition.source_receipt)!;
@@ -14205,11 +14663,46 @@ export class PmService {
           ).run(candidateId, anchor.id, demandUnitId, title, anchor.sender_name, describe,
             nextStep, describe, analysisJson, timestamp, timestamp);
           attachCandidateSources(demandUnitId, sources);
+          revisions.forEach((revision) => this.database.raw.prepare(
+            `INSERT INTO cindy_candidate_source_consumption
+              (owner_scope, account_anchor, source_revision_id, candidate_id, batch_id, group_key, append_request_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
+          ).run(auth.ownerScope, auth.accountAnchor, revision.id, candidateId, input.batch_id, group.group_key, timestamp));
           this.database.raw.prepare(
             `UPDATE cindy_batch_group SET candidate_id = ?
               WHERE owner_scope = ? AND account_anchor = ? AND batch_id = ? AND group_key = ?`,
           ).run(candidateId, auth.ownerScope, auth.accountAnchor, input.batch_id, group.group_key);
-          groupResults.push({ group_key: group.group_key, action: group.action, source_status: 'processed', candidate_id: candidateId });
+          groupResults.push({
+            group_key: group.group_key,
+            action: group.action,
+            source_status: 'processed',
+            candidate_id: candidateId,
+            candidate_key: cindyCandidateKey(auth, candidateId),
+          });
+        } else if (group.action === 'append_candidate') {
+          const append = this.appendCindyCandidateInTransaction(auth, {
+            appendRequestId: group.append_request_id!,
+            batchId: input.batch_id,
+            groupKey: group.group_key,
+            candidateKey: group.candidate_key!,
+            expectedCandidateVersion: group.expected_candidate_version!,
+            sourceReceipts: group.source_receipts!,
+            patch: { title: group.title, describe: group.describe, next_step: group.next_step },
+            fieldEvidence: group.field_evidence ?? {},
+            timestamp,
+            entries: orderedReceipts.map((receipt, index) => ({
+              receipt,
+              revision: revisions[index]!,
+              source: sources[index]!,
+            })),
+          });
+          groupResults.push({
+            group_key: group.group_key,
+            action: group.action,
+            source_status: 'processed',
+            candidate_key: String(append.candidate_key),
+            version: Number(append.version),
+          });
         } else {
           const task = this.getTask(group.task_key!);
           if (!task) throw new CindyIntakeConflictError('update_task 对应的任务不存在。');
@@ -14253,7 +14746,7 @@ export class PmService {
           updatedTaskIds.add(task.id);
           groupResults.push({ group_key: group.group_key, action: group.action, source_status: 'processed', task_key: task.id, version: nextVersion });
         }
-        for (const revision of revisions) {
+        for (const revision of group.action === 'append_candidate' ? [] : revisions) {
           const changed = this.database.raw.prepare(
             `UPDATE source_event_revision SET processing_status = 'processed'
               WHERE id = ? AND processing_status IN ('pending_decision','retryable')`,
@@ -14349,7 +14842,9 @@ export class PmService {
   resolveCindyOwnerDecision(auth: CindyAuthContext, decisionId: string, input: ResolveCindyOwnerDecisionInput) {
     if (!/^cindy_owner_decision_[0-9a-f-]{36}$/iu.test(decisionId)
       || !cindyBatchKeyPattern.test(input.decision_request_id)
-      || !Number.isInteger(input.expected_version) || input.expected_version < 1) {
+      || !Number.isInteger(input.expected_version) || input.expected_version < 1
+      || (input.action === 'append_candidate') !== Boolean(input.append_request_id)
+      || (input.append_request_id !== undefined && !cindyBatchKeyPattern.test(input.append_request_id))) {
       throw new CindySourceContractError('INVALID_INPUT', '主人决定标识、请求标识或 version 无效。');
     }
     const payloadHash = hashCindyOwnerDecisionResolution(input);
@@ -14416,7 +14911,25 @@ export class PmService {
         }
         const timestamp = nowIso();
         let candidateId: string | null = null;
+        const sourceReceipts = sourceRows.map((source) => issueCindySourceReceiptForRevision(this.database, auth, source.revision_id));
+        const promoteDecisionSourcesToGroup = (action: 'create_candidate' | 'append_candidate') => {
+          this.database.raw.prepare(
+            `INSERT INTO cindy_batch_group
+              (owner_scope, account_anchor, batch_id, group_key, action, anchor_revision_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          ).run(auth.ownerScope, auth.accountAnchor, row.batch_id, row.group_key, action, sourceRows[0]!.revision_id, timestamp);
+          for (const source of sourceRows) {
+            const promoted = this.database.raw.prepare(
+              `UPDATE cindy_batch_snapshot
+                  SET primary_disposition = 'group', primary_group_key = ?
+                WHERE owner_scope = ? AND account_anchor = ? AND batch_id = ? AND source_revision_id = ?
+                  AND primary_disposition = 'needs_owner' AND primary_group_key IS NULL`,
+            ).run(row.group_key, auth.ownerScope, auth.accountAnchor, row.batch_id, source.revision_id);
+            if (promoted.changes !== 1) throw new CindySourceContractError('CONFLICT', '主人决定来源已不再属于原 pending group。');
+          }
+        };
         if (input.action === 'create_candidate') {
+          promoteDecisionSourcesToGroup('create_candidate');
           const anchor = sourceRows[0]!;
           candidateId = id('cand');
           const demandUnitId = id('unit');
@@ -14445,8 +14958,69 @@ export class PmService {
           );
           sourceRows.forEach((source, index) => insertSource.run(demandUnitId, source.source_event_id, `owner-source-${index + 1}`,
             index === 0 ? 'anchor' : 'evidence', index, timestamp));
+          sourceRows.forEach((source) => this.database.raw.prepare(
+            `INSERT INTO cindy_candidate_source_consumption
+              (owner_scope, account_anchor, source_revision_id, candidate_id, batch_id, group_key, append_request_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
+          ).run(auth.ownerScope, auth.accountAnchor, source.revision_id, candidateId, row.batch_id, row.group_key, timestamp));
+          this.database.raw.prepare(
+            `UPDATE cindy_batch_group SET candidate_id = ?
+              WHERE owner_scope = ? AND account_anchor = ? AND batch_id = ? AND group_key = ?`,
+          ).run(candidateId, auth.ownerScope, auth.accountAnchor, row.batch_id, row.group_key);
+        } else if (input.action === 'append_candidate') {
+          promoteDecisionSourcesToGroup('append_candidate');
+          const candidate = loadCindyCandidateByKey(this.database, auth, option.candidateKey ?? '');
+          if (!candidate || option.candidateVersion === null) {
+            throw new CindySourceContractError('CONFLICT', '主人选择的候选已不可追加。');
+          }
+          candidateId = candidate.id;
+          const patchFields = (['title', 'describe', 'next_step'] as const)
+            .filter((field) => (field === 'next_step' ? option.nextStep : option[field]) !== null);
+          const storedEvidence = option.fieldEvidenceSourceIndexes;
+          if (storedEvidence !== null && Object.keys(storedEvidence)
+            .some((field) => !patchFields.includes(field as typeof patchFields[number]))) {
+            throw new CindySourceContractError('CONFLICT', '主人决定中的字段 evidence 已损坏。');
+          }
+          const fieldEvidence = Object.fromEntries(patchFields.map((field) => {
+            // v11 append intents predate explicit per-field evidence. Preserve
+            // their prior implicit all-source meaning while every v12 option
+            // persists and replays the Agent-declared source indexes.
+            const indexes = storedEvidence === null
+              ? sourceReceipts.map((_, index) => index)
+              : storedEvidence[field];
+            if (!indexes?.length || new Set(indexes).size !== indexes.length
+              || indexes.some((index) => !Number.isInteger(index) || index < 0 || index >= sourceReceipts.length)) {
+              throw new CindySourceContractError('CONFLICT', '主人决定中的字段 evidence 已损坏。');
+            }
+            return [field, indexes.map((index) => sourceReceipts[index]!)];
+          })) as Partial<Record<'title' | 'describe' | 'next_step', string[]>>;
+          this.appendCindyCandidateInTransaction(auth, {
+            appendRequestId: input.append_request_id!,
+            batchId: row.batch_id,
+            groupKey: row.group_key,
+            candidateKey: option.candidateKey ?? '',
+            expectedCandidateVersion: option.candidateVersion,
+            sourceReceipts,
+            patch: {
+              title: option.title ?? undefined,
+              describe: option.describe ?? undefined,
+              next_step: option.nextStep ?? undefined,
+            },
+            fieldEvidence,
+            ownerDecisionId: row.id,
+            timestamp,
+            entries: sourceRows.map((source, index) => ({
+              receipt: sourceReceipts[index]!,
+              revision: {
+                id: source.revision_id,
+                source_event_id: source.source_event_id,
+                processing_status: source.processing_status,
+              },
+              source: { id: source.source_event_id, content: source.content },
+            })),
+          });
         }
-        for (const source of sourceRows) {
+        for (const source of input.action === 'append_candidate' ? [] : sourceRows) {
           const changed = this.database.raw.prepare(
             `UPDATE source_event_revision SET processing_status = ?
               WHERE id = ? AND processing_status IN ('pending_decision','retryable')`,

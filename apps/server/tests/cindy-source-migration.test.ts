@@ -8,6 +8,7 @@ import { deriveCindyAuthContext, saveCindySources } from '../src/cindy-source.js
 import { loadConfig } from '../src/config.js';
 import {
   AppDatabase,
+  CINDY_CANDIDATE_APPEND_MIGRATION_DESCRIPTOR,
   CINDY_GROUPED_BATCH_MIGRATION_DESCRIPTOR,
   CINDY_OWNER_CONTEXT_MIGRATION_DESCRIPTOR,
   CINDY_TRUSTED_SOURCE_MIGRATION_DESCRIPTOR,
@@ -260,10 +261,44 @@ describe('Cindy trusted source migrations', () => {
     raw.close();
 
     const recovered = new AppDatabase(path, false);
-    expect((recovered.raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(11);
+    expect((recovered.raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(CURRENT_SCHEMA_VERSION);
     expect(recovered.raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cindy_batch'").get())
       .toEqual({ name: 'cindy_batch' });
     expect(recovered.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'v10-marker'").get()).toEqual({ value_json: '{"ok":true}' });
+    recovered.close();
+  });
+
+  it('v11→v12 append migration 失败会阻止启动、保持完整 v11，修复后原子迁移并回填 consumption', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cindy-source-v12-failure-'));
+    roots.push(root);
+    const path = join(root, 'pm.sqlite');
+    const v11 = new AppDatabase(path, false, { targetSchemaVersionForTest: 11 });
+    v11.raw.prepare("INSERT INTO app_setting(key, value_json, updated_at) VALUES ('v11-marker', '{\"ok\":true}', '2026-08-24T00:00:00.000Z')").run();
+    v11.close();
+
+    const [schemaOperation, ...remainingOperations] = CINDY_CANDIDATE_APPEND_MIGRATION_DESCRIPTOR.orderedOperations;
+    if (schemaOperation?.kind !== 'sql_batch') throw new Error('v12 migration fixture expects sql_batch first');
+    const failingDescriptor = {
+      ...CINDY_CANDIDATE_APPEND_MIGRATION_DESCRIPTOR,
+      orderedOperations: [
+        { ...schemaOperation, statements: [...schemaOperation.statements, 'INSERT INTO missing_v12_fault_table(value) VALUES (1);'] },
+        ...remainingOperations,
+      ],
+    };
+    expect(() => new AppDatabase(path, false, { migrationDescriptorForTest: failingDescriptor })).toThrow(DatabaseUpgradeError);
+    await expect(buildAppFromDisk(path, failingDescriptor)).rejects.toThrow(DatabaseUpgradeError);
+
+    const raw = new DatabaseSync(path);
+    expect((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(11);
+    expect(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cindy_append_request'").get()).toBeUndefined();
+    expect(raw.prepare("SELECT value_json FROM app_setting WHERE key = 'v11-marker'").get()).toEqual({ value_json: '{"ok":true}' });
+    raw.close();
+
+    const recovered = new AppDatabase(path, false);
+    expect((recovered.raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(CURRENT_SCHEMA_VERSION);
+    expect(recovered.raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cindy_append_request'").get())
+      .toEqual({ name: 'cindy_append_request' });
+    expect(recovered.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'v11-marker'").get()).toEqual({ value_json: '{"ok":true}' });
     recovered.close();
   });
 });

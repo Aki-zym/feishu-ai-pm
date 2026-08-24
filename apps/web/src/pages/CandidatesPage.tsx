@@ -84,7 +84,7 @@ const ownerActionText: Record<PendingOwnerAction['action'], string> = {
 type OwnerDecisionInboxProps = {
   decisions: CindyOwnerDecision[];
   busy: string;
-  onResolve: (decision: CindyOwnerDecision, action: 'skip' | 'create_candidate', optionKey: string) => void;
+  onResolve: (decision: CindyOwnerDecision, action: 'skip' | 'create_candidate' | 'append_candidate', optionKey: string) => void;
   onCancel: (decision: CindyOwnerDecision) => void;
 };
 
@@ -99,11 +99,11 @@ export function OwnerDecisionInbox({ decisions, busy, onResolve, onCancel }: Own
           {decision.last_attempt_failed && <p>上次执行未完成，请稍后重试。</p>}
           <div className="candidate-owner-action-list">
             {decision.options.map((option) => <section className="candidate-owner-action" key={option.option_key}>
-              <div><strong>{option.action === 'skip' ? '跳过' : option.action === 'create_candidate' ? option.title || '建立候选' : option.title || '追加到已有候选'}</strong><span>{option.available ? '可以执行' : '等待后续追加能力'}</span></div>
+              <div><strong>{option.action === 'skip' ? '跳过' : option.action === 'create_candidate' ? option.title || '建立候选' : option.title || '追加到已有候选'}</strong><span>{option.available ? '可以执行' : '候选已变化，请刷新'}</span></div>
               {option.describe && <p>{option.describe}</p>}
               {option.next_step && <small>下一步：{option.next_step}</small>}
-              {option.available && option.action !== 'append_candidate' && <button className="secondary-button" type="button" disabled={Boolean(busy)} onClick={() => onResolve(decision, option.action === 'skip' ? 'skip' : 'create_candidate', option.option_key)}>
-                {option.action === 'skip' ? '确认跳过' : '建立候选'}
+              {option.available && <button className="secondary-button" type="button" disabled={Boolean(busy)} onClick={() => onResolve(decision, option.action, option.option_key)}>
+                {option.action === 'skip' ? '确认跳过' : option.action === 'create_candidate' ? '建立候选' : '追加到候选'}
               </button>}
             </section>)}
           </div>
@@ -324,7 +324,7 @@ export default function CandidatesPage() {
     return { grouped, unassigned };
   }, [items, pendingOwnerActions]);
 
-  const resolveOwnerDecision = async (decision: CindyOwnerDecision, action: 'skip' | 'create_candidate', optionKey: string) => {
+  const resolveOwnerDecision = async (decision: CindyOwnerDecision, action: 'skip' | 'create_candidate' | 'append_candidate', optionKey: string) => {
     const operation = `owner-decision-${decision.decision_id}`;
     setBusy(operation);
     setError('');
@@ -334,8 +334,10 @@ export default function CandidatesPage() {
         expected_version: decision.version,
         action,
         option_key: optionKey,
+        ...(action === 'append_candidate' ? { append_request_id: `append-${crypto.randomUUID()}` } : {}),
       });
-      setMessage(action === 'create_candidate' ? '已按主人选择建立候选。' : '已按主人选择跳过这些来源。');
+      setMessage(action === 'create_candidate' ? '已按主人选择建立候选。'
+        : action === 'append_candidate' ? '已把这些来源追加到所选候选。' : '已按主人选择跳过这些来源。');
       await load({ silent: true });
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '主人决定执行失败，请刷新后重试。');
