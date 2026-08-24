@@ -614,12 +614,6 @@ function validateContextBounds(
     if (!group.structured && !facts.some((fact) => fact.ownerEvidence)) {
       throw new CindySourceContractError('INVALID_INPUT', '无 thread/reply 上下文必须包含明确主人证据。');
     }
-    if (!group.structured) {
-      const firstOwnerEvidenceAt = Math.min(...facts.filter((fact) => fact.ownerEvidence).map((fact) => fact.occurredAtMs));
-      if (facts.some((fact) => fact.occurredAtMs < firstOwnerEvidenceAt)) {
-        throw new CindySourceContractError('INVALID_INPUT', '无 thread/reply 上下文只能从明确主人证据开始回读。');
-      }
-    }
   }
 }
 

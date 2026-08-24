@@ -149555,11 +149555,6 @@ function validateContextBounds(input, normalizedByRef, externalContexts) {
       throw new CindySourceContractError("INVALID_INPUT", group.structured ? "thread/reply \u4E0A\u4E0B\u6587\u8D85\u8FC7 4 \u5C0F\u65F6\u9650\u5236\u3002" : "\u65E0 thread/reply \u4E0A\u4E0B\u6587\u8D85\u8FC7 60 \u5206\u949F\u9650\u5236\u3002");
     if (!group.structured && !facts.some((fact) => fact.ownerEvidence))
       throw new CindySourceContractError("INVALID_INPUT", "\u65E0 thread/reply \u4E0A\u4E0B\u6587\u5FC5\u987B\u5305\u542B\u660E\u786E\u4E3B\u4EBA\u8BC1\u636E\u3002");
-    if (!group.structured) {
-      let firstOwnerEvidenceAt = Math.min(...facts.filter((fact) => fact.ownerEvidence).map((fact) => fact.occurredAtMs));
-      if (facts.some((fact) => fact.occurredAtMs < firstOwnerEvidenceAt))
-        throw new CindySourceContractError("INVALID_INPUT", "\u65E0 thread/reply \u4E0A\u4E0B\u6587\u53EA\u80FD\u4ECE\u660E\u786E\u4E3B\u4EBA\u8BC1\u636E\u5F00\u59CB\u56DE\u8BFB\u3002");
-    }
   }
 }
 function compareRevisionTuple(left, right) {

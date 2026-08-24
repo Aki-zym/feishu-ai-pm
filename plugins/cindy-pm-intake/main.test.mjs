@@ -422,18 +422,18 @@ test('save_pm_sources preserves MCP facts but rejects context beyond the hard bo
   assert.ok(nodeCalls.some((call) => call.params?.body?.save_request_id === 'save-separate-threads'));
 
   onHostMessage({
-    type: 'tool-call', tool: 'save_pm_sources', callId: 'call-evidence-after-context',
+    type: 'tool-call', tool: 'save_pm_sources', callId: 'call-owner-evidence-context',
     args: {
-      save_request_id: 'save-evidence-after-context',
+      save_request_id: 'save-owner-evidence-context',
       sources: [
         { ...source(0), client_ref: 'before', stable_message_id: 'before', mentioned_owner: false },
         { ...source(1), client_ref: 'evidence', stable_message_id: 'evidence', mentioned_owner: true },
       ],
     },
   });
-  await waitFor(() => sent.some((message) => message.callId === 'call-evidence-after-context'));
-  assert.match(sent.find((message) => message.callId === 'call-evidence-after-context').message, /主人证据开始/);
-  assert.equal(nodeCalls.some((call) => call.params?.body?.save_request_id === 'save-evidence-after-context'), false);
+  await waitFor(() => sent.some((message) => message.callId === 'call-owner-evidence-context'));
+  assert.ok(nodeCalls.some((call) => call.params?.body?.save_request_id === 'save-owner-evidence-context'));
+
 });
 
 test('submit_pm_decisions posts receipts only and rejects update_task without CAS fields', async () => {

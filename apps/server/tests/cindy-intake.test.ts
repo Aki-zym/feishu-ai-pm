@@ -538,12 +538,12 @@ describe('Cindy 对话入库接口', () => {
       sources: [trustedSource({ stable_message_id: 'plain-no-evidence', mentioned_owner: false, sender_is_owner: false, reactions: [] })],
     })).statusCode).toBe(400);
     expect((await saveSources(app, {
-      save_request_id: 'save-plain-before-owner-evidence',
+      save_request_id: 'save-plain-context-around-owner-evidence',
       sources: [
         trustedSource({ client_ref: 'before-evidence', stable_message_id: 'before-evidence', occurred_at: '2026-08-24T00:00:00.000Z', mentioned_owner: false, sender_is_owner: false, reactions: [] }),
         trustedSource({ client_ref: 'owner-evidence', stable_message_id: 'owner-evidence', occurred_at: '2026-08-24T00:01:00.000Z' }),
       ],
-    })).statusCode).toBe(400);
+    })).statusCode).toBe(200);
     expect((await saveSources(app, {
       save_request_id: 'save-plain-too-old',
       sources: [
@@ -584,7 +584,7 @@ describe('Cindy 对话入库接口', () => {
         trustedSource({ client_ref: 'thread-late', stable_message_id: 'thread-late', thread_id: 'old-thread', occurred_at: '2026-08-24T04:00:00.001Z' }),
       ],
     })).statusCode).toBe(400);
-    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get()).toEqual({ count: 121 });
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get()).toEqual({ count: 123 });
   });
 
   it('主人私人候选和任务来源显示安全 display name，响应不泄露技术 ID、receipt 或正文', async () => {

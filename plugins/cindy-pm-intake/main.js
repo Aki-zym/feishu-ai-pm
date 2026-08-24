@@ -364,10 +364,6 @@ function validateSaveSourcesBody(raw) {
     const times = group.map((source) => Date.parse(source.occurred_at));
     if (Math.max(...times) - Math.min(...times) > span) throw new Error(structured ? 'thread/reply 上下文超过 4 小时限制' : '无 thread/reply 上下文超过 60 分钟限制');
     if (!structured && !group.some((source) => source.mentioned_owner || source.sender_is_owner || hasOwnerReaction(source))) throw new Error('无 thread/reply 上下文必须包含明确主人证据');
-    if (!structured) {
-      const firstOwnerEvidenceAt = Math.min(...group.filter((source) => source.mentioned_owner || source.sender_is_owner || hasOwnerReaction(source)).map((source) => Date.parse(source.occurred_at)));
-      if (times.some((time) => time < firstOwnerEvidenceAt)) throw new Error('无 thread/reply 上下文只能从明确主人证据开始回读');
-    }
   }
   return { save_request_id: saveRequestId, sources };
 }
