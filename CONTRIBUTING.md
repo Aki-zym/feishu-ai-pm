@@ -1,61 +1,69 @@
-# 协作、交接与治理
+# 协作方式
 
-本文件把 Issue、隔离工作区、Draft PR、独立复核和发布拆成可恢复的步骤。它是仓库内的流程合同，不代表 GitHub 已经启用同等强度的服务器门禁。
+默认只有一条路：先开 Issue 说明在做什么，在自己的分支上改，开 PR，CI 绿了再合进 `main`。谁都不能日常直接推 `main`，包括 owner 和 admin。
 
-## RACI 与权限
+有 merge 权或管理员权限，只表示你可以处理 PR，不表示可以跳过主干保护。
 
-| 工作 | 产品主人 | 开发者/Worker | 独立 Reviewer | QA/证据负责人 | 发布负责人 | Merge authority（Lead/维护者） |
-|---|---|---|---|---|---|---|
-| 确认 Issue 范围、用户结果和未决产品选择 | A/R | C | C | C | I | C |
-| 实现与本地回归 | C | R | C | C | I | I |
-| 证据层级、changed-path、provenance 和未运行项 | I | C | C | A/R | I | I |
-| 独立复核安全、边界和验收 | I | I | A/R | C | I | I |
-| 标记 Ready | C | I | C | C | I | A/R |
-| 合入 `integration/m1-test-20260815` | C | I | C | C | I | A/R |
-| 构建、签名、发布 Release | A（确认可见结果） | I | I | C | A/R | C |
+## 小团队的 Issue
 
-规则：
+- 先开 Issue，用一两句话说清自己在改什么。这是占坑，让别人看见。
+- 不认领：谁提的谁做完，不必点 assignee。
+- 搜 Open Issue 和 Open PR，避免两个人改同一块。
+- 做完在 Issue 里留一句结果，再关。
 
-- 开发者不能自审、Approve、Ready、merge 或 release 自己的改动。
-- Reviewer 可以指出问题或要求修改，但不能用自己的复核替代产品主人确认，也不能把测试通过写成 Ready 或已合入。
-- 只有产品主人确认用户结果和对外动作边界后，Merge authority 才能标记 Ready 并合入 `integration/m1-test-20260815`；禁止直接推送 `main`。
-- Release 必须在 merge 之后单独发生。发布负责人不能用发布动作代替合并审阅。
-- 真实对外动作仍需系统主人明确确认；M1 与首轮试点保持 draft-only。
-- `CODEOWNERS` 是审阅路由，不等于独立性证明。当前只确认到一个 GitHub owner，因此不能声称已形成两人独立复核。
+## 为什么连 owner 也走分支 + PR
 
-## 可恢复 SOP
+占坑靠搜 Open PR。直接推 `main`，别人 rebase 之前看不见。
 
-1. **恢复现场**：读取当前 Issue、PR 和 handoff；核对 `git status`、当前分支、工作区列表和 exact base。先保存差异或建立可恢复副本，不覆盖未知脏改动。
-2. **主人确认 Issue**：确认目标、非目标、验收、外部动作边界和依赖；没有确认的产品选择保持未决。
-3. **隔离工作区**：为一个 Issue 建一个 branch、一个 worktree、一个 Draft PR。记录 branch、base branch/SHA、依赖 PR 和合并顺序。
-4. **选择证据层级**：对完整 base→HEAD changed paths 运行 `node scripts/ci-plan.mjs`；unknown、mixed、high-risk 一律扩大门禁并要求人工复核。
-5. **实现**：只修改 Issue 范围内的文件。若是 stacked PR，父分支前进时用普通 merge 合入新父分支；不能 rebase 或 force-push（也不得 force-push）。
-6. **同步文档影响**：更新 README/current-state、稳定合同、验证事实源或明确写出“不适用”；不要把旧 run、旧 base 或 artifact hash 当作当前授权。
-7. **写 handoff**：把 [handoff 模板](docs/handoff-template.md) 复制为被忽略的 `.handoff/current.md`，填写 dirty paths、已读材料、精确证据、证据上限、测试已运行/未运行、依赖和下一步。
-8. **创建 Draft PR**：PR 只 `Refs #<issue>`；正文写明 base/head、临时依赖、合并顺序、rebind 规则、测试和未验证项。保持 Draft/Open。
-9. **独立复核**：由另一角色检查产品边界、隐私、安全、证据和回退；发现问题先修改，不以作者自检代替复核。
-10. **主人合入、另行发布**：产品主人确认结果后，Merge authority 才能 Ready/merge 到 integration；父 PR 合入后，子 PR 必须 rebind 到 integration 并取得新的 exact CI。发布负责人随后单独处理构建、签名和 Release。
+每日合主干的前提是 `main` 只通过 PR 前进。直接 push 会让别人的分支无预告地落后。
 
-## GitHub 配置查询边界
+CI、清单、CODEOWNERS、第二人审查都挂在 PR 上。直接 push 等于这些门槛对权限最高的人关闭。
 
-2026-08-16T19:22:35+08:00 通过 `gh api` 只读查询：
+回滚和 blame 依赖主干上一条记录对应一次意图。本地零散提交直接进 `main`，热修会变脏。
 
-- `repos/guanchen-dotcom/feishu-ai-pm/branches/integration%2Fm1-test-20260815/protection`
-- `repos/guanchen-dotcom/feishu-ai-pm/branches/main/protection`
-- `repos/guanchen-dotcom/feishu-ai-pm/rulesets`
+## 日常步骤
 
-三个接口均返回 HTTP 403：`Upgrade to GitHub Pro or make this repository public to enable this feature.` 因此本 Issue 不声称已验证 branch protection、required review 或 rulesets；仓库管理员仍须在有权限的平台界面/API 中独立确认。文件内流程是人工门禁和审阅约定，不能伪装成服务器强制配置。
+1. 开 Issue（本仓库谁提谁做）。
+2. 从最新 `main` 拉个人分支，例如 `docs/main-protection` 或 `fix/...`。
+3. 在分支上改，推远程，开 PR，正文写 `Refs #编号`。
+4. 等 CI 绿。
+5. 按风险合入：
+   - 低风险（文案、注释、文档、纯样式）：CI 绿后，作者可以自己合。仍要有 PR 和描述。
+   - 中高风险（逻辑、API、迁移、配置、权限、CI）：必须另一个人看。自己给自己 +1 不算第二人。
+6. 合入用 squash。禁止 force push `main`，禁止删除 `main`。
 
-## 与产品边界的关系
+仓库暂时只有一个人时：低风险可自己合；高风险把 PR 挂着，隔几小时再看一遍 diff 再合。人一够两个，立刻恢复第二人规则。
 
-- 系统只发现、记录和管理任务，不自动执行。
-- 任何系统主人以外的人可见的内容都属于对外动作，必须由系统主人确认。
-- 来源事实与生成摘要保持分离；文件变化只能说明活动或候选产物，不能证明任务完成。
-- 本治理切片不连接真实飞书、LLM、生产数据或 Windows L5/L6；合成/Mock 证据最高按实际运行环境记录。
+## 主干保护（管理员在 GitHub 打开）
 
-## 相关入口
+`main` 至少打开：
 
-- [handoff 模板](docs/handoff-template.md)
-- [stacked PR 规则与示例](docs/stacked-pr.md)
-- [CODEOWNERS](.github/CODEOWNERS)
-- [当前状态](docs/current-state.md)
+- 禁止直接 push，必须先开 PR
+- 要求 CI 通过，没绿不能合
+- **管理员也不能绕过**（Do not allow bypassing the above settings）
+- 限制 force push、限制删除分支
+- CODEOWNERS 命中的路径要求对应审查
+
+就两三个人时，也打开「管理员不能绕过」。真把自己锁死，再临时关；关之前在 Issue 里留一句，用完立刻开回去。
+
+## 例外很窄
+
+| 情况 | 怎么做 |
+|---|---|
+| 空仓库初始化 | 第一次可以推 README / `.gitignore` / LICENSE。保护规则能开的当天就开，之后不再直推。 |
+| 热修 | 从生产对应提交拉 `hotfix/` 分支，仍开 PR，仍跑 CI。审查可以压缩成当场一个人看完就合。走的是加快的 PR。 |
+| 保护规则把仓库锁死 | 例如必检 CI 任务改名导致所有 PR 永远红。可以短暂关闭「管理员不能绕过」，用一个最小 PR 修好规则，然后马上恢复。直接改业务代码不算这类例外。 |
+| 纯文档 / 注释的极小改动 | 短 PR、自己合，不必硬等第二人。仍然开分支、仍然走 PR。 |
+
+共同边界：事先或事后留一句谁、为什么、何时恢复；一次只做最小改动；用完后门必须关上。不因为「我是 owner」「就几行」「现在没人在线」把业务改动直接推进主干。
+
+发现有人（含自己）直接 push 了业务改动：立刻补 PR 说明或 Revert，并检查保护规则是否被关掉。
+
+## 最小规则
+
+1. 所有人（含 owner / admin）在分支开发，经 PR 合入 `main`。禁止日常 `git push origin main`。
+2. `main` 打开保护：必须 PR、必须 CI 绿、禁止 force push、勾选管理员也不能绕过。
+3. Owner 的低风险 PR 可自行合；中高风险必须另一个人看。
+4. 热修也从生产对应提交开 `hotfix/` 分支走 PR。允许快审，不允许直接推主干。
+5. 先开 Issue 声明在做什么；小团队不认领，谁提谁做。
+6. 只有保护规则把仓库锁死时，才允许短暂关闭「管理员不能绕过」。修好后立即打开，并留下 Issue 记录。
