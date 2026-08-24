@@ -196,7 +196,7 @@ test('Issue #49 工作台失败后可重试为空状态', async ({ page }) => {
   const attemptsBeforeRetry = dashboardAttempts;
   dashboardAvailable = true;
   await page.getByRole('button', { name: '刷新' }).click();
-  await expect(page.getByText('没有新的候选需求。')).toBeVisible();
+  await expect(page.getByText('这里还没有候选需求。回到 Cindy 说「扫近10分钟」即可扫描已授权消息。')).toBeVisible();
   await expect(page.getByText('这里还没有任务。')).toBeVisible();
   await expect(page.getByText('没有正在等待他人的任务。')).toBeVisible();
   await expect(page.getByText('外部适配器已配置')).toBeVisible();
@@ -657,6 +657,7 @@ test('浏览器候选收件箱支持 seed 创建、接受、暂存和忽略', as
 
   await page.goto('/candidates');
   await expect(page.getByRole('heading', { name: '候选收件箱' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '模拟一条需求（浏览器测试）' })).toHaveCount(0);
   const filterBar = page.locator('.filter-bar');
 
   await candidateCardById(page, acceptedId).getByRole('button', { name: '接受为正式任务' }).click();
@@ -677,7 +678,7 @@ test('浏览器候选收件箱支持 seed 创建、接受、暂存和忽略', as
   await expect(candidateCardById(page, ignoredId).locator('.status-text').getByText('已忽略', { exact: true })).toBeVisible();
 });
 
-test('浏览器候选页可添加测试用模拟需求，并在 seed 接口缺失时回退到补录接口', async ({ page }, testInfo) => {
+test('设置页开发者工具可添加测试用模拟需求，并在 seed 接口缺失时回退到补录接口', async ({ page }, testInfo) => {
   testInfo.annotations.push({
     type: 'allow-console-error-for-response',
     description: JSON.stringify({
@@ -690,13 +691,8 @@ test('浏览器候选页可添加测试用模拟需求，并在 seed 接口缺�
       expectedCount: 1,
     }),
   });
-  let candidateLoads = 0;
   let seedCalls = 0;
   let fallbackCalls = 0;
-  await page.route('**/api/candidates*', async (route) => {
-    if (route.request().method() === 'GET') candidateLoads += 1;
-    await route.continue();
-  });
   await page.route('**/api/dev/seed-intake', async (route) => {
     seedCalls += 1;
     expect(route.request().method()).toBe('POST');
@@ -716,20 +712,20 @@ test('浏览器候选页可添加测试用模拟需求，并在 seed 接口缺�
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ duplicate: false, candidate: null, task: null, targetTask: null }) });
   });
 
-  await page.goto('/candidates');
+  await page.goto('/settings');
   const seedButton = page.getByRole('button', { name: '模拟一条需求（浏览器测试）' });
   await expect(seedButton).toBeVisible();
   await seedButton.click();
   await expect(page.getByText('模拟需求已加入候选收件箱。', { exact: true })).toBeVisible();
   expect(seedCalls).toBe(1);
   expect(fallbackCalls).toBe(1);
-  expect(candidateLoads).toBeGreaterThanOrEqual(2);
 });
 
-test('浏览器候选页在 seed 接口可用时显示新增候选', async ({ page }) => {
-  await page.goto('/candidates');
+test('设置页开发者工具生成模拟需求后，候选收件箱显示新增候选', async ({ page }) => {
+  await page.goto('/settings');
   await page.getByRole('button', { name: '模拟一条需求（浏览器测试）' }).click();
   await expect(page.getByText('模拟需求已加入候选收件箱。', { exact: true })).toBeVisible();
+  await page.goto('/candidates');
   await expect(page.getByRole('heading', { name: '浏览器测试用的模拟需求', exact: true })).toBeVisible();
 });
 
@@ -1884,15 +1880,14 @@ test('集成设置明确连接边界，且不暴露开发消息夹具', async ({
   await page.goto('/settings');
   await expect(page.getByRole('heading', { name: '集成设置' })).toBeVisible();
   await expect(page.getByText('当前使用本地规则或 Mock，不会访问飞书或外部模型。')).toBeVisible();
-  await expect(page.getByText('浏览器入口：仅校验格式')).toBeVisible();
+  await expect(page.getByText('开发者工具', { exact: true })).toBeVisible();
   await expect(page.getByText('退出后台进程', { exact: true })).toBeVisible();
   await expect(page.getByText('退出本机任务库后台后，当前浏览器页面会失去连接；任务数据仍保留在本机 SQLite 中。', { exact: true })).toBeVisible();
   await expect(page.locator('article.source-status-row').first()).toContainText('暂无记录');
   await expect(page.getByRole('button', { name: '重新同步' })).toHaveCount(5);
   await page.getByText('我的日历', { exact: true }).locator('xpath=ancestor::article').getByRole('button', { name: '重新同步' }).click();
   await expect(page.getByText('我的日历：skipped（已跳过），本轮未执行同步。')).toBeVisible();
-  await page.getByRole('button', { name: '只校验输入格式' }).click();
-  await expect(page.getByText('格式校验通过；此表单不会保存密钥或连接外部服务。')).toBeVisible();
+  await expect(page.getByRole('button', { name: '模拟一条需求（浏览器测试）' })).toBeVisible();
   await expect(page.getByRole('button', { name: '模拟收到消息' })).toHaveCount(0);
   await expect(page.getByText('虚拟消息测试')).toHaveCount(0);
 });

@@ -2,10 +2,16 @@
 <meta charset="utf-8">
 <body style="margin:0;padding:12px;display:grid;gap:12px">
   <label style="display:grid;gap:6px"><span>本机任务库地址</span><input id="pmBaseUrl" placeholder="http://127.0.0.1:4310" style="padding:8px;border:1px solid var(--border-default,#d9d9d9);border-radius:8px;background:var(--surface,#fff);color:inherit"></label>
-  <label style="display:grid;gap:6px"><span>本机服务令牌</span><input id="token" type="password" placeholder="已保存时留空" style="padding:8px;border:1px solid var(--border-default,#d9d9d9);border-radius:8px;background:var(--surface,#fff);color:inherit"></label>
-  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button id="save" style="padding:8px 14px;border:0;border-radius:8px;cursor:pointer">保存</button><button id="restart" style="padding:8px 14px;border:0;border-radius:8px;cursor:pointer">重启本机任务库</button><label style="display:flex;gap:6px;align-items:center"><input id="autoScan" type="checkbox"><span>启用 10 分钟自动扫描</span></label><span id="status"></span></div>
-  <small>启用插件后 Cindy 运行即拉起本机任务库并保持本机 4310 服务。Cindy 退出时后台服务会停止。任务台浏览器里有「退出后台进程」。本机任务库地址只接受本机回环服务。入库会话仅读取已授权飞书消息，只授权飞书 MCP；不要开 shell、工作区写入或飞书写接口。</small>
+  <label style="display:grid;gap:6px"><span>本机服务令牌</span><input id="token" type="password" placeholder="已保存时留空" style="padding:8px;border:1px solid var(--border-default,#d9d9d9);border-radius:8px;background:var(--surface,#fff);color:inherit"><small>入库与任务进度共用这一枚 pm_token，无需重复填写。</small></label>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button id="save" style="padding:8px 14px;border:0;border-radius:8px;cursor:pointer">保存</button><button id="restart" style="padding:8px 14px;border:0;border-radius:8px;cursor:pointer">重启本机任务库</button><label style="display:flex;gap:6px;align-items:center"><input id="autoScan" type="checkbox"><span>启用自动扫描</span></label><span id="status"></span></div>
+  <fieldset style="margin:0;padding:10px;border:1px solid var(--border-default,#d9d9d9);border-radius:10px;display:grid;gap:10px">
+    <legend style="padding:0 4px">任务进度维护</legend>
+    <label style="display:grid;grid-template-columns:auto 1fr;gap:2px 8px;align-items:start"><input type="radio" name="progressMode" value="manual" checked style="margin-top:3px"><span><strong>主动模式</strong><br><small>主 Agent 在任务出现实际进展时调用进度工具。</small></span></label>
+    <label style="display:grid;grid-template-columns:auto 1fr;gap:2px 8px;align-items:start"><input type="radio" name="progressMode" value="automatic" style="margin-top:3px"><span><strong>自动模式</strong><br><small>轮次结束后只读当前会话当前轮次的最终消息；Orca Worker、入库 errand 和 source=plugin 会跳过。</small></span></label>
+    <label style="display:flex;gap:8px;align-items:center"><input id="progressEnabled" type="checkbox" checked>启用任务进度维护</label>
+  </fieldset>
+  <small>启用插件后 Cindy 运行即拉起本机任务库并保持本机 4310 服务。本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台。Cindy 退出时后台服务会停止。任务台浏览器里有「退出后台进程」。本机任务库地址只接受本机回环服务。入库会话仅读取已授权飞书消息，只授权飞书 MCP；不要开 shell、工作区写入或飞书写接口。</small>
   <small>自动扫描开关打开后会写入本产品设置并打开自动化面板，仍需用户在面板中保存；预填间隔可能被主机抬到 30 分钟，用户可在面板改回 10 分钟。关闭只停止本产品自动流程；Cindy 自动化条目可能仍在，到点会空跑短路。Cindy 必须保持运行，自动扫描才会触发。</small>
-  <small>入库 errand 与自动化扫描请到插件详情的「AI 代办」中手动选择折扣路由 <code>codex/gpt-5.6-luna</code>，思考强度选择 <code>high</code>。插件详情「AI 代办」权限选「自动审核」(Auto-review / <code>auto</code>)，不要选只读 <code>plan</code> 或完全访问 <code>bypassPermissions</code>。请勿选择原价 <code>gpt-5.6-luna</code>。Cindy 草稿默认可能是 <code>fable5</code>，首次使用请改一次并保存。插件不会静默修改 Cindy 的全局默认模型。</small>
+  <small>入库 errand、自动化扫描和任务进度 oneshot 请到插件详情的「AI 代办」中手动选择折扣路由 <code>codex/gpt-5.6-luna</code>，思考强度选择 <code>high</code>。插件详情「AI 代办」权限选「自动审核」(Auto-review / <code>auto</code>)，不要选只读 <code>plan</code> 或完全访问 <code>bypassPermissions</code>。请勿选择原价 <code>gpt-5.6-luna</code>。Cindy 草稿默认可能是 <code>fable5</code>，首次使用请改一次并保存。插件不会静默修改 Cindy 的全局默认模型。</small>
   <script src="/settings.js"></script>
 </body>

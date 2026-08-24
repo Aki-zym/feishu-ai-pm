@@ -259,6 +259,21 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
     if (!body.success) return reply.code(400).send({ error: '自动扫描开关需要布尔值 enabled。' });
     return service.updateAutoScanSettings(body.data.enabled);
   });
+  app.get('/api/runtime/intake-cursor', async (request, reply) => {
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: '入库窗口游标只接受本机请求。' });
+    return service.intakeWindowCursor();
+  });
+  app.put('/api/runtime/intake-cursor', async (request, reply) => {
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: '入库窗口游标只接受本机请求。' });
+    const body = z.object({ window_end: z.string().datetime({ offset: true }) }).strict().safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: '入库窗口游标需要有效的 window_end。' });
+    try {
+      return service.updateIntakeWindowCursor(body.data.window_end);
+    } catch (error) {
+      const status = error instanceof CindyIntakeConflictError ? 409 : 400;
+      return reply.code(status).send({ error: error instanceof Error ? error.message : '入库窗口游标更新失败。' });
+    }
+  });
   registerSeedIntakeRoute(app, service);
   app.get('/api/dashboard', async () => dashboardDtoSchema.parse(service.dashboard()));
   app.get('/api/calendar', async () => service.calendar());
@@ -336,6 +351,41 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
     candidates: service.listCindyCandidates(),
     cursors: service.listCindyConversationCursors(),
   }));
+  app.get('/api/integrations/cindy/bindings/:sessionId', async (request) => {
+    const params = z.object({ sessionId: z.string().min(1).max(200) }).parse(request.params);
+    return { binding: service.getCindySessionBinding(params.sessionId) };
+  });
+  app.post('/api/integrations/cindy/turn-evaluations', async (request, reply) => {
+    try {
+      const body = z.object({
+        sessionId: z.string().min(1).max(200),
+        turnId: z.string().min(1).max(200),
+        candidateTaskIds: z.array(z.string().min(1).max(200)).max(200).default([]),
+        decision: z.enum(['no_match', 'suggest_binding', 'bind', 'no_update', 'progress_update']),
+        taskId: z.string().min(1).max(200).nullable().optional(),
+        associationConfidence: z.number().min(0).max(1).nullable().optional(),
+        updateConfidence: z.number().min(0).max(1).nullable().optional(),
+        patch: z.object({
+          status: z.enum(taskStatuses).optional(),
+          nextStep: z.string().max(1000).optional(),
+          waitingReason: z.string().max(1000).nullable().optional(),
+        }).strict().optional(),
+        reason: z.string().min(1).max(2000),
+        evidence: z.array(z.string().max(500)).max(8).optional(),
+        provider: z.string().max(100).optional(),
+        model: z.string().max(256).optional(),
+        inputHash: z.string().max(128).optional(),
+        promptVersion: z.string().max(100).optional(),
+      }).parse(request.body);
+      return service.recordCindyTurnEvaluation({
+        ...body,
+        taskId: body.taskId ?? undefined,
+        patch: body.patch ? { ...body.patch, status: body.patch.status as TaskStatus | undefined } : undefined,
+      });
+    } catch (error) {
+      return reply.code(error instanceof z.ZodError ? 400 : 409).send({ error: error instanceof Error ? error.message : '轮次判断写入失败。' });
+    }
+  });
   app.post('/api/integrations/cindy/intake', async (request, reply) => {
     try {
       const isoTimestamp = z.string().datetime({ offset: true });

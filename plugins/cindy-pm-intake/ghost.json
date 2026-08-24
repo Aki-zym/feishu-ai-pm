@@ -1,13 +1,13 @@
 {
   "schemaVersion": 2,
   "id": "ai-pm-intake",
-  "name": "TooManyTasks 入库",
-  "description": "扫描近 10 分钟的已授权飞书消息，整理 TooManyTasks 入库候选并提交审核提案。",
-  "whenToUse": "需要把近 10 分钟已授权飞书消息整理为任务候选、已有任务更新提案或跳过结论时使用。",
-  "version": "0.2.5",
+  "name": "TooManyTasks",
+  "description": "把已授权飞书消息整理为 TooManyTasks 入库候选，并维护当前会话的任务进度。本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台。",
+  "whenToUse": "需要扫描已授权飞书消息或把当前会话的实际进展写回任务台时使用；本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台。",
+  "version": "0.3.4",
   "entry": "main.js",
-  "launch": "on-demand",
-  "slots": ["tool", "agent", "node"],
+  "launch": "resident",
+  "slots": ["tool", "agent", "node", "cindy", "session-context", "skill", "subscribe"],
   "agent": { "errand": true, "schedule": true },
   "command": "扫近10分钟",
   "tools": [
@@ -74,7 +74,7 @@
     },
     {
       "name": "scan_intake_window",
-      "description": "扫描当前时间往前 10 分钟的已授权飞书消息，派发独立 errand 读取消息、获取任务快照并提交入库提案。",
+      "description": "扫描已授权飞书消息：优先从上次成功窗口游标开始，最多回看 4 小时；无游标时回看 10 分钟。派发独立 errand 读取消息、获取任务快照并提交入库提案；入库 errand 会话内禁止调用本工具，请直接使用飞书 MCP、get_pm_tasks 和 submit_intake。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -86,8 +86,33 @@
         },
         "additionalProperties": false
       }
+    },
+    {
+      "name": "update_pm_progress",
+      "description": "在设置为主动模式时，用独立轻量模型判断当前会话所属任务及是否需要更新进度。自动模式会在轮次结束后后台评估。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "goal": { "type": "string", "maxLength": 1600 },
+          "completed": { "type": "string", "maxLength": 2600 },
+          "verification": { "type": "string", "maxLength": 1800 },
+          "blockers": { "type": "string", "maxLength": 1000 },
+          "next_step": { "type": "string", "maxLength": 1200 },
+          "status_hint": { "type": "string", "enum": ["unknown", "in_progress", "waiting", "review", "completed"] }
+        },
+        "required": ["goal", "completed", "verification", "blockers", "next_step", "status_hint"],
+        "additionalProperties": false
+      }
     }
   ],
+  "cindy": {
+    "text": ["oneshot"],
+    "oneshotModel": "codex/gpt-5.6-luna"
+  },
+  "subscribe": {
+    "topics": ["turn"],
+    "hooks": ["will-user-message"]
+  },
   "node": {
     "entry": "node/worker.cjs",
     "protocol": "json-rpc-stdio",
@@ -96,7 +121,14 @@
       "key": "pm_token",
       "label": "本机服务令牌",
       "hint": "与本机 TooManyTasks 服务的 CINDY_INTEGRATION_TOKEN 保持一致。",
-      "methods": ["pm/request", "pm/ensure", "pm/stop", "pm/restart"]
+      "methods": ["pm/request", "pm/ensure", "pm/stop", "pm/restart", "cindy/read-completed-turn"]
+    }]
+  },
+  "skill": {
+    "items": [{
+      "dir": "skills/pm-progress-update",
+      "name": "pm-progress-update",
+      "description": "在主动模式下同步当前会话实际进展；自动模式由轮次结束后台评估。"
     }]
   },
   "settingsHtml": "settings.html",

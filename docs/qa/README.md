@@ -4,8 +4,6 @@
 
 > 本页是按里程碑追加的历史 QA 记录，不代表当前分支。当前可引用证据只查 [验证矩阵](../verification-matrix.md)，并以验证 ID、commit、run、环境和限制为准。
 
-本目录保存无真实数据的本地空壳截图。Dashboard 对照 `docs/design/dashboard-concept.png`；设置页对照 `docs/design/settings-concept-desktop.png` 和 `docs/design/settings-concept-mobile.png`。
-
 ## 2026-08-17 Issue #39 FSH-01：scope 三态与 Token/配置代际
 
 本轮只使用虚拟 token、Mock Feishu client、合成 vault、临时配置目录和本地测试；没有真实飞书租户、OAuth 凭证、生产数据库或原文。

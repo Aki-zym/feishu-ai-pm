@@ -939,6 +939,7 @@ type PrivacyTaskMemoryPurgeStage = {
 const PRIVACY_PURGE_TABLES = [
   'data_integrity_gap', 'reference_snapshot', 'memory_projection', 'runtime_tool_call',
   'runtime_checkpoint', 'provider_retry_cooldown', 'job_source_link', 'task_update_proposal', 'requirement_thread_revision',
+  'cindy_turn_evaluation', 'cindy_task_binding_suggestion', 'cindy_session_task_binding',
   'requirement_thread_unit', 'requirement_thread_source', 'notification', 'reminder',
   'reference_binding', 'outbox', 'approval', 'task_event', 'task_source_link', 'correction_event',
   'candidate_revision', 'candidate_merge_exclusion', 'owner_decision', 'ai_decision_log',
@@ -2866,6 +2867,50 @@ export class PmService {
        ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
     ).run(JSON.stringify({ enabled }), timestamp);
     return this.autoScanSettings();
+  }
+
+  intakeWindowCursor() {
+    const row = this.database.raw.prepare(
+      "SELECT value_json FROM app_setting WHERE key = 'intake_window_end'",
+    ).get() as { value_json: string } | undefined;
+    const value = parseMetadata(row?.value_json);
+    const windowEnd = typeof value.window_end === 'string' && Number.isFinite(Date.parse(value.window_end))
+      ? new Date(value.window_end).toISOString()
+      : null;
+    return { window_end: windowEnd };
+  }
+
+  updateIntakeWindowCursor(windowEnd: string) {
+    const next = new Date(windowEnd);
+    if (!Number.isFinite(next.getTime())) throw new CindyIntakeValidationError('window_end 不是有效时间。');
+    const nextIso = next.toISOString();
+    const current = this.intakeWindowCursor().window_end;
+    if (current && Date.parse(nextIso) <= Date.parse(current)) {
+      throw new CindyIntakeConflictError('入库窗口游标只允许向前推进。');
+    }
+    const timestamp = nowIso();
+    this.writeIntakeWindowCursorUnsafe(nextIso, timestamp);
+    return { window_end: nextIso };
+  }
+
+  private writeIntakeWindowCursorUnsafe(windowEnd: string, updatedAt: string) {
+    this.database.raw.prepare(
+      `INSERT INTO app_setting (key, value_json, updated_at) VALUES ('intake_window_end', ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+    ).run(JSON.stringify({ window_end: windowEnd }), updatedAt);
+  }
+
+  private advanceIntakeWindowCursorUnsafe(windowEnd: string, updatedAt: string) {
+    const next = new Date(windowEnd);
+    if (!Number.isFinite(next.getTime())) throw new CindyIntakeValidationError('window_end 不是有效时间。');
+    const nextIso = next.toISOString();
+    const row = this.database.raw.prepare(
+      "SELECT value_json FROM app_setting WHERE key = 'intake_window_end'",
+    ).get() as { value_json: string } | undefined;
+    const currentValue = parseMetadata(row?.value_json).window_end;
+    const currentTime = typeof currentValue === 'string' ? Date.parse(currentValue) : Number.NaN;
+    if (Number.isFinite(currentTime) && currentTime >= next.getTime()) return;
+    this.writeIntakeWindowCursorUnsafe(nextIso, updatedAt);
   }
 
   updateAutomationPolicy(mode: AutomationMode) {
@@ -9664,7 +9709,7 @@ export class PmService {
     provider?: string;
     model?: string;
     promptVersion?: string;
-    origin: 'follow_up' | 'owner_association' | 'reprocess';
+    origin: 'follow_up' | 'owner_association' | 'reprocess' | 'cindy_turn';
     associationConfidence: number | null;
     updateConfidence: number | null;
     usedFallback: boolean;
@@ -13581,6 +13626,165 @@ export class PmService {
     }));
   }
 
+  getCindySessionBinding(sessionId: string) {
+    const row = this.database.raw.prepare(
+      `SELECT binding.*, task.title, task.describe, task.status, task.next_step, task.waiting_reason,
+              task.version, task.updated_at, task.deleted_at, task.record_state, task.auto_update_paused
+       FROM cindy_session_task_binding AS binding
+       JOIN task ON task.id = binding.task_id
+       WHERE binding.session_id = ? AND binding.invalidated_at IS NULL`,
+    ).get(sessionId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    if (row.deleted_at || row.record_state !== 'active' || row.status === 'archived') {
+      const timestamp = nowIso();
+      this.database.raw.prepare(
+        'UPDATE cindy_session_task_binding SET invalidated_at = ?, updated_at = ? WHERE session_id = ? AND invalidated_at IS NULL',
+      ).run(timestamp, timestamp, sessionId);
+      return null;
+    }
+    return {
+      sessionId,
+      confidence: Number(row.confidence),
+      bindingSource: String(row.binding_source),
+      task: {
+        id: String(row.task_id),
+        title: String(row.title),
+        describe: String(row.describe),
+        status: String(row.status),
+        nextStep: String(row.next_step ?? ''),
+        waitingReason: row.waiting_reason === null ? null : String(row.waiting_reason),
+        version: Number(row.version),
+        updatedAt: String(row.updated_at),
+        autoUpdatePaused: Boolean(row.auto_update_paused),
+      },
+    };
+  }
+
+  recordCindyTurnEvaluation(input: {
+    sessionId: string;
+    turnId: string;
+    candidateTaskIds?: string[];
+    decision: 'no_match' | 'suggest_binding' | 'bind' | 'no_update' | 'progress_update';
+    taskId?: string | null;
+    associationConfidence?: number | null;
+    updateConfidence?: number | null;
+    patch?: { status?: TaskStatus; nextStep?: string; waitingReason?: string | null };
+    reason: string;
+    evidence?: string[];
+    provider?: string;
+    model?: string;
+    inputHash?: string;
+    promptVersion?: string;
+  }) {
+    const existing = this.database.raw.prepare(
+      'SELECT * FROM cindy_turn_evaluation WHERE session_id = ? AND turn_id = ?',
+    ).get(input.sessionId, input.turnId) as Record<string, unknown> | undefined;
+    if (existing) {
+      const proposalId = typeof existing.proposal_id === 'string' ? existing.proposal_id : null;
+      const decision = String(existing.decision);
+      return {
+        duplicate: true,
+        evaluation: existing,
+        binding: this.getCindySessionBinding(input.sessionId),
+        suggestion: decision === 'suggest_binding'
+          ? this.database.raw.prepare('SELECT * FROM cindy_task_binding_suggestion WHERE session_id = ? AND turn_id = ?').get(input.sessionId, input.turnId)
+          : null,
+        proposal: proposalId ? this.getTaskUpdateProposal(proposalId) : null,
+      };
+    }
+
+    const binding = this.getCindySessionBinding(input.sessionId);
+    const requestedDecision = input.decision;
+    if (binding) {
+      if (!['no_update', 'progress_update'].includes(requestedDecision)) throw new Error('已有会话绑定时只能提交当前任务的进度判断。');
+    } else if (!['no_match', 'suggest_binding', 'bind'].includes(requestedDecision)) {
+      throw new Error('未绑定会话只能提交匹配、建议绑定或无匹配判断。');
+    }
+    const associationConfidence = input.associationConfidence ?? null;
+    const effectiveDecision = requestedDecision === 'bind' && (associationConfidence ?? 0) < 0.9 ? 'suggest_binding' : requestedDecision;
+    let taskId = input.taskId ?? binding?.task.id ?? null;
+    const candidateTaskIds = new Set(input.candidateTaskIds ?? []);
+    if (!binding && taskId && !candidateTaskIds.has(taskId)) throw new Error('未绑定会话引用的任务不在本轮候选集内。');
+    if (!binding && taskId && !this.database.raw.prepare(
+      `SELECT 1 FROM task WHERE id = ? AND record_state = 'active' AND deleted_at IS NULL AND status <> 'archived'`,
+    ).get(taskId)) throw new Error('未绑定会话只能引用当前未归档任务候选。');
+    const task = taskId ? this.getTask(taskId) : null;
+    if (taskId && (!task || task.record_state !== 'active' || task.deleted_at || task.status === 'archived')) throw new Error('判断指向的任务不存在或已不可维护。');
+    if (binding && taskId && binding.task.id !== taskId) throw new Error('这条会话已有有效绑定，不能由模型改绑到其他任务。');
+    const updateConfidence = input.updateConfidence ?? null;
+    const timestamp = nowIso();
+    if (effectiveDecision === 'bind' && taskId && associationConfidence !== null && associationConfidence >= 0.9) {
+      this.database.raw.prepare(
+        `INSERT INTO cindy_session_task_binding
+          (session_id, task_id, confidence, binding_source, created_at, updated_at, invalidated_at)
+         VALUES (?, ?, ?, 'model', ?, ?, NULL)
+         ON CONFLICT(session_id) DO UPDATE SET
+           task_id = excluded.task_id, confidence = excluded.confidence, binding_source = 'model',
+           updated_at = excluded.updated_at, invalidated_at = NULL`,
+      ).run(input.sessionId, taskId, associationConfidence, timestamp, timestamp);
+    } else if (effectiveDecision === 'suggest_binding' && taskId && associationConfidence !== null) {
+      this.database.raw.prepare(
+        `INSERT OR IGNORE INTO cindy_task_binding_suggestion
+          (id, session_id, turn_id, task_id, confidence, reason, state, created_at, decided_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL)`,
+      ).run(id('cindy-binding'), input.sessionId, input.turnId, taskId, associationConfidence, input.reason, timestamp);
+    }
+
+    let proposalId: string | null = null;
+    if (effectiveDecision === 'progress_update' && task) {
+      const patchRecord = input.patch ?? {};
+      const unknownKeys = Object.keys(patchRecord).filter((key) => !['status', 'nextStep', 'waitingReason'].includes(key));
+      if (unknownKeys.length) throw new Error('当前轮次更新包含越权字段。');
+      const patch: Record<string, unknown> = {};
+      if (patchRecord.status !== undefined && patchRecord.status !== task.status) patch.status = patchRecord.status;
+      if (patchRecord.nextStep !== undefined && patchRecord.nextStep !== task.next_step) patch.nextStep = patchRecord.nextStep;
+      if (patchRecord.waitingReason !== undefined && patchRecord.waitingReason !== task.waiting_reason) patch.waitingReason = patchRecord.waitingReason;
+      if (Object.keys(patch).length) {
+        const proposal = this.createTaskUpdateProposal({
+          task,
+          threadId: null,
+          sourceEventId: null,
+          demandUnitId: null,
+          candidateRevisionId: null,
+          threadRevisionId: null,
+          baseThreadVersion: null,
+          patch,
+          reason: input.reason,
+          evidence: { sessionId: input.sessionId, turnId: input.turnId, relationType: 'cindy_session_binding', excerpts: (input.evidence ?? []).slice(0, 8) },
+          provider: input.provider ?? 'cindy',
+          model: input.model ?? '',
+          promptVersion: input.promptVersion ?? 'cindy-manual-v2',
+          origin: 'cindy_turn',
+          associationConfidence,
+          updateConfidence,
+          usedFallback: false,
+          idempotencyKey: `cindy-turn:${input.sessionId}:${input.turnId}`,
+          createdAt: timestamp,
+        });
+        proposalId = proposal.id;
+      }
+    }
+    this.database.raw.prepare(
+      `INSERT INTO cindy_turn_evaluation
+        (id, session_id, turn_id, task_id, decision, association_confidence, update_confidence,
+         reason, evidence_json, provider, model, input_hash, prompt_version, proposal_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id('cindy-turn'), input.sessionId, input.turnId, taskId, effectiveDecision,
+      associationConfidence, updateConfidence, input.reason, JSON.stringify((input.evidence ?? []).slice(0, 8)),
+      input.provider ?? 'cindy', input.model ?? '', input.inputHash ?? '', input.promptVersion ?? '', proposalId, timestamp,
+    );
+    if (proposalId) this.dispatchTaskUpdateProposal(proposalId, null);
+    return {
+      duplicate: false,
+      binding: this.getCindySessionBinding(input.sessionId),
+      suggestion: effectiveDecision === 'suggest_binding'
+        ? this.database.raw.prepare('SELECT * FROM cindy_task_binding_suggestion WHERE session_id = ? AND turn_id = ?').get(input.sessionId, input.turnId)
+        : null,
+      proposal: proposalId ? this.getTaskUpdateProposal(proposalId) : null,
+    };
+  }
+
   listCindyCandidates() {
     const candidates = this.database.raw.prepare(
       `SELECT candidate_request.id,
@@ -13889,6 +14093,7 @@ export class PmService {
             SET cursor = ?, last_success_at = ?, updated_at = ?
           WHERE integration = 'cindy_intake' AND scope_key = ?`,
       ).run(JSON.stringify(storedResult), timestamp, timestamp, input.window_id);
+      this.advanceIntakeWindowCursorUnsafe(input.window_end, timestamp);
       for (const [conversationKey, occurredAt] of conversationCursors) {
         this.database.advanceCindyConversationCursor(conversationKey, occurredAt, timestamp);
       }

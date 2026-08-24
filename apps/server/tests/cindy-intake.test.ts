@@ -105,6 +105,51 @@ describe('Cindy 对话入库接口', () => {
     expect(invalid.statusCode).toBe(400);
   });
 
+  it('入库窗口游标默认为空，仅允许 loopback，并且 PUT 只保留最晚时间', async () => {
+    const { app, database } = await makeApp();
+    const initial = await app.inject({ method: 'GET', url: '/api/runtime/intake-cursor', remoteAddress: '127.0.0.1' });
+    expect(initial.statusCode).toBe(200);
+    expect(initial.json()).toEqual({ window_end: null });
+
+    const first = await app.inject({
+      method: 'PUT',
+      url: '/api/runtime/intake-cursor',
+      remoteAddress: '127.0.0.1',
+      payload: { window_end: '2026-08-24T00:10:00.000Z' },
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toEqual({ window_end: '2026-08-24T00:10:00.000Z' });
+
+    const same = await app.inject({
+      method: 'PUT',
+      url: '/api/runtime/intake-cursor',
+      remoteAddress: '127.0.0.1',
+      payload: { window_end: '2026-08-24T00:10:00.000Z' },
+    });
+    expect(same.statusCode).toBe(409);
+    expect(same.json()).toMatchObject({ error: '入库窗口游标只允许向前推进。' });
+    const earlier = await app.inject({
+      method: 'PUT',
+      url: '/api/runtime/intake-cursor',
+      remoteAddress: '127.0.0.1',
+      payload: { window_end: '2026-08-24T00:09:00.000Z' },
+    });
+    expect(earlier.statusCode).toBe(409);
+    expect(earlier.json()).toMatchObject({ error: '入库窗口游标只允许向前推进。' });
+
+    const remoteGet = await app.inject({ method: 'GET', url: '/api/runtime/intake-cursor', remoteAddress: '203.0.113.10' });
+    expect(remoteGet.statusCode).toBe(403);
+    const remotePut = await app.inject({
+      method: 'PUT',
+      url: '/api/runtime/intake-cursor',
+      remoteAddress: '203.0.113.10',
+      payload: { window_end: '2026-08-24T00:11:00.000Z' },
+    });
+    expect(remotePut.statusCode).toBe(403);
+    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'intake_window_end'").get())
+      .toEqual({ value_json: '{"window_end":"2026-08-24T00:10:00.000Z"}' });
+  });
+
   it('任务快照包含 pending 候选和会话游标，无会话来源不生成 source 或游标', async () => {
     const { app, database } = await makeApp();
     const response = await app.inject({
@@ -131,6 +176,8 @@ describe('Cindy 对话入库接口', () => {
       },
     });
     expect(response.statusCode).toBe(200);
+    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'intake_window_end'").get())
+      .toEqual({ value_json: '{"window_end":"2026-08-24T00:10:00.000Z"}' });
 
     const snapshot = await app.inject({
       method: 'GET',
@@ -234,6 +281,25 @@ describe('Cindy 对话入库接口', () => {
     expect((database.raw.prepare('SELECT COUNT(*) AS count FROM correction_event').get() as { count: number }).count).toBe(1);
   });
 
+  it('成功提交空窗口时也推进 intake_window_end', async () => {
+    const { app, database } = await makeApp();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/intake',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        window_id: 'window-20260824-empty',
+        window_start: '2026-08-24T00:00:00.000Z',
+        window_end: '2026-08-24T00:10:00.000Z',
+        sources: [],
+        proposals: [],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'intake_window_end'").get())
+      .toEqual({ value_json: '{"window_end":"2026-08-24T00:10:00.000Z"}' });
+  });
+
   it('update_task 使用 expected_version CAS，冲突时不写入来源或任务', async () => {
     const { app, database } = await makeApp();
     makeTask(database);
@@ -298,5 +364,77 @@ describe('Cindy 对话入库接口', () => {
     expect(duplicate.statusCode).toBe(200);
     expect(duplicate.json()).toMatchObject({ window_id: payload.window_id, duplicate: true });
     expect((database.raw.prepare('SELECT version FROM task WHERE id = ?').get('task-cindy-intake-1') as { version: number }).version).toBe(2);
+  });
+
+  it('进度接口支持会话绑定、重复轮次幂等和服务端待确认安全门', async () => {
+    const { app, database } = await makeApp();
+    makeTask(database);
+    const noAuth = await app.inject({ method: 'GET', url: '/api/integrations/cindy/bindings/session-progress-1' });
+    expect(noAuth.statusCode).toBe(401);
+    const removedConfirmRoute = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/bindings/session-progress-1/confirm',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { taskId: 'task-cindy-intake-1' },
+    });
+    expect(removedConfirmRoute.statusCode).toBe(404);
+    const first = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/turn-evaluations',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        sessionId: 'session-progress-1',
+        turnId: 'turn-1',
+        candidateTaskIds: ['task-cindy-intake-1'],
+        decision: 'bind',
+        taskId: 'task-cindy-intake-1',
+        associationConfidence: 0.95,
+        updateConfidence: 0.9,
+        reason: '当前会话目标与候选任务唯一匹配。',
+        evidence: ['本轮围绕活动留存分析推进。'],
+        provider: 'codex',
+        model: 'gpt-5.6-luna',
+      },
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toMatchObject({ duplicate: false, binding: { sessionId: 'session-progress-1', task: { id: 'task-cindy-intake-1' } } });
+
+    const duplicate = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/turn-evaluations',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        sessionId: 'session-progress-1',
+        turnId: 'turn-1',
+        decision: 'bind',
+        taskId: 'task-cindy-intake-1',
+        associationConfidence: 0.95,
+        reason: '重复提交。',
+      },
+    });
+    expect(duplicate.statusCode).toBe(200);
+    expect(duplicate.json()).toMatchObject({ duplicate: true });
+
+    const progress = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/turn-evaluations',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        sessionId: 'session-progress-1',
+        turnId: 'turn-2',
+        candidateTaskIds: ['task-cindy-intake-1'],
+        decision: 'progress_update',
+        taskId: 'task-cindy-intake-1',
+        associationConfidence: 1,
+        updateConfidence: 0.9,
+        patch: { nextStep: '补充实验分组并复核结论。' },
+        reason: '本轮完成数据核验，下一步已明确。',
+        evidence: ['已确认数据口径。'],
+      },
+    });
+    expect(progress.statusCode).toBe(200);
+    expect(progress.json()).toMatchObject({ duplicate: false, proposal: { state: 'awaiting_approval' } });
+    expect(database.raw.prepare('SELECT next_step, version FROM task WHERE id = ?').get('task-cindy-intake-1'))
+      .toEqual({ next_step: '补充分区口径', version: 1 });
   });
 });

@@ -19,12 +19,14 @@ function waitFor(predicate, timeoutMs = 1000) {
   });
 }
 
-function setup({ errandText = '{"accepted":true}', autoScanEnabled = false } = {}) {
+function setup({ errandText = '{"accepted":true}', errandResponse = null, errandError = null, autoScanEnabled = false, intakeWindowEnd = null, progressMode = 'manual', progressEnabled = true, progressModelText = '{"decision":"no_update","reason":"无变化","evidence":[]}' } = {}) {
   let onHostMessage;
   const nodeCalls = [];
   const sent = [];
   const errandCalls = [];
   const secretCalls = [];
+  const cursorWrites = [];
+  const intakePosts = [];
   const cindy = {
     onHostMessage(handler) { onHostMessage = handler; },
     node: {
@@ -37,6 +39,21 @@ function setup({ errandText = '{"accepted":true}', autoScanEnabled = false } = {
           ok: true,
           result: { enabled: autoScanEnabled },
         };
+        if (request.params.path === '/api/runtime/intake-cursor') {
+          if (request.params.method === 'PUT') {
+            cursorWrites.push(request.params.body);
+            return { ok: true, result: { window_end: request.params.body.window_end } };
+          }
+          return { ok: true, result: { window_end: intakeWindowEnd } };
+        }
+        if (request.params.path.includes('/bindings/')) return {
+          ok: true,
+          result: { binding: null },
+        };
+        if (request.params.path.endsWith('/turn-evaluations')) return {
+          ok: true,
+          result: { duplicate: false, binding: null, proposal: null, suggestion: null },
+        };
         if (request.params.path.endsWith('/tasks')) return {
           ok: true,
           result: {
@@ -45,18 +62,23 @@ function setup({ errandText = '{"accepted":true}', autoScanEnabled = false } = {
             cursors: [{ conversation_key: 'conversation-1', cursor: '2026-08-24T00:00:00.000Z' }],
           },
         };
-        if (request.params.path.endsWith('/intake')) return { ok: true, result: { accepted: true, intake_id: 'intake-1' } };
+        if (request.params.path.endsWith('/intake')) {
+          intakePosts.push(request.params.body);
+          return { ok: true, result: { accepted: true, intake_id: 'intake-1' } };
+        }
         throw new Error(`unexpected node request: ${JSON.stringify(request)}`);
       },
     },
     agent: {
       async errand(request) {
         errandCalls.push(request);
-        return { ok: true, status: 'done', jobId: 'job-1', sessionId: 'session-intake', text: errandText };
+        if (errandError) throw errandError;
+        return errandResponse || { ok: true, status: 'done', jobId: 'job-1', sessionId: 'session-intake', text: errandText };
       },
     },
     async send(message) {
       sent.push(message);
+      if (message.type === 'cindy-request') return { ok: true, text: progressModelText, model: 'codex/gpt-5.6-luna' };
       return { ok: true };
     },
   };
@@ -71,7 +93,7 @@ function setup({ errandText = '{"accepted":true}', autoScanEnabled = false } = {
         secretCalls.push({ url, options });
         return { ok: true, json: async () => ({}) };
       }
-      return { json: async () => ({ pmBaseUrl: 'http://127.0.0.1:4310' }) };
+      return { json: async () => ({ pmBaseUrl: 'http://127.0.0.1:4310', progressMode, progressEnabled }) };
     },
     setInterval,
     clearInterval,
@@ -81,11 +103,11 @@ function setup({ errandText = '{"accepted":true}', autoScanEnabled = false } = {
     Number,
     Error,
   }), { filename: 'main.js' });
-  return { onHostMessage, nodeCalls, sent, errandCalls, secretCalls };
+  return { onHostMessage, nodeCalls, sent, errandCalls, secretCalls, cursorWrites, intakePosts };
 }
 
 test('scan_intake_window starts the fixed intake errand session and returns its result', async () => {
-  const { onHostMessage, nodeCalls, errandCalls, sent } = setup({
+  const { onHostMessage, nodeCalls, errandCalls, sent, cursorWrites, intakePosts } = setup({
     errandText: '{"status":"skipped","reason":"empty_window","summary":"窗口无消息，跳过提交。","proposals":[]}',
   });
   onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-scan', args: {} });
@@ -116,7 +138,41 @@ test('scan_intake_window starts the fixed intake errand session and returns its 
   assert.equal(result.result.status, 'skipped');
   assert.equal(result.result.reason, 'empty_window');
   assert.deepEqual(JSON.parse(JSON.stringify(result.result.proposals)), []);
+  const firstWindowDuration = Date.parse(result.result.window_end) - Date.parse(result.result.window_start);
+  assert.ok(firstWindowDuration >= 10 * 60 * 1000);
+  assert.ok(firstWindowDuration < 10 * 60 * 1000 + 2000);
   assert.equal(nodeCalls[0].method, 'pm/ensure');
+  assert.equal(nodeCalls.some((call) => call.params?.path === '/api/runtime/intake-cursor'), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(cursorWrites)), []);
+  assert.deepEqual(JSON.parse(JSON.stringify(intakePosts)), [{
+    window_id: result.result.window_id,
+    window_start: result.result.window_start,
+    window_end: result.result.window_end,
+    sources: [],
+    proposals: [],
+  }]);
+});
+
+test('scan_intake_window starts after the last successful intake window end', async () => {
+  const cursor = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const { onHostMessage, errandCalls, sent } = setup({ intakeWindowEnd: cursor });
+  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-cursor', args: {} });
+  await waitFor(() => sent.some((message) => message.callId === 'call-cursor'));
+  assert.equal(errandCalls.length, 1);
+  assert.equal(errandCalls[0].context.window_start, cursor);
+  assert.equal(errandCalls[0].context.window_end, sent.find((message) => message.callId === 'call-cursor').result.window_end);
+});
+
+test('scan_intake_window caps an old intake cursor at four hours before now', async () => {
+  const cursor = new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString();
+  const { onHostMessage, errandCalls, sent } = setup({ intakeWindowEnd: cursor });
+  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-old-cursor', args: {} });
+  await waitFor(() => sent.some((message) => message.callId === 'call-old-cursor'));
+  const result = sent.find((message) => message.callId === 'call-old-cursor');
+  const startMs = Date.parse(errandCalls[0].context.window_start);
+  const endMs = Date.parse(result.result.window_end);
+  assert.ok(endMs - startMs >= 4 * 60 * 60 * 1000);
+  assert.ok(endMs - startMs < 4 * 60 * 60 * 1000 + 2000);
 });
 
 test('schedule scan skips the errand when the product auto-scan switch is disabled', async () => {
@@ -147,6 +203,54 @@ test('manual scan runs even when the product auto-scan switch is disabled', asyn
   assert.equal(nodeCalls.some((call) => call.params?.path === '/api/runtime/auto-scan'), false);
 });
 
+test('scan_intake_window skips nested dispatch inside the intake errand session', async () => {
+  const { onHostMessage, nodeCalls, errandCalls, sent } = setup();
+  onHostMessage({
+    type: 'tool-call',
+    tool: 'scan_intake_window',
+    callId: 'call-nested-intake',
+    args: { session_context: { session: { sessionKey: 'intake' } } },
+  });
+  await waitFor(() => sent.some((message) => message.callId === 'call-nested-intake'));
+  const result = sent.find((message) => message.callId === 'call-nested-intake');
+  assert.equal(errandCalls.length, 0);
+  assert.equal(nodeCalls.length, 0);
+  assert.equal(result.ok, true);
+  assert.equal(result.result.reason, 'already_in_intake_errand');
+  assert.match(result.result.next_action, /get_pm_tasks/);
+  assert.match(result.result.next_action, /submit_intake/);
+  assert.match(result.result.next_action, /不要再次调用 scan_intake_window/);
+});
+
+test('scan_intake_window turns a BUSY errand response into direct intake instructions', async () => {
+  const { onHostMessage, nodeCalls, errandCalls, sent } = setup({
+    errandResponse: { ok: false, errorCode: 'BUSY', message: '已有 intake session occupied' },
+  });
+  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-busy', args: {} });
+  await waitFor(() => sent.some((message) => message.callId === 'call-busy'));
+  const result = sent.find((message) => message.callId === 'call-busy');
+  assert.equal(errandCalls.length, 1);
+  assert.equal(result.ok, true);
+  assert.equal(result.result.reason, 'intake_errand_busy');
+  assert.match(result.result.summary, /已占用/);
+  assert.match(result.result.next_action, /飞书 MCP/);
+  assert.match(result.result.next_action, /不要再次调用 scan_intake_window/);
+  assert.equal(nodeCalls[0].method, 'pm/ensure');
+});
+
+test('scan_intake_window turns a thrown session-occupied error into direct intake instructions', async () => {
+  const error = new Error('intake session occupied');
+  error.code = 'BUSY';
+  const { onHostMessage, errandCalls, sent } = setup({ errandError: error });
+  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-thrown-busy', args: {} });
+  await waitFor(() => sent.some((message) => message.callId === 'call-thrown-busy'));
+  const result = sent.find((message) => message.callId === 'call-thrown-busy');
+  assert.equal(errandCalls.length, 1);
+  assert.equal(result.ok, true);
+  assert.equal(result.result.reason, 'intake_errand_busy');
+  assert.match(result.result.next_action, /submit_intake/);
+});
+
 test('get_pm_tasks exposes task items, pending candidates, and read cursors', async () => {
   const { onHostMessage, sent } = setup();
   onHostMessage({ type: 'tool-call', tool: 'get_pm_tasks', callId: 'call-snapshot', args: {} });
@@ -159,7 +263,7 @@ test('get_pm_tasks exposes task items, pending candidates, and read cursors', as
 });
 
 test('scan result returns a readable short proposal list with action and title', async () => {
-  const { onHostMessage, sent } = setup({
+  const { onHostMessage, sent, cursorWrites } = setup({
     errandText: '{"status":"done","summary":"已更新已有任务。","proposals":[{"action":"update_task","title":"活动留存分析"},{"action":"skip","title":"礼貌确认"}]}',
   });
   onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-proposals', args: {} });
@@ -169,17 +273,39 @@ test('scan result returns a readable short proposal list with action and title',
     { action: 'update_task', title: '活动留存分析' },
     { action: 'skip', title: '礼貌确认' },
   ]);
-  assert.equal(result.result.summary, '已更新已有任务。');
+  assert.equal(result.result.summary, '已更新正式任务：活动留存分析。');
+  assert.equal(result.result.model_summary, '已更新已有任务。');
+  assert.equal(cursorWrites.length, 0);
+});
+
+test('scan result uses human language for candidates, formal task updates, and empty windows', async () => {
+  const { onHostMessage, sent } = setup({
+    errandText: '{"status":"done","proposals":[{"action":"create_candidate","title":"新候选"},{"action":"update_task","title":"正式任务 A"},{"action":"update_task","title":"正式任务 B"}]}' ,
+  });
+  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-readable', args: {} });
+  await waitFor(() => sent.some((message) => message.callId === 'call-readable'));
+  const result = sent.find((message) => message.callId === 'call-readable');
+  assert.equal(result.result.summary, '新建 1 张候选；已更新正式任务：正式任务 A、正式任务 B。');
 });
 
 test('ghost declares schedule support while retaining errand', () => {
-  assert.equal(ghost.version, '0.2.5');
+  assert.equal(ghost.version, '0.3.4');
+  assert.equal(ghost.id, 'ai-pm-intake');
+  assert.equal(ghost.name, 'TooManyTasks');
+  assert.match(ghost.description, /本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台/);
+  assert.match(ghost.whenToUse, /本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台/);
+  assert.equal(ghost.launch, 'resident');
   assert.deepEqual(Object.keys(ghost.agent).sort(), ['errand', 'schedule']);
   assert.equal(ghost.agent.errand, true);
   assert.equal(ghost.agent.schedule, true);
   const scanTool = ghost.tools.find((tool) => tool.name === 'scan_intake_window');
+  assert.match(scanTool.description, /入库 errand 会话内禁止调用本工具/);
   assert.deepEqual(scanTool.parameters.properties.trigger.enum, ['manual', 'schedule']);
   assert.equal(scanTool.parameters.properties.trigger.default, 'manual');
+  assert.equal(ghost.cindy.oneshotModel, 'codex/gpt-5.6-luna');
+  assert.deepEqual(ghost.subscribe.topics, ['turn']);
+  assert.deepEqual(ghost.subscribe.hooks, ['will-user-message']);
+  assert.ok(ghost.tools.some((tool) => tool.name === 'update_pm_progress'));
 });
 
 test('main flow creates a local task-service token through settings before ensuring the resident service', async () => {
@@ -255,4 +381,52 @@ test('submit_intake rejects an empty window so the errand must short-circuit', a
   const failure = sent.find((message) => message.callId === 'call-empty-window');
   assert.equal(failure.ok, false);
   assert.match(failure.message, /empty_window/);
+});
+
+test('update_pm_progress keeps progress oneshot separate from intake errand', async () => {
+  const { onHostMessage, nodeCalls, sent, errandCalls } = setup({
+    progressModelText: JSON.stringify({ decision: 'bind', taskId: 'task-1', associationConfidence: 0.95, updateConfidence: 0, reason: '当前会话与候选任务匹配。', evidence: [] }),
+  });
+  onHostMessage({
+    type: 'tool-call',
+    tool: 'update_pm_progress',
+    callId: 'call-progress',
+    args: {
+      goal: '完成活动留存核验',
+      completed: '已复核数据口径',
+      verification: '测试通过',
+      blockers: '',
+      next_step: '补充分组',
+      status_hint: 'in_progress',
+      session_context: { session_id: 'session-progress-1' },
+    },
+  });
+  await waitFor(() => sent.some((message) => message.type === 'tool-result' && message.callId === 'call-progress'));
+  const result = sent.find((message) => message.type === 'tool-result' && message.callId === 'call-progress');
+  assert.equal(result.ok, true);
+  assert.equal(result.result.mode, 'manual');
+  assert.equal(errandCalls.length, 0);
+  assert.equal(sent.some((message) => message.type === 'cindy-request' && message.kind === 'oneshot_text'), true);
+  assert.equal(nodeCalls.some((request) => request.params?.path?.endsWith('/intake')), false);
+  assert.equal(nodeCalls.some((request) => request.params?.path?.endsWith('/turn-evaluations')), true);
+});
+
+test('automatic progress skips the intake errand session', async () => {
+  const { onHostMessage, nodeCalls, sent } = setup({ progressMode: 'automatic' });
+  onHostMessage({
+    type: 'event',
+    name: 'will-user-message',
+    hookId: 'hook-intake',
+    ts: Date.now(),
+    data: { sessionId: 'session-intake', sessionKey: 'intake', source: 'plugin', text: '入库 errand' },
+  });
+  onHostMessage({
+    type: 'event',
+    name: 'did-turn-end',
+    ts: Date.now(),
+    data: { sessionId: 'session-intake', sessionKey: 'intake', source: 'plugin', endReason: 'completed' },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(nodeCalls.some((request) => request.method === 'cindy/read-completed-turn'), false);
+  assert.equal(sent.some((message) => message.type === 'cindy-request'), false);
 });

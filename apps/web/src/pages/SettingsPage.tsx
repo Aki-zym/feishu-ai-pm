@@ -1,6 +1,6 @@
-import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
-import { AtSign, Bot, BrainCircuit, CalendarDays, CheckCircle2, Database, FileText, FlaskConical, FolderOpen, KeyRound, Link2, MessageCircle, Power, RefreshCw, ShieldCheck, Trash2, UserRound } from 'lucide-react';
-import { api } from '../api';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { AtSign, Bot, BrainCircuit, CalendarDays, CheckCircle2, FileText, FlaskConical, FolderOpen, KeyRound, MessageCircle, Power, RefreshCw, ShieldCheck, Sparkles, Trash2, UserRound } from 'lucide-react';
+import { api, ApiRequestError } from '../api';
 import { AsyncState } from '../components/AsyncState';
 import { desktopBridge, type DesktopConfigInput, type PublicDesktopConfig } from '../desktop';
 import { FeishuPermissionGuide } from '../components/FeishuPermissionGuide';
@@ -45,7 +45,6 @@ type OwnerInformation = {
   }>;
 };
 
-const icons = { feishu: Bot, llm: FlaskConical, database: Database, workspace: Link2 };
 const sourceIcons = { owner_dm: MessageCircle, owner_mentions: AtSign, calendar: CalendarDays, minutes: FileText, bot_supplement: Bot };
 const sourceNames = { owner_dm: '我的普通私聊', owner_mentions: '群聊中 @我', calendar: '我的日历', minutes: '会议纪要与妙记', bot_supplement: '机器人补充入口' };
 const sourceStatusNames: Record<string, string> = {
@@ -97,14 +96,14 @@ export default function SettingsPage() {
   const [autoScanSaving, setAutoScanSaving] = useState(false);
   const [autoScanMessage, setAutoScanMessage] = useState('');
   const [autoScanError, setAutoScanError] = useState(false);
+  const [browserSeedState, setBrowserSeedState] = useState<'idle' | 'pending' | 'success' | 'error'>('idle');
+  const [browserSeedMessage, setBrowserSeedMessage] = useState('');
   const [desktopConfig, setDesktopConfig] = useState<PublicDesktopConfig | null>(null);
   const [savedDesktopConfig, setSavedDesktopConfig] = useState<PublicDesktopConfig | null>(null);
   const [secretInput, setSecretInput] = useState<DesktopConfigInput['secrets']>({});
   const [connectionMessage, setConnectionMessage] = useState('');
   const [connectionError, setConnectionError] = useState(false);
   const [connectionTarget, setConnectionTarget] = useState<'feishu' | 'llm' | 'workspace' | 'local'>('feishu');
-  const [values, setValues] = useState<Record<string, string>>({});
-  const [message, setMessage] = useState('');
   const [sourceSyncing, setSourceSyncing] = useState<Record<string, boolean>>({});
   const [syncResource, setSyncResource] = useState<ResourceState<SyncOperation>>(loadingResource);
   const [lastSyncAction, setLastSyncAction] = useState<{ kind: 'all' | 'source'; source?: OwnerInformation['sources'][number]['kind'] } | null>(null);
@@ -205,12 +204,6 @@ export default function SettingsPage() {
     await readOwnerInformation(request).catch(() => undefined);
   }, [readOwnerInformation]);
 
-  const validate = async (event: FormEvent) => {
-    event.preventDefault();
-    const result = await api.post<{ message: string }>('/api/configuration/validate', { values });
-    setMessage(result.message);
-  };
-
   const saveDesktop = async (target: 'feishu' | 'llm' | 'local' | 'workspace') => {
     if (!desktop || !desktopConfig) return;
     setConnectionTarget(target);
@@ -218,7 +211,6 @@ export default function SettingsPage() {
     setDesktopConfig(saved);
     setSavedDesktopConfig(saved);
     setSecretInput({});
-    setMessage('本机配置已保存；密钥只写入本机安全凭证存储。');
     setConnectionError(false);
     setConnectionMessage('配置已保存并加载；密钥只写入本机安全凭证存储。');
     return saved;
@@ -523,6 +515,37 @@ export default function SettingsPage() {
     }
   };
 
+  const seedBrowserCandidate = async () => {
+    if (desktop || browserSeedState === 'pending') return;
+    const occurredAt = new Date().toISOString();
+    const seedPayload = {
+      title: '浏览器测试用的模拟需求',
+      describe: '请核对候选收件箱是否能接收新内容。',
+      background: '用于验证浏览器候选页能够接收一条测试需求。',
+    };
+    setBrowserSeedState('pending');
+    setBrowserSeedMessage('正在生成测试用模拟需求…');
+    try {
+      try {
+        await api.post('/api/dev/seed-intake', seedPayload);
+      } catch (reason) {
+        if (!(reason instanceof ApiRequestError) || reason.status !== 404) throw reason;
+        await api.post('/api/corrections', {
+          correctionType: 'missed_request',
+          idempotencyKey: `browser-seed:${Date.now()}`,
+          manualContent: `${seedPayload.title}：${seedPayload.describe}`,
+          manualSenderName: '浏览器测试需求方',
+          manualOccurredAt: occurredAt,
+        });
+      }
+      setBrowserSeedState('success');
+      setBrowserSeedMessage('模拟需求已加入候选收件箱。');
+    } catch (reason) {
+      setBrowserSeedState('error');
+      setBrowserSeedMessage(reason instanceof Error ? reason.message : '模拟需求添加失败，请稍后重试。');
+    }
+  };
+
   const primarySources = ownerInformation?.sources.filter((source) => source.kind !== 'bot_supplement') ?? [];
   const usablePrimarySources = primarySources.filter((source) => source.status === 'ready' || source.status === 'mock_ready' || source.status === 'partial').length;
   const platformLimitedPrimarySources = primarySources.filter((source) => source.status === 'unsupported').length;
@@ -748,38 +771,14 @@ export default function SettingsPage() {
           <div className="settings-actions danger-actions"><button className="danger-text-button" type="button" disabled={runtimeShutdownState === 'pending' || runtimeShutdownState === 'success' || runtimeShutdownState === 'warning'} onClick={() => void shutdownRuntime()}><Power size={15} />{runtimeShutdownState === 'pending' ? '退出中…' : runtimeShutdownState === 'success' ? '后台已退出' : '退出本机任务库后台'}</button><button className="quiet-button" type="button" disabled={runtimeRestartState === 'pending'} onClick={() => void restartRuntime()}><RefreshCw size={15} className={runtimeRestartState === 'pending' ? 'spin' : undefined} />{runtimeRestartState === 'pending' ? '重启中…' : runtimeRestartState === 'success' ? '后台已重启' : '重启本机任务库后台'}</button></div>
         </div>
       </details>
-      {!desktop && <form onSubmit={validate} className="integration-list">
-        <div className="security-banner"><ShieldCheck size={20} /><div><strong>浏览器入口：仅校验格式</strong><span>下方字段只做格式校验，不读取或保存密钥，也不会连接真实服务；本机连接和令牌请在 Cindy 插件设置中完成。</span></div></div>
-        {configuration?.integrations.map((integration) => {
-          const Icon = icons[integration.id as keyof typeof icons] ?? CheckCircle2;
-          return (
-            <section className="integration-section" key={integration.id}>
-              <div className="integration-heading">
-                <span className="integration-icon"><Icon size={19} /></span>
-                <div><h2>{integration.name}</h2><span>当前适配器：{integration.adapter}</span></div>
-                <span className={'integration-status status-' + integration.status}>{integration.status}</span>
-              </div>
-              <div className="settings-fields">
-                {integration.fields.map((field) => (
-                  <label key={field}>
-                    <span>{field}</span>
-                    <input
-                      type={field.includes('SECRET') || field.includes('KEY') ? 'password' : 'text'}
-                      value={values[field] ?? ''}
-                      onChange={(event) => setValues((current) => ({ ...current, [field]: event.target.value }))}
-                      placeholder={field.includes('SECRET') || field.includes('KEY') ? '••••••••（不会保存）' : '暂未配置'}
-                    />
-                  </label>
-                ))}
-              </div>
-              {integration.id === 'workspace' && <p className="integration-note">默认只保存 reference path；读取、写入和归档权限全部关闭。</p>}
-              {integration.id === 'feishu' && <p className="integration-note">浏览器入口不会读取或保存用户 OAuth token；本机连接和令牌请在 Cindy 插件设置中完成。</p>}
-            </section>
-          );
-        })}
-        <div className="settings-actions"><button className="primary-button" type="submit">只校验输入格式</button><span>不会保存，也不会尝试连接</span></div>
-        {message && <div className="success-banner">{message}</div>}
-      </form>}
+      {!desktop && <details open className="settings-disclosure">
+        <summary><span>开发者工具</span><small>仅用于浏览器测试</small></summary>
+        <div className="settings-disclosure-content">
+          <p className="integration-note">这里的模拟需求只用于验证候选收件箱；日常使用请回到 Cindy 说「扫近10分钟」。</p>
+          <div className="settings-actions"><button className="secondary-button" type="button" disabled={browserSeedState === 'pending'} onClick={() => void seedBrowserCandidate()}><Sparkles size={15} />{browserSeedState === 'pending' ? '生成中…' : '模拟一条需求（浏览器测试）'}</button></div>
+          {browserSeedMessage && <div className={browserSeedState === 'error' ? 'error-banner settings-feedback' : browserSeedState === 'pending' ? 'warning-banner settings-feedback' : 'success-banner settings-feedback'} role={browserSeedState === 'error' ? 'alert' : 'status'}>{browserSeedMessage}</div>}
+        </div>
+      </details>}
     </div>
   );
 }
