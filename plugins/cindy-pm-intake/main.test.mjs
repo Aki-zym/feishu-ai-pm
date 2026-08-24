@@ -19,7 +19,7 @@ function waitFor(predicate, timeoutMs = 1000) {
   });
 }
 
-function setup({ errandText = '{"accepted":true}', autoScanEnabled = false, progressMode = 'manual', progressEnabled = true, progressModelText = '{"decision":"no_update","reason":"无变化","evidence":[]}' } = {}) {
+function setup({ errandText = '{"accepted":true}', errandResponse = null, errandError = null, autoScanEnabled = false, progressMode = 'manual', progressEnabled = true, progressModelText = '{"decision":"no_update","reason":"无变化","evidence":[]}' } = {}) {
   let onHostMessage;
   const nodeCalls = [];
   const sent = [];
@@ -60,7 +60,8 @@ function setup({ errandText = '{"accepted":true}', autoScanEnabled = false, prog
     agent: {
       async errand(request) {
         errandCalls.push(request);
-        return { ok: true, status: 'done', jobId: 'job-1', sessionId: 'session-intake', text: errandText };
+        if (errandError) throw errandError;
+        return errandResponse || { ok: true, status: 'done', jobId: 'job-1', sessionId: 'session-intake', text: errandText };
       },
     },
     async send(message) {
@@ -156,6 +157,54 @@ test('manual scan runs even when the product auto-scan switch is disabled', asyn
   assert.equal(nodeCalls.some((call) => call.params?.path === '/api/runtime/auto-scan'), false);
 });
 
+test('scan_intake_window skips nested dispatch inside the intake errand session', async () => {
+  const { onHostMessage, nodeCalls, errandCalls, sent } = setup();
+  onHostMessage({
+    type: 'tool-call',
+    tool: 'scan_intake_window',
+    callId: 'call-nested-intake',
+    args: { session_context: { session: { sessionKey: 'intake' } } },
+  });
+  await waitFor(() => sent.some((message) => message.callId === 'call-nested-intake'));
+  const result = sent.find((message) => message.callId === 'call-nested-intake');
+  assert.equal(errandCalls.length, 0);
+  assert.equal(nodeCalls.length, 0);
+  assert.equal(result.ok, true);
+  assert.equal(result.result.reason, 'already_in_intake_errand');
+  assert.match(result.result.next_action, /get_pm_tasks/);
+  assert.match(result.result.next_action, /submit_intake/);
+  assert.match(result.result.next_action, /不要再次调用 scan_intake_window/);
+});
+
+test('scan_intake_window turns a BUSY errand response into direct intake instructions', async () => {
+  const { onHostMessage, nodeCalls, errandCalls, sent } = setup({
+    errandResponse: { ok: false, errorCode: 'BUSY', message: '已有 intake session occupied' },
+  });
+  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-busy', args: {} });
+  await waitFor(() => sent.some((message) => message.callId === 'call-busy'));
+  const result = sent.find((message) => message.callId === 'call-busy');
+  assert.equal(errandCalls.length, 1);
+  assert.equal(result.ok, true);
+  assert.equal(result.result.reason, 'intake_errand_busy');
+  assert.match(result.result.summary, /已占用/);
+  assert.match(result.result.next_action, /飞书 MCP/);
+  assert.match(result.result.next_action, /不要再次调用 scan_intake_window/);
+  assert.equal(nodeCalls[0].method, 'pm/ensure');
+});
+
+test('scan_intake_window turns a thrown session-occupied error into direct intake instructions', async () => {
+  const error = new Error('intake session occupied');
+  error.code = 'BUSY';
+  const { onHostMessage, errandCalls, sent } = setup({ errandError: error });
+  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-thrown-busy', args: {} });
+  await waitFor(() => sent.some((message) => message.callId === 'call-thrown-busy'));
+  const result = sent.find((message) => message.callId === 'call-thrown-busy');
+  assert.equal(errandCalls.length, 1);
+  assert.equal(result.ok, true);
+  assert.equal(result.result.reason, 'intake_errand_busy');
+  assert.match(result.result.next_action, /submit_intake/);
+});
+
 test('get_pm_tasks exposes task items, pending candidates, and read cursors', async () => {
   const { onHostMessage, sent } = setup();
   onHostMessage({ type: 'tool-call', tool: 'get_pm_tasks', callId: 'call-snapshot', args: {} });
@@ -193,7 +242,7 @@ test('scan result uses human language for candidates, formal task updates, and e
 });
 
 test('ghost declares schedule support while retaining errand', () => {
-  assert.equal(ghost.version, '0.3.0');
+  assert.equal(ghost.version, '0.3.1');
   assert.equal(ghost.id, 'ai-pm-intake');
   assert.equal(ghost.name, 'TooManyTasks');
   assert.equal(ghost.launch, 'resident');
@@ -201,6 +250,7 @@ test('ghost declares schedule support while retaining errand', () => {
   assert.equal(ghost.agent.errand, true);
   assert.equal(ghost.agent.schedule, true);
   const scanTool = ghost.tools.find((tool) => tool.name === 'scan_intake_window');
+  assert.match(scanTool.description, /入库 errand 会话内禁止调用本工具/);
   assert.deepEqual(scanTool.parameters.properties.trigger.enum, ['manual', 'schedule']);
   assert.equal(scanTool.parameters.properties.trigger.default, 'manual');
   assert.equal(ghost.cindy.oneshotModel, 'codex/gpt-5.6-luna');

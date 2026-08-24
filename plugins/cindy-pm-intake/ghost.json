@@ -4,7 +4,7 @@
   "name": "TooManyTasks",
   "description": "把已授权飞书消息整理为 TooManyTasks 入库候选，并维护当前会话的任务进度。",
   "whenToUse": "需要扫描已授权飞书消息或把当前会话的实际进展写回任务台时使用。",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "entry": "main.js",
   "launch": "resident",
   "slots": ["tool", "agent", "node", "cindy", "session-context", "skill", "subscribe"],
@@ -74,7 +74,7 @@
     },
     {
       "name": "scan_intake_window",
-      "description": "扫描当前时间往前 10 分钟的已授权飞书消息，派发独立 errand 读取消息、获取任务快照并提交入库提案。",
+      "description": "扫描当前时间往前 10 分钟的已授权飞书消息，派发独立 errand 读取消息、获取任务快照并提交入库提案；入库 errand 会话内禁止调用本工具，请直接使用飞书 MCP、get_pm_tasks 和 submit_intake。",
       "parameters": {
         "type": "object",
         "properties": {

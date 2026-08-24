@@ -111,6 +111,62 @@ function createWindow() {
   };
 }
 
+function isIntakeSessionValue(value) {
+  return safeText(value, 120).toLowerCase() === 'intake';
+}
+
+function isInsideIntakeErrand(args) {
+  const context = args && typeof args.session_context === 'object' && args.session_context !== null
+    ? args.session_context
+    : null;
+  if (!context) return false;
+  const session = context.session;
+  const sessionObject = session && typeof session === 'object' ? session : null;
+  return [
+    context.sessionKey,
+    context.session_key,
+    context.errandSessionKey,
+    context.errand_session_key,
+    typeof session === 'string' ? session : null,
+    sessionObject?.key,
+    sessionObject?.sessionKey,
+    sessionObject?.session_key,
+  ].some(isIntakeSessionValue);
+}
+
+function isBusyErrandResult(result) {
+  const values = [
+    result?.errorCode,
+    result?.error_code,
+    result?.code,
+    result?.status,
+    result?.message,
+    result?.errorCode,
+    result?.errorMessage,
+    result?.error,
+    result?.error?.code,
+    result?.error?.message,
+    result?.details,
+    result?.details?.code,
+    result?.details?.message,
+  ];
+  return values.some((value) => typeof value === 'string'
+    && /(?:\bBUSY\b|session.{0,40}(?:busy|occupied)|errand.{0,40}(?:busy|occupied)|会话.{0,20}(?:占用|忙)|任务.{0,20}(?:占用|忙))/iu.test(value));
+}
+
+function directIntakeInstruction(window, reason) {
+  return {
+    ...window,
+    status: 'skipped',
+    reason,
+    summary: reason === 'intake_errand_busy'
+      ? '入库 errand 当前已占用，已跳过嵌套派发。'
+      : '当前已在入库 errand 会话中，已跳过嵌套派发。',
+    next_action: '请直接使用当前已授权的飞书 MCP 读取本次 10 分钟窗口，调用 get_pm_tasks 获取 items、candidates、cursors，再调用 submit_intake 提交 sources 和 proposals；不要再次调用 scan_intake_window。',
+    proposals: [],
+  };
+}
+
 function normalizeTaskSnapshot(raw) {
   const snapshot = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
   const items = Array.isArray(snapshot.items) ? snapshot.items : [];
@@ -720,8 +776,17 @@ async function handleToolCall(msg) {
     if (trigger !== 'manual' && trigger !== 'schedule') {
       throw new Error('scan_intake_window 的 trigger 只能是 manual 或 schedule');
     }
-    await ensurePm();
     const window = createWindow();
+    if (isInsideIntakeErrand(msg.args)) {
+      cindy.send({
+        type: 'tool-result',
+        callId: msg.callId,
+        ok: true,
+        result: directIntakeInstruction(window, 'already_in_intake_errand'),
+      });
+      return;
+    }
+    await ensurePm();
     if (trigger === 'schedule') {
       const autoScan = await pmRequest('GET', '/api/runtime/auto-scan');
       if (autoScan && autoScan.enabled === false) {
@@ -740,8 +805,31 @@ async function handleToolCall(msg) {
         return;
       }
     }
-    const result = await runErrand(window, msg.callId);
+    let result;
+    try {
+      result = await runErrand(window, msg.callId);
+    } catch (error) {
+      if (isBusyErrandResult(error)) {
+        cindy.send({
+          type: 'tool-result',
+          callId: msg.callId,
+          ok: true,
+          result: directIntakeInstruction(window, 'intake_errand_busy'),
+        });
+        return;
+      }
+      throw error;
+    }
     if (!result || result.ok !== true) {
+      if (isBusyErrandResult(result)) {
+        cindy.send({
+          type: 'tool-result',
+          callId: msg.callId,
+          ok: true,
+          result: directIntakeInstruction(window, 'intake_errand_busy'),
+        });
+        return;
+      }
       throw new Error(result?.message || '任务入库 errand 未完成');
     }
     const errand = parseErrandResult(result.text);
