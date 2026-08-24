@@ -1,0 +1,9 @@
+<!doctype html>
+<meta charset="utf-8">
+<body style="margin:0;padding:12px;display:grid;gap:12px">
+  <label style="display:grid;gap:6px"><span>本机任务库地址</span><input id="pmBaseUrl" placeholder="http://127.0.0.1:4310" style="padding:8px;border:1px solid var(--border-default,#d9d9d9);border-radius:8px;background:var(--surface,#fff);color:inherit"></label>
+  <label style="display:grid;gap:6px"><span>本机服务令牌</span><input id="token" type="password" placeholder="已保存时留空" style="padding:8px;border:1px solid var(--border-default,#d9d9d9);border-radius:8px;background:var(--surface,#fff);color:inherit"></label>
+  <div style="display:flex;gap:8px;align-items:center"><button id="save" style="padding:8px 14px;border:0;border-radius:8px;cursor:pointer">保存</button><span id="status"></span></div>
+  <small>启用插件后 Cindy 运行即拉起本机任务库并保持本机 4310 服务。Cindy 退出时后台服务会停止。任务台浏览器里有「退出后台进程」。本机任务库地址只接受本机回环服务。intake 会话保持只读，只授权飞书 MCP；不要开 shell、工作区写入或飞书写接口。</small>
+  <script src="/settings.js"></script>
+</body>

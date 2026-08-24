@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
-import { AtSign, Bot, BrainCircuit, CalendarDays, CheckCircle2, Database, FileText, FlaskConical, FolderOpen, KeyRound, Link2, MessageCircle, RefreshCw, ShieldCheck, Trash2, UserRound } from 'lucide-react';
+import { AtSign, Bot, BrainCircuit, CalendarDays, CheckCircle2, Database, FileText, FlaskConical, FolderOpen, KeyRound, Link2, MessageCircle, Power, RefreshCw, ShieldCheck, Trash2, UserRound } from 'lucide-react';
 import { api } from '../api';
 import { AsyncState } from '../components/AsyncState';
 import { desktopBridge, type DesktopConfigInput, type PublicDesktopConfig } from '../desktop';
@@ -103,6 +103,9 @@ export default function SettingsPage() {
   const [syncResource, setSyncResource] = useState<ResourceState<SyncOperation>>(loadingResource);
   const [lastSyncAction, setLastSyncAction] = useState<{ kind: 'all' | 'source'; source?: OwnerInformation['sources'][number]['kind'] } | null>(null);
   const [listenerActionState, setListenerActionState] = useState<'start' | 'stop' | 'sync' | null>(null);
+  const [runtimeShutdownState, setRuntimeShutdownState] = useState<'idle' | 'pending' | 'warning' | 'success' | 'error'>('idle');
+  const [runtimeShutdownMessage, setRuntimeShutdownMessage] = useState('');
+  const [runtimeExited, setRuntimeExited] = useState(false);
   const listenerActionRef = useRef(false);
   const desktop = desktopBridge();
   const configuration = configurationResource.data;
@@ -199,10 +202,32 @@ export default function SettingsPage() {
     setDesktopConfig(saved);
     setSavedDesktopConfig(saved);
     setSecretInput({});
-    setMessage('本机配置已保存；密钥只写入 Windows 安全凭证存储。');
+    setMessage('本机配置已保存；密钥只写入本机安全凭证存储。');
     setConnectionError(false);
-    setConnectionMessage('配置已保存并加载；密钥只写入 Windows 安全凭证存储。');
+    setConnectionMessage('配置已保存并加载；密钥只写入本机安全凭证存储。');
     return saved;
+  };
+
+  const shutdownRuntime = async () => {
+    if (runtimeShutdownState === 'pending' || runtimeShutdownState === 'success') return;
+    setRuntimeShutdownState('pending');
+    setRuntimeShutdownMessage('正在退出本机任务库后台…');
+    try {
+      await api.post<{ message: string }>('/api/runtime/shutdown', {});
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+      try {
+        await api.get<HealthResponse>('/api/health');
+        setRuntimeShutdownState('warning');
+        setRuntimeShutdownMessage('4310 仍在，可能是其它进程，当前按钮关不掉它');
+      } catch {
+        setRuntimeShutdownState('success');
+        setRuntimeShutdownMessage('后台已退出，请关闭此标签页');
+        setRuntimeExited(true);
+      }
+    } catch (error) {
+      setRuntimeShutdownState('error');
+      setRuntimeShutdownMessage(error instanceof Error ? error.message : '退出本机任务库后台失败，请稍后重试。');
+    }
   };
 
   const addWorkspaceDirectory = async () => {
@@ -412,7 +437,7 @@ export default function SettingsPage() {
       setSavedDesktopConfig(saved);
       setSecretInput({});
       setConnectionError(false);
-      setConnectionMessage(`${label}已从 Windows 安全凭证存储中清除。`);
+      setConnectionMessage(`${label}已从本机安全凭证存储中清除。`);
     } catch (error) {
       setConnectionError(true);
       setConnectionMessage(error instanceof Error ? error.message : '密钥清除失败。');
@@ -431,7 +456,7 @@ export default function SettingsPage() {
       if (!isLatestResourceRequest(automationPolicyGenerationRef.current, request)) return;
       setAutomationPolicyResource(successResource(updated));
       setConnectionMessage(mode === 'auto'
-        ? '已启用 AI 自动维护私人任务；低置信度、推测时间和版本冲突仍会等待你确认。'
+        ? '已启用 AI 自动维护本机任务；低置信度、推测时间和版本冲突仍会等待你确认。'
         : '已切换为仅建议；来源继续保存，但 AI 不再自动改正式任务。');
     } catch (error) {
       if (isLatestResourceRequest(automationPolicyGenerationRef.current, request)) {
@@ -467,6 +492,7 @@ export default function SettingsPage() {
 
   return (
     <div className="page settings-page">
+      {runtimeExited && <div className="runtime-exited-overlay" role="status" aria-live="polite"><div className="runtime-exited-card"><Power size={24} /><h1>后台已退出，请关闭此标签页</h1></div></div>}
       <div className="page-header"><div><h1>集成设置</h1><p><KeyRound size={16} />先看连接状态，需要时再展开高级参数</p></div></div>
       <div className="settings-resource-states" aria-label="设置读取状态">
         <AsyncState resource={configurationResource} emptyText={null} errorTitle="配置状态读取失败" onRetry={loadSettings}>{null}</AsyncState>
@@ -496,7 +522,7 @@ export default function SettingsPage() {
       <section className="integration-section automation-policy-card" aria-labelledby="automation-policy-title">
         <div className="integration-heading">
           <span className="integration-icon"><BrainCircuit size={19} /></span>
-          <div><h2 id="automation-policy-title">AI 如何维护我的任务</h2><span>只修改私人 PM 内部记录；不会回复别人、执行任务或删除文件。</span></div>
+          <div><h2 id="automation-policy-title">AI 如何维护我的任务</h2><span>只修改本机任务库记录；不会回复别人、执行任务或删除文件。</span></div>
           <span className={'connection-state ' + (automationPolicy?.mode === 'auto' ? 'connection-state-ready' : 'connection-state-warning')}>{automationPolicy?.mode === 'auto' ? '自动维护' : automationPolicy ? '仅建议' : '正在读取'}</span>
         </div>
         <div className="automation-mode-options" role="radiogroup" aria-label="AI 自动维护模式">
@@ -603,7 +629,7 @@ export default function SettingsPage() {
         <FeishuPermissionGuide onApplyOAuthScopes={(value) => setDesktopConfig({ ...desktopConfig, feishu: { ...desktopConfig.feishu, oauthScopes: value } })} />
 
         <details className="settings-disclosure">
-          <summary><span>收件运行控制</span><small>仅用于诊断；桌面启动后会自动运行</small></summary>
+          <summary><span>收件运行控制</span><small>仅用于诊断；应用启动后会自动运行</small></summary>
           <div className="settings-disclosure-content">
             <p className="integration-note">启动、停止只控制本次运行；日常使用不需要手动点击。修改飞书连接参数后请在上方保存或重新授权。</p>
             <div className="settings-actions"><button className="secondary-button" type="button" onClick={() => void listenerAction('start')}>启动收件</button><button className="quiet-button" type="button" onClick={() => void listenerAction('stop')}>停止收件</button><button className="quiet-button" type="button" onClick={() => void saveDesktop('feishu')}>保存高级设置</button></div>
@@ -646,8 +672,16 @@ export default function SettingsPage() {
           </div>
         </details>
       </>}
+      <details open className="settings-disclosure settings-danger-zone runtime-shutdown-panel">
+        <summary><span>退出后台进程</span><small>关闭本机任务库后台与 4310 端口</small></summary>
+        <div className="settings-disclosure-content">
+          <p className="integration-note">退出本机任务库后台后，当前浏览器页面会失去连接；任务数据仍保留在本机 SQLite 中。</p>
+          {runtimeShutdownMessage && <div className={runtimeShutdownState === 'error' ? 'error-banner settings-feedback' : runtimeShutdownState === 'warning' ? 'warning-banner settings-feedback' : 'success-banner settings-feedback'} role={runtimeShutdownState === 'error' ? 'alert' : 'status'}>{runtimeShutdownMessage}</div>}
+          <div className="settings-actions danger-actions"><button className="danger-text-button" type="button" disabled={runtimeShutdownState === 'pending' || runtimeShutdownState === 'success' || runtimeShutdownState === 'warning'} onClick={() => void shutdownRuntime()}><Power size={15} />{runtimeShutdownState === 'pending' ? '退出中…' : runtimeShutdownState === 'success' ? '后台已退出' : '退出本机任务库后台'}</button></div>
+        </div>
+      </details>
       {!desktop && <form onSubmit={validate} className="integration-list">
-        <div className="security-banner"><ShieldCheck size={20} /><div><strong>浏览器开发模式：仅校验格式</strong><span>下方字段不会读取桌面保存的配置，也不会保存密钥或连接真实服务。正式 EXE 请使用上方真实设置区域。</span></div></div>
+        <div className="security-banner"><ShieldCheck size={20} /><div><strong>浏览器入口：仅校验格式</strong><span>下方字段只做格式校验，不读取或保存密钥，也不会连接真实服务；本机连接和令牌请在 Cindy 插件设置中完成。</span></div></div>
         {configuration?.integrations.map((integration) => {
           const Icon = icons[integration.id as keyof typeof icons] ?? CheckCircle2;
           return (
@@ -671,7 +705,7 @@ export default function SettingsPage() {
                 ))}
               </div>
               {integration.id === 'workspace' && <p className="integration-note">默认只保存 reference path；读取、写入和归档权限全部关闭。</p>}
-              {integration.id === 'feishu' && <p className="integration-note">使用官方 Node SDK；用户 OAuth token 由桌面主进程加密保存，不进入页面、任务数据库或日志。</p>}
+              {integration.id === 'feishu' && <p className="integration-note">浏览器入口不会读取或保存用户 OAuth token；本机连接和令牌请在 Cindy 插件设置中完成。</p>}
             </section>
           );
         })}

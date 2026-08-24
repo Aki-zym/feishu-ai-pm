@@ -39,16 +39,16 @@ export default function SetupPage({ initial }: Props) {
       <section className="setup-card">
         <div className="setup-heading">
           <span className="brand-mark"><Bot size={22} /></span>
-          <div><span>首次启动</span><h1>配置你的个人数据 PM</h1></div>
+          <div><span>首次启动</span><h1>配置 TooManyTasks</h1></div>
         </div>
-        <div className="security-banner"><ShieldCheck size={20} /><div><strong>密钥只保存在这台电脑</strong><span>使用 Windows 安全凭证存储加密，不会写入项目、日志或任务数据库。</span></div></div>
+        <div className="security-banner"><ShieldCheck size={20} /><div><strong>密钥只保存在这台电脑</strong><span>使用本机安全凭证存储加密，不会写入项目、日志或任务数据库。</span></div></div>
         <form onSubmit={submit} className="setup-form">
           <section className="setup-connection-panel">
             <div className="setup-section-title"><span className="setup-step-number">1</span><UserRound size={18} /><div><h2>连接我的飞书</h2><p>保存后到“集成设置”完成授权；现有个人私聊会自动发现并可按人排除，群聊仍按群名选择，无需填写 chat ID。</p></div></div>
             <label className="check-row setup-primary-toggle"><input type="checkbox" checked={form.feishu.externalEnabled} onChange={(event) => setForm((current) => ({ ...current, feishu: { ...current.feishu, externalEnabled: event.target.checked } }))} /><span>允许真实飞书连接</span></label>
             <div className="settings-fields settings-fields-compact">
               <label><span>App ID</span><input value={form.feishu.appId} onChange={(event) => setForm((current) => ({ ...current, feishu: { ...current.feishu, appId: event.target.value } }))} placeholder="cli_xxx" /></label>
-              <label><span>App Secret</span><input type="password" value={form.secrets?.feishuAppSecret ?? ''} onChange={(event) => setForm((current) => ({ ...current, secrets: { ...current.secrets, feishuAppSecret: event.target.value } }))} placeholder={initial.secretState.feishuAppSecret ? '已安全保存；留空保持不变' : '输入后由 Windows 加密'} /></label>
+              <label><span>App Secret</span><input type="password" value={form.secrets?.feishuAppSecret ?? ''} onChange={(event) => setForm((current) => ({ ...current, secrets: { ...current.secrets, feishuAppSecret: event.target.value } }))} placeholder={initial.secretState.feishuAppSecret ? '已安全保存；留空保持不变' : '输入后由本机安全存储加密'} /></label>
               <label className="field-wide"><span>OAuth 回调地址</span><input value={form.feishu.oauthRedirectUri} onChange={(event) => setForm((current) => ({ ...current, feishu: { ...current.feishu, oauthRedirectUri: event.target.value } }))} /></label>
               <label className="field-wide"><span>OAuth 权限范围（空格分隔）</span><textarea className="scope-textarea" value={form.feishu.oauthScopes} onChange={(event) => setForm((current) => ({ ...current, feishu: { ...current.feishu, oauthScopes: event.target.value } }))} placeholder="先按下方指南申请权限，再填入 OAuth scope" /></label>
             </div>
@@ -64,7 +64,7 @@ export default function SetupPage({ initial }: Props) {
               <label><span>Provider</span><input value={form.llm.provider} onChange={(event) => setForm((current) => ({ ...current, llm: { ...current.llm, provider: event.target.value } }))} placeholder="deepseek" /></label>
               <label><span>Model</span><input value={form.llm.model} onChange={(event) => setForm((current) => ({ ...current, llm: { ...current.llm, model: event.target.value } }))} placeholder="deepseek-v4-flash" /></label>
               <label className="field-wide"><span>API Base</span><input value={form.llm.apiBase} onChange={(event) => setForm((current) => ({ ...current, llm: { ...current.llm, apiBase: event.target.value } }))} placeholder="https://api.deepseek.com" /></label>
-              <label className="field-wide"><span>API Key</span><input type="password" value={form.secrets?.llmApiKey ?? ''} onChange={(event) => setForm((current) => ({ ...current, secrets: { ...current.secrets, llmApiKey: event.target.value } }))} placeholder={initial.secretState.llmApiKey ? '已安全保存；留空保持不变' : '输入后由 Windows 加密'} /></label>
+              <label className="field-wide"><span>API Key</span><input type="password" value={form.secrets?.llmApiKey ?? ''} onChange={(event) => setForm((current) => ({ ...current, secrets: { ...current.secrets, llmApiKey: event.target.value } }))} placeholder={initial.secretState.llmApiKey ? '已安全保存；留空保持不变' : '输入后由本机安全存储加密'} /></label>
             </div>
             <details className="setup-advanced"><summary>模型高级设置</summary><div className="settings-fields settings-fields-compact"><label><span>超时（毫秒）</span><input type="number" min="1000" value={form.llm.timeoutMs} onChange={(event) => setForm((current) => ({ ...current, llm: { ...current.llm, timeoutMs: Number(event.target.value) || 30000 } }))} /></label><label><span>最大重试次数</span><input type="number" min="0" max="5" value={form.llm.maxRetries} onChange={(event) => setForm((current) => ({ ...current, llm: { ...current.llm, maxRetries: Number(event.target.value) || 0 } }))} /></label></div></details>
           </section>

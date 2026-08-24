@@ -42,6 +42,7 @@ const schema = z.object({
   WORKSPACE_WRITE_ENABLED: booleanFromEnv,
   WORKSPACE_ALLOWED_PATHS: z.string().default('[]'),
   TASK_MEMORY_ROOT: z.string().default(''),
+  CINDY_INTEGRATION_TOKEN: z.string().default(''),
 });
 
 export type AppConfig = ReturnType<typeof loadConfig>;
@@ -111,5 +112,6 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env) {
       allowedPaths: parseAllowedPaths(parsed.WORKSPACE_ALLOWED_PATHS),
     },
     taskMemoryRoot: parsed.TASK_MEMORY_ROOT ? resolve(parsed.TASK_MEMORY_ROOT) : resolve(process.cwd(), 'tmp', 'task-memory'),
+    cindyIntegrationToken: parsed.CINDY_INTEGRATION_TOKEN,
   };
 }

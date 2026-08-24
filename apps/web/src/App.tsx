@@ -25,7 +25,7 @@ export default function App() {
     return <main className="setup-page"><div className="error-banner">无法读取本地安全配置：{startupError}</div></main>;
   }
   if (desktop && !desktopConfig) {
-    return <main className="setup-page"><div className="loading-state">正在打开本地数据 PM…</div></main>;
+    return <main className="setup-page"><div className="loading-state">正在打开 TooManyTasks…</div></main>;
   }
   if (desktopConfig && !desktopConfig.setupComplete) {
     return <SetupPage initial={desktopConfig} />;

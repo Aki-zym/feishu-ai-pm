@@ -1,5 +1,5 @@
 appId: com.guanchen.feishu-ai-pm
-productName: 数据 PM
+productName: TooManyTasks
 copyright: Copyright © 2026
 asar: true
 # npm install 已提供与项目版本一致的 Electron 运行时。打包时直接使用
@@ -16,7 +16,7 @@ win:
     - target: nsis
       arch:
         - x64
-  artifactName: Feishu-AI-PM-${version}-${arch}-Setup.${ext}
+  artifactName: TooManyTasks-${version}-${arch}-Setup.${ext}
 nsis:
   oneClick: false
   perMachine: false

@@ -10,5 +10,5 @@ export function formatBootstrapFailure(error: unknown) {
   if (error instanceof DatabaseUpgradeError) {
     return `数据库启动失败（${error.stage}）：${error.message}`;
   }
-  return '数据 PM 无法启动，请查看脱敏诊断日志。应用将退出。';
+  return 'TooManyTasks 无法启动，请查看脱敏诊断日志。应用将退出。';
 }

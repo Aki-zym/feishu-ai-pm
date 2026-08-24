@@ -51,6 +51,20 @@ const openIssue52Task = async (page: Page, taskId: string) => {
 const candidateCardById = (page: Page, candidateId: string) =>
   page.locator(`article.candidate-card[data-candidate-id="${candidateId}"]`);
 
+const seedPendingCandidate = async (page: Page, title: string) => {
+  const response = await page.request.post('/api/dev/seed-intake', {
+    data: {
+      title,
+      describe: `${title} 的浏览器验收描述。`,
+      background: `${title} 的浏览器验收背景。`,
+    },
+  });
+  expect(response.ok()).toBeTruthy();
+  const body = await response.json() as { candidate_id?: string };
+  expect(body.candidate_id).toEqual(expect.any(String));
+  return body.candidate_id as string;
+};
+
 const issue57Candidate = {
   id: 'issue57-candidate',
   source_event_id: 'issue57-source',
@@ -97,7 +111,7 @@ test('工作台、任务详情和安全边界可访问', async ({ page }) => {
   await expect(page.getByLabel('任务详情', { exact: true }).getByText('谁向我提出')).toBeVisible();
   await expect(page.getByText('只生成、审阅、修改或废止，不发送')).toBeVisible();
   await page.getByRole('button', { name: '纠错' }).click();
-  await expect(page.getByText('这里只修正私人 PM 记录')).toBeVisible();
+  await expect(page.getByText('这里只修正本机任务记录')).toBeVisible();
   await expect(page.getByRole('button', { name: '记录私人纠错' })).toBeVisible();
   await page.getByLabel('哪里判断错了').selectOption('wrong_association');
   await expect(page.getByText('要移动的具体需求')).toBeVisible();
@@ -631,6 +645,92 @@ test('候选收件箱可以显示并接受需求', async ({ page }, testInfo) =>
   await expect(candidateCard).toBeVisible();
   await candidateCard.getByRole('button', { name: '接受为正式任务' }).click();
   await expect(page.getByText(/已建立正式任务/)).toBeVisible();
+});
+
+test('浏览器候选收件箱支持 seed 创建、接受、暂存和忽略', async ({ page }, testInfo) => {
+  const acceptedTitle = '浏览器接受候选';
+  const snoozedTitle = '浏览器暂存候选';
+  const ignoredTitle = '浏览器忽略候选';
+  const acceptedId = await seedPendingCandidate(page, acceptedTitle);
+  const snoozedId = await seedPendingCandidate(page, snoozedTitle);
+  const ignoredId = await seedPendingCandidate(page, ignoredTitle);
+
+  await page.goto('/candidates');
+  await expect(page.getByRole('heading', { name: '候选收件箱' })).toBeVisible();
+  const filterBar = page.locator('.filter-bar');
+
+  await candidateCardById(page, acceptedId).getByRole('button', { name: '接受为正式任务' }).click();
+  await expect(page.getByText(`已建立正式任务：${acceptedTitle}`, { exact: true })).toBeVisible();
+  await filterBar.getByRole('button', { name: '已接受', exact: true }).click();
+  await expect(candidateCardById(page, acceptedId).getByText('已接受', { exact: true })).toBeVisible();
+
+  await filterBar.getByRole('button', { name: '待确认', exact: true }).click();
+  await candidateCardById(page, snoozedId).getByRole('button', { name: '稍后再议' }).click();
+  await expect(page.getByText('已放入稍后再议。', { exact: true })).toBeVisible();
+  await filterBar.getByRole('button', { name: '稍后再议', exact: true }).click();
+  await expect(candidateCardById(page, snoozedId).locator('.status-text').getByText('稍后再议', { exact: true })).toBeVisible();
+
+  await filterBar.getByRole('button', { name: '待确认', exact: true }).click();
+  await candidateCardById(page, ignoredId).getByRole('button', { name: '忽略' }).click();
+  await expect(page.getByText('已忽略这条候选。', { exact: true })).toBeVisible();
+  await filterBar.getByRole('button', { name: '已忽略', exact: true }).click();
+  await expect(candidateCardById(page, ignoredId).locator('.status-text').getByText('已忽略', { exact: true })).toBeVisible();
+});
+
+test('浏览器候选页可添加测试用模拟需求，并在 seed 接口缺失时回退到补录接口', async ({ page }, testInfo) => {
+  testInfo.annotations.push({
+    type: 'allow-console-error-for-response',
+    description: JSON.stringify({
+      testScope: testInfo.testId,
+      consoleText: 'Failed to load resource: the server responded with a status of 404 (Not Found)',
+      method: 'POST',
+      pathname: '/api/dev/seed-intake',
+      search: '',
+      status: 404,
+      expectedCount: 1,
+    }),
+  });
+  let candidateLoads = 0;
+  let seedCalls = 0;
+  let fallbackCalls = 0;
+  await page.route('**/api/candidates*', async (route) => {
+    if (route.request().method() === 'GET') candidateLoads += 1;
+    await route.continue();
+  });
+  await page.route('**/api/dev/seed-intake', async (route) => {
+    seedCalls += 1;
+    expect(route.request().method()).toBe('POST');
+    await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'Not Found' }) });
+  });
+  await page.route('**/api/corrections', async (route) => {
+    if (route.request().method() !== 'POST') {
+      await route.continue();
+      return;
+    }
+    fallbackCalls += 1;
+    expect(route.request().postDataJSON()).toMatchObject({
+      correctionType: 'missed_request',
+      manualContent: '浏览器测试用的模拟需求：请核对候选收件箱是否能接收新内容。',
+      manualSenderName: '浏览器测试需求方',
+    });
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ duplicate: false, candidate: null, task: null, targetTask: null }) });
+  });
+
+  await page.goto('/candidates');
+  const seedButton = page.getByRole('button', { name: '模拟一条需求（浏览器测试）' });
+  await expect(seedButton).toBeVisible();
+  await seedButton.click();
+  await expect(page.getByText('模拟需求已加入候选收件箱。', { exact: true })).toBeVisible();
+  expect(seedCalls).toBe(1);
+  expect(fallbackCalls).toBe(1);
+  expect(candidateLoads).toBeGreaterThanOrEqual(2);
+});
+
+test('浏览器候选页在 seed 接口可用时显示新增候选', async ({ page }) => {
+  await page.goto('/candidates');
+  await page.getByRole('button', { name: '模拟一条需求（浏览器测试）' }).click();
+  await expect(page.getByText('模拟需求已加入候选收件箱。', { exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '浏览器测试用的模拟需求', exact: true })).toBeVisible();
 });
 
 test('候选 mutation 已成功但刷新失败时保留 canonical 状态并禁止继续操作', async ({ page }) => {
@@ -1486,7 +1586,7 @@ test('长更新、记忆失败与 Runtime 失败在桌面和手机端都可恢�
   await page.getByRole('button', { name: '重试任务记忆' }).click();
   await expect(page.getByText('任务记忆已重新生成。')).toBeVisible();
   await page.getByRole('button', { name: '打开任务记忆目录' }).click();
-  await expect(page.getByText('已在 Windows 文件资源管理器中打开任务记忆目录。')).toBeVisible();
+  await expect(page.getByText('已在本机文件管理器中打开任务记忆目录。')).toBeVisible();
   expect(await page.evaluate(() => (window as any).__openedTaskMemory)).toBe(taskId);
   await page.getByRole('button', { name: '重试', exact: true }).click();
   await expect(page.getByText('Runtime 工作项已重新加入安全重试队列。')).toBeVisible();
@@ -1722,7 +1822,7 @@ test('Issue #11 可编辑任务、监督 AI 修改、暂停维护并安全管理
   await editor.getByLabel('计划开始').fill('2030-08-15T09:00');
   await editor.getByLabel('计划完成').fill('2030-08-15T18:00');
   await editor.getByRole('button', { name: '保存全部修改' }).click();
-  await expect(page.getByText('任务已完整更新并刷新任务记忆；这只是私人 PM 内部修改。')).toBeVisible();
+  await expect(page.getByText('任务已完整更新并刷新任务记忆；这只是本机任务库中的修改。')).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Issue #11 人工修正后的任务' })).toBeVisible();
 
   await page.getByRole('button', { name: '暂停自动维护' }).click();
@@ -1771,7 +1871,7 @@ test('Issue #11 可编辑任务、监督 AI 修改、暂停维护并安全管理
   const automaticMode = automationCard.getByRole('radio', { name: /自动维护/ });
   await automaticMode.click();
   await expect(automaticMode).toBeChecked();
-  await expect(page.getByText('已启用 AI 自动维护私人任务；低置信度、推测时间和版本冲突仍会等待你确认。')).toBeVisible();
+  await expect(page.getByText('已启用 AI 自动维护本机任务；低置信度、推测时间和版本冲突仍会等待你确认。')).toBeVisible();
   expect(automationMode).toBe('auto');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 
@@ -1784,7 +1884,9 @@ test('集成设置明确连接边界，且不暴露开发消息夹具', async ({
   await page.goto('/settings');
   await expect(page.getByRole('heading', { name: '集成设置' })).toBeVisible();
   await expect(page.getByText('当前使用本地规则或 Mock，不会访问飞书或外部模型。')).toBeVisible();
-  await expect(page.getByText('浏览器开发模式：仅校验格式')).toBeVisible();
+  await expect(page.getByText('浏览器入口：仅校验格式')).toBeVisible();
+  await expect(page.getByText('退出后台进程', { exact: true })).toBeVisible();
+  await expect(page.getByText('退出本机任务库后台后，当前浏览器页面会失去连接；任务数据仍保留在本机 SQLite 中。', { exact: true })).toBeVisible();
   await expect(page.locator('article.source-status-row').first()).toContainText('暂无记录');
   await expect(page.getByRole('button', { name: '重新同步' })).toHaveCount(5);
   await page.getByText('我的日历', { exact: true }).locator('xpath=ancestor::article').getByRole('button', { name: '重新同步' }).click();

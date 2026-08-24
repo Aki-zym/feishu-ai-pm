@@ -40,7 +40,7 @@ export default function AppShell() {
         </button>
         <div className="brand brand-mobile">
           <span className="brand-mark"><Bot size={18} /></span>
-          <span>数据 PM</span>
+          <span>TooManyTasks</span>
         </div>
       </header>
 
@@ -48,7 +48,7 @@ export default function AppShell() {
         <div className="sidebar-top">
           <div className="brand">
             <span className="brand-mark"><Bot size={19} /></span>
-            <span>数据 PM</span>
+            <span>TooManyTasks</span>
           </div>
           <button className="icon-button mobile-close" aria-label="关闭导航" onClick={() => setMenuOpen(false)}>
             <X size={20} />
@@ -70,7 +70,7 @@ export default function AppShell() {
         </nav>
         <div className="sidebar-note">
           <span className="status-dot status-dot-safe" />
-          <span>本地 PM · 外部连接按设置启用</span>
+          <span>TooManyTasks · 外部连接按设置启用</span>
         </div>
         <div className="profile-row">
           <span className="avatar">我</span>

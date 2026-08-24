@@ -405,7 +405,7 @@ export function describeFeishuAuthError(error: unknown, stage: FeishuAuthErrorSt
   const category = feishuAuthErrorCategory(details);
   const stageLabel = stage === 'token_exchange' ? '授权码换 Token' : stage === 'token_refresh' ? '刷新 Token' : stage === 'owner_identity' ? '读取系统主人身份' : '连接检查';
   const hint = code === '20049'
-    ? '这是 PKCE 校验失败，不是 scope 权限问题。请关闭旧授权页，并从当前数据 PM 重新发起授权。'
+    ? 'PKCE 校验失败。请关闭旧授权页，并从 TooManyTasks 重新发起授权。'
     : category === 'configuration'
     ? '请确认 App ID、App Secret 属于同一个自建应用。'
     : category === 'authorization'
@@ -631,7 +631,7 @@ export class LiveFeishuAdapter implements FeishuAdapter {
     const startedAt = state ? this.pendingOAuthStates.get(state) : undefined;
     if (!state || startedAt === undefined || Date.now() - startedAt > 10 * 60 * 1000) {
       if (state) this.pendingOAuthStates.delete(state);
-      throw new Error('飞书 OAuth 状态已失效，请关闭旧授权页并从数据 PM 重新发起授权。');
+      throw new Error('飞书 OAuth 状态已失效，请关闭旧授权页并从 TooManyTasks 重新发起授权。');
     }
     // A callback state is single-use, even if the provider exchange fails.
     this.pendingOAuthStates.delete(state);

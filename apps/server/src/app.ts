@@ -1,13 +1,13 @@
 import { existsSync } from 'node:fs';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, relative, resolve, sep } from 'node:path';
 import cors from '@fastify/cors';
-import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import type { CandidateState, RiskLevel, TaskStatus } from './domain.js';
 import { AUDIT_REPLAY_INTENT, type ReplayCapabilityBinding } from './data04.js';
-import { CandidateVersionConflictError, CandidateVersionRequiredError, PrivacyAuthorizationError, ReplayAuthorizationError, type PmService } from './service.js';
+import { CandidateVersionConflictError, CandidateVersionRequiredError, CindyIntakeConflictError, CindyIntakeValidationError, PrivacyAuthorizationError, ReplayAuthorizationError, type PmService } from './service.js';
 import { createOperationContext, failedSourceOutcome, operationEnvelope, type SyncSourceName } from './observability.js';
 import { assertShanghaiCalendarPlanRange } from './shanghai-time.js';
 import {
@@ -31,6 +31,11 @@ import {
 const candidateStates = ['pending', 'snoozed', 'ignored', 'accepted'] as const;
 const taskStatuses = ['unplanned', 'planned', 'in_progress', 'waiting', 'review', 'completed', 'archived'] as const;
 const requestIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+const seedIntakeBodySchema = z.object({
+  title: z.string().trim().min(1).max(160),
+  describe: z.string().trim().min(1).max(2_000).optional(),
+  background: z.string().trim().min(1).max(8_000).optional(),
+}).strict();
 
 function requestTraceContext(request: FastifyRequest) {
   const header = (name: string) => {
@@ -75,6 +80,9 @@ type BuildAppOptions = {
   serveWeb?: boolean;
   webRoot?: string;
   desktopCapability?: LocalActionCapability;
+  cindyIntegrationToken?: string;
+  runtimeShutdown?: () => Promise<void> | void;
+  logger?: boolean;
 };
 
 export type LocalActionCapability = {
@@ -145,14 +153,86 @@ function requirePrivacyCapability(
   return capabilityBinding(capability);
 }
 
+export function registerSeedIntakeRoute(app: FastifyInstance, service: PmService) {
+  if (app.hasRoute({ method: 'POST', url: '/api/dev/seed-intake' })) return;
+  app.post('/api/dev/seed-intake', async (request, reply) => {
+    const remoteAddress = request.socket.remoteAddress ?? request.ip;
+    const normalizedAddress = remoteAddress?.replace(/^::ffff:/u, '').replace(/^\[|\]$/gu, '').split('%')[0];
+    if (normalizedAddress !== '127.0.0.1' && normalizedAddress !== '::1') {
+      return reply.code(403).send({ error: '模拟需求入口只接受本机回环请求。' });
+    }
+    try {
+      const body = seedIntakeBodySchema.parse(request.body);
+      const occurredAt = new Date().toISOString();
+      const sourceKey = `dev-seed-source-${randomUUID()}`;
+      const background = body.background ?? body.describe ?? body.title;
+      const result = service.processCindyIntake({
+        window_id: `dev-seed-window-${randomUUID()}`,
+        window_start: occurredAt,
+        window_end: occurredAt,
+        sources: [{
+          source_key: sourceKey,
+          occurred_at: occurredAt,
+          conversation_key: `dev-seed-conversation-${sourceKey}`,
+          sender_role: '测试模拟需求',
+          text: background,
+        }],
+        proposals: [{
+          action: 'create_candidate',
+          source_keys: [sourceKey],
+          title: body.title,
+          ...(body.describe === undefined ? {} : { describe: body.describe }),
+          reason: '浏览器 HTML 测试模拟需求。',
+        }],
+      });
+      const candidateId = result.proposals.find((proposal) => proposal.action === 'create_candidate')?.candidate_id;
+      if (!candidateId) return reply.code(500).send({ error: '模拟需求未生成候选。' });
+      return { candidate_id: candidateId };
+    } catch (error) {
+      const status = error instanceof z.ZodError ? 400 : 409;
+      return reply.code(status).send({ error: error instanceof Error ? error.message : '模拟需求写入失败。' });
+    }
+  });
+}
+
 export async function buildApp(service: PmService, input: string | BuildAppOptions = 'http://localhost:5173') {
   const options: BuildAppOptions = typeof input === 'string' ? { webOrigin: input } : input;
   const webOrigin = options.webOrigin ?? 'http://localhost:5173';
   if (options.desktopCapability) service.registerAuditReplayCapability(options.desktopCapability);
-  const app = Fastify({ logger: process.env.NODE_ENV !== 'test' });
+  const app = Fastify({ logger: options.logger ?? process.env.NODE_ENV !== 'test' });
   await app.register(cors, { origin: webOrigin });
+  let runtimeShutdownScheduled = false;
+
+  app.addHook('onRequest', async (request, reply) => {
+    if (!request.url.startsWith('/api/integrations/cindy/')) return;
+    if (request.method === 'OPTIONS') return;
+    const expected = options.cindyIntegrationToken?.trim();
+    const authorization = String(request.headers.authorization ?? '');
+    const expectedAuthorization = expected ? `Bearer ${expected}` : '';
+    const authorizationMatches = Boolean(expectedAuthorization)
+      && authorization.length === expectedAuthorization.length
+      && timingSafeEqual(Buffer.from(authorization, 'utf8'), Buffer.from(expectedAuthorization, 'utf8'));
+    if (!authorizationMatches) {
+      return reply.code(401).send({ error: 'Cindy 集成令牌无效或尚未配置。' });
+    }
+  });
 
   app.get('/api/health', async () => service.health(randomUUID()));
+  app.post('/api/runtime/shutdown', async (request, reply) => {
+    const remoteAddress = request.socket.remoteAddress ?? request.ip;
+    const normalizedAddress = remoteAddress?.replace(/^::ffff:/u, '').replace(/^\[|\]$/gu, '').split('%')[0];
+    const isLoopback = normalizedAddress === '127.0.0.1' || normalizedAddress === '::1';
+    if (!isLoopback) return reply.code(403).send({ error: '后台关闭接口只接受本机请求。' });
+    if (!options.runtimeShutdown) return reply.code(409).send({ error: '当前运行方式不支持关闭后台进程。' });
+    if (runtimeShutdownScheduled) return reply.code(409).send({ error: '后台进程已经在退出。' });
+    runtimeShutdownScheduled = true;
+    reply.code(200).send({ message: '本机任务库后台已收到退出请求，4310 即将关闭。' });
+    setTimeout(() => {
+      void Promise.resolve(options.runtimeShutdown?.()).catch(() => undefined);
+    }, 25);
+    return reply;
+  });
+  registerSeedIntakeRoute(app, service);
   app.get('/api/dashboard', async () => dashboardDtoSchema.parse(service.dashboard()));
   app.get('/api/calendar', async () => service.calendar());
   app.get('/api/calendar/sources', async (request) => {
@@ -224,6 +304,47 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
     }
   });
   app.get('/api/integrations/health', async () => service.integrationHealth());
+  app.get('/api/integrations/cindy/tasks', async () => ({ items: service.listCindyTasks() }));
+  app.post('/api/integrations/cindy/intake', async (request, reply) => {
+    try {
+      const isoTimestamp = z.string().datetime({ offset: true });
+      const body = z.object({
+        window_id: z.string().trim().min(1).max(200),
+        window_start: isoTimestamp,
+        window_end: isoTimestamp,
+        sources: z.array(z.object({
+          source_key: z.string().trim().min(1).max(200),
+          occurred_at: isoTimestamp,
+          conversation_key: z.string().trim().min(1).max(500).optional(),
+          sender_role: z.string().trim().min(1).max(120).optional(),
+          text: z.string().min(1).max(20_000),
+        }).strict()).max(500),
+        proposals: z.array(z.object({
+          action: z.enum(['create_candidate', 'update_task', 'skip', 'needs_owner']),
+          source_keys: z.array(z.string().trim().min(1).max(200)).min(1).max(100),
+          task_key: z.string().trim().min(1).max(200).optional(),
+          expected_version: z.number().int().nonnegative().optional(),
+          title: z.string().trim().min(1).max(160).optional(),
+          describe: z.string().trim().min(1).max(2_000).optional(),
+          next_step: z.string().trim().min(1).max(1_000).optional(),
+          reason: z.string().trim().max(2_000).optional(),
+        }).strict()).max(500),
+      }).strict().parse(request.body);
+      return service.processCindyIntake(body);
+    } catch (error) {
+      const status = error instanceof z.ZodError || error instanceof CindyIntakeValidationError
+        ? 400
+        : error instanceof CindyIntakeConflictError ? 409 : 409;
+      const payload: Record<string, unknown> = {
+        error: error instanceof Error ? error.message : 'Cindy 入库失败。',
+      };
+      if (error instanceof CindyIntakeConflictError) {
+        payload.error_code = error.errorCode;
+        payload.current_version = error.currentVersion;
+      }
+      return reply.code(status).send(payload);
+    }
+  });
   app.get('/api/owner-information', async () => service.ownerInformation());
   app.get('/api/privacy/status', async () => service.privacyStatus());
   app.post('/api/privacy/collection/stop', async (request, reply) => {

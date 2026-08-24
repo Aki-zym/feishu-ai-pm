@@ -32,7 +32,7 @@ export function FeishuPermissionGuide({ onApplyOAuthScopes, defaultOpen = false 
           <li><span>1</span><div><strong>进入应用的“权限管理”</strong><p>开发者后台 → 选择当前企业自建应用 → 开发配置 → 权限管理。</p></div></li>
           <li><span>2</span><div><strong>点击“批量导入/导出权限”</strong><p>选择“导入”页签；已有权限不会被这次导入删除。</p></div></li>
           <li><span>3</span><div><strong>粘贴下面的 JSON 并申请</strong><p>确认新增权限，等待管理员审批；高级权限是否免审以当前租户为准。</p></div></li>
-          <li><span>4</span><div><strong>发布应用版本并重新授权</strong><p>旧 user_access_token 不会自动扩权；发布后必须在数据 PM 重新授权一次。</p></div></li>
+          <li><span>4</span><div><strong>发布应用版本并重新授权</strong><p>旧 user_access_token 不会自动扩权；发布后必须在 TooManyTasks 重新授权一次。</p></div></li>
         </ol>
       </div>
       <div className="permission-guide-visual" role="img" aria-label="飞书开放平台权限管理与批量导入权限示意图">

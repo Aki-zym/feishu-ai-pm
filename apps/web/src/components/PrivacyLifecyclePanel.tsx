@@ -138,7 +138,7 @@ export function PrivacyLifecyclePanel() {
       <span>留存：{status?.retentionStatus ?? '读取中'}</span>
       <span>平台撤权：{status?.platformRevocation === 'not_verified' ? '未验证（需平台侧确认）' : status?.platformRevocation ? '已报告' : '未完成'}</span>
     </div>
-    <p className="integration-note">软删除不等于硬删除；真实飞书撤权、平台备份残留和 Windows 文件锁仍需主人在真实环境中核验。</p>
+    <p className="integration-note">软删除不等于硬删除；真实飞书撤权、平台备份残留和本机文件锁仍需主人在真实环境中核验。</p>
     <div className="settings-actions privacy-lifecycle-actions">
       <button className="secondary-button" type="button" disabled={busy} onClick={() => void run(() => api.post('/api/privacy/collection/stop', { expectedVersion: status?.version }), '已停止后续采集。')}><Square size={14} />停止采集</button>
       <button className="secondary-button" type="button" disabled={busy} onClick={() => void run(() => api.post('/api/privacy/revoke', { expectedVersion: status?.version }), '已撤销本地授权；平台侧撤权仍未验证。')}><KeyRound size={14} />撤销本地授权</button>

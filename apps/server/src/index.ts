@@ -15,16 +15,31 @@ const database = new AppDatabase(config.database.sqlitePath);
 const adapters = createAdapters(config);
 const service = new PmService(database, adapters, config);
 const webRoot = fileURLToPath(new URL('../../web/dist/', import.meta.url));
-const app = await buildApp(service, { webOrigin: config.webOrigin, webRoot });
+let app: Awaited<ReturnType<typeof buildApp>>;
+let shutdownInProgress: Promise<void> | null = null;
+const shutdown = async () => {
+  if (shutdownInProgress) return shutdownInProgress;
+  shutdownInProgress = (async () => {
+    await service.stopRuntimeRecovery();
+    await app.close();
+    database.close();
+  })();
+  return shutdownInProgress;
+};
+const shutdownAndExit = async () => {
+  await shutdown();
+  if (config.nodeEnv !== 'test') process.exit(0);
+};
+
+app = await buildApp(service, {
+  webOrigin: config.webOrigin,
+  webRoot,
+  cindyIntegrationToken: config.cindyIntegrationToken,
+  runtimeShutdown: shutdownAndExit,
+});
 service.startRuntimeRecovery();
 
 await app.listen({ port: config.port, host: '127.0.0.1' });
 
-const shutdown = async () => {
-  await service.stopRuntimeRecovery();
-  await app.close();
-  database.close();
-};
-
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.on('SIGINT', () => { void shutdownAndExit(); });
+process.on('SIGTERM', () => { void shutdownAndExit(); });

@@ -382,7 +382,7 @@ export default function TaskDrawer() {
         taskId: currentTask.id,
         expectedTaskVersion: currentTask.version,
         idempotencyKey: `task-ui:${currentTask.id}:${Date.now()}`,
-        note: '来自任务详情的人工纠错；仅修改私人 PM 记录。',
+        note: '来自任务详情的人工纠错；仅修改本机任务记录。',
       };
       if (correctionType === 'wrong_fields' || correctionType === 'describe_incomplete') {
         if (!correctionValue.trim()) throw new Error(correctionType === 'wrong_fields' ? '请填写正确的提出人。' : '请填写完整 describe。');
@@ -505,7 +505,7 @@ export default function TaskDrawer() {
       if (!applyTaskDetail(identity, updated)) return;
       syncTaskControls(updated);
       setEditOpen(false);
-      setSuccess('任务已完整更新并刷新任务记忆；这只是私人 PM 内部修改。');
+      setSuccess('任务已完整更新并刷新任务记忆；这只是本机任务库中的修改。');
       announceTaskChange();
     } catch (reason) {
       failTaskAction(identity, reason, '任务保存失败。');
@@ -646,7 +646,7 @@ export default function TaskDrawer() {
     try {
       await desktop.taskMemory.open(identity.task.id);
       if (!identityIsCurrent(identity)) return;
-      setSuccess('已在 Windows 文件资源管理器中打开任务记忆目录。');
+      setSuccess('已在本机文件管理器中打开任务记忆目录。');
     } catch (reason) {
       failTaskAction(identity, reason, '无法打开任务记忆目录。');
     } finally {
@@ -963,7 +963,7 @@ export default function TaskDrawer() {
               )}
               {tab === 'corrections' && (
                 <div className="task-correction-panel">
-                  <div className="correction-private-note"><RotateCcw size={16} /><span><strong>这里只修正私人 PM 记录</strong>不会回复需求方、发送排期或创建群聊。</span></div>
+                  <div className="correction-private-note"><RotateCcw size={16} /><span><strong>这里只修正本机任务记录</strong>不会回复需求方、发送排期或创建群聊。</span></div>
                   <label className="correction-field">
                     <span>哪里判断错了</span>
                     <select value={correctionType} onChange={(event) => setCorrectionType(event.target.value as TaskCorrectionType)}>

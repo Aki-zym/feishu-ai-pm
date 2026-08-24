@@ -5,6 +5,7 @@ import { AppDatabase } from '../src/database.js';
 import { createAdapters } from '../src/integrations.js';
 import { PmService } from '../src/service.js';
 import { registerSimulatedMessageRoute } from './support/simulated-message-route.js';
+import { registerSeedIntakeRoute } from './support/seed-intake-route.js';
 
 // Keep the browser fixture isolated from user configuration and persistent data.
 const databaseUrl = process.env.DATABASE_URL ?? ':memory:';
@@ -43,6 +44,12 @@ const service = new PmService(database, createAdapters(config), config);
 const webRoot = fileURLToPath(new URL('../../web/dist/', import.meta.url));
 const app = await buildApp(service, { webOrigin: config.webOrigin, webRoot });
 registerSimulatedMessageRoute(app, service, {
+  testOnly: true,
+  nodeEnv: config.nodeEnv,
+  databaseProvider: config.database.provider,
+  databaseUrl: config.database.url,
+});
+registerSeedIntakeRoute(app, service, {
   testOnly: true,
   nodeEnv: config.nodeEnv,
   databaseProvider: config.database.provider,

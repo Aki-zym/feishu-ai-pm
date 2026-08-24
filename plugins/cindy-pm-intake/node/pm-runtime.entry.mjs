@@ -1,0 +1,251 @@
+import { existsSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
+
+import { buildApp } from '../../../apps/server/src/app.ts';
+import { loadConfig } from '../../../apps/server/src/config.ts';
+import { AppDatabase } from '../../../apps/server/src/database.ts';
+import { createAdapters } from '../../../apps/server/src/integrations.ts';
+import { PmService } from '../../../apps/server/src/service.ts';
+
+const DEFAULT_HOST = '127.0.0.1';
+const DEFAULT_PORT = 4310;
+const INTEGRATION_PATH = '/api/integrations/cindy/tasks';
+const DEFAULT_WEB_ROOT = resolve(__dirname, '..', 'web-dist');
+let ownedRuntime = null;
+
+function normalizePort(value) {
+  const port = value === undefined ? DEFAULT_PORT : Number(value);
+  if (!Number.isInteger(port) || port < 0 || port > 65_535) {
+    throw new RangeError('本机任务库端口必须是 0 到 65535 的整数。');
+  }
+  return port;
+}
+
+function normalizeHost(value) {
+  const host = typeof value === 'string' && value.trim() ? value.trim() : DEFAULT_HOST;
+  return host;
+}
+
+function formatHost(host) {
+  return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+}
+
+function serverUrl(host, port) {
+  return `http://${formatHost(host)}:${port}`;
+}
+
+function normalizeSqlitePath(value) {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new TypeError('sqlitePath 必须是本机 SQLite 文件路径。');
+  }
+  return value === ':memory:' ? value : resolve(value);
+}
+
+function runtimeConfig({ host, port, sqlitePath, token }) {
+  const databaseUrl = sqlitePath === ':memory:' ? sqlitePath : `file:${sqlitePath}`;
+  return loadConfig({
+    NODE_ENV: 'production',
+    PORT: String(port || DEFAULT_PORT),
+    WEB_ORIGIN: serverUrl(host, port),
+    DATABASE_URL: databaseUrl,
+    DATABASE_PROVIDER: 'sqlite',
+    FEISHU_EXTERNAL_ENABLED: 'false',
+    FEISHU_SCAN_ENABLED: 'false',
+    LLM_PROVIDER: 'rule_mock',
+    WORKSPACE_MODE: 'reference_only',
+    WORKSPACE_READ_ENABLED: 'false',
+    WORKSPACE_WRITE_ENABLED: 'false',
+    CINDY_INTEGRATION_TOKEN: token,
+  });
+}
+
+async function canReachPmEndpoint(url, token) {
+  try {
+    const response = await fetch(`${url}${INTEGRATION_PATH}`, {
+      method: 'GET',
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+      redirect: 'error',
+      signal: AbortSignal.timeout(1_500),
+    });
+    // A configured local task service returns 200 with the matching token and 401
+    // without it. Both prove that the Cindy endpoint is already reachable.
+    return response.status === 200 || response.status === 401;
+  } catch {
+    return false;
+  }
+}
+
+async function closeOwnedResources(app, database) {
+  const failures = [];
+  const server = app?.server;
+  try {
+    if (app) await app.close();
+  } catch {
+    failures.push('fastify');
+  }
+  if (server?.listening) {
+    try {
+      await new Promise((resolveClose, rejectClose) => {
+        server.close((error) => (error ? rejectClose(error) : resolveClose()));
+      });
+    } catch {
+      failures.push('fastify_server');
+    }
+  }
+  if (server?.listening !== false) failures.push('fastify_listening');
+  try {
+    database?.close();
+  } catch {
+    failures.push('sqlite');
+  }
+  return failures;
+}
+
+function resultWithStop(payload, stop) {
+  Object.defineProperty(payload, 'stop', {
+    value: stop,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  return payload;
+}
+
+function noOpStop(errorCode, message) {
+  return async () => ({
+    stopped: false,
+    error_code: errorCode,
+    error: message,
+  });
+}
+
+function scheduleProcessExit() {
+  if (process.env.NODE_ENV === 'test') return;
+  setTimeout(() => process.exit(0), 150);
+}
+
+/**
+ * Start the bundled local task service for the Cindy resident worker.
+ *
+ * The runtime intentionally does not start Feishu polling or classifier
+ * scans. Cindy submits already-reviewed intake proposals through the guarded
+ * integration routes; external collection remains outside this resident worker.
+ */
+export async function startPmServer({
+  port: requestedPort,
+  host: requestedHost,
+  sqlitePath: requestedSqlitePath,
+  token: requestedToken,
+  webRoot: requestedWebRoot,
+} = {}) {
+  const host = normalizeHost(requestedHost);
+  const port = normalizePort(requestedPort);
+  const sqlitePath = normalizeSqlitePath(requestedSqlitePath);
+  const token = typeof requestedToken === 'string' ? requestedToken : '';
+  const webRoot = resolve(
+    typeof requestedWebRoot === 'string' && requestedWebRoot.trim()
+      ? requestedWebRoot
+      : DEFAULT_WEB_ROOT,
+  );
+
+  if (!existsSync(resolve(webRoot, 'index.html'))) {
+    throw new Error(`本机任务库网页资源缺少 index.html：${webRoot}`);
+  }
+
+  if (ownedRuntime && ownedRuntime.host === host && ownedRuntime.requestedPort === port) {
+    return resultWithStop({
+      url: ownedRuntime.url,
+      port: ownedRuntime.port,
+      alreadyRunning: true,
+      foreign: false,
+    }, ownedRuntime.stop);
+  }
+
+  // Avoid opening or mutating SQLite when the resident server is already up.
+  // This also makes repeated worker initialization idempotent.
+  if (port !== 0) {
+    const url = serverUrl(host, port);
+    if (await canReachPmEndpoint(url, token)) {
+      return resultWithStop(
+        { url, port, alreadyRunning: true, foreign: false },
+        noOpStop('PM_ALREADY_RUNNING', '本机任务库由其他进程持有，未执行停止。'),
+      );
+    }
+  }
+
+  if (sqlitePath !== ':memory:') await mkdir(dirname(sqlitePath), { recursive: true });
+
+  let database;
+  let app;
+  let stopOwnedRuntime;
+  try {
+    const config = runtimeConfig({ host, port, sqlitePath, token });
+    database = new AppDatabase(config.database.sqlitePath);
+    const service = new PmService(database, createAdapters(config), config);
+    let stopInFlight = null;
+    let stopResult = null;
+    stopOwnedRuntime = async () => {
+      if (stopResult?.stopped) return { stopped: false, alreadyStopped: true };
+      if (stopInFlight) return stopInFlight;
+      stopInFlight = (async () => {
+        const failures = await closeOwnedResources(app, database);
+        if (failures.length) {
+          stopResult = {
+            stopped: false,
+            error_code: 'PM_STOP_FAILED',
+            error: `本机任务库停止未完全完成：${failures.join('、')}。`,
+          };
+          stopInFlight = null;
+          return stopResult;
+        }
+        if (ownedRuntime?.app === app) ownedRuntime = null;
+        stopResult = { stopped: true };
+        scheduleProcessExit();
+        return stopResult;
+      })();
+      return stopInFlight;
+    };
+    app = await buildApp(service, {
+      webOrigin: serverUrl(host, port),
+      webRoot,
+      cindyIntegrationToken: token,
+      logger: false,
+      runtimeShutdown: async () => {
+        const result = await stopOwnedRuntime();
+        if (!result.stopped && !result.alreadyStopped) throw new Error(result.error || '本机任务库停止失败。');
+      },
+    });
+    await app.listen({ port, host });
+
+    const address = app.server.address();
+    const actualPort = address && typeof address === 'object' ? address.port : port;
+    const payload = {
+      url: serverUrl(host, actualPort),
+      port: actualPort,
+      alreadyRunning: false,
+      foreign: false,
+    };
+    ownedRuntime = { host, requestedPort: port, url: payload.url, port: actualPort, app, database, stop: stopOwnedRuntime };
+    return resultWithStop(payload, stopOwnedRuntime);
+  } catch (error) {
+    if (error && typeof error === 'object' && error.code === 'EADDRINUSE') {
+      const url = serverUrl(host, port);
+      if (await canReachPmEndpoint(url, token)) {
+        await closeOwnedResources(app, database);
+        return resultWithStop(
+          { url, port, alreadyRunning: true, foreign: false },
+          noOpStop('PM_ALREADY_RUNNING', '本机任务库由其他进程持有，未执行停止。'),
+        );
+      }
+      await closeOwnedResources(app, database);
+      console.warn(`本机任务库端口 ${url} 已被其他进程占用；插件不会抢占该端口。`);
+      return resultWithStop(
+        { url, port, alreadyRunning: false, foreign: true },
+        noOpStop('PM_FOREIGN_PROCESS', '本机任务库端口由外来进程占用，未执行停止。'),
+      );
+    }
+    await closeOwnedResources(app, database);
+    throw error;
+  }
+}

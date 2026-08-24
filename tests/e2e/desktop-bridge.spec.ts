@@ -78,7 +78,7 @@ test.describe('L4 本地 browser bridge Mock（不等于 Electron L5）', () => 
     await installBrowserBridgeMock(page, initialConfig());
 
     await page.goto('/');
-    await expect(page.getByRole('heading', { name: '配置你的个人数据 PM' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: '配置 TooManyTasks' })).toBeVisible();
     await expect(page.getByLabel('Provider')).toHaveValue('deepseek');
     await page.getByLabel('Provider').fill('  deepseek  ');
     await page.getByText('飞书权限开通指南', { exact: true }).click();

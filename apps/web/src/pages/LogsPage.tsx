@@ -60,10 +60,7 @@ export default function LogsPage() {
     corrections: data?.corrections.length ?? 0,
   }), [data]);
   const exportDiagnostics = async () => {
-    if (!desktop) {
-      setMessage('请在 Windows EXE 中导出脱敏诊断包。');
-      return;
-    }
+    if (!desktop) return;
     const result = await desktop.diagnostics.export();
     setMessage(result.saved ? '脱敏诊断包已导出。' : '已取消导出。');
   };
@@ -118,7 +115,9 @@ export default function LogsPage() {
         <label className="log-correlation-field"><span>operation_id</span><input value={operationId} onChange={(event) => setOperationId(event.target.value)} placeholder="可选 UUID" /></label>
         <label className="log-correlation-field"><span>trace_id</span><input value={traceId} onChange={(event) => setTraceId(event.target.value)} placeholder="可选 UUID" /></label>
         <label className="log-correlation-field"><span>事件类型</span><input value={eventType} onChange={(event) => setEventType(event.target.value)} placeholder="例如 feishu.sync.completed" /></label>
-        <button className="secondary-button" type="button" onClick={() => void exportDiagnostics()}><Download size={15} />导出脱敏诊断包</button>
+        {desktop
+          ? <button className="secondary-button" type="button" onClick={() => void exportDiagnostics()}><Download size={15} />导出脱敏诊断包</button>
+          : <span className="integration-note">浏览器入口暂不提供脱敏诊断包导出。</span>}
         <button className="quiet-button" type="button" onClick={() => void cleanupExpiredLogs()}><Eraser size={15} />清理到期日志</button>
         <button className="quiet-button" type="button" onClick={() => void deleteDiagnosticLogs()}><Eraser size={15} />一键删除日志</button>
       </div>

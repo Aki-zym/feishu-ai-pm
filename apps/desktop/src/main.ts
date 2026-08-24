@@ -66,7 +66,7 @@ const handleExternalLinkIpc = createExternalLinkIpcHandler(verifyRenderer, openE
 
 const allowedRequest = z.object({
   method: z.enum(['GET', 'POST', 'PATCH', 'DELETE']),
-  url: z.string().min(1).max(2048).refine((value) => value.startsWith('/api/'), '只允许调用本地 PM API。'),
+  url: z.string().min(1).max(2048).refine((value) => value.startsWith('/api/'), '只允许调用本地服务 API。'),
   body: z.unknown().optional(),
 });
 
@@ -85,7 +85,7 @@ function requireConfigStore() {
 
 function requireReadyCore() {
   if (lifecycle.phase !== 'ready' || !localApp || !service) {
-    throw new Error('本地 PM 服务尚未启动。');
+    throw new Error('TooManyTasks 本地服务尚未启动。');
   }
   return { app: localApp, service };
 }
@@ -240,7 +240,7 @@ async function startOAuthCallbackServer() {
     if (!code || !state || error) {
       const providerMessage = url.searchParams.get('error_description');
       const detail = error ? `飞书返回：${error}${providerMessage ? `；${providerMessage}` : ''}` : '回调缺少授权码或状态。';
-      response.writeHead(400, { 'content-type': 'text/html; charset=utf-8' }).end(`<h3>飞书授权未完成</h3><p>${escapeHtml(detail)}</p><p>请回到数据 PM 重新发起授权。</p>`);
+      response.writeHead(400, { 'content-type': 'text/html; charset=utf-8' }).end(`<h3>飞书授权未完成</h3><p>${escapeHtml(detail)}</p><p>请回到 TooManyTasks 重新发起授权。</p>`);
       return;
     }
     try {
@@ -251,12 +251,12 @@ async function startOAuthCallbackServer() {
       const detail = body.ownerError || body.error || '';
       if (ok) void service?.startFeishu({ refreshOwner: true, syncOnce: true }).catch(() => undefined);
       const html = ok
-        ? `<h3>${body.ownerError ? '飞书令牌已保存，但主人身份读取失败' : '飞书授权完成'}</h3>${detail ? `<p>${escapeHtml(detail)}</p>` : ''}<p>可以关闭此页面并回到数据 PM。</p>`
-        : `<h3>飞书授权失败</h3><p>${escapeHtml(detail || '数据 PM 未取得可诊断的错误信息。')}</p><p>请回到数据 PM 重新发起授权。</p>`;
+        ? `<h3>${body.ownerError ? '飞书令牌已保存，但主人身份读取失败' : '飞书授权完成'}</h3>${detail ? `<p>${escapeHtml(detail)}</p>` : ''}<p>可以关闭此页面并回到 TooManyTasks。</p>`
+        : `<h3>飞书授权失败</h3><p>${escapeHtml(detail || 'TooManyTasks 未取得可诊断的错误信息。')}</p><p>请回到 TooManyTasks 重新发起授权。</p>`;
       response.writeHead(ok ? 200 : 502, { 'content-type': 'text/html; charset=utf-8' }).end(html);
       if (ok) showWindow();
     } catch {
-      response.writeHead(502, { 'content-type': 'text/html; charset=utf-8' }).end('<h3>数据 PM 未能完成授权，请查看诊断日志。</h3>');
+      response.writeHead(502, { 'content-type': 'text/html; charset=utf-8' }).end('<h3>TooManyTasks 未能完成授权，请查看诊断日志。</h3>');
     }
   });
   await new Promise<void>((resolve, reject) => {
@@ -270,10 +270,10 @@ function createTray() {
     'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAO0lEQVR42mNgGAWjYBSMglEwCkbB////Z2BgYGBg+M/AwMDwH4j/MzAwMPxnYGD4z8DAwMDA8J+BgYGBAQBs8Q8fD87b1AAAAABJRU5ErkJggg==',
   );
   tray = new Tray(icon);
-  tray.setToolTip('数据 PM');
+  tray.setToolTip('TooManyTasks');
   tray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: '打开数据 PM', click: () => showWindow() },
+      { label: '打开 TooManyTasks', click: () => showWindow() },
       { type: 'separator' },
       {
         label: '完全退出',
@@ -450,7 +450,7 @@ async function failBootstrap(error: unknown) {
   try {
     await dialog.showMessageBox({
       type: 'error',
-      title: '数据 PM 启动失败',
+      title: 'TooManyTasks 启动失败',
       message,
       buttons: ['退出'],
       noLink: true,
@@ -470,7 +470,7 @@ async function showLegacyDatabaseNotice() {
   }
   await dialog.showMessageBox({
     type: 'info',
-    title: '数据 PM',
+    title: 'TooManyTasks',
     message,
     buttons: ['知道了'],
     noLink: true,
@@ -588,7 +588,7 @@ function registerIpc() {
     const response = await currentApp.inject({ method: 'GET', url: '/api/diagnostics' });
     const target = await dialog.showSaveDialog(mainWindow!, {
       title: '导出脱敏诊断包',
-      defaultPath: `ai-pm-diagnostics-${new Date().toISOString().slice(0, 10)}.json`,
+      defaultPath: `toomanytasks-diagnostics-${new Date().toISOString().slice(0, 10)}.json`,
       filters: [{ name: 'JSON', extensions: ['json'] }],
     });
     if (target.canceled || !target.filePath) return { saved: false };

@@ -112,7 +112,7 @@ export default function DashboardPage() {
                 <article className="notification-row" key={notification.id}>
                   <span className="notification-icon"><BellRing size={16} /></span>
                   <div>
-                    <strong>{notification.task_title || notification.candidate_title || '新的私人 PM 提醒'}</strong>
+                    <strong>{notification.task_title || notification.candidate_title || '新的任务提醒'}</strong>
                     <p>{notification.reason}</p>
                     <small>{formatFullDate(notification.created_at)}</small>
                   </div>

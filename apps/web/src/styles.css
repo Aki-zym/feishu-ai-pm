@@ -49,6 +49,7 @@ a { color: inherit; text-decoration: none; }
 .page { width: min(1180px, 100%); margin: 0 auto; padding: 32px 32px 64px; }
 .page-dashboard { width: min(1080px, 100%); }
 .page-header { min-height: 54px; display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 20px; }
+.page-header-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
 .page-header h1 { margin: 0; color: var(--navy); font-size: 25px; line-height: 1.25; letter-spacing: -0.025em; }
 .page-header p { margin: 8px 0 0; display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 13px; }
 
@@ -617,6 +618,10 @@ a { color: inherit; text-decoration: none; }
 .permission-guide-boundary { grid-column: 1 / -1; display: flex; align-items: flex-start; gap: 8px; color: #6f5b2d; font-size: 11px; line-height: 1.55; }
 .permission-guide-boundary svg { flex: 0 0 auto; margin-top: 1px; }
 .settings-danger-zone > summary span { color: #b33d3d; }
+.runtime-exited-overlay { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 24px; background: #f7f9fc; pointer-events: all; }
+.runtime-exited-card { width: min(520px, 100%); padding: 30px; display: grid; justify-items: center; gap: 12px; color: #304159; text-align: center; background: white; border: 1px solid #d6e2f3; border-radius: 10px; box-shadow: var(--shadow); }
+.runtime-exited-card svg { color: #2563eb; }
+.runtime-exited-card h1 { margin: 0; font-size: 22px; line-height: 1.4; }
 .privacy-lifecycle-panel { border-color: #e2d6bd; }
 .privacy-lifecycle-summary { display: flex; gap: 18px; flex-wrap: wrap; margin: 12px 0; color: #59677b; font-size: 12px; }
 .privacy-lifecycle-actions { margin-top: 8px; }
@@ -892,6 +897,7 @@ a { color: inherit; text-decoration: none; }
   .main-content { min-height: calc(100vh - 56px); }
   .page { padding: 22px 16px 48px; }
   .page-header { margin-bottom: 16px; }
+  .page-header-actions { width: 100%; justify-content: flex-start; }
   .page-header h1 { font-size: 22px; }
   .dashboard-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .task-table th:nth-child(4), .task-table td:nth-child(4), .task-table th:nth-child(5), .task-table td:nth-child(5) { display: none; }

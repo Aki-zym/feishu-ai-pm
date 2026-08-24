@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Check, ChevronDown, Clock3, ExternalLink, FileText, GitBranch, Inbox, RefreshCw, RotateCcw, Sparkles, Split, Star, Trash2, X } from 'lucide-react';
 import { api, ApiRequestError } from '../api';
 import { AsyncState } from '../components/AsyncState';
+import { desktopBridge } from '../desktop';
 import { candidateStateText, formatDate } from '../format';
 import { beginResource, beginResourceMutation, beginResourceRequest, failureResource, isLatestResourceMutation, isLatestResourceRequest, loadingResource, mutationRefreshFailure, MUTATION_REFRESH_FAILURE_MESSAGE, successResource, type ResourceMutation, type ResourceState } from '../resource-state';
 import { externalLinkFeedbackMessage, requestExternalLinkOpen } from '../external-links';
@@ -213,6 +214,7 @@ export default function CandidatesPage() {
   const [guidanceByCandidate, setGuidanceByCandidate] = useState<Record<string, string>>({});
   const [threadSelections, setThreadSelections] = useState<Record<string, string>>({});
   const [mergePrimarySelections, setMergePrimarySelections] = useState<Record<string, string>>({});
+  const desktop = desktopBridge();
   const requestGenerationRef = useRef({ current: 0 });
   const mutationGenerationRef = useRef({ generations: new Map<string, number>() });
   const listAbortRef = useRef<AbortController | null>(null);
@@ -327,6 +329,41 @@ export default function CandidatesPage() {
       setMessage(MUTATION_REFRESH_FAILURE_MESSAGE);
     }
   }, [applyCanonicalCandidates, load]);
+  const seedBrowserCandidate = async () => {
+    if (desktop) return;
+    const occurredAt = new Date().toISOString();
+    const idempotencyKey = `browser-seed:${Date.now()}`;
+    const seedPayload = {
+      title: '浏览器测试用的模拟需求',
+      describe: '请核对候选收件箱是否能接收新内容。',
+      background: '用于验证浏览器候选页能够接收一条测试需求。',
+    };
+    setBusy('browser-seed');
+    setMessage('');
+    setError('');
+    try {
+      try {
+        await api.post('/api/dev/seed-intake', seedPayload);
+      } catch (reason) {
+        if (!(reason instanceof ApiRequestError) || reason.status !== 404) throw reason;
+        await api.post('/api/corrections', {
+          correctionType: 'missed_request',
+          idempotencyKey,
+          manualContent: `${seedPayload.title}：${seedPayload.describe}`,
+          manualSenderName: '浏览器测试需求方',
+          manualOccurredAt: occurredAt,
+        });
+      }
+      const refreshed = await load({ silent: true });
+      setMessage(refreshed
+        ? '模拟需求已加入候选收件箱。'
+        : '模拟需求已加入候选收件箱，但列表刷新失败，请点击刷新。');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '模拟需求添加失败，请稍后重试。');
+    } finally {
+      setBusy((current) => current === 'browser-seed' ? '' : current);
+    }
+  };
   const applyCandidateConflict = useCallback((reason: unknown) => {
     if (!(reason instanceof ApiRequestError) || reason.status !== 409 || !reason.body || typeof reason.body !== 'object') return false;
     const body = reason.body as { error_code?: string; current?: { id?: string; version?: number; state?: Candidate['state']; processing_state?: Candidate['processing_state']; deleted_at?: string | null; accepted_task_id?: string | null; updated_at?: string } | null };
@@ -474,7 +511,7 @@ export default function CandidatesPage() {
         idempotencyKey: `candidate-ui:${candidate.id}:${Date.now()}`,
       });
       if (isCurrentMutation(mutation)) {
-        setMessage('纠错已记录，只影响私人 PM 记录。');
+        setMessage('纠错已记录，只影响本机任务记录。');
         setCorrectionId('');
         setReplacementValue('');
         await refreshAfterMutation(mutation, result);
@@ -677,7 +714,7 @@ export default function CandidatesPage() {
 
   return (
     <div className="page">
-      <div className="page-header"><div><h1>候选收件箱</h1><p><Inbox size={16} />先判断是不是任务，再进入正式台账</p></div><button className="secondary-button" type="button" onClick={() => void load()}><RefreshCw size={16} />刷新</button></div>
+      <div className="page-header"><div><h1>候选收件箱</h1><p><Inbox size={16} />先判断是不是任务，再进入正式台账</p></div><div className="page-header-actions">{!desktop && <button className="secondary-button" type="button" disabled={Boolean(busy) || resource.status === 'stale'} onClick={() => void seedBrowserCandidate()}><Sparkles size={16} />{busy === 'browser-seed' ? '生成中…' : '模拟一条需求（浏览器测试）'}</button>}<button className="secondary-button" type="button" disabled={Boolean(busy)} onClick={() => void load()}><RefreshCw size={16} />刷新</button></div></div>
       <div className="filter-bar">
         {filters.map((item) => <button key={item.value} className={filter === item.value ? 'filter-active' : ''} onClick={() => setFilter(item.value)}>{item.label}</button>)}
         <button className={filter === 'trash' ? 'filter-active filter-trash' : 'filter-trash'} onClick={() => setFilter('trash')}><Trash2 size={14} />回收站</button>

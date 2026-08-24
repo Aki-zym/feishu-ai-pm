@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 2,
+  "id": "ai-pm-intake",
+  "name": "TooManyTasks 入库",
+  "description": "扫描近 10 分钟的已授权飞书消息，整理 TooManyTasks 入库候选并提交审核提案。",
+  "whenToUse": "需要把近 10 分钟已授权飞书消息整理为任务候选、已有任务更新提案或跳过结论时使用。",
+  "version": "0.2.3",
+  "entry": "main.js",
+  "launch": "on-demand",
+  "slots": ["tool", "agent", "node"],
+  "agent": { "errand": true },
+  "command": "扫近10分钟",
+  "tools": [
+    {
+      "name": "get_pm_tasks",
+      "description": "读取当前任务快照，供入库扫描判断已有任务归属和版本。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "submit_intake",
+      "description": "提交一次任务入库窗口的来源消息和候选提案；只登记候选，不直接创建正式任务。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "window_id": { "type": "string", "minLength": 1, "maxLength": 200 },
+          "window_start": { "type": "string", "minLength": 1, "maxLength": 80 },
+          "window_end": { "type": "string", "minLength": 1, "maxLength": 80 },
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "source_key": { "type": "string", "minLength": 1, "maxLength": 120 },
+                "occurred_at": { "type": "string", "minLength": 1, "maxLength": 80 },
+                "conversation_key": { "type": "string", "maxLength": 240 },
+                "sender_role": { "type": "string", "maxLength": 120 },
+                "text": { "type": "string", "minLength": 1, "maxLength": 12000 }
+              },
+              "required": ["source_key", "occurred_at", "text"],
+              "additionalProperties": false
+            }
+          },
+          "proposals": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "action": { "type": "string", "enum": ["create_candidate", "update_task", "skip", "needs_owner"] },
+                "source_keys": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": { "type": "string", "minLength": 1, "maxLength": 120 }
+                },
+                "task_key": { "type": "string", "maxLength": 200 },
+                "expected_version": { "type": "integer", "minimum": 1 },
+                "title": { "type": "string", "maxLength": 160 },
+                "describe": { "type": "string", "maxLength": 2000 },
+                "next_step": { "type": "string", "maxLength": 1000 },
+                "reason": { "type": "string", "maxLength": 2000 }
+              },
+              "required": ["action", "source_keys"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["window_id", "window_start", "window_end", "sources", "proposals"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "scan_intake_window",
+      "description": "扫描当前时间往前 10 分钟的已授权飞书消息，派发独立 errand 读取消息、获取任务快照并提交入库提案。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  ],
+  "node": {
+    "entry": "node/worker.cjs",
+    "protocol": "json-rpc-stdio",
+    "lifecycle": "resident",
+    "secretBindings": [{
+      "key": "pm_token",
+      "label": "本机服务令牌",
+      "hint": "与本机 TooManyTasks 服务的 CINDY_INTEGRATION_TOKEN 保持一致。",
+      "methods": ["pm/request", "pm/ensure", "pm/stop"]
+    }]
+  },
+  "settingsHtml": "settings.html",
+  "settingsHeight": 300
+}

@@ -14,7 +14,7 @@ describe('desktop bootstrap failure boundary', () => {
 
   it('uses a fixed redacted message for unknown errors', () => {
     const message = formatBootstrapFailure(new Error('D:\\canary\\secret.sqlite: SQLITE_CORRUPT raw details'));
-    expect(message).toBe('数据 PM 无法启动，请查看脱敏诊断日志。应用将退出。');
+    expect(message).toBe('TooManyTasks 无法启动，请查看脱敏诊断日志。应用将退出。');
     expect(message).not.toContain('canary');
     expect(message).not.toContain('secret.sqlite');
     expect(message).not.toContain('SQLITE_CORRUPT');
