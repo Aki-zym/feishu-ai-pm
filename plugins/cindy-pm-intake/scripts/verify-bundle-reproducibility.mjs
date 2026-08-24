@@ -36,7 +36,10 @@ async function snapshot() {
 }
 
 async function runBundle() {
-  await execFileAsync(process.execPath, [bundleScript], { cwd: root, maxBuffer: 20 * 1024 * 1024 });
+  const { stdout } = await execFileAsync(process.execPath, [bundleScript], { cwd: root, maxBuffer: 20 * 1024 * 1024 });
+  const stateLine = stdout.split(/\r?\n/u).findLast((line) => line.startsWith('bundle-runtime-state '));
+  assert.ok(stateLine, 'bundle did not report its deterministic runtime state');
+  return JSON.parse(stateLine.slice('bundle-runtime-state '.length));
 }
 
 async function gitOutput(args) {
@@ -44,12 +47,19 @@ async function gitOutput(args) {
 }
 
 assert.equal(await gitOutput(['status', '--porcelain=v1', '--untracked-files=all']), '', 'bundle verification requires a clean committed HEAD');
-await runBundle();
+const committed = await snapshot();
+const firstState = await runBundle();
 const first = await snapshot();
-await runBundle();
+assert.deepEqual(first, committed, 'first bundle generation differs from the clean committed HEAD');
+await gitOutput(['diff', '--exit-code']);
+await gitOutput(['diff', '--check']);
+assert.equal(await gitOutput(['status', '--porcelain=v1', '--untracked-files=all']), '', 'first bundle generation changed the committed worktree');
+const secondState = await runBundle();
 const second = await snapshot();
-assert.deepEqual(second, first);
+assert.deepEqual(second, first, 'second bundle generation differs from the first generation');
+assert.deepEqual(second, committed, 'second bundle generation differs from the clean committed HEAD');
+assert.deepEqual(secondState, firstState, 'bundle input/config/esbuild state changed inside one verification round');
 await gitOutput(['diff', '--exit-code']);
 await gitOutput(['diff', '--check']);
 assert.equal(await gitOutput(['status', '--porcelain=v1', '--untracked-files=all']), '', 'bundle generation changed the committed worktree');
-console.log(`bundle reproducibility verified against committed HEAD: ${first.size} generated files, LF-only text, identical hashes, clean worktree`);
+console.log(`bundle reproducibility verified against committed HEAD: ${first.size} generated files, runtime=${firstState.output_sha256}, inputs=${firstState.input_sha256}, config=${firstState.config_sha256}, esbuild=${firstState.esbuild_version}@${firstState.esbuild_module}, LF-only text, identical hashes, clean worktree`);
