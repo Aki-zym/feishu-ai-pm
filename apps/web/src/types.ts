@@ -289,7 +289,6 @@ export type PendingOwnerAction = {
 
 export type CindyOwnerDecision = {
   decision_id: string;
-  batch_id: string;
   status: 'pending' | 'resolved' | 'superseded' | 'cancelled';
   version: number;
   reason_summary: string;
@@ -302,7 +301,7 @@ export type CindyOwnerDecision = {
     available: boolean;
   }>;
   source_count: number;
-  last_error: string | null;
+  last_attempt_failed: boolean;
   resolution_action: 'skip' | 'create_candidate' | null;
   resolved_candidate_id: string | null;
   created_at: string;

@@ -1,5 +1,13 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { buildApp } from '../src/app.js';
+import {
+  CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH,
+  serializeCindyOwnerDecisionStoredOptions,
+  type CindyOwnerDecisionOptionInput,
+} from '../src/cindy-batch.js';
 import { loadConfig } from '../src/config.js';
 import { AppDatabase } from '../src/database.js';
 import { createCindyAdapters } from '../src/integrations.js';
@@ -8,6 +16,7 @@ import { PmService } from '../src/service.js';
 describe('Cindy grouped batch contract', () => {
   const databases: AppDatabase[] = [];
   const apps: Array<Awaited<ReturnType<typeof buildApp>>> = [];
+  const temporaryRoots: string[] = [];
   const token = 'test-cindy-batch-token';
   const accountAnchor = 'test-cindy-batch-account';
   const receiptSecret = 'test-cindy-batch-receipt-secret-0123456789abcdef';
@@ -15,6 +24,7 @@ describe('Cindy grouped batch contract', () => {
   afterEach(async () => {
     for (const app of apps.splice(0)) await app.close();
     for (const database of databases.splice(0)) database.close();
+    for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
   });
 
   async function makeApp(existingDatabase?: AppDatabase, bearer = token, anchor = accountAnchor) {
@@ -96,6 +106,33 @@ describe('Cindy grouped batch contract', () => {
        merged_into_task_id, thread_id, auto_update_paused, created_at, updated_at)
       VALUES ('task-batch-cas', '旧任务', '需求方', '旧描述', 'planned', NULL, NULL, NULL,
        '旧下一步', 'low', NULL, 1, NULL, NULL, NULL, 'active', NULL, NULL, 0, ?, ?)`).run(timestamp, timestamp);
+  }
+
+  function ownerDecisionOptionsAtStoredLength(target: number): CindyOwnerDecisionOptionInput[] {
+    const options: CindyOwnerDecisionOptionInput[] = Array.from({ length: 4 }, (_, index) => ({
+      option_key: `option-${index}`,
+      action: 'create_candidate',
+      title: '题',
+      describe: '描',
+      next_step: '步',
+    }));
+    let remaining = target - serializeCindyOwnerDecisionStoredOptions(options).length;
+    const fields = [
+      ['describe', 2_000],
+      ['next_step', 1_000],
+      ['title', 160],
+    ] as const;
+    for (const option of options) {
+      for (const [field, limit] of fields) {
+        const current = option[field] ?? '';
+        const added = Math.min(Math.max(remaining, 0), limit - current.length);
+        option[field] = `${current}${'x'.repeat(added)}`;
+        remaining -= added;
+      }
+    }
+    expect(remaining).toBe(0);
+    expect(serializeCindyOwnerDecisionStoredOptions(options).length).toBe(target);
+    return options;
   }
 
   it('可控 Agent 替身能把三条延续消息归为一个目标，同时把另一个目标和闲聊分开', async () => {
@@ -217,6 +254,59 @@ describe('Cindy grouped batch contract', () => {
     }
   });
 
+  it('owner decision canonical options 容量在 API、服务与 SQLite 使用同一 10000 字符上限', async () => {
+    const { app, database } = await makeApp();
+    const validReceipt = (await save(app, [source(50, '容量边界合法来源')], 'save-capacity-valid'))[0]!;
+    const validOptions = ownerDecisionOptionsAtStoredLength(CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH);
+    const valid = await submit(app, batch([validReceipt], {
+      decision_request_id: 'decision-capacity-valid',
+      batch_id: 'batch-capacity-valid',
+      primary_dispositions: [{
+        disposition_ref: 'capacity-valid',
+        source_receipt: validReceipt,
+        disposition: 'needs_owner',
+        owner_decision_key: 'capacity-valid',
+      }],
+      owner_decisions: [{ decision_key: 'capacity-valid', reason: '容量边界', options: validOptions }],
+    }));
+    expect(valid.statusCode).toBe(200);
+    expect(database.raw.prepare('SELECT length(options_json) AS length FROM cindy_owner_decision WHERE decision_key = ?')
+      .get('capacity-valid')).toEqual({ length: CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH });
+
+    const invalidReceipt = (await save(app, [source(51, '容量超限来源')], 'save-capacity-invalid'))[0]!;
+    const before = {
+      batches: database.raw.prepare('SELECT COUNT(*) AS count FROM cindy_batch').get(),
+      candidates: database.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get(),
+      units: database.raw.prepare('SELECT COUNT(*) AS count FROM source_demand_unit').get(),
+      audit: database.raw.prepare('SELECT COUNT(*) AS count FROM task_event').get(),
+    };
+    const invalid = await submit(app, batch([invalidReceipt], {
+      decision_request_id: 'decision-capacity-invalid',
+      batch_id: 'batch-capacity-invalid',
+      primary_dispositions: [{
+        disposition_ref: 'capacity-invalid',
+        source_receipt: invalidReceipt,
+        disposition: 'needs_owner',
+        owner_decision_key: 'capacity-invalid',
+      }],
+      owner_decisions: [{
+        decision_key: 'capacity-invalid',
+        reason: '容量超限',
+        options: ownerDecisionOptionsAtStoredLength(CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH + 1),
+      }],
+    }));
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.json().error).toMatch(/10000/u);
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM cindy_batch').get()).toEqual(before.batches);
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get()).toEqual(before.candidates);
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM source_demand_unit').get()).toEqual(before.units);
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM task_event').get()).toEqual(before.audit);
+    expect(database.raw.prepare(
+      `SELECT processing_status FROM source_event_revision
+        WHERE id = (SELECT current_revision_id FROM source_event WHERE content = ?)`,
+    ).get('容量超限来源')).toEqual({ processing_status: 'pending_decision' });
+  });
+
   it('候选与 update_task CAS 在同一批次失败时全部回滚，并发提交只允许一个 CAS 胜出', async () => {
     const { app, database } = await makeApp();
     seedTask(database);
@@ -263,7 +353,7 @@ describe('Cindy grouped batch contract', () => {
       primary_dispositions: [{ disposition_ref: 'seed', source_receipt: seedReceipt, disposition: 'group', primary_group_key: 'seed' }],
     }));
     const candidateId = seeded.json().groups[0].candidate_id as string;
-    const receipts = await save(app, [source(2, '需要主人判断 A'), source(3, '需要主人判断 B'), source(4, '可能追加'), source(5, '暂不处理')], 'save-owner-decisions');
+    const receipts = await save(app, [source(2, '需要主人判断 A'), source(3, '需要主人判断 B'), source(4, 'CANARY_PRIVATE_SOURCE_BODY'), source(5, '暂不处理')], 'save-owner-decisions');
     const submitted = await submit(app, batch(receipts, {
       decision_request_id: 'decision-owner-options', batch_id: 'batch-owner-options',
       primary_dispositions: [
@@ -282,18 +372,36 @@ describe('Cindy grouped batch contract', () => {
     expect(submitted.statusCode).toBe(200);
     const list = await app.inject({ method: 'GET', url: '/api/owner-decisions?status=all' });
     expect(list.statusCode).toBe(200);
-    expect(JSON.stringify(list.json())).not.toMatch(/source_receipt|synthetic-sender|batch-message|可能追加/u);
+    expect(JSON.stringify(list.json())).not.toMatch(/batch_id|source_receipt|source_revision|synthetic-sender|batch-message|CANARY_PRIVATE_SOURCE_BODY|prompt|reasoning/u);
+    expect(list.json().items.every((item: Record<string, unknown>) => !Object.hasOwn(item, 'last_error'))).toBe(true);
     const byReason = new Map(list.json().items.map((item: { reason_summary: string }) => [item.reason_summary, item]));
     const createDecision = byReason.get('是否建立新候选？') as { decision_id: string; version: number };
     const skipDecision = byReason.get('是否跳过？') as { decision_id: string; version: number };
     const appendDecision = byReason.get('是否追加？') as { decision_id: string; version: number; options: Array<{ available: boolean }> };
     const cancelDecision = byReason.get('是否暂不处理？') as { decision_id: string; version: number };
     expect(appendDecision.options[0]!.available).toBe(false);
+    const existingCandidateSources = database.raw.prepare(
+      `SELECT COUNT(*) AS count FROM source_demand_unit_source AS source
+        JOIN candidate_request AS candidate ON candidate.demand_unit_id = source.demand_unit_id
+       WHERE candidate.id = ?`,
+    ).get(candidateId);
+    const candidateCountBeforeAppend = database.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get();
     const appendDenied = await app.inject({
       method: 'POST', url: `/api/owner-decisions/${appendDecision.decision_id}/resolve`,
       payload: { decision_request_id: 'resolve-append', expected_version: 1, action: 'skip', option_key: 'append' },
     });
     expect(appendDenied.statusCode).toBe(400);
+    expect(database.raw.prepare(
+      `SELECT revision.processing_status FROM source_event_revision AS revision
+        JOIN cindy_owner_decision_source AS source ON source.source_revision_id = revision.id
+       WHERE source.decision_id = ?`,
+    ).get(appendDecision.decision_id)).toEqual({ processing_status: 'pending_decision' });
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get()).toEqual(candidateCountBeforeAppend);
+    expect(database.raw.prepare(
+      `SELECT COUNT(*) AS count FROM source_demand_unit_source AS source
+        JOIN candidate_request AS candidate ON candidate.demand_unit_id = source.demand_unit_id
+       WHERE candidate.id = ?`,
+    ).get(candidateId)).toEqual(existingCandidateSources);
 
     const created = await app.inject({
       method: 'POST', url: `/api/owner-decisions/${createDecision.decision_id}/resolve`,
@@ -301,6 +409,8 @@ describe('Cindy grouped batch contract', () => {
     });
     expect(created.statusCode).toBe(200);
     expect(created.json()).toMatchObject({ status: 'resolved', version: 2, resolution_action: 'create_candidate' });
+    expect(created.json()).toMatchObject({ last_attempt_failed: false });
+    expect(JSON.stringify(created.json())).not.toMatch(/batch_id|last_error|source_revision|source_receipt|prompt|reasoning/u);
     const replay = await app.inject({
       method: 'POST', url: `/api/owner-decisions/${createDecision.decision_id}/resolve`,
       payload: { decision_request_id: 'resolve-create', expected_version: createDecision.version, action: 'create_candidate', option_key: 'create' },
@@ -357,7 +467,7 @@ describe('Cindy grouped batch contract', () => {
     const retryDecisionId = retryBatch.json().owner_decisions[0].decision_id as string;
     database.raw.exec(`CREATE TRIGGER fail_owner_candidate BEFORE INSERT ON candidate_request
       WHEN NEW.analysis_json LIKE '%cindy_owner_decision%'
-      BEGIN SELECT RAISE(ABORT, 'synthetic owner resolution failure'); END;`);
+      BEGIN SELECT RAISE(ABORT, 'CANARY_INTERNAL_OWNER_ERROR'); END;`);
     const failed = await app.inject({
       method: 'POST', url: `/api/owner-decisions/${retryDecisionId}/resolve`,
       payload: { decision_request_id: 'resolve-retry-failed', expected_version: 1, action: 'create_candidate', option_key: 'create' },
@@ -365,6 +475,11 @@ describe('Cindy grouped batch contract', () => {
     expect(failed.statusCode).toBe(409);
     expect(database.raw.prepare('SELECT status, version, last_error FROM cindy_owner_decision WHERE id = ?').get(retryDecisionId))
       .toMatchObject({ status: 'pending', version: 1, last_error: expect.any(String) });
+    const retryList = await app.inject({ method: 'GET', url: '/api/owner-decisions?status=all' });
+    expect(retryList.statusCode).toBe(200);
+    const retryProjection = retryList.json().items.find((item: { decision_id: string }) => item.decision_id === retryDecisionId);
+    expect(retryProjection).toMatchObject({ last_attempt_failed: true });
+    expect(JSON.stringify(retryList.json())).not.toMatch(/batch_id|last_error|CANARY_INTERNAL_OWNER_ERROR|CANARY_PRIVATE_SOURCE_BODY|source_revision|source_receipt|prompt|reasoning/u);
     database.raw.exec('DROP TRIGGER fail_owner_candidate;');
     const retried = await app.inject({
       method: 'POST', url: `/api/owner-decisions/${retryDecisionId}/resolve`,
@@ -374,6 +489,80 @@ describe('Cindy grouped batch contract', () => {
     expect(retried.json().status).toBe('resolved');
     expect(database.raw.prepare('SELECT status FROM cindy_owner_decision WHERE id = ?').get(appendDecision.decision_id))
       .toEqual({ status: 'pending' });
+    expect(database.raw.prepare(
+      `SELECT revision.processing_status FROM source_event_revision AS revision
+        JOIN cindy_owner_decision_source AS source ON source.source_revision_id = revision.id
+       WHERE source.decision_id = ?`,
+    ).get(appendDecision.decision_id)).toEqual({ processing_status: 'pending_decision' });
+    expect(database.raw.prepare(
+      `SELECT COUNT(*) AS count FROM source_demand_unit_source AS source
+        JOIN candidate_request AS candidate ON candidate.demand_unit_id = source.demand_unit_id
+       WHERE candidate.id = ?`,
+    ).get(candidateId)).toEqual(existingCandidateSources);
+  });
+
+  it('磁盘 SQLite 双连接确定性覆盖 revision 先胜与 batch 先胜两种写入顺序', async () => {
+    const revisionFirstRoot = mkdtempSync(join(tmpdir(), 'cindy-batch-revision-first-'));
+    temporaryRoots.push(revisionFirstRoot);
+    const revisionFirstPath = join(revisionFirstRoot, 'shared.sqlite');
+    const revisionFirstBatchDb = new AppDatabase(revisionFirstPath, false);
+    const revisionFirstSaveDb = new AppDatabase(revisionFirstPath, false);
+    databases.push(revisionFirstBatchDb, revisionFirstSaveDb);
+    expect(revisionFirstBatchDb.raw).not.toBe(revisionFirstSaveDb.raw);
+    const { app: revisionFirstBatchApp } = await makeApp(revisionFirstBatchDb);
+    const { app: revisionFirstSaveApp } = await makeApp(revisionFirstSaveDb);
+    const oldReceipt = (await save(revisionFirstBatchApp, [source(52, '旧 revision')], 'save-race-a-v1'))[0]!;
+    const newerSource = source(52, '高 revision 先保存');
+    newerSource.revision = { sequence: 2 };
+    const currentReceipt = (await save(revisionFirstSaveApp, [newerSource], 'save-race-a-v2'))[0]!;
+    const staleBatch = await submit(revisionFirstBatchApp, batch([oldReceipt], {
+      decision_request_id: 'decision-race-a-stale',
+      batch_id: 'batch-race-a-stale',
+      groups: [{ group_key: 'stale', action: 'create_candidate', anchor_receipt: oldReceipt, field_evidence_receipts: [], title: '不得写入' }],
+      primary_dispositions: [{ disposition_ref: 'stale', source_receipt: oldReceipt, disposition: 'group', primary_group_key: 'stale' }],
+    }));
+    expect(staleBatch.statusCode).toBe(403);
+    expect(revisionFirstBatchDb.raw.prepare('SELECT COUNT(*) AS count FROM cindy_batch').get()).toEqual({ count: 0 });
+    expect(revisionFirstBatchDb.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get()).toEqual({ count: 0 });
+    expect(revisionFirstBatchDb.raw.prepare('SELECT COUNT(*) AS count FROM task').get()).toEqual({ count: 0 });
+    expect(revisionFirstBatchDb.raw.prepare('SELECT COUNT(*) AS count FROM source_demand_unit').get()).toEqual({ count: 0 });
+    expect(revisionFirstBatchDb.raw.prepare('SELECT COUNT(*) AS count FROM task_event').get()).toEqual({ count: 0 });
+    expect(revisionFirstBatchDb.raw.prepare(
+      `SELECT processing_status FROM source_event_revision
+        WHERE id = (SELECT current_revision_id FROM source_event WHERE content = ?)`,
+    ).get('高 revision 先保存')).toEqual({ processing_status: 'pending_decision' });
+    const currentRetry = await submit(revisionFirstBatchApp, batch([currentReceipt], {
+      decision_request_id: 'decision-race-a-current',
+      batch_id: 'batch-race-a-current',
+    }));
+    expect(currentRetry.statusCode).toBe(200);
+
+    const batchFirstRoot = mkdtempSync(join(tmpdir(), 'cindy-batch-batch-first-'));
+    temporaryRoots.push(batchFirstRoot);
+    const batchFirstPath = join(batchFirstRoot, 'shared.sqlite');
+    const batchFirstDb = new AppDatabase(batchFirstPath, false);
+    const laterSaveDb = new AppDatabase(batchFirstPath, false);
+    databases.push(batchFirstDb, laterSaveDb);
+    expect(batchFirstDb.raw).not.toBe(laterSaveDb.raw);
+    const { app: batchFirstApp } = await makeApp(batchFirstDb);
+    const { app: laterSaveApp } = await makeApp(laterSaveDb);
+    const batchFirstReceipt = (await save(batchFirstApp, [source(53, 'batch 先处理')], 'save-race-b-v1'))[0]!;
+    const winningBatch = await submit(batchFirstApp, batch([batchFirstReceipt], {
+      decision_request_id: 'decision-race-b-winning',
+      batch_id: 'batch-race-b-winning',
+      groups: [{ group_key: 'winning', action: 'create_candidate', anchor_receipt: batchFirstReceipt, field_evidence_receipts: [], title: '先落库候选' }],
+      primary_dispositions: [{ disposition_ref: 'winning', source_receipt: batchFirstReceipt, disposition: 'group', primary_group_key: 'winning' }],
+    }));
+    expect(winningBatch.statusCode).toBe(200);
+    const laterSource = source(53, '随后保存高 revision');
+    laterSource.revision = { sequence: 2 };
+    await save(laterSaveApp, [laterSource], 'save-race-b-v2');
+    expect(batchFirstDb.raw.prepare('SELECT COUNT(*) AS count FROM cindy_batch').get()).toEqual({ count: 1 });
+    expect(batchFirstDb.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get()).toEqual({ count: 1 });
+    expect(batchFirstDb.raw.prepare(
+      `SELECT processing_status FROM source_event_revision
+        WHERE id = (SELECT current_revision_id FROM source_event WHERE content = ?)`,
+    ).get('随后保存高 revision')).toEqual({ processing_status: 'pending_decision' });
   });
 
   it('旧 revision、伪造 receipt、跨 account 和同来源重复快照均 fail closed', async () => {

@@ -15,6 +15,10 @@ import {
   CindySourceContractError,
   deriveCindyAuthContext,
 } from './cindy-source.js';
+import {
+  CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH,
+  serializeCindyOwnerDecisionStoredOptions,
+} from './cindy-batch.js';
 import { assertShanghaiCalendarPlanRange } from './shanghai-time.js';
 import {
   candidateActionDtoSchema,
@@ -384,6 +388,27 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
     try {
       const isoTimestamp = z.string().datetime({ offset: true });
       const receipt = z.string().min(32).max(200);
+      const ownerDecision = z.object({
+        decision_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+        reason: z.string().trim().min(1).max(500),
+        options: z.array(z.object({
+          option_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+          action: z.enum(['skip', 'create_candidate', 'append_candidate']),
+          title: z.string().trim().min(1).max(160).optional(),
+          describe: z.string().trim().min(1).max(2_000).optional(),
+          next_step: z.string().trim().min(1).max(1_000).optional(),
+          candidate_key: z.string().trim().min(1).max(200).optional(),
+        }).strict()).min(1).max(10),
+      }).strict().superRefine((decision, context) => {
+        const projection = serializeCindyOwnerDecisionStoredOptions(decision.options);
+        if (projection.length > CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH) {
+          context.addIssue({
+            code: 'custom',
+            path: ['options'],
+            message: `owner decision options 聚合后不能超过 ${CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH} 个 SQLite 文本字符。`,
+          });
+        }
+      });
       const body = z.object({
         decision_request_id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
         batch_id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
@@ -415,18 +440,7 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
           source_receipt: receipt,
           shared_group_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
         }).strict()).max(500).optional(),
-        owner_decisions: z.array(z.object({
-          decision_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
-          reason: z.string().trim().min(1).max(500),
-          options: z.array(z.object({
-            option_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
-            action: z.enum(['skip', 'create_candidate', 'append_candidate']),
-            title: z.string().trim().min(1).max(160).optional(),
-            describe: z.string().trim().min(1).max(2_000).optional(),
-            next_step: z.string().trim().min(1).max(1_000).optional(),
-            candidate_key: z.string().trim().min(1).max(200).optional(),
-          }).strict()).min(1).max(10),
-        }).strict()).max(100).optional(),
+        owner_decisions: z.array(ownerDecision).max(100).optional(),
       }).strict().parse(request.body);
       return service.processCindyDecisions(cindyAuthContext(), body);
     } catch (error) {

@@ -81,6 +81,39 @@ const ownerActionText: Record<PendingOwnerAction['action'], string> = {
   delegate: '转交',
 };
 
+type OwnerDecisionInboxProps = {
+  decisions: CindyOwnerDecision[];
+  busy: string;
+  onResolve: (decision: CindyOwnerDecision, action: 'skip' | 'create_candidate', optionKey: string) => void;
+  onCancel: (decision: CindyOwnerDecision) => void;
+};
+
+export function OwnerDecisionInbox({ decisions, busy, onResolve, onCancel }: OwnerDecisionInboxProps) {
+  if (decisions.length === 0) return null;
+  return <section className="source-failure-inbox" aria-label="等待主人决定的来源">
+    <div className="source-failure-heading"><div><strong>等待你决定（{decisions.length}）</strong><span>Cindy 无法安全确定处理方式。这里只展示安全摘要，不显示聊天正文或技术标识。</span></div></div>
+    <div className="source-failure-list">
+      {decisions.map((decision) => <article className="source-failure-card" key={decision.decision_id}>
+        <div className="source-failure-card-main">
+          <div className="source-failure-card-title"><strong>{decision.reason_summary}</strong><span>{decision.source_count} 条已保存来源</span><em>等待确认</em></div>
+          {decision.last_attempt_failed && <p>上次执行未完成，请稍后重试。</p>}
+          <div className="candidate-owner-action-list">
+            {decision.options.map((option) => <section className="candidate-owner-action" key={option.option_key}>
+              <div><strong>{option.action === 'skip' ? '跳过' : option.action === 'create_candidate' ? option.title || '建立候选' : option.title || '追加到已有候选'}</strong><span>{option.available ? '可以执行' : '等待后续追加能力'}</span></div>
+              {option.describe && <p>{option.describe}</p>}
+              {option.next_step && <small>下一步：{option.next_step}</small>}
+              {option.available && option.action !== 'append_candidate' && <button className="secondary-button" type="button" disabled={Boolean(busy)} onClick={() => onResolve(decision, option.action === 'skip' ? 'skip' : 'create_candidate', option.option_key)}>
+                {option.action === 'skip' ? '确认跳过' : '建立候选'}
+              </button>}
+            </section>)}
+          </div>
+        </div>
+        <div className="source-failure-actions"><button className="quiet-button" type="button" disabled={Boolean(busy)} onClick={() => onCancel(decision)}>暂不处理</button></div>
+      </article>)}
+    </div>
+  </section>;
+}
+
 function formatCandidateTime(candidate: Candidate) {
   const range = candidate.analysis?.timeRange;
   if (!range || range.status === 'unknown' || (!range.startAt && !range.endAt)) return '未识别到时间';
@@ -724,28 +757,12 @@ export default function CandidatesPage() {
       </div>
       {message && <div className="success-banner">{message}</div>}
       {error && <div className="error-banner">{error}</div>}
-      {ownerDecisions.length > 0 && <section className="source-failure-inbox" aria-label="等待主人决定的来源">
-        <div className="source-failure-heading"><div><strong>等待你决定（{ownerDecisions.length}）</strong><span>Cindy 无法安全确定处理方式。这里只展示安全摘要，不显示聊天正文或技术标识。</span></div></div>
-        <div className="source-failure-list">
-          {ownerDecisions.map((decision) => <article className="source-failure-card" key={decision.decision_id}>
-            <div className="source-failure-card-main">
-              <div className="source-failure-card-title"><strong>{decision.reason_summary}</strong><span>{decision.source_count} 条已保存来源</span><em>等待确认</em></div>
-              {decision.last_error && <p>上次执行未完成：{decision.last_error}</p>}
-              <div className="candidate-owner-action-list">
-                {decision.options.map((option) => <section className="candidate-owner-action" key={option.option_key}>
-                  <div><strong>{option.action === 'skip' ? '跳过' : option.action === 'create_candidate' ? option.title || '建立候选' : option.title || '追加到已有候选'}</strong><span>{option.available ? '可以执行' : '等待后续追加能力'}</span></div>
-                  {option.describe && <p>{option.describe}</p>}
-                  {option.next_step && <small>下一步：{option.next_step}</small>}
-                  {option.available && option.action !== 'append_candidate' && <button className="secondary-button" type="button" disabled={Boolean(busy)} onClick={() => void resolveOwnerDecision(decision, option.action === 'skip' ? 'skip' : 'create_candidate', option.option_key)}>
-                    {option.action === 'skip' ? '确认跳过' : '建立候选'}
-                  </button>}
-                </section>)}
-              </div>
-            </div>
-            <div className="source-failure-actions"><button className="quiet-button" type="button" disabled={Boolean(busy)} onClick={() => void cancelOwnerDecision(decision)}>暂不处理</button></div>
-          </article>)}
-        </div>
-      </section>}
+      <OwnerDecisionInbox
+        decisions={ownerDecisions}
+        busy={busy}
+        onResolve={(decision, action, optionKey) => { void resolveOwnerDecision(decision, action, optionKey); }}
+        onCancel={(decision) => { void cancelOwnerDecision(decision); }}
+      />
       {hasSourceFailureHistory && <section className="source-failure-inbox" aria-label="失败来源收件箱">
         <div className="source-failure-heading">
           <div><strong>失败来源收件箱（{activeSourceFailures.length}）</strong><span>来源已保存，但 AI 整理没有完成。这里不显示聊天正文，只提供脱敏诊断和主人确认后的本地重试。</span></div>

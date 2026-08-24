@@ -14,6 +14,17 @@ export type CindyOwnerDecisionOptionInput = {
   candidate_key?: string;
 };
 
+export type CindyOwnerDecisionStoredOption = {
+  optionKey: string;
+  action: CindyOwnerDecisionOptionAction;
+  title: string | null;
+  describe: string | null;
+  nextStep: string | null;
+  candidateKey: string | null;
+};
+
+export const CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH = 10_000;
+
 export type CindyBatchInput = {
   decision_request_id: string;
   batch_id: string;
@@ -54,7 +65,6 @@ export type CindyBatchInput = {
 
 export type CindyOwnerDecisionDto = {
   decision_id: string;
-  batch_id: string;
   status: CindyOwnerDecisionStatus;
   version: number;
   reason_summary: string;
@@ -67,7 +77,7 @@ export type CindyOwnerDecisionDto = {
     available: boolean;
   }>;
   source_count: number;
-  last_error: string | null;
+  last_attempt_failed: boolean;
   resolution_action: 'skip' | 'create_candidate' | null;
   resolved_candidate_id: string | null;
   created_at: string;
@@ -112,6 +122,29 @@ export type CancelCindyOwnerDecisionInput = {
 
 export const cindyBatchKeyPattern = /^[A-Za-z0-9_-]{1,128}$/u;
 export const cindyGroupKeyPattern = /^[A-Za-z0-9_-]{1,64}$/u;
+
+export function projectCindyOwnerDecisionStoredOptions(
+  options: readonly CindyOwnerDecisionOptionInput[],
+): CindyOwnerDecisionStoredOption[] {
+  return options.map((option) => ({
+    optionKey: option.option_key,
+    action: option.action,
+    title: option.title ?? (option.action === 'append_candidate' ? '追加到已有候选' : null),
+    describe: option.describe ?? null,
+    nextStep: option.next_step ?? null,
+    candidateKey: option.action === 'append_candidate' ? option.candidate_key ?? null : null,
+  }));
+}
+
+export function sqliteTextLength(value: string) {
+  return [...value].length;
+}
+
+export function serializeCindyOwnerDecisionStoredOptions(options: readonly CindyOwnerDecisionOptionInput[]) {
+  const storedOptions = projectCindyOwnerDecisionStoredOptions(options);
+  const json = JSON.stringify(storedOptions);
+  return { storedOptions, json, length: sqliteTextLength(json) };
+}
 
 function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize);

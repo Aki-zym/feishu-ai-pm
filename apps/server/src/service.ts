@@ -48,16 +48,19 @@ import {
   type CindySaveSourcesInput,
 } from './cindy-source.js';
 import {
+  CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH,
   cindyBatchKeyPattern,
   cindyGroupKeyPattern,
   hashCindyBatchInput,
   hashCindyBatchSnapshot,
   hashCindyOwnerDecisionResolution,
+  serializeCindyOwnerDecisionStoredOptions,
   type CancelCindyOwnerDecisionInput,
   type CindyBatchInput,
   type CindyBatchResult,
   type CindyOwnerDecisionDto,
   type CindyOwnerDecisionOptionInput,
+  type CindyOwnerDecisionStoredOption,
   type ResolveCindyOwnerDecisionInput,
 } from './cindy-batch.js';
 import type { ClassificationResult, ClassificationUnitResult, DurableEventReceipt, FeishuScopeUpdate, IntegrationCheck } from './integration-contracts.js';
@@ -1335,15 +1338,6 @@ type SourceEventRow = {
   current_revision_id: string | null;
 };
 
-type CindyOwnerDecisionStoredOption = {
-  optionKey: string;
-  action: 'skip' | 'create_candidate' | 'append_candidate';
-  title: string | null;
-  describe: string | null;
-  nextStep: string | null;
-  candidateKey: string | null;
-};
-
 type CindyOwnerDecisionRow = {
   id: string;
   owner_scope: string;
@@ -1394,7 +1388,6 @@ function parseCindyOwnerDecisionOptions(value: string): CindyOwnerDecisionStored
 function projectCindyOwnerDecision(row: CindyOwnerDecisionRow, sourceCount: number): CindyOwnerDecisionDto {
   return {
     decision_id: row.id,
-    batch_id: row.batch_id,
     status: row.status,
     version: row.version,
     reason_summary: row.reason_summary,
@@ -1407,13 +1400,23 @@ function projectCindyOwnerDecision(row: CindyOwnerDecisionRow, sourceCount: numb
       available: option.action !== 'append_candidate',
     })),
     source_count: sourceCount,
-    last_error: row.last_error,
+    last_attempt_failed: row.last_error !== null,
     resolution_action: row.resolution_action,
     resolved_candidate_id: row.resolved_candidate_id,
     created_at: row.created_at,
     updated_at: row.updated_at,
     resolved_at: row.resolved_at,
   };
+}
+
+function loadProjectedCindyOwnerDecision(database: AppDatabase, decisionId: string): CindyOwnerDecisionDto {
+  const row = database.raw.prepare(
+    `SELECT decision.*,
+            (SELECT COUNT(*) FROM cindy_owner_decision_source AS source WHERE source.decision_id = decision.id) AS source_count
+       FROM cindy_owner_decision AS decision WHERE decision.id = ?`,
+  ).get(decisionId) as (CindyOwnerDecisionRow & { source_count: number }) | undefined;
+  if (!row) throw new CindySourceContractError('CONFLICT', '主人决定状态无法读取。');
+  return projectCindyOwnerDecision(row, row.source_count);
 }
 
 const nowIso = () => new Date().toISOString();
@@ -14021,7 +14024,12 @@ export class PmService {
       ).get(auth.ownerScope, auth.accountAnchor, input.batch_id) as { payload_hash: string; response_json: string } | undefined;
       if (replay) {
         if (replay.payload_hash !== payloadHash) throw new CindySourceContractError('CONFLICT', 'batch_id 已绑定到不同 canonical payload。');
-        return { ...(JSON.parse(replay.response_json) as CindyDecisionResult), duplicate: true };
+        const stored = JSON.parse(replay.response_json) as CindyDecisionResult;
+        return {
+          ...stored,
+          duplicate: true,
+          owner_decisions: stored.owner_decisions.map((decision) => loadProjectedCindyOwnerDecision(this.database, decision.decision_id)),
+        };
       }
       const requestReplay = this.database.raw.prepare(
         `SELECT batch_id, payload_hash FROM cindy_batch
@@ -14103,26 +14111,31 @@ export class PmService {
           .sort((left, right) => left.disposition_ref.localeCompare(right.disposition_ref));
         const sources = dispositions.map((item) => sourceByRevision.get(revisionByReceipt.get(item.source_receipt)!.id)!);
         const sourceContents = sources.map((source) => source.content);
-        const storedOptions: CindyOwnerDecisionStoredOption[] = decision.options.map((option: CindyOwnerDecisionOptionInput) => {
-          let candidateTitle: string | null = null;
+        const sanitizedOptions: CindyOwnerDecisionOptionInput[] = decision.options.map((option: CindyOwnerDecisionOptionInput) => {
           if (option.action === 'append_candidate') {
             const candidate = this.database.raw.prepare(
-              `SELECT id, title FROM candidate_request WHERE id = ? AND deleted_at IS NULL AND state <> 'accepted'`,
-            ).get(option.candidate_key!) as { id: string; title: string } | undefined;
+              `SELECT id FROM candidate_request WHERE id = ? AND deleted_at IS NULL AND state <> 'accepted'`,
+            ).get(option.candidate_key!) as { id: string } | undefined;
             if (!candidate) throw new CindySourceContractError('CONFLICT', 'append_candidate 意图对应候选不可用。');
-            candidateTitle = safeCandidateNarrative(candidate.title, sourceContents, '已有候选', 160);
           }
           return {
-            optionKey: option.option_key,
+            option_key: option.option_key,
             action: option.action,
             title: option.title === undefined
-              ? candidateTitle
+              ? option.action === 'append_candidate' ? '追加到已有候选' : undefined
               : safeCandidateNarrative(option.title, sourceContents, option.action === 'create_candidate' ? '待主人确认的新候选' : '已有候选', 160),
-            describe: option.describe === undefined ? null : safeCandidateNarrative(option.describe, sourceContents, '候选摘要待主人确认。', 2_000),
-            nextStep: option.next_step === undefined ? null : safeCandidateNarrative(option.next_step, sourceContents, '下一步待主人确认。', 1_000),
-            candidateKey: option.action === 'append_candidate' ? option.candidate_key! : null,
+            describe: option.describe === undefined ? undefined : safeCandidateNarrative(option.describe, sourceContents, '候选摘要待主人确认。', 2_000),
+            next_step: option.next_step === undefined ? undefined : safeCandidateNarrative(option.next_step, sourceContents, '下一步待主人确认。', 1_000),
+            candidate_key: option.action === 'append_candidate' ? option.candidate_key! : undefined,
           };
         });
+        const serializedOptions = serializeCindyOwnerDecisionStoredOptions(sanitizedOptions);
+        if (serializedOptions.length > CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH) {
+          throw new CindySourceContractError(
+            'INVALID_INPUT',
+            `owner decision options 聚合后不能超过 ${CINDY_OWNER_DECISION_OPTIONS_JSON_MAX_LENGTH} 个 SQLite 文本字符。`,
+          );
+        }
         const decisionId = id('cindy_owner_decision');
         const reasonSummary = safeCandidateNarrative(decision.reason, sourceContents, '这组来源需要主人决定如何处理。', 500);
         this.database.raw.prepare(
@@ -14131,7 +14144,7 @@ export class PmService {
              status, version, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?)`,
         ).run(decisionId, auth.ownerScope, auth.accountAnchor, input.batch_id, decisionKey, reasonSummary,
-          JSON.stringify(storedOptions), timestamp, timestamp);
+          serializedOptions.json, timestamp, timestamp);
         dispositions.forEach((disposition, index) => {
           const revision = revisionByReceipt.get(disposition.source_receipt)!;
           this.database.raw.prepare(
@@ -14353,7 +14366,7 @@ export class PmService {
           if (row.resolution_payload_hash !== payloadHash || !row.resolution_response_json) {
             throw new CindySourceContractError('CONFLICT', 'decision_request_id 已绑定到不同主人决定 payload。');
           }
-          return JSON.parse(row.resolution_response_json) as CindyOwnerDecisionDto;
+          return loadProjectedCindyOwnerDecision(this.database, row.id);
         }
         if (row.status !== 'pending') throw new CindyIntakeConflictError('主人决定已不再等待处理。', row.version);
         if (row.version !== input.expected_version) throw new CindyIntakeConflictError('主人决定已变化，请刷新后重试。', row.version);
@@ -14451,8 +14464,7 @@ export class PmService {
             WHERE id = ? AND status = 'pending' AND version = ?`,
         ).run(nextVersion, input.action, input.decision_request_id, payloadHash, candidateId,
           timestamp, timestamp, row.id, row.version);
-        const resolved = this.database.raw.prepare('SELECT * FROM cindy_owner_decision WHERE id = ?').get(row.id) as CindyOwnerDecisionRow;
-        const dto = projectCindyOwnerDecision(resolved, sourceRows.length);
+        const dto = loadProjectedCindyOwnerDecision(this.database, row.id);
         this.database.raw.prepare(
           `UPDATE cindy_owner_decision SET resolution_response_json = ? WHERE id = ?`,
         ).run(JSON.stringify(dto), row.id);
@@ -14497,7 +14509,7 @@ export class PmService {
           || !priorResolution.resolution_response_json) {
           throw new CindySourceContractError('CONFLICT', 'decision_request_id 已绑定到其他主人决定或 payload。');
         }
-        return JSON.parse(priorResolution.resolution_response_json) as CindyOwnerDecisionDto;
+        return loadProjectedCindyOwnerDecision(this.database, row.id);
       }
       if (row.status !== 'pending') throw new CindyIntakeConflictError('主人决定已不再等待处理。', row.version);
       if (row.version !== input.expected_version) throw new CindyIntakeConflictError('主人决定已变化，请刷新后重试。', row.version);
@@ -14510,11 +14522,7 @@ export class PmService {
           WHERE id = ? AND status = 'pending' AND version = ?`,
       ).run(nextVersion, input.decision_request_id, payloadHash, timestamp, row.id, row.version);
       if (changed.changes !== 1) throw new CindyIntakeConflictError('主人决定已变化，请刷新后重试。');
-      const sourceCount = (this.database.raw.prepare(
-        'SELECT COUNT(*) AS count FROM cindy_owner_decision_source WHERE decision_id = ?',
-      ).get(row.id) as { count: number }).count;
-      const cancelled = this.database.raw.prepare('SELECT * FROM cindy_owner_decision WHERE id = ?').get(row.id) as CindyOwnerDecisionRow;
-      const dto = projectCindyOwnerDecision(cancelled, sourceCount);
+      const dto = loadProjectedCindyOwnerDecision(this.database, row.id);
       this.database.raw.prepare('UPDATE cindy_owner_decision SET resolution_response_json = ? WHERE id = ?')
         .run(JSON.stringify(dto), row.id);
       return dto;
