@@ -65,7 +65,7 @@ const openExternalLink = createExternalLinkOpener((url) => shell.openExternal(ur
 const handleExternalLinkIpc = createExternalLinkIpcHandler(verifyRenderer, openExternalLink);
 
 const allowedRequest = z.object({
-  method: z.enum(['GET', 'POST', 'PATCH', 'DELETE']),
+  method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
   url: z.string().min(1).max(2048).refine((value) => value.startsWith('/api/'), '只允许调用本地服务 API。'),
   body: z.unknown().optional(),
 });

@@ -45,6 +45,12 @@ function requestTraceContext(request: FastifyRequest) {
   return { traceId: header('x-trace-id'), parentSpanId: header('x-parent-span-id') };
 }
 
+function isLoopbackRequest(request: FastifyRequest) {
+  const remoteAddress = request.socket.remoteAddress ?? request.ip;
+  const normalizedAddress = remoteAddress?.replace(/^::ffff:/u, '').replace(/^\[|\]$/gu, '').split('%')[0];
+  return normalizedAddress === '127.0.0.1' || normalizedAddress === '::1';
+}
+
 function candidateMutationError(error: unknown, fallback: string, current?: unknown) {
   const message = error instanceof Error ? error.message : fallback;
   if (error instanceof CandidateVersionRequiredError) {
@@ -82,6 +88,7 @@ type BuildAppOptions = {
   desktopCapability?: LocalActionCapability;
   cindyIntegrationToken?: string;
   runtimeShutdown?: () => Promise<void> | void;
+  runtimeRestart?: () => Promise<void> | void;
   logger?: boolean;
 };
 
@@ -202,6 +209,7 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
   const app = Fastify({ logger: options.logger ?? process.env.NODE_ENV !== 'test' });
   await app.register(cors, { origin: webOrigin });
   let runtimeShutdownScheduled = false;
+  let runtimeRestartScheduled = false;
 
   app.addHook('onRequest', async (request, reply) => {
     if (!request.url.startsWith('/api/integrations/cindy/')) return;
@@ -219,10 +227,7 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
 
   app.get('/api/health', async () => service.health(randomUUID()));
   app.post('/api/runtime/shutdown', async (request, reply) => {
-    const remoteAddress = request.socket.remoteAddress ?? request.ip;
-    const normalizedAddress = remoteAddress?.replace(/^::ffff:/u, '').replace(/^\[|\]$/gu, '').split('%')[0];
-    const isLoopback = normalizedAddress === '127.0.0.1' || normalizedAddress === '::1';
-    if (!isLoopback) return reply.code(403).send({ error: '后台关闭接口只接受本机请求。' });
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: '后台关闭接口只接受本机请求。' });
     if (!options.runtimeShutdown) return reply.code(409).send({ error: '当前运行方式不支持关闭后台进程。' });
     if (runtimeShutdownScheduled) return reply.code(409).send({ error: '后台进程已经在退出。' });
     runtimeShutdownScheduled = true;
@@ -231,6 +236,28 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
       void Promise.resolve(options.runtimeShutdown?.()).catch(() => undefined);
     }, 25);
     return reply;
+  });
+  app.post('/api/runtime/restart', async (request, reply) => {
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: '后台重启接口只接受本机请求。' });
+    if (!options.runtimeRestart) return reply.code(409).send({ error: '当前运行方式不支持重启后台进程。' });
+    if (runtimeShutdownScheduled) return reply.code(409).send({ error: '后台进程已经在退出。' });
+    if (runtimeRestartScheduled) return reply.code(409).send({ error: '后台进程已经在重启。' });
+    runtimeRestartScheduled = true;
+    reply.code(200).send({ message: '本机任务库后台已收到重启请求，4310 即将重新监听。' });
+    setTimeout(() => {
+      void Promise.resolve(options.runtimeRestart?.()).catch(() => undefined);
+    }, 25);
+    return reply;
+  });
+  app.get('/api/runtime/auto-scan', async (request, reply) => {
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: '自动扫描开关只接受本机请求。' });
+    return service.autoScanSettings();
+  });
+  app.put('/api/runtime/auto-scan', async (request, reply) => {
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: '自动扫描开关只接受本机请求。' });
+    const body = z.object({ enabled: z.boolean() }).strict().safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: '自动扫描开关需要布尔值 enabled。' });
+    return service.updateAutoScanSettings(body.data.enabled);
   });
   registerSeedIntakeRoute(app, service);
   app.get('/api/dashboard', async () => dashboardDtoSchema.parse(service.dashboard()));
@@ -304,7 +331,11 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
     }
   });
   app.get('/api/integrations/health', async () => service.integrationHealth());
-  app.get('/api/integrations/cindy/tasks', async () => ({ items: service.listCindyTasks() }));
+  app.get('/api/integrations/cindy/tasks', async () => ({
+    items: service.listCindyTasks(),
+    candidates: service.listCindyCandidates(),
+    cursors: service.listCindyConversationCursors(),
+  }));
   app.post('/api/integrations/cindy/intake', async (request, reply) => {
     try {
       const isoTimestamp = z.string().datetime({ offset: true });

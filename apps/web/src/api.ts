@@ -12,7 +12,7 @@ export class ApiRequestError extends Error {
   }
 }
 
-async function request<T>(method: 'GET' | 'POST' | 'PATCH' | 'DELETE', url: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+async function request<T>(method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE', url: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const desktop = desktopBridge();
   if (desktop) {
     const response = await desktop.api.request({ method, url, body });
@@ -39,6 +39,7 @@ async function request<T>(method: 'GET' | 'POST' | 'PATCH' | 'DELETE', url: stri
 export const api = {
   get: <T>(url: string, signal?: AbortSignal) => request<T>('GET', url, undefined, signal),
   post: <T>(url: string, body: unknown) => request<T>('POST', url, body),
+  put: <T>(url: string, body: unknown) => request<T>('PUT', url, body),
   patch: <T>(url: string, body: unknown) => request<T>('PATCH', url, body),
   delete: <T>(url: string, body?: unknown) => request<T>('DELETE', url, body),
 };

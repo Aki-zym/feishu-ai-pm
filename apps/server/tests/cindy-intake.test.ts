@@ -70,6 +70,94 @@ describe('Cindy 对话入库接口', () => {
     expect(response.json().items.some((item: { id: string }) => item.id === 'task-cindy-intake-archived')).toBe(false);
   });
 
+  it('自动扫描开关只接受本机请求，默认关闭并持久化 enabled 状态', async () => {
+    const { app, database } = await makeApp();
+    const initial = await app.inject({ method: 'GET', url: '/api/runtime/auto-scan', remoteAddress: '127.0.0.1' });
+    expect(initial.statusCode).toBe(200);
+    expect(initial.json()).toMatchObject({ enabled: false });
+
+    const enabled = await app.inject({
+      method: 'PUT',
+      url: '/api/runtime/auto-scan',
+      remoteAddress: '127.0.0.1',
+      payload: { enabled: true },
+    });
+    expect(enabled.statusCode).toBe(200);
+    expect(enabled.json()).toEqual({ enabled: true });
+    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'auto_scan_enabled'").get()).toEqual({ value_json: '{"enabled":true}' });
+
+    const remote = await app.inject({ method: 'GET', url: '/api/runtime/auto-scan', remoteAddress: '203.0.113.10' });
+    expect(remote.statusCode).toBe(403);
+    const remotePut = await app.inject({
+      method: 'PUT',
+      url: '/api/runtime/auto-scan',
+      remoteAddress: '203.0.113.10',
+      payload: { enabled: false },
+    });
+    expect(remotePut.statusCode).toBe(403);
+
+    const invalid = await app.inject({
+      method: 'PUT',
+      url: '/api/runtime/auto-scan',
+      remoteAddress: '127.0.0.1',
+      payload: { enabled: 'true' },
+    });
+    expect(invalid.statusCode).toBe(400);
+  });
+
+  it('任务快照包含 pending 候选和会话游标，无会话来源不生成 source 或游标', async () => {
+    const { app, database } = await makeApp();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/intake',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        window_id: 'window-20260824-snapshot',
+        window_start: '2026-08-24T00:00:00.000Z',
+        window_end: '2026-08-24T00:10:00.000Z',
+        sources: [
+          source,
+          source2,
+          {
+            source_key: 's-no-conversation',
+            occurred_at: '2026-08-24T00:09:00.000Z',
+            text: '无会话来源的候选。',
+          },
+        ],
+        proposals: [
+          { action: 'create_candidate', source_keys: ['s1'], title: '会话候选', describe: '带会话来源。' },
+          { action: 'create_candidate', source_keys: ['s-no-conversation'], title: '无会话候选', describe: '不带会话来源。' },
+        ],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+
+    const snapshot = await app.inject({
+      method: 'GET',
+      url: '/api/integrations/cindy/tasks',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(snapshot.statusCode).toBe(200);
+    const body = snapshot.json() as {
+      items: Array<Record<string, unknown>>;
+      candidates: Array<Record<string, unknown>>;
+      cursors: Array<Record<string, unknown>>;
+    };
+    expect(body.items.find((item) => item.title === '会话候选')).toBeUndefined();
+    expect(body.candidates.find((item) => item.title === '会话候选')).toMatchObject({
+      title: '会话候选',
+      describe: '带会话来源。',
+      status: 'pending',
+      source: { conversation_key: 'conversation-1' },
+      version: 1,
+    });
+    const noConversation = body.candidates.find((item) => item.title === '无会话候选');
+    expect(noConversation).toMatchObject({ title: '无会话候选', status: 'pending', version: 1 });
+    expect(noConversation).not.toHaveProperty('source');
+    expect(body.cursors).toEqual([{ conversation_key: 'conversation-1', last_occurred_at: source2.occurred_at }]);
+    expect(database.raw.prepare("SELECT COUNT(*) AS count FROM sync_cursor WHERE integration = 'cindy_conversation'").get()).toEqual({ count: 1 });
+  });
+
   it('窗口幂等、跨窗来源去重，多来源候选只建立一张候选且挂上全部来源', async () => {
     const { app, database } = await makeApp();
     const payload = {

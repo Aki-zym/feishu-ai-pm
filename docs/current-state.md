@@ -26,9 +26,10 @@ Issue #39 FSH-01（验证 ID `VER-ISSUE39-FSH01-L3-20260816`）的 owner message
 - PR #81、PR #83、PR #84 与旧 PR #82 的最终 docs/evidence head、merge-ref、parents 与 run/job 只用于历史证据新鲜度，写在各自 PR body，不替代产品/构建 source；PR #86 / Issue #36 与 PR #87 / Issue #42 已合入/关闭，PR #87 的 exact head、merge-ref、parents 与 run/job 仅作为历史 provenance。
 - Issue #29 目标快照竞态修复行为/source 为 `60e10b1f1f9df0c9580772487e07b623e600a03e`；该提交是基于当前 integration tip 的普通 merge，包含 owner snapshot schema/CAS 兼容和退休目标 stale 结算修复。最终 exact head/merge-ref/tree/parents/run/job 以 PR #93 body 绑定；旧 head/CI 仅作 historical evidence。
 - Issue #45 / PROD-01 已由 PR #92 合入并 POST_MERGE_STABLE；默认候选、任务、线程、提案、主人信息和操作回执使用严格最小 DTO，不返回来源正文、稳定/外部 ID、provider/raw error 或未经核验自由文本。安全派生摘要仅对长度门槛的整段/近整段复制、NFKC/跨空白复现、结构化 Feishu/Docx token、URL/路径、UUID 和 secret-like token fail-closed；主人核验仍为显式、task-scoped、私有审计且 `external_action: none`，仅核验本地保存快照并返回带时间的 provider unknown/last-known 状态。验证 ID 为 `VER-ISSUE45-PROD01-SOURCE-PRIVACY-L4-20260816`；证据仅 synthetic/local L2-L4，不外推真实租户、provider、Windows L5 或 L6。
-- 产品阶段：`M1：Windows 桌面成熟化`。
+- 产品阶段：`M1：本机任务库与 Cindy 插件入口维护`。
 - Issue #29 的 owner_decision 退休闭环验证 ID 为 `VER-ISSUE29-OWNER-RETIREMENT-L2-20260816`；证据仅限 synthetic SQLite/service L2，不代表真实 provider、飞书租户、生产数据或 Windows L5/L6。
-- 正式载体：Windows Electron EXE；React 是内嵌界面。
+- 当前使用入口：Cindy 插件 + 本机后台 + 浏览器，默认地址为 `http://127.0.0.1:4310`。
+- Windows Electron EXE 属于遗留载体，用于安装包证据和维护验证；React 网页界面继续由浏览器入口提供。
 - 产品版本：`0.2.0`。
 - server Vitest 门禁固定使用 single-thread threads pool、`--no-file-parallelism` 与单 worker；默认 5 秒 test timeout 仍保留，不通过提高 timeout 掩盖迁移或 worker 收尾问题。JSON 报告只有在子进程真实 zero exit、无失败测试且至少有一项通过时才算通过。
 
@@ -83,7 +84,9 @@ M1 与首轮试点固定为 draft-only；当前没有发送执行路径，只生
 
 对象级数据权威、状态机、错误合同和 ADR supersession 以 [领域合同](domain-contracts.md) 为准，本页不复制第二套定义。
 
-## 当前安装包
+## Windows 遗留安装包
+
+本节只记录 Windows Electron/EXE 遗留载体的安装包和验证事实；当前使用从上面的 Cindy 插件与浏览器入口开始。
 
 - 文件：`release/Feishu-AI-PM-0.2.0-x64-Setup.exe`。
 - 产品/构建 source commit：`f9e77aec70aaa846047f987672c9171e0790846a`；artifact/record carrier ancestor：`3dcd9d0779542a7f3b6beebe73048273a0eff68a`。

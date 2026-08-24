@@ -19,6 +19,7 @@ type Integration = { id: string; name: string; adapter: string; status: string; 
 type Configuration = { liveConnectionsEnabled: boolean; notice: string; integrations: Integration[] };
 type IntegrationHealth = IntegrationHealthDto;
 type HealthResponse = HealthDto;
+type RuntimeAutoScan = { enabled: boolean };
 type OwnerInformation = {
   owner: null | {
     name: string;
@@ -83,14 +84,19 @@ export default function SettingsPage() {
   const [automationPolicyResource, setAutomationPolicyResource] = useState<ResourceState<AutomationPolicy>>(loadingResource);
   const [integrationHealthResource, setIntegrationHealthResource] = useState<ResourceState<IntegrationHealth[]>>(loadingResource);
   const [healthResource, setHealthResource] = useState<ResourceState<HealthSnapshot>>(loadingResource);
+  const [autoScanResource, setAutoScanResource] = useState<ResourceState<RuntimeAutoScan>>(loadingResource);
   const configurationGenerationRef = useRef({ current: 0 });
   const ownerInformationGenerationRef = useRef({ current: 0 });
   const automationPolicyGenerationRef = useRef({ current: 0 });
   const integrationHealthGenerationRef = useRef({ current: 0 });
   const healthGenerationRef = useRef({ current: 0 });
+  const autoScanGenerationRef = useRef({ current: 0 });
   const syncGenerationRef = useRef({ current: 0 });
   const desktopConfigGenerationRef = useRef({ current: 0 });
   const [automationSaving, setAutomationSaving] = useState(false);
+  const [autoScanSaving, setAutoScanSaving] = useState(false);
+  const [autoScanMessage, setAutoScanMessage] = useState('');
+  const [autoScanError, setAutoScanError] = useState(false);
   const [desktopConfig, setDesktopConfig] = useState<PublicDesktopConfig | null>(null);
   const [savedDesktopConfig, setSavedDesktopConfig] = useState<PublicDesktopConfig | null>(null);
   const [secretInput, setSecretInput] = useState<DesktopConfigInput['secrets']>({});
@@ -105,6 +111,8 @@ export default function SettingsPage() {
   const [listenerActionState, setListenerActionState] = useState<'start' | 'stop' | 'sync' | null>(null);
   const [runtimeShutdownState, setRuntimeShutdownState] = useState<'idle' | 'pending' | 'warning' | 'success' | 'error'>('idle');
   const [runtimeShutdownMessage, setRuntimeShutdownMessage] = useState('');
+  const [runtimeRestartState, setRuntimeRestartState] = useState<'idle' | 'pending' | 'success' | 'error'>('idle');
+  const [runtimeRestartMessage, setRuntimeRestartMessage] = useState('');
   const [runtimeExited, setRuntimeExited] = useState(false);
   const listenerActionRef = useRef(false);
   const desktop = desktopBridge();
@@ -117,19 +125,22 @@ export default function SettingsPage() {
     const automationPolicyRequest = beginResourceRequest(automationPolicyGenerationRef.current);
     const integrationHealthRequest = beginResourceRequest(integrationHealthGenerationRef.current);
     const healthRequest = beginResourceRequest(healthGenerationRef.current);
+    const autoScanRequest = beginResourceRequest(autoScanGenerationRef.current);
     const desktopConfigRequest = beginResourceRequest(desktopConfigGenerationRef.current);
     setConfigurationResource((current) => beginResource(current));
     setOwnerInformationResource((current) => beginResource(current));
     setAutomationPolicyResource((current) => beginResource(current));
     setIntegrationHealthResource(loadingResource<IntegrationHealth[]>());
     setHealthResource(loadingResource<HealthSnapshot>());
+    setAutoScanResource((current) => beginResource(current));
     void Promise.allSettled([
       api.get<Configuration>('/api/configuration'),
       api.get<OwnerInformation>('/api/owner-information'),
       api.get<AutomationPolicy>('/api/automation-policy'),
       api.get<IntegrationHealth[]>('/api/integrations/health'),
       api.get<HealthResponse>('/api/health'),
-    ]).then(([configurationResult, ownerResult, automationResult, integrationHealthResult, healthResult]) => {
+      api.get<RuntimeAutoScan>('/api/runtime/auto-scan'),
+    ]).then(([configurationResult, ownerResult, automationResult, integrationHealthResult, healthResult, autoScanResult]) => {
       if (configurationResult.status === 'fulfilled') {
         if (isLatestResourceRequest(configurationGenerationRef.current, configurationRequest)) setConfigurationResource(successResource(configurationResult.value));
       } else if (isLatestResourceRequest(configurationGenerationRef.current, configurationRequest)) {
@@ -154,6 +165,11 @@ export default function SettingsPage() {
         if (isLatestResourceRequest(healthGenerationRef.current, healthRequest)) setHealthResource(successResource(normalizeHealth(healthResult.value)));
       } else if (isLatestResourceRequest(healthGenerationRef.current, healthRequest)) {
         setHealthResource(failureResource(loadingResource<HealthSnapshot>(), healthResult.reason instanceof Error ? healthResult.reason.message : '系统就绪状态读取失败。'));
+      }
+      if (autoScanResult.status === 'fulfilled') {
+        if (isLatestResourceRequest(autoScanGenerationRef.current, autoScanRequest)) setAutoScanResource(successResource(autoScanResult.value));
+      } else if (isLatestResourceRequest(autoScanGenerationRef.current, autoScanRequest)) {
+        setAutoScanResource(failureResource(loadingResource<RuntimeAutoScan>(), autoScanResult.reason instanceof Error ? autoScanResult.reason.message : '自动扫描设置读取失败。'));
       }
     });
     if (desktop) desktop.config.get().then((config) => {
@@ -227,6 +243,20 @@ export default function SettingsPage() {
     } catch (error) {
       setRuntimeShutdownState('error');
       setRuntimeShutdownMessage(error instanceof Error ? error.message : '退出本机任务库后台失败，请稍后重试。');
+    }
+  };
+
+  const restartRuntime = async () => {
+    if (runtimeRestartState === 'pending') return;
+    setRuntimeRestartState('pending');
+    setRuntimeRestartMessage('正在重启本机任务库后台…');
+    try {
+      await api.post<{ message: string }>('/api/runtime/restart', {});
+      setRuntimeRestartState('success');
+      setRuntimeRestartMessage('后台已重启，本页可继续用。');
+    } catch (error) {
+      setRuntimeRestartState('error');
+      setRuntimeRestartMessage(error instanceof Error ? error.message : '重启本机任务库后台失败，请稍后重试。');
     }
   };
 
@@ -469,6 +499,30 @@ export default function SettingsPage() {
     }
   };
 
+  const changeAutoScan = async (enabled: boolean) => {
+    const request = beginResourceRequest(autoScanGenerationRef.current);
+    const previous = autoScanResource.data;
+    setAutoScanResource((current) => current.data ? { ...beginResource(current), data: { enabled } } : beginResource(current));
+    setAutoScanSaving(true);
+    setAutoScanError(false);
+    setAutoScanMessage('正在保存自动扫描设置…');
+    try {
+      const updated = await api.put<RuntimeAutoScan>('/api/runtime/auto-scan', { enabled });
+      if (!isLatestResourceRequest(autoScanGenerationRef.current, request)) return;
+      setAutoScanResource(successResource(updated));
+      setAutoScanMessage(enabled ? '已开启每 10 分钟自动扫描新任务。' : '已关闭每 10 分钟自动扫描；定时触发不会入库。');
+    } catch (error) {
+      if (isLatestResourceRequest(autoScanGenerationRef.current, request)) {
+        const reason = error instanceof Error ? error.message : '自动扫描设置保存失败。';
+        setAutoScanResource((current) => failureResource({ ...current, data: previous }, reason));
+        setAutoScanError(true);
+        setAutoScanMessage(reason);
+      }
+    } finally {
+      if (isLatestResourceRequest(autoScanGenerationRef.current, request)) setAutoScanSaving(false);
+    }
+  };
+
   const primarySources = ownerInformation?.sources.filter((source) => source.kind !== 'bot_supplement') ?? [];
   const usablePrimarySources = primarySources.filter((source) => source.status === 'ready' || source.status === 'mock_ready' || source.status === 'partial').length;
   const platformLimitedPrimarySources = primarySources.filter((source) => source.status === 'unsupported').length;
@@ -536,6 +590,19 @@ export default function SettingsPage() {
           </label>
         </div>
         {automationPolicy && <p className="automation-policy-note">当前安全门槛：归属 {Math.round(automationPolicy.associationThreshold * 100)}% · 字段修改 {Math.round(automationPolicy.updateThreshold * 100)}%。完成/归档还需更高明确证据。</p>}
+      </section>
+      <section className="integration-section auto-scan-card" aria-labelledby="auto-scan-title">
+        <div className="integration-heading">
+          <span className="integration-icon"><RefreshCw size={19} /></span>
+          <div><h2 id="auto-scan-title">定时扫描</h2><span>按固定间隔检查新的需求来源</span></div>
+          <span className={'connection-state ' + (autoScanResource.data?.enabled ? 'connection-state-ready' : 'connection-state-warning')}>{autoScanResource.status === 'error' ? '读取失败' : autoScanResource.status === 'loading' && !autoScanResource.data ? '正在读取' : autoScanResource.data?.enabled ? '已开启' : '已关闭'}</span>
+        </div>
+        <AsyncState resource={autoScanResource} emptyText={null} loadingText="正在读取自动扫描设置…" errorTitle="自动扫描设置读取失败" onRetry={loadSettings}>
+          <label className="check-row connection-toggle"><input type="checkbox" aria-label="每 10 分钟自动扫描新任务" checked={Boolean(autoScanResource.data?.enabled)} disabled={!autoScanResource.data || autoScanSaving} onChange={(event) => void changeAutoScan(event.target.checked)} /><span>每 10 分钟自动扫描新任务</span></label>
+          <p className="integration-note">打开后还需在 Cindy 插件设置里保存过自动化；关闭后定时即使触发也不入库。手动扫描不受影响。</p>
+          <p className="integration-note">入库扫描模型请到 Cindy 插件详情「AI 代办」里改：推荐折扣路由 <code>codex/gpt-5.6-luna</code>、思考强度 <code>high</code>、权限 <code>自动审核</code>。草稿默认可能是 <code>fable5</code>，改完要保存。</p>
+          {autoScanMessage && <div className={autoScanError ? 'error-banner settings-feedback' : 'success-banner settings-feedback'} role={autoScanError ? 'alert' : 'status'}>{autoScanMessage}</div>}
+        </AsyncState>
       </section>
       <div className="security-banner settings-security-banner"><ShieldCheck size={20} /><div><strong>安全边界</strong><span>{configurationResource.status === 'error' ? '配置状态读取失败，请点击上方“重试”；在确认配置前不要把连接状态当作最新结果。' : configuration?.notice ?? '正在读取配置状态…'}</span></div></div>
       <PrivacyLifecyclePanel />
@@ -677,7 +744,8 @@ export default function SettingsPage() {
         <div className="settings-disclosure-content">
           <p className="integration-note">退出本机任务库后台后，当前浏览器页面会失去连接；任务数据仍保留在本机 SQLite 中。</p>
           {runtimeShutdownMessage && <div className={runtimeShutdownState === 'error' ? 'error-banner settings-feedback' : runtimeShutdownState === 'warning' ? 'warning-banner settings-feedback' : 'success-banner settings-feedback'} role={runtimeShutdownState === 'error' ? 'alert' : 'status'}>{runtimeShutdownMessage}</div>}
-          <div className="settings-actions danger-actions"><button className="danger-text-button" type="button" disabled={runtimeShutdownState === 'pending' || runtimeShutdownState === 'success' || runtimeShutdownState === 'warning'} onClick={() => void shutdownRuntime()}><Power size={15} />{runtimeShutdownState === 'pending' ? '退出中…' : runtimeShutdownState === 'success' ? '后台已退出' : '退出本机任务库后台'}</button></div>
+          {runtimeRestartMessage && <div className={runtimeRestartState === 'error' ? 'error-banner settings-feedback' : 'success-banner settings-feedback'} role={runtimeRestartState === 'error' ? 'alert' : 'status'}>{runtimeRestartMessage}</div>}
+          <div className="settings-actions danger-actions"><button className="danger-text-button" type="button" disabled={runtimeShutdownState === 'pending' || runtimeShutdownState === 'success' || runtimeShutdownState === 'warning'} onClick={() => void shutdownRuntime()}><Power size={15} />{runtimeShutdownState === 'pending' ? '退出中…' : runtimeShutdownState === 'success' ? '后台已退出' : '退出本机任务库后台'}</button><button className="quiet-button" type="button" disabled={runtimeRestartState === 'pending'} onClick={() => void restartRuntime()}><RefreshCw size={15} className={runtimeRestartState === 'pending' ? 'spin' : undefined} />{runtimeRestartState === 'pending' ? '重启中…' : runtimeRestartState === 'success' ? '后台已重启' : '重启本机任务库后台'}</button></div>
         </div>
       </details>
       {!desktop && <form onSubmit={validate} className="integration-list">

@@ -1897,6 +1897,53 @@ test('集成设置明确连接边界，且不暴露开发消息夹具', async ({
   await expect(page.getByText('虚拟消息测试')).toHaveCount(0);
 });
 
+test('设置页可以重启本机任务库后台并继续使用当前页面', async ({ page }) => {
+  let restartCalls = 0;
+  await page.route('**/api/runtime/restart', async (route) => {
+    restartCalls += 1;
+    expect(route.request().method()).toBe('POST');
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ message: '后台已重启，本页可继续用。' }) });
+  });
+
+  await page.goto('/settings');
+  await page.getByRole('button', { name: '重启本机任务库后台' }).click();
+  await expect(page.getByText('后台已重启，本页可继续用。', { exact: true })).toBeVisible();
+  await expect(page.getByText('后台已退出，请关闭此标签页', { exact: true })).toHaveCount(0);
+  expect(restartCalls).toBe(1);
+});
+
+test('设置页可以即时保存每 10 分钟自动扫描开关', async ({ page }) => {
+  let enabled = false;
+  const savedValues: boolean[] = [];
+  await page.route('**/api/runtime/auto-scan', async (route) => {
+    if (route.request().method() === 'GET') {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ enabled }) });
+      return;
+    }
+    expect(route.request().method()).toBe('PUT');
+    const body = route.request().postDataJSON() as { enabled?: boolean };
+    expect(typeof body.enabled).toBe('boolean');
+    enabled = body.enabled as boolean;
+    savedValues.push(enabled);
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ enabled }) });
+  });
+
+  await page.goto('/settings');
+  const toggle = page.getByRole('checkbox', { name: '每 10 分钟自动扫描新任务' });
+  await expect(toggle).toBeVisible();
+  await expect(toggle).not.toBeChecked();
+  await expect(page.getByText('打开后还需在 Cindy 插件设置里保存过自动化；关闭后定时即使触发也不入库。手动扫描不受影响。', { exact: true })).toBeVisible();
+  await expect(page.getByText('入库扫描模型请到 Cindy 插件详情「AI 代办」里改：推荐折扣路由 codex/gpt-5.6-luna、思考强度 high、权限 自动审核。草稿默认可能是 fable5，改完要保存。', { exact: true })).toBeVisible();
+
+  await toggle.check();
+  await expect(toggle).toBeChecked();
+  await expect(page.getByText('已开启每 10 分钟自动扫描新任务。', { exact: true })).toBeVisible();
+  await toggle.uncheck();
+  await expect(toggle).not.toBeChecked();
+  await expect(page.getByText('已关闭每 10 分钟自动扫描；定时触发不会入库。', { exact: true })).toBeVisible();
+  expect(savedValues).toEqual([true, false]);
+});
+
 test('来源同步碰到后台轮次时显示真实忙碌状态，不误报配置问题', async ({ page }) => {
   await page.route('**/api/integrations/feishu/sources/calendar/sync', async (route) => {
     const response = await route.fetch();

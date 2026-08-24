@@ -177523,6 +177523,40 @@ var AppDatabase = class {
       }
     };
   }
+  /** Cindy keeps one durable replay watermark per conversation. */
+  listCindyConversationCursors() {
+    return this.raw.prepare(
+      `SELECT scope_key AS conversation_key, cursor AS last_occurred_at
+         FROM sync_cursor
+        WHERE integration = 'cindy_conversation'
+          AND cursor IS NOT NULL
+          AND cursor <> ''
+        ORDER BY scope_key ASC`
+    ).all();
+  }
+  advanceCindyConversationCursor(conversationKey, occurredAt, updatedAt) {
+    const normalizedConversationKey = conversationKey.trim();
+    const nextOccurredAt = new Date(occurredAt);
+    if (!normalizedConversationKey || !Number.isFinite(nextOccurredAt.getTime())) return;
+    const nextCursor = nextOccurredAt.toISOString();
+    const current = this.raw.prepare(
+      `SELECT cursor
+         FROM sync_cursor
+        WHERE integration = 'cindy_conversation' AND scope_key = ?`
+    ).get(normalizedConversationKey);
+    const currentTime = current?.cursor ? Date.parse(current.cursor) : Number.NaN;
+    if (Number.isFinite(currentTime) && currentTime >= nextOccurredAt.getTime()) return;
+    this.raw.prepare(
+      `INSERT INTO sync_cursor
+        (integration, scope_key, cursor, last_success_at, last_error, updated_at)
+       VALUES ('cindy_conversation', ?, ?, ?, NULL, ?)
+       ON CONFLICT (integration, scope_key) DO UPDATE SET
+         cursor = excluded.cursor,
+         last_success_at = excluded.last_success_at,
+         last_error = NULL,
+         updated_at = excluded.updated_at`
+    ).run(normalizedConversationKey, nextCursor, updatedAt, updatedAt);
+  }
   close() {
     this.raw.close();
   }
@@ -189679,6 +189713,19 @@ var PmService = class {
       updatedAt: row?.updated_at ?? null
     };
   }
+  autoScanSettings() {
+    const row = this.database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'auto_scan_enabled'").get();
+    const value = parseMetadata(row?.value_json);
+    return { enabled: value.enabled === true };
+  }
+  updateAutoScanSettings(enabled) {
+    const timestamp = nowIso4();
+    this.database.raw.prepare(
+      `INSERT INTO app_setting (key, value_json, updated_at) VALUES ('auto_scan_enabled', ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`
+    ).run(JSON.stringify({ enabled }), timestamp);
+    return this.autoScanSettings();
+  }
   updateAutomationPolicy(mode) {
     const timestamp = nowIso4();
     this.database.raw.prepare(
@@ -199154,6 +199201,43 @@ var PmService = class {
       updated_at: row.updated_at
     }));
   }
+  listCindyCandidates() {
+    const candidates = this.database.raw.prepare(
+      `SELECT candidate_request.id,
+              candidate_request.title,
+              candidate_request.describe,
+              candidate_request.state,
+              candidate_request.version,
+              candidate_request.updated_at,
+              CASE
+                WHEN source_event.conversation_id IS NOT NULL
+                 AND source_event.conversation_id NOT LIKE 'cindy:source:%'
+                THEN source_event.conversation_id
+                ELSE NULL
+              END AS conversation_id
+         FROM candidate_request
+         JOIN source_event ON source_event.id = candidate_request.source_event_id
+         LEFT JOIN source_demand_unit ON source_demand_unit.id = candidate_request.demand_unit_id
+        WHERE candidate_request.state = 'pending'
+          AND candidate_request.accepted_task_id IS NULL
+          AND candidate_request.deleted_at IS NULL
+          AND candidate_request.merged_into_candidate_id IS NULL
+          AND (candidate_request.demand_unit_id IS NULL OR source_demand_unit.state <> 'superseded')
+        ORDER BY candidate_request.updated_at DESC, candidate_request.id ASC`
+    ).all();
+    return candidates.map((candidate) => ({
+      id: candidate.id,
+      title: candidate.title,
+      describe: candidate.describe,
+      status: candidate.state,
+      ...candidate.conversation_id ? { source: { conversation_key: candidate.conversation_id } } : {},
+      version: candidate.version,
+      updated_at: candidate.updated_at
+    }));
+  }
+  listCindyConversationCursors() {
+    return this.database.listCindyConversationCursors();
+  }
   processCindyIntake(input) {
     const sourceKeys = input.sources.map((source) => source.source_key);
     if (new Set(sourceKeys).size !== sourceKeys.length) {
@@ -199204,6 +199288,7 @@ var PmService = class {
         return { ...stored, duplicate: true };
       }
       const sourceRows = /* @__PURE__ */ new Map();
+      const conversationCursors = /* @__PURE__ */ new Map();
       for (const source of input.sources) {
         const conversationId = source.conversation_key?.trim() || `cindy:source:${source.source_key}`;
         const persisted = this.persistSourceEventUnsafe({
@@ -199222,11 +199307,18 @@ var PmService = class {
             sourceScope: "cindy",
             cindyWindowId: input.window_id,
             cindySourceKey: source.source_key,
+            cindyConversationKey: source.conversation_key?.trim() ?? null,
             windowStart: input.window_start,
             windowEnd: input.window_end
           }
         });
         sourceRows.set(source.source_key, persisted.row);
+        if (source.conversation_key?.trim()) {
+          const previous = conversationCursors.get(source.conversation_key.trim());
+          if (!previous || Date.parse(source.occurred_at) > Date.parse(previous)) {
+            conversationCursors.set(source.conversation_key.trim(), source.occurred_at);
+          }
+        }
       }
       const attachCandidateSources = (demandUnitId, proposalSources, proposalSourceKeys) => {
         const insert = this.database.raw.prepare(
@@ -199400,6 +199492,9 @@ var PmService = class {
             SET cursor = ?, last_success_at = ?, updated_at = ?
           WHERE integration = 'cindy_intake' AND scope_key = ?`
       ).run(JSON.stringify(storedResult), timestamp, timestamp, input.window_id);
+      for (const [conversationKey, occurredAt] of conversationCursors) {
+        this.database.advanceCindyConversationCursor(conversationKey, occurredAt, timestamp);
+      }
       return storedResult;
     });
     for (const taskId of updatedTaskIds) this.projectTaskMemory(taskId);
@@ -202876,6 +202971,11 @@ function requestTraceContext(request) {
   };
   return { traceId: header("x-trace-id"), parentSpanId: header("x-parent-span-id") };
 }
+function isLoopbackRequest(request) {
+  const remoteAddress = request.socket.remoteAddress ?? request.ip;
+  const normalizedAddress = remoteAddress?.replace(/^::ffff:/u, "").replace(/^\[|\]$/gu, "").split("%")[0];
+  return normalizedAddress === "127.0.0.1" || normalizedAddress === "::1";
+}
 function candidateMutationError(error51, fallback, current) {
   const message = error51 instanceof Error ? error51.message : fallback;
   if (error51 instanceof CandidateVersionRequiredError) {
@@ -202985,6 +203085,7 @@ async function buildApp(service, input = "http://localhost:5173") {
   const app = (0, import_fastify.default)({ logger: options.logger ?? process.env.NODE_ENV !== "test" });
   await app.register(import_cors.default, { origin: webOrigin });
   let runtimeShutdownScheduled = false;
+  let runtimeRestartScheduled = false;
   app.addHook("onRequest", async (request, reply) => {
     if (!request.url.startsWith("/api/integrations/cindy/")) return;
     if (request.method === "OPTIONS") return;
@@ -202998,10 +203099,7 @@ async function buildApp(service, input = "http://localhost:5173") {
   });
   app.get("/api/health", async () => service.health((0, import_node_crypto14.randomUUID)()));
   app.post("/api/runtime/shutdown", async (request, reply) => {
-    const remoteAddress = request.socket.remoteAddress ?? request.ip;
-    const normalizedAddress = remoteAddress?.replace(/^::ffff:/u, "").replace(/^\[|\]$/gu, "").split("%")[0];
-    const isLoopback = normalizedAddress === "127.0.0.1" || normalizedAddress === "::1";
-    if (!isLoopback) return reply.code(403).send({ error: "\u540E\u53F0\u5173\u95ED\u63A5\u53E3\u53EA\u63A5\u53D7\u672C\u673A\u8BF7\u6C42\u3002" });
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: "\u540E\u53F0\u5173\u95ED\u63A5\u53E3\u53EA\u63A5\u53D7\u672C\u673A\u8BF7\u6C42\u3002" });
     if (!options.runtimeShutdown) return reply.code(409).send({ error: "\u5F53\u524D\u8FD0\u884C\u65B9\u5F0F\u4E0D\u652F\u6301\u5173\u95ED\u540E\u53F0\u8FDB\u7A0B\u3002" });
     if (runtimeShutdownScheduled) return reply.code(409).send({ error: "\u540E\u53F0\u8FDB\u7A0B\u5DF2\u7ECF\u5728\u9000\u51FA\u3002" });
     runtimeShutdownScheduled = true;
@@ -203010,6 +203108,28 @@ async function buildApp(service, input = "http://localhost:5173") {
       void Promise.resolve(options.runtimeShutdown?.()).catch(() => void 0);
     }, 25);
     return reply;
+  });
+  app.post("/api/runtime/restart", async (request, reply) => {
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: "\u540E\u53F0\u91CD\u542F\u63A5\u53E3\u53EA\u63A5\u53D7\u672C\u673A\u8BF7\u6C42\u3002" });
+    if (!options.runtimeRestart) return reply.code(409).send({ error: "\u5F53\u524D\u8FD0\u884C\u65B9\u5F0F\u4E0D\u652F\u6301\u91CD\u542F\u540E\u53F0\u8FDB\u7A0B\u3002" });
+    if (runtimeShutdownScheduled) return reply.code(409).send({ error: "\u540E\u53F0\u8FDB\u7A0B\u5DF2\u7ECF\u5728\u9000\u51FA\u3002" });
+    if (runtimeRestartScheduled) return reply.code(409).send({ error: "\u540E\u53F0\u8FDB\u7A0B\u5DF2\u7ECF\u5728\u91CD\u542F\u3002" });
+    runtimeRestartScheduled = true;
+    reply.code(200).send({ message: "\u672C\u673A\u4EFB\u52A1\u5E93\u540E\u53F0\u5DF2\u6536\u5230\u91CD\u542F\u8BF7\u6C42\uFF0C4310 \u5373\u5C06\u91CD\u65B0\u76D1\u542C\u3002" });
+    setTimeout(() => {
+      void Promise.resolve(options.runtimeRestart?.()).catch(() => void 0);
+    }, 25);
+    return reply;
+  });
+  app.get("/api/runtime/auto-scan", async (request, reply) => {
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: "\u81EA\u52A8\u626B\u63CF\u5F00\u5173\u53EA\u63A5\u53D7\u672C\u673A\u8BF7\u6C42\u3002" });
+    return service.autoScanSettings();
+  });
+  app.put("/api/runtime/auto-scan", async (request, reply) => {
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: "\u81EA\u52A8\u626B\u63CF\u5F00\u5173\u53EA\u63A5\u53D7\u672C\u673A\u8BF7\u6C42\u3002" });
+    const body = external_exports.object({ enabled: external_exports.boolean() }).strict().safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: "\u81EA\u52A8\u626B\u63CF\u5F00\u5173\u9700\u8981\u5E03\u5C14\u503C enabled\u3002" });
+    return service.updateAutoScanSettings(body.data.enabled);
   });
   registerSeedIntakeRoute(app, service);
   app.get("/api/dashboard", async () => dashboardDtoSchema.parse(service.dashboard()));
@@ -203082,7 +203202,11 @@ async function buildApp(service, input = "http://localhost:5173") {
     }
   });
   app.get("/api/integrations/health", async () => service.integrationHealth());
-  app.get("/api/integrations/cindy/tasks", async () => ({ items: service.listCindyTasks() }));
+  app.get("/api/integrations/cindy/tasks", async () => ({
+    items: service.listCindyTasks(),
+    candidates: service.listCindyCandidates(),
+    cursors: service.listCindyConversationCursors()
+  }));
   app.post("/api/integrations/cindy/intake", async (request, reply) => {
     try {
       const isoTimestamp = external_exports.string().datetime({ offset: true });
@@ -204339,9 +204463,15 @@ async function closeOwnedResources(app, database) {
   }
   return failures;
 }
-function resultWithStop(payload, stop) {
+function resultWithLifecycle(payload, stop, restart) {
   Object.defineProperty(payload, "stop", {
     value: stop,
+    enumerable: false,
+    configurable: false,
+    writable: false
+  });
+  Object.defineProperty(payload, "restart", {
+    value: restart,
     enumerable: false,
     configurable: false,
     writable: false
@@ -204351,6 +204481,13 @@ function resultWithStop(payload, stop) {
 function noOpStop(errorCode, message) {
   return async () => ({
     stopped: false,
+    error_code: errorCode,
+    error: message
+  });
+}
+function noOpRestart(errorCode, message) {
+  return async () => ({
+    restarted: false,
     error_code: errorCode,
     error: message
   });
@@ -204377,19 +204514,20 @@ async function startPmServer({
     throw new Error(`\u672C\u673A\u4EFB\u52A1\u5E93\u7F51\u9875\u8D44\u6E90\u7F3A\u5C11 index.html\uFF1A${webRoot}`);
   }
   if (ownedRuntime && ownedRuntime.host === host && ownedRuntime.requestedPort === port) {
-    return resultWithStop({
+    return resultWithLifecycle({
       url: ownedRuntime.url,
       port: ownedRuntime.port,
       alreadyRunning: true,
       foreign: false
-    }, ownedRuntime.stop);
+    }, ownedRuntime.stop, ownedRuntime.restart);
   }
   if (port !== 0) {
     const url2 = serverUrl(host, port);
     if (await canReachPmEndpoint(url2, token)) {
-      return resultWithStop(
+      return resultWithLifecycle(
         { url: url2, port, alreadyRunning: true, foreign: false },
-        noOpStop("PM_ALREADY_RUNNING", "\u672C\u673A\u4EFB\u52A1\u5E93\u7531\u5176\u4ED6\u8FDB\u7A0B\u6301\u6709\uFF0C\u672A\u6267\u884C\u505C\u6B62\u3002")
+        noOpStop("PM_ALREADY_RUNNING", "\u672C\u673A\u4EFB\u52A1\u5E93\u7531\u5176\u4ED6\u8FDB\u7A0B\u6301\u6709\uFF0C\u672A\u6267\u884C\u505C\u6B62\u3002"),
+        noOpRestart("PM_ALREADY_RUNNING", "\u672C\u673A\u4EFB\u52A1\u5E93\u7531\u5176\u4ED6\u8FDB\u7A0B\u6301\u6709\uFF0C\u672A\u6267\u884C\u91CD\u542F\u3002")
       );
     }
   }
@@ -204403,7 +204541,9 @@ async function startPmServer({
     const service = new PmService(database, createAdapters(config2), config2);
     let stopInFlight = null;
     let stopResult = null;
-    stopOwnedRuntime = async () => {
+    let restartInFlight = null;
+    let restartOwnedRuntime;
+    stopOwnedRuntime = async ({ scheduleExit = true } = {}) => {
       if (stopResult?.stopped) return { stopped: false, alreadyStopped: true };
       if (stopInFlight) return stopInFlight;
       stopInFlight = (async () => {
@@ -204419,10 +204559,24 @@ async function startPmServer({
         }
         if (ownedRuntime?.app === app) ownedRuntime = null;
         stopResult = { stopped: true };
-        scheduleProcessExit();
+        if (scheduleExit) scheduleProcessExit();
         return stopResult;
       })();
       return stopInFlight;
+    };
+    const runtimeOptions = { port, host, sqlitePath, token, webRoot };
+    restartOwnedRuntime = async () => {
+      if (restartInFlight) return restartInFlight;
+      restartInFlight = (async () => {
+        const stopped = await stopOwnedRuntime({ scheduleExit: false });
+        if (!stopped.stopped) return stopped;
+        return startPmServer(runtimeOptions);
+      })();
+      try {
+        return await restartInFlight;
+      } finally {
+        restartInFlight = null;
+      }
     };
     app = await buildApp(service, {
       webOrigin: serverUrl(host, port),
@@ -204432,6 +204586,10 @@ async function startPmServer({
       runtimeShutdown: async () => {
         const result = await stopOwnedRuntime();
         if (!result.stopped && !result.alreadyStopped) throw new Error(result.error || "\u672C\u673A\u4EFB\u52A1\u5E93\u505C\u6B62\u5931\u8D25\u3002");
+      },
+      runtimeRestart: async () => {
+        const result = await restartOwnedRuntime();
+        if (!result?.url || result.foreign) throw new Error(result?.error || "\u672C\u673A\u4EFB\u52A1\u5E93\u91CD\u542F\u5931\u8D25\u3002");
       }
     });
     await app.listen({ port, host });
@@ -204443,23 +204601,34 @@ async function startPmServer({
       alreadyRunning: false,
       foreign: false
     };
-    ownedRuntime = { host, requestedPort: port, url: payload.url, port: actualPort, app, database, stop: stopOwnedRuntime };
-    return resultWithStop(payload, stopOwnedRuntime);
+    ownedRuntime = {
+      host,
+      requestedPort: port,
+      url: payload.url,
+      port: actualPort,
+      app,
+      database,
+      stop: stopOwnedRuntime,
+      restart: restartOwnedRuntime
+    };
+    return resultWithLifecycle(payload, stopOwnedRuntime, restartOwnedRuntime);
   } catch (error51) {
     if (error51 && typeof error51 === "object" && error51.code === "EADDRINUSE") {
       const url2 = serverUrl(host, port);
       if (await canReachPmEndpoint(url2, token)) {
         await closeOwnedResources(app, database);
-        return resultWithStop(
+        return resultWithLifecycle(
           { url: url2, port, alreadyRunning: true, foreign: false },
-          noOpStop("PM_ALREADY_RUNNING", "\u672C\u673A\u4EFB\u52A1\u5E93\u7531\u5176\u4ED6\u8FDB\u7A0B\u6301\u6709\uFF0C\u672A\u6267\u884C\u505C\u6B62\u3002")
+          noOpStop("PM_ALREADY_RUNNING", "\u672C\u673A\u4EFB\u52A1\u5E93\u7531\u5176\u4ED6\u8FDB\u7A0B\u6301\u6709\uFF0C\u672A\u6267\u884C\u505C\u6B62\u3002"),
+          noOpRestart("PM_ALREADY_RUNNING", "\u672C\u673A\u4EFB\u52A1\u5E93\u7531\u5176\u4ED6\u8FDB\u7A0B\u6301\u6709\uFF0C\u672A\u6267\u884C\u91CD\u542F\u3002")
         );
       }
       await closeOwnedResources(app, database);
       console.warn(`\u672C\u673A\u4EFB\u52A1\u5E93\u7AEF\u53E3 ${url2} \u5DF2\u88AB\u5176\u4ED6\u8FDB\u7A0B\u5360\u7528\uFF1B\u63D2\u4EF6\u4E0D\u4F1A\u62A2\u5360\u8BE5\u7AEF\u53E3\u3002`);
-      return resultWithStop(
+      return resultWithLifecycle(
         { url: url2, port, alreadyRunning: false, foreign: true },
-        noOpStop("PM_FOREIGN_PROCESS", "\u672C\u673A\u4EFB\u52A1\u5E93\u7AEF\u53E3\u7531\u5916\u6765\u8FDB\u7A0B\u5360\u7528\uFF0C\u672A\u6267\u884C\u505C\u6B62\u3002")
+        noOpStop("PM_FOREIGN_PROCESS", "\u672C\u673A\u4EFB\u52A1\u5E93\u7AEF\u53E3\u7531\u5916\u6765\u8FDB\u7A0B\u5360\u7528\uFF0C\u672A\u6267\u884C\u505C\u6B62\u3002"),
+        noOpRestart("PM_FOREIGN_PROCESS", "\u672C\u673A\u4EFB\u52A1\u5E93\u7AEF\u53E3\u7531\u5916\u6765\u8FDB\u7A0B\u5360\u7528\uFF0C\u672A\u6267\u884C\u91CD\u542F\u3002")
       );
     }
     await closeOwnedResources(app, database);

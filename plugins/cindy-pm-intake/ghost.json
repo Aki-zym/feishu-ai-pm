@@ -4,11 +4,11 @@
   "name": "TooManyTasks 入库",
   "description": "扫描近 10 分钟的已授权飞书消息，整理 TooManyTasks 入库候选并提交审核提案。",
   "whenToUse": "需要把近 10 分钟已授权飞书消息整理为任务候选、已有任务更新提案或跳过结论时使用。",
-  "version": "0.2.3",
+  "version": "0.2.5",
   "entry": "main.js",
   "launch": "on-demand",
   "slots": ["tool", "agent", "node"],
-  "agent": { "errand": true },
+  "agent": { "errand": true, "schedule": true },
   "command": "扫近10分钟",
   "tools": [
     {
@@ -31,6 +31,7 @@
           "window_end": { "type": "string", "minLength": 1, "maxLength": 80 },
           "sources": {
             "type": "array",
+            "minItems": 1,
             "items": {
               "type": "object",
               "properties": {
@@ -76,7 +77,13 @@
       "description": "扫描当前时间往前 10 分钟的已授权飞书消息，派发独立 errand 读取消息、获取任务快照并提交入库提案。",
       "parameters": {
         "type": "object",
-        "properties": {},
+        "properties": {
+          "trigger": {
+            "type": "string",
+            "enum": ["manual", "schedule"],
+            "default": "manual"
+          }
+        },
         "additionalProperties": false
       }
     }
@@ -89,7 +96,7 @@
       "key": "pm_token",
       "label": "本机服务令牌",
       "hint": "与本机 TooManyTasks 服务的 CINDY_INTEGRATION_TOKEN 保持一致。",
-      "methods": ["pm/request", "pm/ensure", "pm/stop"]
+      "methods": ["pm/request", "pm/ensure", "pm/stop", "pm/restart"]
     }]
   },
   "settingsHtml": "settings.html",

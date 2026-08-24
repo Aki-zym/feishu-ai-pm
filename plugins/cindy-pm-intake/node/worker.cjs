@@ -48,6 +48,19 @@ async function stopPm() {
   return result === undefined ? { stopped: true } : result;
 }
 
+async function restartPm(request) {
+  if (!pmServerHandle) return ensurePm(request);
+  if (typeof pmServerHandle.restart !== 'function') {
+    throw new Error('本机任务库运行时结果缺少 restart()');
+  }
+  const restarted = await pmServerHandle.restart();
+  if (!restarted || typeof restarted.stop !== 'function' || typeof restarted.restart !== 'function') {
+    throw new Error('本机任务库重启结果缺少 stop()/restart()');
+  }
+  pmServerHandle = restarted;
+  return restarted;
+}
+
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
@@ -70,8 +83,8 @@ function isLoopbackUrl(value) {
 
 function isAllowedPath(value) {
   return typeof value === 'string'
-    && /^\/api\/integrations\/cindy\/[A-Za-z0-9._/-]+$/.test(value)
-    && !value.includes('..');
+    && !value.includes('..')
+    && (value === '/api/runtime/auto-scan' || /^\/api\/integrations\/cindy\/[A-Za-z0-9._/-]+$/.test(value));
 }
 
 async function requestPm(request) {
@@ -83,7 +96,7 @@ async function requestPm(request) {
   if (!token) throw new Error('本机任务库令牌尚未配置');
   if (!isLoopbackUrl(baseUrl)) throw new Error('本机任务库地址必须是本机 HTTP 回环地址');
   if (!isAllowedPath(requestPath)) throw new Error('只允许调用 Cindy 专用本机任务库接口');
-  if (!['GET', 'POST'].includes(method)) throw new Error('只允许 GET 或 POST');
+  if (!['GET', 'POST', 'PUT'].includes(method)) throw new Error('只允许 GET、POST 或 PUT');
 
   const response = await fetch(baseUrl + requestPath, {
     method,
@@ -91,9 +104,9 @@ async function requestPm(request) {
     headers: {
       authorization: `Bearer ${token}`,
       accept: 'application/json',
-      ...(method === 'POST' ? { 'content-type': 'application/json' } : {}),
+      ...(method === 'POST' || method === 'PUT' ? { 'content-type': 'application/json' } : {}),
     },
-    ...(method === 'POST' ? { body: JSON.stringify(params.body ?? {}) } : {}),
+    ...(method === 'POST' || method === 'PUT' ? { body: JSON.stringify(params.body ?? {}) } : {}),
     signal: AbortSignal.timeout(25000),
   });
   const responseText = await response.text();
@@ -118,6 +131,11 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
     }
     if (request.method === 'pm/stop') {
       const result = await stopPm();
+      send({ jsonrpc: '2.0', id: request.id, result });
+      return;
+    }
+    if (request.method === 'pm/restart') {
+      const result = await restartPm(request);
       send({ jsonrpc: '2.0', id: request.id, result });
       return;
     }

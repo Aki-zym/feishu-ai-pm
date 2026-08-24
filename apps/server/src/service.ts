@@ -2853,6 +2853,21 @@ export class PmService {
     };
   }
 
+  autoScanSettings() {
+    const row = this.database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'auto_scan_enabled'").get() as { value_json: string } | undefined;
+    const value = parseMetadata(row?.value_json);
+    return { enabled: value.enabled === true };
+  }
+
+  updateAutoScanSettings(enabled: boolean) {
+    const timestamp = nowIso();
+    this.database.raw.prepare(
+      `INSERT INTO app_setting (key, value_json, updated_at) VALUES ('auto_scan_enabled', ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+    ).run(JSON.stringify({ enabled }), timestamp);
+    return this.autoScanSettings();
+  }
+
   updateAutomationPolicy(mode: AutomationMode) {
     const timestamp = nowIso();
     this.database.raw.prepare(
@@ -13566,6 +13581,53 @@ export class PmService {
     }));
   }
 
+  listCindyCandidates() {
+    const candidates = this.database.raw.prepare(
+      `SELECT candidate_request.id,
+              candidate_request.title,
+              candidate_request.describe,
+              candidate_request.state,
+              candidate_request.version,
+              candidate_request.updated_at,
+              CASE
+                WHEN source_event.conversation_id IS NOT NULL
+                 AND source_event.conversation_id NOT LIKE 'cindy:source:%'
+                THEN source_event.conversation_id
+                ELSE NULL
+              END AS conversation_id
+         FROM candidate_request
+         JOIN source_event ON source_event.id = candidate_request.source_event_id
+         LEFT JOIN source_demand_unit ON source_demand_unit.id = candidate_request.demand_unit_id
+        WHERE candidate_request.state = 'pending'
+          AND candidate_request.accepted_task_id IS NULL
+          AND candidate_request.deleted_at IS NULL
+          AND candidate_request.merged_into_candidate_id IS NULL
+          AND (candidate_request.demand_unit_id IS NULL OR source_demand_unit.state <> 'superseded')
+        ORDER BY candidate_request.updated_at DESC, candidate_request.id ASC`,
+    ).all() as Array<{
+      id: string;
+      title: string;
+      describe: string;
+      state: CandidateState;
+      version: number;
+      updated_at: string;
+      conversation_id: string | null;
+    }>;
+    return candidates.map((candidate) => ({
+      id: candidate.id,
+      title: candidate.title,
+      describe: candidate.describe,
+      status: candidate.state,
+      ...(candidate.conversation_id ? { source: { conversation_key: candidate.conversation_id } } : {}),
+      version: candidate.version,
+      updated_at: candidate.updated_at,
+    }));
+  }
+
+  listCindyConversationCursors() {
+    return this.database.listCindyConversationCursors();
+  }
+
   processCindyIntake(input: CindyIntakeInput): CindyIntakeResult {
     const sourceKeys = input.sources.map((source) => source.source_key);
     if (new Set(sourceKeys).size !== sourceKeys.length) {
@@ -13618,6 +13680,7 @@ export class PmService {
       }
 
       const sourceRows = new Map<string, SourceEventRow>();
+      const conversationCursors = new Map<string, string>();
       for (const source of input.sources) {
         const conversationId = source.conversation_key?.trim() || `cindy:source:${source.source_key}`;
         const persisted = this.persistSourceEventUnsafe({
@@ -13636,11 +13699,18 @@ export class PmService {
             sourceScope: 'cindy',
             cindyWindowId: input.window_id,
             cindySourceKey: source.source_key,
+            cindyConversationKey: source.conversation_key?.trim() ?? null,
             windowStart: input.window_start,
             windowEnd: input.window_end,
           },
         });
         sourceRows.set(source.source_key, persisted.row);
+        if (source.conversation_key?.trim()) {
+          const previous = conversationCursors.get(source.conversation_key.trim());
+          if (!previous || Date.parse(source.occurred_at) > Date.parse(previous)) {
+            conversationCursors.set(source.conversation_key.trim(), source.occurred_at);
+          }
+        }
       }
 
       const attachCandidateSources = (demandUnitId: string, proposalSources: SourceEventRow[], proposalSourceKeys: string[]) => {
@@ -13819,6 +13889,9 @@ export class PmService {
             SET cursor = ?, last_success_at = ?, updated_at = ?
           WHERE integration = 'cindy_intake' AND scope_key = ?`,
       ).run(JSON.stringify(storedResult), timestamp, timestamp, input.window_id);
+      for (const [conversationKey, occurredAt] of conversationCursors) {
+        this.database.advanceCindyConversationCursor(conversationKey, occurredAt, timestamp);
+      }
       return storedResult;
     });
     for (const taskId of updatedTaskIds) this.projectTaskMemory(taskId);

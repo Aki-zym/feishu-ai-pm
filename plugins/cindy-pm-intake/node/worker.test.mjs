@@ -53,17 +53,23 @@ function callWorkerLines(requests) {
       let starts = 0;
       Module._load = function load(request, parent, isMain) {
         if (parent && parent.filename === workerPath && request === './pm-runtime.cjs') {
+          const createHandle = (startCount, restartCount = 0) => ({
+            url: 'http://127.0.0.1:4310',
+            port: 4310,
+            alreadyRunning: false,
+            foreign: false,
+            startCount,
+            restartCount,
+            stop: async () => ({ stopped: true, stopCount: startCount }),
+            restart: async () => {
+              starts += 1;
+              return createHandle(starts, restartCount + 1);
+            },
+          });
           return {
             startPmServer(options) {
               starts += 1;
-              return {
-                url: 'http://127.0.0.1:4310',
-                port: options.port,
-                alreadyRunning: starts > 1,
-                foreign: false,
-                startCount: starts,
-                stop: async () => ({ stopped: true, stopCount: starts }),
-              };
+              return createHandle(starts, 0);
             },
           };
         }
@@ -146,6 +152,23 @@ test('pm/stop invokes the current server stop handle and a later pm/ensure start
   assert.deepEqual(results[3].result, { stopped: true, stopCount: 2 });
 });
 
+test('pm/restart uses the runtime restart handle and keeps the worker process alive', async () => {
+  const results = await callWorkerLines([
+    {
+      jsonrpc: '2.0',
+      id: 20,
+      method: 'pm/ensure',
+      cindy: { secrets: { pm_token: 'test-token' } },
+    },
+    { jsonrpc: '2.0', id: 21, method: 'pm/restart' },
+    { jsonrpc: '2.0', id: 22, method: 'pm/stop' },
+  ]);
+  assert.equal(results[0].result.startCount, 1);
+  assert.equal(results[1].result.startCount, 2);
+  assert.equal(results[1].result.restartCount, 1);
+  assert.deepEqual(results[2].result, { stopped: true, stopCount: 2 });
+});
+
 test('GET tasks uses the bearer token and Cindy-only loopback path', async () => {
   const requests = [];
   const server = createServer((request, response) => {
@@ -201,6 +224,32 @@ test('POST intake forwards the exact JSON body', async () => {
     });
     assert.deepEqual(result.result, { intake_id: 'intake-1', accepted: true });
     assert.deepEqual(JSON.parse(receivedBody), body);
+  } finally {
+    await close(server);
+  }
+});
+
+test('PUT auto-scan forwards the enabled JSON body', async () => {
+  let receivedBody = '';
+  const server = createServer((request, response) => {
+    request.setEncoding('utf8');
+    request.on('data', (chunk) => { receivedBody += chunk; });
+    request.on('end', () => {
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({ enabled: true }));
+    });
+  });
+  const port = await listen(server);
+  try {
+    const result = await callWorker({
+      jsonrpc: '2.0',
+      id: 6,
+      method: 'pm/request',
+      params: { baseUrl: `http://127.0.0.1:${port}`, method: 'PUT', path: '/api/runtime/auto-scan', body: { enabled: true } },
+      cindy: { secrets: { pm_token: 'test-token' } },
+    });
+    assert.deepEqual(result.result, { enabled: true });
+    assert.deepEqual(JSON.parse(receivedBody), { enabled: true });
   } finally {
     await close(server);
   }

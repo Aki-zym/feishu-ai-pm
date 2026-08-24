@@ -36,7 +36,7 @@ export type DesktopConfigInput = PublicDesktopConfig & {
 
 export type DesktopBridge = {
   api: {
-    request(input: { method: 'GET' | 'POST' | 'PATCH' | 'DELETE'; url: string; body?: unknown }): Promise<{
+    request(input: { method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'; url: string; body?: unknown }): Promise<{
       status: number;
       body: unknown;
     }>;

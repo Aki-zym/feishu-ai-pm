@@ -4257,6 +4257,42 @@ export class AppDatabase {
     };
   }
 
+  /** Cindy keeps one durable replay watermark per conversation. */
+  listCindyConversationCursors() {
+    return this.raw.prepare(
+      `SELECT scope_key AS conversation_key, cursor AS last_occurred_at
+         FROM sync_cursor
+        WHERE integration = 'cindy_conversation'
+          AND cursor IS NOT NULL
+          AND cursor <> ''
+        ORDER BY scope_key ASC`,
+    ).all() as Array<{ conversation_key: string; last_occurred_at: string }>;
+  }
+
+  advanceCindyConversationCursor(conversationKey: string, occurredAt: string, updatedAt: string) {
+    const normalizedConversationKey = conversationKey.trim();
+    const nextOccurredAt = new Date(occurredAt);
+    if (!normalizedConversationKey || !Number.isFinite(nextOccurredAt.getTime())) return;
+    const nextCursor = nextOccurredAt.toISOString();
+    const current = this.raw.prepare(
+      `SELECT cursor
+         FROM sync_cursor
+        WHERE integration = 'cindy_conversation' AND scope_key = ?`,
+    ).get(normalizedConversationKey) as { cursor: string | null } | undefined;
+    const currentTime = current?.cursor ? Date.parse(current.cursor) : Number.NaN;
+    if (Number.isFinite(currentTime) && currentTime >= nextOccurredAt.getTime()) return;
+    this.raw.prepare(
+      `INSERT INTO sync_cursor
+        (integration, scope_key, cursor, last_success_at, last_error, updated_at)
+       VALUES ('cindy_conversation', ?, ?, ?, NULL, ?)
+       ON CONFLICT (integration, scope_key) DO UPDATE SET
+         cursor = excluded.cursor,
+         last_success_at = excluded.last_success_at,
+         last_error = NULL,
+         updated_at = excluded.updated_at`,
+    ).run(normalizedConversationKey, nextCursor, updatedAt, updatedAt);
+  }
+
   close() {
     this.raw.close();
   }

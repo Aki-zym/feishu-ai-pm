@@ -3,7 +3,7 @@ import type { OpenExternalUrlInput, OpenExternalUrlResult } from '@ai-pm/url-pol
 export type { OpenExternalUrlInput, OpenExternalUrlResult } from '@ai-pm/url-policy';
 
 export type DesktopRequest = {
-  method: 'GET' | 'POST' | 'PATCH' | 'DELETE';
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   url: string;
   body?: unknown;
 };

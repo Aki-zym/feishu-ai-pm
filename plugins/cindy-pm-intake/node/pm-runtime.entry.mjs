@@ -102,9 +102,15 @@ async function closeOwnedResources(app, database) {
   return failures;
 }
 
-function resultWithStop(payload, stop) {
+function resultWithLifecycle(payload, stop, restart) {
   Object.defineProperty(payload, 'stop', {
     value: stop,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  Object.defineProperty(payload, 'restart', {
+    value: restart,
     enumerable: false,
     configurable: false,
     writable: false,
@@ -115,6 +121,14 @@ function resultWithStop(payload, stop) {
 function noOpStop(errorCode, message) {
   return async () => ({
     stopped: false,
+    error_code: errorCode,
+    error: message,
+  });
+}
+
+function noOpRestart(errorCode, message) {
+  return async () => ({
+    restarted: false,
     error_code: errorCode,
     error: message,
   });
@@ -154,12 +168,12 @@ export async function startPmServer({
   }
 
   if (ownedRuntime && ownedRuntime.host === host && ownedRuntime.requestedPort === port) {
-    return resultWithStop({
+    return resultWithLifecycle({
       url: ownedRuntime.url,
       port: ownedRuntime.port,
       alreadyRunning: true,
       foreign: false,
-    }, ownedRuntime.stop);
+    }, ownedRuntime.stop, ownedRuntime.restart);
   }
 
   // Avoid opening or mutating SQLite when the resident server is already up.
@@ -167,9 +181,10 @@ export async function startPmServer({
   if (port !== 0) {
     const url = serverUrl(host, port);
     if (await canReachPmEndpoint(url, token)) {
-      return resultWithStop(
+      return resultWithLifecycle(
         { url, port, alreadyRunning: true, foreign: false },
         noOpStop('PM_ALREADY_RUNNING', '本机任务库由其他进程持有，未执行停止。'),
+        noOpRestart('PM_ALREADY_RUNNING', '本机任务库由其他进程持有，未执行重启。'),
       );
     }
   }
@@ -185,7 +200,9 @@ export async function startPmServer({
     const service = new PmService(database, createAdapters(config), config);
     let stopInFlight = null;
     let stopResult = null;
-    stopOwnedRuntime = async () => {
+    let restartInFlight = null;
+    let restartOwnedRuntime;
+    stopOwnedRuntime = async ({ scheduleExit = true } = {}) => {
       if (stopResult?.stopped) return { stopped: false, alreadyStopped: true };
       if (stopInFlight) return stopInFlight;
       stopInFlight = (async () => {
@@ -201,10 +218,24 @@ export async function startPmServer({
         }
         if (ownedRuntime?.app === app) ownedRuntime = null;
         stopResult = { stopped: true };
-        scheduleProcessExit();
+        if (scheduleExit) scheduleProcessExit();
         return stopResult;
       })();
       return stopInFlight;
+    };
+    const runtimeOptions = { port, host, sqlitePath, token, webRoot };
+    restartOwnedRuntime = async () => {
+      if (restartInFlight) return restartInFlight;
+      restartInFlight = (async () => {
+        const stopped = await stopOwnedRuntime({ scheduleExit: false });
+        if (!stopped.stopped) return stopped;
+        return startPmServer(runtimeOptions);
+      })();
+      try {
+        return await restartInFlight;
+      } finally {
+        restartInFlight = null;
+      }
     };
     app = await buildApp(service, {
       webOrigin: serverUrl(host, port),
@@ -214,6 +245,10 @@ export async function startPmServer({
       runtimeShutdown: async () => {
         const result = await stopOwnedRuntime();
         if (!result.stopped && !result.alreadyStopped) throw new Error(result.error || '本机任务库停止失败。');
+      },
+      runtimeRestart: async () => {
+        const result = await restartOwnedRuntime();
+        if (!result?.url || result.foreign) throw new Error(result?.error || '本机任务库重启失败。');
       },
     });
     await app.listen({ port, host });
@@ -226,23 +261,34 @@ export async function startPmServer({
       alreadyRunning: false,
       foreign: false,
     };
-    ownedRuntime = { host, requestedPort: port, url: payload.url, port: actualPort, app, database, stop: stopOwnedRuntime };
-    return resultWithStop(payload, stopOwnedRuntime);
+    ownedRuntime = {
+      host,
+      requestedPort: port,
+      url: payload.url,
+      port: actualPort,
+      app,
+      database,
+      stop: stopOwnedRuntime,
+      restart: restartOwnedRuntime,
+    };
+    return resultWithLifecycle(payload, stopOwnedRuntime, restartOwnedRuntime);
   } catch (error) {
     if (error && typeof error === 'object' && error.code === 'EADDRINUSE') {
       const url = serverUrl(host, port);
       if (await canReachPmEndpoint(url, token)) {
         await closeOwnedResources(app, database);
-        return resultWithStop(
+        return resultWithLifecycle(
           { url, port, alreadyRunning: true, foreign: false },
           noOpStop('PM_ALREADY_RUNNING', '本机任务库由其他进程持有，未执行停止。'),
+          noOpRestart('PM_ALREADY_RUNNING', '本机任务库由其他进程持有，未执行重启。'),
         );
       }
       await closeOwnedResources(app, database);
       console.warn(`本机任务库端口 ${url} 已被其他进程占用；插件不会抢占该端口。`);
-      return resultWithStop(
+      return resultWithLifecycle(
         { url, port, alreadyRunning: false, foreign: true },
         noOpStop('PM_FOREIGN_PROCESS', '本机任务库端口由外来进程占用，未执行停止。'),
+        noOpRestart('PM_FOREIGN_PROCESS', '本机任务库端口由外来进程占用，未执行重启。'),
       );
     }
     await closeOwnedResources(app, database);

@@ -17,6 +17,8 @@ const service = new PmService(database, adapters, config);
 const webRoot = fileURLToPath(new URL('../../web/dist/', import.meta.url));
 let app: Awaited<ReturnType<typeof buildApp>>;
 let shutdownInProgress: Promise<void> | null = null;
+let restartInProgress: Promise<void> | null = null;
+const listenOptions = { port: config.port, host: '127.0.0.1' } as const;
 const shutdown = async () => {
   if (shutdownInProgress) return shutdownInProgress;
   shutdownInProgress = (async () => {
@@ -31,15 +33,32 @@ const shutdownAndExit = async () => {
   if (config.nodeEnv !== 'test') process.exit(0);
 };
 
-app = await buildApp(service, {
+const buildRuntimeApp = () => buildApp(service, {
   webOrigin: config.webOrigin,
   webRoot,
   cindyIntegrationToken: config.cindyIntegrationToken,
   runtimeShutdown: shutdownAndExit,
+  runtimeRestart: restart,
 });
+
+const restart = async () => {
+  if (restartInProgress) return restartInProgress;
+  restartInProgress = (async () => {
+    await app.close();
+    app = await buildRuntimeApp();
+    await app.listen(listenOptions);
+  })();
+  try {
+    await restartInProgress;
+  } finally {
+    restartInProgress = null;
+  }
+};
+
+app = await buildRuntimeApp();
 service.startRuntimeRecovery();
 
-await app.listen({ port: config.port, host: '127.0.0.1' });
+await app.listen(listenOptions);
 
 process.on('SIGINT', () => { void shutdownAndExit(); });
 process.on('SIGTERM', () => { void shutdownAndExit(); });
