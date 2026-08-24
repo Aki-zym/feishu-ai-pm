@@ -9,6 +9,11 @@ import test from 'node:test';
 
 process.env.NODE_ENV = 'test';
 const { startPmServer } = createRequire(import.meta.url)('./pm-runtime.cjs');
+const runtimeAuth = {
+  token: 'test-token',
+  accountAnchor: 'test-account-anchor',
+  receiptSecret: 'test-receipt-secret-0123456789abcdef0123456789abcdef',
+};
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -37,7 +42,7 @@ test('stop closes the owned Fastify listener and SQLite handle', async () => {
   const runtime = await startPmServer({
     port: 0,
     sqlitePath: join(root, 'pm.sqlite'),
-    token: 'test-token',
+    ...runtimeAuth,
   });
   assert.deepEqual(Object.keys(runtime), ['url', 'port', 'alreadyRunning', 'foreign']);
   assert.equal(typeof runtime.stop, 'function');
@@ -76,7 +81,7 @@ test('status bar skips non-darwin and stop kills the spawned child', async () =>
     const linuxRuntime = await startPmServer({
       port: 0,
       sqlitePath: join(root, 'linux.sqlite'),
-      token: 'test-token',
+      ...runtimeAuth,
     });
     assert.equal(spawnCalls.length, 0);
     await linuxRuntime.stop();
@@ -86,7 +91,7 @@ test('status bar skips non-darwin and stop kills the spawned child', async () =>
     const missingBinaryRuntime = await startPmServer({
       port: 0,
       sqlitePath: join(root, 'missing-binary.sqlite'),
-      token: 'test-token',
+      ...runtimeAuth,
     });
     assert.equal(spawnCalls.length, 0);
     await missingBinaryRuntime.stop();
@@ -95,7 +100,7 @@ test('status bar skips non-darwin and stop kills the spawned child', async () =>
     const macRuntime = await startPmServer({
       port: 0,
       sqlitePath: join(root, 'mac.sqlite'),
-      token: 'test-token',
+      ...runtimeAuth,
     });
     assert.equal(spawnCalls.length, 1);
     assert.deepEqual(spawnCalls[0][1], [macRuntime.url]);
@@ -130,7 +135,7 @@ test('foreign stop returns an explicit error and leaves the foreign listener ali
     const runtime = await startPmServer({
       port,
       sqlitePath: join(root, 'pm.sqlite'),
-      token: 'test-token',
+      ...runtimeAuth,
     });
     assert.equal(runtime.foreign, true);
     assert.deepEqual(await runtime.stop(), {
@@ -160,7 +165,7 @@ test('restart reopens the same listener without scheduling process exit', async 
   const runtime = await startPmServer({
     port,
     sqlitePath: join(root, 'pm.sqlite'),
-    token: 'test-token',
+    ...runtimeAuth,
   });
   try {
     const restarted = await runtime.restart();
@@ -181,7 +186,7 @@ test('restart reopens the same listener without scheduling process exit', async 
     const current = await startPmServer({
       port,
       sqlitePath: join(root, 'pm.sqlite'),
-      token: 'test-token',
+      ...runtimeAuth,
     });
     assert.equal(current.alreadyRunning, true);
     await current.stop();
@@ -193,12 +198,74 @@ test('restart reopens the same listener without scheduling process exit', async 
   }
 });
 
+test('restart can rotate the Bearer while preserving receipts under the stable account secrets', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cindy-pm-runtime-token-rotation-'));
+  const initial = await startPmServer({
+    port: 0,
+    sqlitePath: join(root, 'pm.sqlite'),
+    ...runtimeAuth,
+  });
+  const sourcePayload = {
+    save_request_id: 'runtime-save-before-rotation',
+    sources: [{
+      client_ref: 'source',
+      provider: 'synthetic',
+      source_kind: 'synthetic_message',
+      stable_message_id: 'runtime-message-before-rotation',
+      occurred_at: '2026-08-24T00:01:00.000Z',
+      text: '轮换前保存的来源。',
+      revision: { sequence: 1 },
+    }],
+  };
+  const saved = await fetch(`${initial.url}/api/integrations/cindy/sources`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+    body: JSON.stringify(sourcePayload),
+  });
+  assert.equal(saved.status, 200);
+  const receipt = (await saved.json()).sources[0].source_receipt;
+
+  const rotated = await initial.restart({
+    token: 'rotated-test-token',
+    accountAnchor: runtimeAuth.accountAnchor,
+    receiptSecret: runtimeAuth.receiptSecret,
+  });
+  try {
+    assert.equal((await fetch(`${rotated.url}/api/integrations/cindy/tasks`, {
+      headers: { authorization: 'Bearer test-token' },
+    })).status, 401);
+    const replay = await fetch(`${rotated.url}/api/integrations/cindy/sources`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer rotated-test-token', 'content-type': 'application/json' },
+      body: JSON.stringify(sourcePayload),
+    });
+    assert.equal(replay.status, 200);
+    const replayBody = await replay.json();
+    assert.equal(replayBody.duplicate, true);
+    assert.equal(replayBody.sources[0].source_receipt, receipt);
+    const decision = await fetch(`${rotated.url}/api/integrations/cindy/decisions`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer rotated-test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        decision_request_id: 'runtime-decision-after-rotation',
+        window_id: 'runtime-window-after-rotation',
+        window_start: '2026-08-24T00:00:00.000Z',
+        window_end: '2026-08-24T00:05:00.000Z',
+        decisions: [{ decision_ref: 'skip', action: 'skip', source_receipts: [receipt], reason: '合成验证。' }],
+      }),
+    });
+    assert.equal(decision.status, 200);
+  } finally {
+    await rotated.stop();
+  }
+});
+
 test('auto-scan switch is available through the bundled runtime and persists in SQLite', async () => {
   const root = mkdtempSync(join(tmpdir(), 'cindy-pm-runtime-auto-scan-'));
   const runtime = await startPmServer({
     port: 0,
     sqlitePath: join(root, 'pm.sqlite'),
-    token: 'test-token',
+    ...runtimeAuth,
   });
   try {
     const initial = await fetch(`${runtime.url}/api/runtime/auto-scan`);
@@ -229,7 +296,7 @@ test('resident runtime does not start the classifier recovery chain', async () =
   const initial = await startPmServer({
     port: 0,
     sqlitePath,
-    token: 'test-token',
+    ...runtimeAuth,
   });
   await initial.stop();
 
@@ -248,7 +315,7 @@ test('resident runtime does not start the classifier recovery chain', async () =
   const runtime = await startPmServer({
     port: 0,
     sqlitePath,
-    token: 'test-token',
+    ...runtimeAuth,
   });
   try {
     const check = new DatabaseSync(sqlitePath);
@@ -260,12 +327,12 @@ test('resident runtime does not start the classifier recovery chain', async () =
   }
 });
 
-test('resident runtime exposes two-step Cindy intake and omits the raw-source decision route', async () => {
+test('resident runtime exposes two-step Cindy intake and omits all raw-source write routes', async () => {
   const root = mkdtempSync(join(tmpdir(), 'cindy-pm-runtime-cindy-routes-'));
   const runtime = await startPmServer({
     port: 0,
     sqlitePath: join(root, 'pm.sqlite'),
-    token: 'test-token',
+    ...runtimeAuth,
   });
   try {
     assert.equal((await fetch(`${runtime.url}/api/health`)).status, 200);
@@ -276,6 +343,7 @@ test('resident runtime exposes two-step Cindy intake and omits the raw-source de
       '/api/integrations/feishu/sync',
       '/api/integrations/feishu/sources/calendar/sync',
       '/api/dev/simulate-message',
+      '/api/dev/seed-intake',
     ]) {
       assert.equal((await fetch(`${runtime.url}${path}`, { method: 'POST' })).status, 404, path);
     }
@@ -303,7 +371,7 @@ test('shutdown still schedules process exit outside the test environment', async
   const runtime = await startPmServer({
     port: 0,
     sqlitePath: join(root, 'pm.sqlite'),
-    token: 'test-token',
+    ...runtimeAuth,
   });
   try {
     const response = await fetch(`${runtime.url}/api/runtime/shutdown`, { method: 'POST' });

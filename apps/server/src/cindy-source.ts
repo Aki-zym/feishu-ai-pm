@@ -16,6 +16,11 @@ export type CindyAuthContext = {
   receiptSecret: string;
 };
 
+export type CindyAuthMaterial = {
+  accountAnchor: string;
+  receiptSecret: string;
+};
+
 export type CindySourceRelationInput = {
   kind: 'reply_to' | 'thread_parent';
   client_ref?: string;
@@ -142,16 +147,19 @@ function normalizedRevision(source: CindySourceInput) {
   };
 }
 
-export function deriveCindyAuthContext(token: string): CindyAuthContext {
-  const secret = token.trim();
-  if (!secret) throw new CindySourceContractError('INVALID_INPUT', 'Cindy 集成认证上下文尚未配置。');
+export function deriveCindyAuthContext(material: CindyAuthMaterial): CindyAuthContext {
+  const accountAnchor = material.accountAnchor.trim();
+  const receiptSecret = material.receiptSecret.trim();
+  if (!accountAnchor || !receiptSecret) {
+    throw new CindySourceContractError('INVALID_INPUT', 'Cindy 稳定账号锚点或 receipt 密钥尚未配置。');
+  }
   return {
-    // M1 is a single-owner local product. The authenticated plugin route binds
-    // that durable owner scope; the connected-account anchor separates token
-    // contexts without accepting either value from request bodies.
+    // M1 is a single-owner local product. Bearer authentication is checked by
+    // the HTTP route, while these separately persisted plugin secrets bind the
+    // durable connected account and receipt signature across bearer rotation.
     ownerScope: 'primary',
-    accountAnchor: `cindy_account_${sha256(`account\u0000${secret}`)}`,
-    receiptSecret: secret,
+    accountAnchor: `cindy_account_${sha256(`connected-account\u0000${accountAnchor}`)}`,
+    receiptSecret,
   };
 }
 

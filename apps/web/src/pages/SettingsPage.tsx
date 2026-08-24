@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AtSign, Bot, BrainCircuit, CalendarDays, CheckCircle2, FileText, FlaskConical, FolderOpen, KeyRound, MessageCircle, Power, RefreshCw, ShieldCheck, Sparkles, Trash2, UserRound } from 'lucide-react';
-import { api, ApiRequestError } from '../api';
+import { api } from '../api';
 import { AsyncState } from '../components/AsyncState';
 import { desktopBridge, type DesktopConfigInput, type PublicDesktopConfig } from '../desktop';
 import { FeishuPermissionGuide } from '../components/FeishuPermissionGuide';
@@ -529,18 +529,13 @@ export default function SettingsPage() {
     setBrowserSeedState('pending');
     setBrowserSeedMessage('正在生成测试用模拟需求…');
     try {
-      try {
-        await api.post('/api/dev/seed-intake', seedPayload);
-      } catch (reason) {
-        if (!(reason instanceof ApiRequestError) || reason.status !== 404) throw reason;
-        await api.post('/api/corrections', {
-          correctionType: 'missed_request',
-          idempotencyKey: `browser-seed:${Date.now()}`,
-          manualContent: `${seedPayload.title}：${seedPayload.describe}`,
-          manualSenderName: '浏览器测试需求方',
-          manualOccurredAt: occurredAt,
-        });
-      }
+      await api.post('/api/corrections', {
+        correctionType: 'missed_request',
+        idempotencyKey: `browser-seed:${Date.now()}`,
+        manualContent: `${seedPayload.title}：${seedPayload.describe}`,
+        manualSenderName: '浏览器测试需求方',
+        manualOccurredAt: occurredAt,
+      });
       setBrowserSeedState('success');
       setBrowserSeedMessage('模拟需求已加入候选收件箱。');
     } catch (reason) {

@@ -14,6 +14,8 @@ test('browser shutdown route closes the owned listener after returning 200', asy
     port: 0,
     sqlitePath: join(root, 'pm.sqlite'),
     token: 'test-token',
+    accountAnchor: 'test-account-anchor',
+    receiptSecret: 'test-receipt-secret-0123456789abcdef0123456789abcdef',
   });
 
   const response = await fetch(`${runtime.url}/api/runtime/shutdown`, { method: 'POST' });

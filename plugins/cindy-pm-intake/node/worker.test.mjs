@@ -8,6 +8,11 @@ import path from 'node:path';
 import test from 'node:test';
 
 const workerPath = path.resolve(import.meta.dirname, 'worker.cjs');
+const pmSecrets = {
+  pm_token: 'test-token',
+  pm_account_anchor: 'test-account-anchor',
+  pm_receipt_secret: 'test-receipt-secret-0123456789abcdef0123456789abcdef',
+};
 
 function createCindyFixture({ source = 'desktop', orcaRole = null, sessionId = 'session-a' } = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'cindy-pm-worker-'));
@@ -103,9 +108,14 @@ function callWorkerLines(requests) {
             startCount,
             restartCount,
             stop: async () => ({ stopped: true, stopCount: startCount }),
-            restart: async () => {
+            restart: async (options) => {
               starts += 1;
-              return createHandle(starts, restartCount + 1);
+              return {
+                ...createHandle(starts, restartCount + 1),
+                restartToken: options && options.token,
+                restartAccountAnchor: options && options.accountAnchor,
+                restartReceiptSecret: options && options.receiptSecret,
+              };
             },
           });
           return {
@@ -177,14 +187,14 @@ test('pm/stop invokes the current server stop handle and a later pm/ensure start
       jsonrpc: '2.0',
       id: 10,
       method: 'pm/ensure',
-      cindy: { secrets: { pm_token: 'test-token' } },
+      cindy: { secrets: pmSecrets },
     },
     { jsonrpc: '2.0', id: 11, method: 'pm/stop' },
     {
       jsonrpc: '2.0',
       id: 12,
       method: 'pm/ensure',
-      cindy: { secrets: { pm_token: 'test-token' } },
+      cindy: { secrets: pmSecrets },
     },
     { jsonrpc: '2.0', id: 13, method: 'pm/stop' },
   ]);
@@ -200,14 +210,17 @@ test('pm/restart uses the runtime restart handle and keeps the worker process al
       jsonrpc: '2.0',
       id: 20,
       method: 'pm/ensure',
-      cindy: { secrets: { pm_token: 'test-token' } },
+      cindy: { secrets: pmSecrets },
     },
-    { jsonrpc: '2.0', id: 21, method: 'pm/restart' },
+    { jsonrpc: '2.0', id: 21, method: 'pm/restart', cindy: { secrets: pmSecrets } },
     { jsonrpc: '2.0', id: 22, method: 'pm/stop' },
   ]);
   assert.equal(results[0].result.startCount, 1);
   assert.equal(results[1].result.startCount, 2);
   assert.equal(results[1].result.restartCount, 1);
+  assert.equal(results[1].result.restartToken, pmSecrets.pm_token);
+  assert.equal(results[1].result.restartAccountAnchor, pmSecrets.pm_account_anchor);
+  assert.equal(results[1].result.restartReceiptSecret, pmSecrets.pm_receipt_secret);
   assert.deepEqual(results[2].result, { stopped: true, stopCount: 2 });
 });
 
@@ -225,7 +238,7 @@ test('GET tasks uses the bearer token and Cindy-only loopback path', async () =>
       id: 1,
       method: 'pm/request',
       params: { baseUrl: `http://127.0.0.1:${port}`, method: 'GET', path: '/api/integrations/cindy/tasks' },
-      cindy: { secrets: { pm_token: 'test-token' } },
+      cindy: { secrets: pmSecrets },
     });
     assert.deepEqual(result.result.items, [{ id: 'task-1', version: 3 }]);
     assert.deepEqual(requests, [{
@@ -266,7 +279,7 @@ test('POST trusted source save forwards the exact JSON body', async () => {
       id: 2,
       method: 'pm/request',
       params: { baseUrl: `http://127.0.0.1:${port}`, method: 'POST', path: '/api/integrations/cindy/sources', body },
-      cindy: { secrets: { pm_token: 'test-token' } },
+      cindy: { secrets: pmSecrets },
     });
     assert.deepEqual(result.result, { save_request_id: 'save-1', sources: [] });
     assert.deepEqual(JSON.parse(receivedBody), body);
@@ -292,7 +305,7 @@ test('PUT auto-scan forwards the enabled JSON body', async () => {
       id: 6,
       method: 'pm/request',
       params: { baseUrl: `http://127.0.0.1:${port}`, method: 'PUT', path: '/api/runtime/auto-scan', body: { enabled: true } },
-      cindy: { secrets: { pm_token: 'test-token' } },
+      cindy: { secrets: pmSecrets },
     });
     assert.deepEqual(result.result, { enabled: true });
     assert.deepEqual(JSON.parse(receivedBody), { enabled: true });
@@ -341,7 +354,7 @@ test('rejects non-loopback hosts and paths outside the Cindy integration prefix'
     id: 3,
     method: 'pm/request',
     params: { baseUrl: 'http://example.com', method: 'GET', path: '/api/integrations/cindy/tasks' },
-    cindy: { secrets: { pm_token: 'test-token' } },
+    cindy: { secrets: pmSecrets },
   });
   assert.match(hostResult.error.message, /本机 HTTP 回环地址/);
 
@@ -350,7 +363,7 @@ test('rejects non-loopback hosts and paths outside the Cindy integration prefix'
     id: 4,
     method: 'pm/request',
     params: { baseUrl: 'http://127.0.0.1:4310', method: 'GET', path: '/api/tasks' },
-    cindy: { secrets: { pm_token: 'test-token' } },
+    cindy: { secrets: pmSecrets },
   });
   assert.match(pathResult.error.message, /Cindy 专用本机任务库接口/);
 });
@@ -375,7 +388,7 @@ test('rejects HTTP redirects instead of following them', async () => {
       id: 5,
       method: 'pm/request',
       params: { baseUrl: `http://127.0.0.1:${port}`, method: 'GET', path: '/api/integrations/cindy/tasks' },
-      cindy: { secrets: { pm_token: 'test-token' } },
+      cindy: { secrets: pmSecrets },
     });
     assert.equal(result.result, undefined);
     assert.ok(result.error);

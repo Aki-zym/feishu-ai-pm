@@ -43,6 +43,8 @@ const schema = z.object({
   WORKSPACE_ALLOWED_PATHS: z.string().default('[]'),
   TASK_MEMORY_ROOT: z.string().default(''),
   CINDY_INTEGRATION_TOKEN: z.string().default(''),
+  CINDY_ACCOUNT_ANCHOR: z.string().default(''),
+  CINDY_RECEIPT_SECRET: z.string().default(''),
 });
 
 export type AppConfig = ReturnType<typeof loadConfig>;
@@ -113,5 +115,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env) {
     },
     taskMemoryRoot: parsed.TASK_MEMORY_ROOT ? resolve(parsed.TASK_MEMORY_ROOT) : resolve(process.cwd(), 'tmp', 'task-memory'),
     cindyIntegrationToken: parsed.CINDY_INTEGRATION_TOKEN,
+    cindyAccountAnchor: parsed.CINDY_ACCOUNT_ANCHOR,
+    cindyReceiptSecret: parsed.CINDY_RECEIPT_SECRET,
   };
 }

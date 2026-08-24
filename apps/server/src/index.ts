@@ -36,6 +36,8 @@ const buildRuntimeApp = () => buildApp(service, {
   webOrigin: config.webOrigin,
   webRoot,
   cindyIntegrationToken: config.cindyIntegrationToken,
+  cindyIntegrationAccountAnchor: config.cindyAccountAnchor,
+  cindyReceiptSecret: config.cindyReceiptSecret,
   runtimeShutdown: shutdownAndExit,
   runtimeRestart: restart,
 });

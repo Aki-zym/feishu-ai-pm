@@ -40,29 +40,49 @@ function randomToken() {
   return `cindy-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
 }
 
-async function hasSavedPmToken() {
+function secureRandomSecret(prefix) {
+  if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === 'function'
+    && typeof Uint8Array === 'function') {
+    const bytes = new Uint8Array(32);
+    globalThis.crypto.getRandomValues(bytes);
+    return `${prefix}-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+  }
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+    return `${prefix}-${globalThis.crypto.randomUUID()}${globalThis.crypto.randomUUID()}`;
+  }
+  throw new Error('当前环境不支持生成本机可信来源密钥');
+}
+
+async function savedPmSecrets() {
   try {
     const response = await fetch('/secrets');
     const secrets = await response.json();
     const items = Array.isArray(secrets) ? secrets : secrets && Array.isArray(secrets.items) ? secrets.items : [];
-    return items.some((item) => item && item.key === 'pm_token' && item.saved === true);
+    return new Set(items.filter((item) => item && item.saved === true).map((item) => item.key));
   } catch {
-    return false;
+    return new Set();
   }
 }
 
-async function saveGeneratedPmToken() {
-  const response = await fetch('/secrets/pm_token', {
+async function saveGeneratedPmSecret(key, value) {
+  const response = await fetch(`/secrets/${key}`, {
     method: 'PUT',
-    body: JSON.stringify({ value: randomToken() }),
+    body: JSON.stringify({ value }),
   });
   if (response && response.ok === false) {
-    throw new Error('无法保存本机服务令牌');
+    throw new Error('无法保存本机任务库秘密');
   }
 }
 
 async function ensurePmOnce() {
-  if (!(await hasSavedPmToken())) await saveGeneratedPmToken();
+  const saved = await savedPmSecrets();
+  if (!saved.has('pm_token')) await saveGeneratedPmSecret('pm_token', randomToken());
+  if (!saved.has('pm_account_anchor')) {
+    await saveGeneratedPmSecret('pm_account_anchor', secureRandomSecret('cindy-account'));
+  }
+  if (!saved.has('pm_receipt_secret')) {
+    await saveGeneratedPmSecret('pm_receipt_secret', secureRandomSecret('cindy-receipt'));
+  }
   const cfg = await settings();
   const response = await cindy.node.request({
     method: 'pm/ensure',

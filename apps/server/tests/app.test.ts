@@ -31,8 +31,13 @@ describe('本机服务入口', () => {
     expect(response.json()).toMatchObject({ status: 'ok', mode: 'local-shell', externalConnections: false });
   });
 
-  it('生产装配保留 loopback seed，旧 simulate-message 与 Feishu sync 均无路由', async () => {
-    const { app, database } = await makeApp();
+  it('生产装配不暴露 raw-source intake 或 seed 路由且保持零写入', async () => {
+    const { app, database } = await makeApp({
+      serveWeb: false,
+      cindyIntegrationToken: 'production-route-test-token',
+      cindyIntegrationAccountAnchor: 'production-route-test-account',
+      cindyReceiptSecret: 'production-route-test-receipt-secret-0123456789abcdef',
+    });
     const oldRoute = await app.inject({ method: 'POST', url: '/api/dev/simulate-message', payload: { content: 'old' } });
     expect(oldRoute.statusCode).toBe(404);
     const syncRoute = await app.inject({ method: 'POST', url: '/api/integrations/feishu/sync' });
@@ -43,9 +48,16 @@ describe('本机服务入口', () => {
       remoteAddress: '127.0.0.1',
       payload: { title: '测试候选', describe: '用于 app 合同测试。' },
     });
-    expect(seeded.statusCode).toBe(200);
-    expect(seeded.json().candidate_id).toEqual(expect.any(String));
+    expect(seeded.statusCode).toBe(404);
+    const rawIntake = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/intake',
+      headers: { authorization: 'Bearer production-route-test-token' },
+      payload: { sources: [{ text: 'raw source should not be accepted' }] },
+    });
+    expect(rawIntake.statusCode).toBe(404);
     expect(database.raw.prepare('SELECT COUNT(*) AS count FROM task').get()).toEqual({ count: 0 });
-    expect(database.raw.prepare("SELECT COUNT(*) AS count FROM candidate_request WHERE state = 'pending'").get()).toEqual({ count: 1 });
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get()).toEqual({ count: 0 });
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get()).toEqual({ count: 0 });
   });
 });

@@ -9,6 +9,8 @@ describe('Cindy 对话入库接口', () => {
   const databases: AppDatabase[] = [];
   const apps: Array<Awaited<ReturnType<typeof buildApp>>> = [];
   const token = 'test-cindy-intake-token';
+  const accountAnchor = 'test-connected-account-anchor';
+  const receiptSecret = 'test-receipt-secret-0123456789abcdef0123456789abcdef';
 
   afterEach(async () => {
     for (const app of apps.splice(0)) await app.close();
@@ -25,12 +27,22 @@ describe('Cindy 对话入库接口', () => {
        '补充分区口径', 'low', NULL, 1, NULL, NULL, NULL, 'active', NULL, NULL, 0, ?, ?)`).run(id, timestamp, timestamp);
   }
 
-  async function makeApp(integrationToken = token, existingDatabase?: AppDatabase) {
+  async function makeApp(
+    integrationToken = token,
+    existingDatabase?: AppDatabase,
+    integrationAccountAnchor = accountAnchor,
+    integrationReceiptSecret = receiptSecret,
+  ) {
     const database = existingDatabase ?? new AppDatabase(':memory:', false);
     if (!existingDatabase) databases.push(database);
     const config = loadConfig({ NODE_ENV: 'test', DATABASE_URL: ':memory:' });
     const service = new PmService(database, createCindyAdapters(config), config);
-    const app = await buildApp(service, { serveWeb: false, cindyIntegrationToken: integrationToken });
+    const app = await buildApp(service, {
+      serveWeb: false,
+      cindyIntegrationToken: integrationToken,
+      cindyIntegrationAccountAnchor: integrationAccountAnchor,
+      cindyReceiptSecret: integrationReceiptSecret,
+    });
     apps.push(app);
     return { app, database };
   }
@@ -99,6 +111,16 @@ describe('Cindy 对话入库接口', () => {
       expect.objectContaining({ id: 'task-cindy-intake-1', status: 'planned', version: 1 }),
     ]);
     expect(response.json().items.some((item: { id: string }) => item.id === 'task-cindy-intake-archived')).toBe(false);
+  });
+
+  it('配置 Bearer 时缺少稳定账号锚点或独立 receipt 密钥会拒绝启动', async () => {
+    const database = new AppDatabase(':memory:', false);
+    databases.push(database);
+    const config = loadConfig({ NODE_ENV: 'test', DATABASE_URL: ':memory:' });
+    const service = new PmService(database, createCindyAdapters(config), config);
+    await expect(buildApp(service, { serveWeb: false, cindyIntegrationToken: token })).rejects.toThrow(
+      '缺少稳定账号锚点或独立 receipt 密钥',
+    );
   });
 
   it('自动扫描开关只接受本机请求，默认关闭并持久化 enabled 状态', async () => {
@@ -198,6 +220,41 @@ describe('Cindy 对话入库接口', () => {
     expect(replay.json()).toMatchObject({ duplicate: true });
     expect(replay.json().sources[0].source_receipt).toBe(receipt);
     expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(1);
+  });
+
+  it('同一稳定账号下轮换 Bearer 后旧 receipt、来源与保存/决策幂等仍可用', async () => {
+    const { app, database } = await makeApp();
+    const savePayload = { save_request_id: 'save-before-token-rotation', sources: [trustedSource()] };
+    const first = await saveSources(app, savePayload);
+    expect(first.statusCode).toBe(200);
+    const receipt = first.json().sources[0].source_receipt as string;
+
+    const rotatedToken = 'rotated-cindy-bearer-token';
+    const { app: rotatedApp } = await makeApp(rotatedToken, database);
+    const requestReplay = await saveSources(rotatedApp, savePayload, rotatedToken);
+    expect(requestReplay.statusCode).toBe(200);
+    expect(requestReplay.json()).toMatchObject({ duplicate: true });
+    expect(requestReplay.json().sources[0].source_receipt).toBe(receipt);
+
+    const identityReplay = await saveSources(rotatedApp, {
+      save_request_id: 'save-after-token-rotation',
+      sources: [trustedSource()],
+    }, rotatedToken);
+    expect(identityReplay.statusCode).toBe(200);
+    expect(identityReplay.json().sources[0].source_receipt).toBe(receipt);
+
+    const decisionPayload = {
+      decision_request_id: 'decision-after-token-rotation',
+      window_id: 'window-after-token-rotation',
+      window_start: '2026-08-24T00:00:00.000Z',
+      window_end: '2026-08-24T00:05:00.000Z',
+      decisions: [{ decision_ref: 'skip', action: 'skip', source_receipts: [receipt], reason: '合成来源无需任务。' }],
+    };
+    const decision = await submitDecisions(rotatedApp, decisionPayload, rotatedToken);
+    expect(decision.statusCode).toBe(200);
+    const decisionReplay = await submitDecisions(rotatedApp, decisionPayload, rotatedToken);
+    expect(decisionReplay.statusCode).toBe(200);
+    expect(decisionReplay.json()).toMatchObject({ duplicate: true });
   });
 
   it('保存请求的幂等 hash 使用规范化后的白名单字段', async () => {
@@ -391,7 +448,7 @@ describe('Cindy 对话入库接口', () => {
     const higher = await saveSources(app, { save_request_id: 'save-receipt-gates-v2', sources: [trustedSource({ revision: { sequence: 2 }, text: '第二版。' })] });
     const receipt2 = higher.json().sources[0].source_receipt as string;
     const foreignToken = 'different-cindy-owner-token';
-    const { app: foreignApp } = await makeApp(foreignToken, database);
+    const { app: foreignApp } = await makeApp(foreignToken, database, 'different-connected-account-anchor');
     const baseDecision = (sourceReceipt: string, id: string) => ({
       decision_request_id: id,
       window_id: id,
@@ -433,7 +490,7 @@ describe('Cindy 对话入库接口', () => {
     expect(replay.json()).toMatchObject({ duplicate: true });
     expect(database.raw.prepare('SELECT version, next_step FROM task WHERE id = ?').get('task-cindy-intake-1')).toEqual({ version: 2, next_step: '新口径' });
     const foreignToken = 'different-cindy-account-token';
-    const { app: foreignApp } = await makeApp(foreignToken, database);
+    const { app: foreignApp } = await makeApp(foreignToken, database, 'different-connected-account-anchor');
     const foreignReplay = await submitDecisions(foreignApp, successPayload, foreignToken);
     expect(foreignReplay.statusCode).toBe(403);
     expect(database.raw.prepare('SELECT COUNT(*) AS count FROM task_event WHERE event_type = ?').get('task_cindy_intake_update'))

@@ -159,8 +159,18 @@
     "secretBindings": [{
       "key": "pm_token",
       "label": "本机服务令牌",
-      "hint": "与本机 TooManyTasks 服务的 CINDY_INTEGRATION_TOKEN 保持一致。",
+      "hint": "只用于本机 HTTP Bearer 鉴权；轮换不会改变可信来源身份。",
       "methods": ["pm/request", "pm/ensure", "pm/stop", "pm/restart", "cindy/read-completed-turn"]
+    }, {
+      "key": "pm_account_anchor",
+      "label": "连接账号锚点",
+      "hint": "插件首次启动时自动生成并稳定保存，用于绑定可信来源身份。",
+      "methods": ["pm/ensure", "pm/restart"]
+    }, {
+      "key": "pm_receipt_secret",
+      "label": "来源凭证密钥",
+      "hint": "插件首次启动时自动生成并稳定保存，只用于签发和验证来源 receipt。",
+      "methods": ["pm/ensure", "pm/restart"]
     }]
   },
   "skill": {

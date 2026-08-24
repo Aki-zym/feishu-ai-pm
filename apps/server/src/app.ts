@@ -3,7 +3,7 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, relative, resolve, sep } from 'node:path';
 import cors from '@fastify/cors';
-import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
+import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import type { CandidateState, RiskLevel, TaskStatus } from './domain.js';
 import { AUDIT_REPLAY_INTENT, type ReplayCapabilityBinding } from './data04.js';
@@ -32,12 +32,6 @@ import {
 
 const candidateStates = ['pending', 'snoozed', 'ignored', 'accepted'] as const;
 const taskStatuses = ['unplanned', 'planned', 'in_progress', 'waiting', 'review', 'completed', 'archived'] as const;
-const seedIntakeBodySchema = z.object({
-  title: z.string().trim().min(1).max(160),
-  describe: z.string().trim().min(1).max(2_000).optional(),
-  background: z.string().trim().min(1).max(8_000).optional(),
-}).strict();
-
 function isLoopbackRequest(request: FastifyRequest) {
   const remoteAddress = request.socket.remoteAddress ?? request.ip;
   const normalizedAddress = remoteAddress?.replace(/^::ffff:/u, '').replace(/^\[|\]$/gu, '').split('%')[0];
@@ -71,12 +65,14 @@ function candidateMutationError(error: unknown, fallback: string, current?: unkn
 }
 const risks = ['low', 'medium', 'high'] as const;
 
-type BuildAppOptions = {
+export type BuildAppOptions = {
   webOrigin?: string;
   serveWeb?: boolean;
   webRoot?: string;
   desktopCapability?: LocalActionCapability;
   cindyIntegrationToken?: string;
+  cindyIntegrationAccountAnchor?: string;
+  cindyReceiptSecret?: string;
   /** Resident Cindy runtime omits the legacy Feishu collection/classification routes. */
   cindyRuntime?: boolean;
   runtimeShutdown?: () => Promise<void> | void;
@@ -152,62 +148,29 @@ function requirePrivacyCapability(
   return capabilityBinding(capability);
 }
 
-export function registerSeedIntakeRoute(app: FastifyInstance, service: PmService) {
-  if (app.hasRoute({ method: 'POST', url: '/api/dev/seed-intake' })) return;
-  app.post('/api/dev/seed-intake', async (request, reply) => {
-    const remoteAddress = request.socket.remoteAddress ?? request.ip;
-    const normalizedAddress = remoteAddress?.replace(/^::ffff:/u, '').replace(/^\[|\]$/gu, '').split('%')[0];
-    if (normalizedAddress !== '127.0.0.1' && normalizedAddress !== '::1') {
-      return reply.code(403).send({ error: '模拟需求入口只接受本机回环请求。' });
-    }
-    try {
-      const body = seedIntakeBodySchema.parse(request.body);
-      const occurredAt = new Date().toISOString();
-      const sourceKey = `dev-seed-source-${randomUUID()}`;
-      const background = body.background ?? body.describe ?? body.title;
-      const result = service.processCindyIntake({
-        window_id: `dev-seed-window-${randomUUID()}`,
-        window_start: occurredAt,
-        window_end: occurredAt,
-        sources: [{
-          source_key: sourceKey,
-          occurred_at: occurredAt,
-          conversation_key: `dev-seed-conversation-${sourceKey}`,
-          sender_role: '测试模拟需求',
-          text: background,
-        }],
-        proposals: [{
-          action: 'create_candidate',
-          source_keys: [sourceKey],
-          title: body.title,
-          ...(body.describe === undefined ? {} : { describe: body.describe }),
-          reason: '浏览器 HTML 测试模拟需求。',
-        }],
-      });
-      const candidateId = result.proposals.find((proposal) => proposal.action === 'create_candidate')?.candidate_id;
-      if (!candidateId) return reply.code(500).send({ error: '模拟需求未生成候选。' });
-      return { candidate_id: candidateId };
-    } catch (error) {
-      const status = error instanceof z.ZodError ? 400 : 409;
-      return reply.code(status).send({ error: error instanceof Error ? error.message : '模拟需求写入失败。' });
-    }
-  });
-}
-
 export async function buildApp(service: PmService, input: string | BuildAppOptions = 'http://localhost:5173') {
   const options: BuildAppOptions = typeof input === 'string' ? { webOrigin: input } : input;
   const webOrigin = options.webOrigin ?? 'http://localhost:5173';
+  const cindyIntegrationToken = options.cindyIntegrationToken?.trim() ?? '';
+  const cindyIntegrationAccountAnchor = options.cindyIntegrationAccountAnchor?.trim() ?? '';
+  const cindyReceiptSecret = options.cindyReceiptSecret?.trim() ?? '';
+  if (cindyIntegrationToken && (!cindyIntegrationAccountAnchor || !cindyReceiptSecret)) {
+    throw new Error('Cindy 集成已配置 Bearer，但缺少稳定账号锚点或独立 receipt 密钥。');
+  }
   if (options.desktopCapability) service.registerAuditReplayCapability(options.desktopCapability);
   const app = Fastify({ logger: options.logger ?? process.env.NODE_ENV !== 'test' });
   await app.register(cors, { origin: webOrigin });
   let runtimeShutdownScheduled = false;
   let runtimeRestartScheduled = false;
-  const cindyAuthContext = () => deriveCindyAuthContext(options.cindyIntegrationToken ?? '');
+  const cindyAuthContext = () => deriveCindyAuthContext({
+    accountAnchor: cindyIntegrationAccountAnchor,
+    receiptSecret: cindyReceiptSecret,
+  });
 
   app.addHook('onRequest', async (request, reply) => {
     if (!request.url.startsWith('/api/integrations/cindy/')) return;
     if (request.method === 'OPTIONS') return;
-    const expected = options.cindyIntegrationToken?.trim();
+    const expected = cindyIntegrationToken;
     const authorization = String(request.headers.authorization ?? '');
     const expectedAuthorization = expected ? `Bearer ${expected}` : '';
     const authorizationMatches = Boolean(expectedAuthorization)
@@ -267,7 +230,6 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
       return reply.code(status).send({ error: error instanceof Error ? error.message : '入库窗口游标更新失败。' });
     }
   });
-  registerSeedIntakeRoute(app, service);
   app.get('/api/dashboard', async () => dashboardDtoSchema.parse(service.dashboard()));
   app.get('/api/calendar', async () => service.calendar());
   app.get('/api/calendar/sources', async (request) => {

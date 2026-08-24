@@ -1,12 +1,63 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
-import { deriveCindyAuthContext } from '../src/cindy-source.js';
+import { buildApp } from '../src/app.js';
+import { deriveCindyAuthContext, saveCindySources } from '../src/cindy-source.js';
 import { loadConfig } from '../src/config.js';
-import { AppDatabase, CURRENT_SCHEMA_VERSION } from '../src/database.js';
+import {
+  AppDatabase,
+  CINDY_TRUSTED_SOURCE_MIGRATION_DESCRIPTOR,
+  CURRENT_SCHEMA_VERSION,
+  DatabaseUpgradeError,
+  type MigrationDescriptor,
+} from '../src/database.js';
 import { createCindyAdapters } from '../src/integrations.js';
 import { PmService } from '../src/service.js';
+
+const migrationAuth = deriveCindyAuthContext({
+  accountAnchor: 'migration-test-account-anchor',
+  receiptSecret: 'migration-test-receipt-secret-0123456789abcdef0123456789abcdef',
+});
+
+function seedLegacyV8Source(database: AppDatabase) {
+  const timestamp = '2026-08-24T00:01:00.000Z';
+  const sourceId = 'legacy-source';
+  const revisionId = 'legacy-source-revision';
+  const metadata = JSON.stringify({
+    provider: 'synthetic',
+    sourceKind: 'synthetic_message',
+    stableMessageId: 'legacy-message-1',
+  });
+  database.raw.prepare(
+    `INSERT INTO source_event
+      (id, external_id, source_type, conversation_id, sender_id, sender_name, content, owner_mentioned,
+       source_url, completeness, discovery_reason, metadata_json, occurred_at, captured_at,
+       owner_scope, revision_generation, current_revision_id)
+     VALUES (?, ?, 'manual', 'legacy-conversation', 'legacy-sender', '旧来源', '旧来源正文。', 0,
+             NULL, 'complete', 'v8 migration fixture', ?, ?, ?, 'primary', 1, ?)`,
+  ).run(sourceId, 'legacy-external-id', metadata, timestamp, timestamp, revisionId);
+  database.raw.prepare(
+    `INSERT INTO source_event_revision
+      (id, source_event_id, revision_number, revision_kind, external_id, source_type, conversation_id,
+       sender_id, sender_name, content, owner_mentioned, source_url, completeness, discovery_reason,
+       metadata_json, occurred_at, captured_at, owner_scope, revision_hash, created_at)
+     VALUES (?, ?, 1, 'migration', ?, 'manual', 'legacy-conversation', 'legacy-sender', '旧来源',
+             '旧来源正文。', 0, NULL, 'complete', 'v8 migration fixture', ?, ?, ?, 'primary', ?, ?)`,
+  ).run(revisionId, sourceId, 'legacy-external-id', metadata, timestamp, timestamp, 'a'.repeat(64), timestamp);
+  return { sourceId, revisionId };
+}
+
+async function buildAppFromDisk(
+  path: string,
+  migrationDescriptorForTest: MigrationDescriptor,
+) {
+  const database = new AppDatabase(path, false, { migrationDescriptorForTest });
+  const config = loadConfig({ NODE_ENV: 'test', DATABASE_URL: `file:${path}` });
+  const service = new PmService(database, createCindyAdapters(config), config);
+  return buildApp(service, { serveWeb: false });
+}
 
 describe('Cindy trusted source v9 migration', () => {
   const roots: string[] = [];
@@ -20,31 +71,18 @@ describe('Cindy trusted source v9 migration', () => {
     roots.push(root);
     const path = join(root, 'pm.sqlite');
     const oldDatabase = new AppDatabase(path, false, { targetSchemaVersionForTest: 8 });
-    const config = loadConfig({ NODE_ENV: 'test', DATABASE_URL: `file:${path}` });
-    const oldService = new PmService(oldDatabase, createCindyAdapters(config), config);
-    oldService.processCindyIntake({
-      window_id: 'legacy-window',
-      window_start: '2026-08-24T00:00:00.000Z',
-      window_end: '2026-08-24T00:05:00.000Z',
-      sources: [{ source_key: 'legacy-key', occurred_at: '2026-08-24T00:01:00.000Z', text: '旧来源正文。' }],
-      proposals: [],
-    });
-    const legacy = oldDatabase.raw.prepare('SELECT id, current_revision_id FROM source_event').get() as { id: string; current_revision_id: string };
-    const metadata = JSON.stringify({ provider: 'synthetic', sourceKind: 'synthetic_message', stableMessageId: 'legacy-message-1' });
-    oldDatabase.raw.prepare('UPDATE source_event SET metadata_json = ? WHERE id = ?').run(metadata, legacy.id);
-    oldDatabase.raw.prepare('UPDATE source_event_revision SET metadata_json = ? WHERE id = ?').run(metadata, legacy.current_revision_id);
+    const legacy = seedLegacyV8Source(oldDatabase);
     oldDatabase.close();
 
     const database = new AppDatabase(path, false);
     expect((database.raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(CURRENT_SCHEMA_VERSION);
-    expect(database.raw.prepare('SELECT ingest_state FROM source_event WHERE id = ?').get(legacy.id)).toEqual({ ingest_state: 'legacy_read_only' });
-    expect(database.raw.prepare('SELECT processing_status, receipt_digest FROM source_event_revision WHERE id = ?').get(legacy.current_revision_id))
+    expect(database.raw.prepare('SELECT ingest_state FROM source_event WHERE id = ?').get(legacy.sourceId)).toEqual({ ingest_state: 'legacy_read_only' });
+    expect(database.raw.prepare('SELECT processing_status, receipt_digest FROM source_event_revision WHERE id = ?').get(legacy.revisionId))
       .toEqual({ processing_status: 'legacy_read_only', receipt_digest: null });
-    expect(database.raw.prepare('SELECT state, current_revision_id FROM cindy_source_identity WHERE source_event_id = ?').get(legacy.id))
-      .toEqual({ state: 'legacy_read_only', current_revision_id: legacy.current_revision_id });
+    expect(database.raw.prepare('SELECT state, current_revision_id FROM cindy_source_identity WHERE source_event_id = ?').get(legacy.sourceId))
+      .toEqual({ state: 'legacy_read_only', current_revision_id: legacy.revisionId });
 
-    const service = new PmService(database, createCindyAdapters(config), config);
-    const result = service.saveCindySources(deriveCindyAuthContext('migration-test-token'), {
+    const result = saveCindySources(database, migrationAuth, {
       save_request_id: 'save-legacy-reread',
       sources: [{
         client_ref: 'legacy',
@@ -57,10 +95,51 @@ describe('Cindy trusted source v9 migration', () => {
       }],
     });
     expect(result.sources[0]).toMatchObject({ source_status: 'pending_decision', revision: { generation: 2 } });
-    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM source_event WHERE id = ?').get(legacy.id)).toEqual({ count: 1 });
-    expect(database.raw.prepare('SELECT ingest_state, revision_generation FROM source_event WHERE id = ?').get(legacy.id))
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM source_event WHERE id = ?').get(legacy.sourceId)).toEqual({ count: 1 });
+    expect(database.raw.prepare('SELECT ingest_state, revision_generation FROM source_event WHERE id = ?').get(legacy.sourceId))
       .toEqual({ ingest_state: 'trusted_current', revision_generation: 2 });
     database.close();
+  });
+
+  it('v8→v9 migration 失败会阻止 AppDatabase/buildApp 启动、恢复完整 v8，修复后可完整迁移', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cindy-source-v9-failure-'));
+    roots.push(root);
+    const path = join(root, 'pm.sqlite');
+    const oldDatabase = new AppDatabase(path, false, { targetSchemaVersionForTest: 8 });
+    const legacy = seedLegacyV8Source(oldDatabase);
+    oldDatabase.close();
+
+    const [schemaOperation, ...remainingOperations] = CINDY_TRUSTED_SOURCE_MIGRATION_DESCRIPTOR.orderedOperations;
+    if (schemaOperation?.kind !== 'sql_batch') throw new Error('v9 migration fixture expects sql_batch first');
+    const failingDescriptor = {
+      ...CINDY_TRUSTED_SOURCE_MIGRATION_DESCRIPTOR,
+      orderedOperations: [
+        { ...schemaOperation, statements: [...schemaOperation.statements, 'INSERT INTO missing_v9_fault_table(value) VALUES (1);'] },
+        ...remainingOperations,
+      ],
+    };
+    expect(() => {
+      new AppDatabase(path, false, { migrationDescriptorForTest: failingDescriptor });
+    }).toThrow(DatabaseUpgradeError);
+    await expect(buildAppFromDisk(path, failingDescriptor)).rejects.toThrow(DatabaseUpgradeError);
+
+    const raw = new DatabaseSync(path);
+    expect((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(8);
+    expect(raw.prepare('SELECT id, current_revision_id FROM source_event WHERE id = ?').get(legacy.sourceId))
+      .toEqual({ id: legacy.sourceId, current_revision_id: legacy.revisionId });
+    expect(raw.prepare("SELECT name FROM pragma_table_info('source_event_revision') WHERE name = 'processing_status'").get()).toBeUndefined();
+    expect(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cindy_source_identity'").get()).toBeUndefined();
+    raw.close();
+
+    const recovered = new AppDatabase(path, false);
+    expect((recovered.raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(9);
+    expect(recovered.raw.prepare('SELECT ingest_state FROM source_event WHERE id = ?').get(legacy.sourceId))
+      .toEqual({ ingest_state: 'legacy_read_only' });
+    expect(recovered.raw.prepare('SELECT processing_status FROM source_event_revision WHERE id = ?').get(legacy.revisionId))
+      .toEqual({ processing_status: 'legacy_read_only' });
+    expect(recovered.raw.prepare('SELECT state FROM cindy_source_identity WHERE source_event_id = ?').get(legacy.sourceId))
+      .toEqual({ state: 'legacy_read_only' });
+    recovered.close();
   });
 
   it('无法形成稳定身份的旧来源继续只读隔离', () => {

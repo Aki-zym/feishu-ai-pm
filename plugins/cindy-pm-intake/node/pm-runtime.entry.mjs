@@ -44,7 +44,7 @@ function normalizeSqlitePath(value) {
   return value === ':memory:' ? value : resolve(value);
 }
 
-function runtimeConfig({ host, port, sqlitePath, token }) {
+function runtimeConfig({ host, port, sqlitePath, token, accountAnchor, receiptSecret }) {
   const databaseUrl = sqlitePath === ':memory:' ? sqlitePath : `file:${sqlitePath}`;
   return loadConfig({
     NODE_ENV: 'production',
@@ -59,6 +59,8 @@ function runtimeConfig({ host, port, sqlitePath, token }) {
     WORKSPACE_READ_ENABLED: 'false',
     WORKSPACE_WRITE_ENABLED: 'false',
     CINDY_INTEGRATION_TOKEN: token,
+    CINDY_ACCOUNT_ANCHOR: accountAnchor,
+    CINDY_RECEIPT_SECRET: receiptSecret,
   });
 }
 
@@ -187,12 +189,19 @@ export async function startPmServer({
   host: requestedHost,
   sqlitePath: requestedSqlitePath,
   token: requestedToken,
+  accountAnchor: requestedAccountAnchor,
+  receiptSecret: requestedReceiptSecret,
   webRoot: requestedWebRoot,
 } = {}) {
   const host = normalizeHost(requestedHost);
   const port = normalizePort(requestedPort);
   const sqlitePath = normalizeSqlitePath(requestedSqlitePath);
   const token = typeof requestedToken === 'string' ? requestedToken : '';
+  const accountAnchor = typeof requestedAccountAnchor === 'string' ? requestedAccountAnchor : '';
+  const receiptSecret = typeof requestedReceiptSecret === 'string' ? requestedReceiptSecret : '';
+  if (token.trim() && (!accountAnchor.trim() || !receiptSecret.trim())) {
+    throw new Error('本机任务库已配置 Bearer，但缺少稳定账号锚点或独立 receipt 密钥。');
+  }
   const webRoot = resolve(
     typeof requestedWebRoot === 'string' && requestedWebRoot.trim()
       ? requestedWebRoot
@@ -232,7 +241,7 @@ export async function startPmServer({
   let statusBarProcess = null;
   let stopOwnedRuntime;
   try {
-    const config = runtimeConfig({ host, port, sqlitePath, token });
+    const config = runtimeConfig({ host, port, sqlitePath, token, accountAnchor, receiptSecret });
     database = new AppDatabase(config.database.sqlitePath);
     // The resident worker receives Cindy source saves and receipt decisions. It deliberately does not
     // construct a legacy semantic adapter or any Feishu scanning adapter.
@@ -264,13 +273,13 @@ export async function startPmServer({
       })();
       return stopInFlight;
     };
-    const runtimeOptions = { port, host, sqlitePath, token, webRoot };
-    restartOwnedRuntime = async () => {
+    const runtimeOptions = { port, host, sqlitePath, token, accountAnchor, receiptSecret, webRoot };
+    restartOwnedRuntime = async (nextOptions = {}) => {
       if (restartInFlight) return restartInFlight;
       restartInFlight = (async () => {
         const stopped = await stopOwnedRuntime({ scheduleExit: false });
         if (!stopped.stopped) return stopped;
-        return startPmServer(runtimeOptions);
+        return startPmServer({ ...runtimeOptions, ...nextOptions });
       })();
       try {
         return await restartInFlight;
@@ -283,6 +292,8 @@ export async function startPmServer({
       webOrigin: serverUrl(host, port),
       webRoot,
       cindyIntegrationToken: token,
+      cindyIntegrationAccountAnchor: accountAnchor,
+      cindyReceiptSecret: receiptSecret,
       logger: false,
       runtimeShutdown: async () => {
         const result = await stopOwnedRuntime();

@@ -94,7 +94,7 @@ function setup({ errandText = '{"accepted":true}', errandResponse = null, errand
     console,
     fetch: async (url, options = {}) => {
       if (url === '/secrets' && !options.method) return { json: async () => [] };
-      if (url === '/secrets/pm_token' && options.method === 'PUT') {
+      if (url.startsWith('/secrets/') && options.method === 'PUT') {
         secretCalls.push({ url, options });
         return { ok: true, json: async () => ({}) };
       }
@@ -107,6 +107,7 @@ function setup({ errandText = '{"accepted":true}', errandResponse = null, errand
     JSON,
     Number,
     Error,
+    crypto: globalThis.crypto,
   }), { filename: 'main.js' });
   return { onHostMessage, nodeCalls, sent, errandCalls, secretCalls, cursorWrites, sourcePosts, decisionPosts };
 }
@@ -316,16 +317,29 @@ test('ghost declares schedule support while retaining errand', () => {
   assert.ok(ghost.tools.some((tool) => tool.name === 'save_pm_sources'));
   assert.ok(ghost.tools.some((tool) => tool.name === 'submit_pm_decisions'));
   assert.equal(ghost.tools.some((tool) => tool.name === 'submit_intake'), false);
+  assert.deepEqual(ghost.node.secretBindings.map((binding) => binding.key), [
+    'pm_token',
+    'pm_account_anchor',
+    'pm_receipt_secret',
+  ]);
 });
 
-test('main flow creates a local task-service token through settings before ensuring the resident service', async () => {
+test('main flow creates separate Bearer, account anchor and receipt secrets before ensuring the resident service', async () => {
   const { onHostMessage, nodeCalls, secretCalls, sent } = setup();
   onHostMessage({ type: 'tool-call', tool: 'get_pm_tasks', callId: 'call-ensure', args: {} });
   await waitFor(() => sent.some((message) => message.callId === 'call-ensure'));
-  assert.equal(secretCalls.length, 1);
-  assert.equal(secretCalls[0].url, '/secrets/pm_token');
-  const saved = JSON.parse(secretCalls[0].options.body);
-  assert.match(saved.value, /^cindy-/);
+  assert.equal(secretCalls.length, 3);
+  assert.deepEqual(secretCalls.map((call) => call.url), [
+    '/secrets/pm_token',
+    '/secrets/pm_account_anchor',
+    '/secrets/pm_receipt_secret',
+  ]);
+  const saved = secretCalls.map((call) => JSON.parse(call.options.body).value);
+  assert.match(saved[0], /^cindy-/);
+  assert.match(saved[1], /^cindy-account-/);
+  assert.match(saved[2], /^cindy-receipt-/);
+  assert.ok(saved[1].length >= 64);
+  assert.ok(saved[2].length >= 64);
   assert.equal(nodeCalls[0].method, 'pm/ensure');
   assert.equal(nodeCalls[1].params.path, '/api/integrations/cindy/tasks');
 });

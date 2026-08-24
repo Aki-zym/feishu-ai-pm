@@ -6,6 +6,16 @@ const readline = require('node:readline');
 const { join } = path;
 let pmServerHandle = null;
 
+function pmAuthSecrets(request) {
+  const secrets = request.cindy && request.cindy.secrets;
+  const token = secrets && secrets.pm_token;
+  const accountAnchor = secrets && secrets.pm_account_anchor;
+  const receiptSecret = secrets && secrets.pm_receipt_secret;
+  if (!token) throw new Error('本机任务库令牌尚未配置');
+  if (!accountAnchor || !receiptSecret) throw new Error('本机可信来源账号锚点或 receipt 密钥尚未配置');
+  return { token, accountAnchor, receiptSecret };
+}
+
 function pmRuntime() {
   try {
     const runtime = require('./pm-runtime.cjs');
@@ -20,8 +30,7 @@ function pmRuntime() {
 }
 
 async function ensurePm(request) {
-  const token = request.cindy && request.cindy.secrets && request.cindy.secrets.pm_token;
-  if (!token) throw new Error('本机任务库令牌尚未配置');
+  const { token, accountAnchor, receiptSecret } = pmAuthSecrets(request);
 
   const sqlitePath = join(os.homedir(), 'Library/Application Support/ai-pm-intake', 'ai-pm.sqlite');
   fs.mkdirSync(path.dirname(sqlitePath), { recursive: true });
@@ -31,6 +40,8 @@ async function ensurePm(request) {
     host: '127.0.0.1',
     sqlitePath,
     token,
+    accountAnchor,
+    receiptSecret,
     webRoot,
   });
   if (!server || typeof server.stop !== 'function') {
@@ -53,7 +64,7 @@ async function restartPm(request) {
   if (typeof pmServerHandle.restart !== 'function') {
     throw new Error('本机任务库运行时结果缺少 restart()');
   }
-  const restarted = await pmServerHandle.restart();
+  const restarted = await pmServerHandle.restart(pmAuthSecrets(request));
   if (!restarted || typeof restarted.stop !== 'function' || typeof restarted.restart !== 'function') {
     throw new Error('本机任务库重启结果缺少 stop()/restart()');
   }
