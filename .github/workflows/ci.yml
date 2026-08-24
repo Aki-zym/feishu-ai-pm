@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Plugin tests
+        run: node --test plugins/cindy-pm-intake/main.test.mjs plugins/cindy-pm-intake/settings.test.mjs plugins/cindy-pm-intake/node/worker.test.mjs plugins/cindy-pm-intake/node/pm-runtime.test.mjs plugins/cindy-pm-intake/node/pm-runtime.shutdown.test.mjs
+      - name: Web tests
+        run: npm test -w @ai-pm/web
+      - name: Server intake and runtime tests
+        run: npm test -w @ai-pm/server -- tests/cindy-intake.test.ts tests/runtime-shutdown.test.ts tests/seed-intake-route.test.ts
