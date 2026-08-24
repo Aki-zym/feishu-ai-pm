@@ -17,7 +17,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { shanghaiDayWindow } from './shanghai-time.js';
 
-export const CURRENT_SCHEMA_VERSION = 8;
+export const CURRENT_SCHEMA_VERSION = 9;
 
 function registerData04SqlFunctions(database: DatabaseSync) {
   database.function('sha256', { deterministic: true }, (value: unknown) => createHash('sha256').update(String(value ?? '')).digest('hex'));
@@ -48,6 +48,7 @@ export class DatabaseUpgradeError extends Error {
 export interface DatabaseOptions {
   now?: () => Date;
   migrationDescriptorForTest?: MigrationDescriptor;
+  targetSchemaVersionForTest?: number;
   transactionFaults?: {
     beforeCommit?: () => void;
   };
@@ -1769,7 +1770,7 @@ export type MigrationOperation =
 export interface MigrationDescriptor {
   version: number;
   name: string;
-  expectedPostSchemaIdentity: 'current-schema-v1' | 'current-schema-v2' | 'current-schema-v3' | 'current-schema-v4' | 'current-schema-v5' | 'current-schema-v6' | 'current-schema-v7' | 'current-schema-v8';
+  expectedPostSchemaIdentity: 'current-schema-v1' | 'current-schema-v2' | 'current-schema-v3' | 'current-schema-v4' | 'current-schema-v5' | 'current-schema-v6' | 'current-schema-v7' | 'current-schema-v8' | 'current-schema-v9';
   orderedOperations: readonly MigrationOperation[];
 }
 
@@ -3268,6 +3269,135 @@ export const PROVIDER_RETRY_COOLDOWN_MIGRATION_DESCRIPTOR = deepFreeze(Object.fr
 }) satisfies MigrationDescriptor);
 
 export const PROVIDER_RETRY_COOLDOWN_MIGRATION_CHECKSUM = migrationDescriptorChecksum(PROVIDER_RETRY_COOLDOWN_MIGRATION_DESCRIPTOR);
+
+/** Cindy trusted-source v9: save authenticated source facts before decisions. */
+const CINDY_TRUSTED_SOURCE_MIGRATION_SQL = Object.freeze([
+  `ALTER TABLE source_event ADD COLUMN ingest_state TEXT NOT NULL DEFAULT 'legacy_read_only'
+    CHECK (ingest_state IN ('legacy_read_only','trusted_current','revoked','invalid'));`,
+  `ALTER TABLE source_event_revision ADD COLUMN processing_status TEXT NOT NULL DEFAULT 'legacy_read_only'
+    CHECK (processing_status IN ('pending_decision','processed','retryable','skipped','legacy_read_only','superseded','revoked','invalid'));`,
+  'ALTER TABLE source_event_revision ADD COLUMN trusted_payload_hash TEXT CHECK (trusted_payload_hash IS NULL OR length(trusted_payload_hash) = 64);',
+  'ALTER TABLE source_event_revision ADD COLUMN provider_revision_modified_at_ms INTEGER CHECK (provider_revision_modified_at_ms IS NULL OR provider_revision_modified_at_ms >= 0);',
+  'ALTER TABLE source_event_revision ADD COLUMN provider_revision_sequence INTEGER CHECK (provider_revision_sequence IS NULL OR provider_revision_sequence >= 0);',
+  'ALTER TABLE source_event_revision ADD COLUMN receipt_nonce TEXT;',
+  'ALTER TABLE source_event_revision ADD COLUMN receipt_digest TEXT;',
+  'ALTER TABLE source_event_revision ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0 AND retry_count <= 3);',
+  'CREATE UNIQUE INDEX idx_source_event_revision_receipt_digest ON source_event_revision(receipt_digest) WHERE receipt_digest IS NOT NULL;',
+  `CREATE TABLE cindy_source_identity (
+    id TEXT PRIMARY KEY,
+    owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
+    provider TEXT NOT NULL CHECK (provider IN ('feishu','synthetic')),
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('im_message','im_thread_message','im_reaction_context','synthetic_message')),
+    stable_id_hash TEXT NOT NULL CHECK (length(stable_id_hash) = 64),
+    source_event_id TEXT NOT NULL UNIQUE REFERENCES source_event(id) ON DELETE CASCADE,
+    current_revision_id TEXT REFERENCES source_event_revision(id) ON DELETE SET NULL,
+    state TEXT NOT NULL CHECK (state IN ('active','legacy_read_only','revoked','invalid')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(owner_scope, provider, source_kind, stable_id_hash)
+  );`,
+  'CREATE INDEX idx_cindy_source_identity_current ON cindy_source_identity(owner_scope, state, current_revision_id);',
+  `CREATE TABLE cindy_source_relation (
+    source_revision_id TEXT NOT NULL REFERENCES source_event_revision(id) ON DELETE CASCADE,
+    relation_kind TEXT NOT NULL CHECK (relation_kind IN ('reply_to','thread_parent')),
+    target_revision_id TEXT NOT NULL REFERENCES source_event_revision(id) ON DELETE CASCADE,
+    owner_scope TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(source_revision_id, relation_kind, target_revision_id),
+    CHECK (source_revision_id <> target_revision_id)
+  );`,
+  'CREATE INDEX idx_cindy_source_relation_target ON cindy_source_relation(target_revision_id, source_revision_id);',
+  `CREATE TABLE cindy_save_request (
+    owner_scope TEXT NOT NULL,
+    save_request_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
+    response_map_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(owner_scope, save_request_id)
+  );`,
+  `CREATE TABLE cindy_decision_request (
+    owner_scope TEXT NOT NULL,
+    decision_request_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(owner_scope, decision_request_id)
+  );`,
+  `INSERT INTO cindy_source_identity
+    (id, owner_scope, account_anchor, provider, source_kind, stable_id_hash, source_event_id,
+     current_revision_id, state, created_at, updated_at)
+   SELECT 'legacy-cindy-source:' || source_event.id,
+          source_event.owner_scope,
+          'legacy',
+          json_extract(source_event.metadata_json, '$.provider'),
+          json_extract(source_event.metadata_json, '$.sourceKind'),
+          sha256(json_extract(source_event.metadata_json, '$.stableMessageId')),
+          source_event.id,
+          source_event.current_revision_id,
+          'legacy_read_only',
+          source_event.captured_at,
+          source_event.captured_at
+     FROM source_event
+    WHERE json_valid(source_event.metadata_json)
+      AND json_extract(source_event.metadata_json, '$.provider') IN ('feishu','synthetic')
+      AND json_extract(source_event.metadata_json, '$.sourceKind') IN ('im_message','im_thread_message','im_reaction_context','synthetic_message')
+      AND typeof(json_extract(source_event.metadata_json, '$.stableMessageId')) = 'text'
+      AND length(json_extract(source_event.metadata_json, '$.stableMessageId')) > 0
+    ON CONFLICT(owner_scope, provider, source_kind, stable_id_hash) DO NOTHING;`,
+] as const);
+
+function cindyTrustedSourceSchemaChecksum() {
+  const canonical = new DatabaseSync(':memory:');
+  try {
+    registerData04SqlFunctions(canonical);
+    executeMigrationOperations(canonical, { ...BASELINE_MIGRATION_DESCRIPTOR, checksum: BASELINE_MIGRATION_CHECKSUM }, {
+      databaseInstanceId: '00000000000000000000000000000000',
+      instanceCreatedAt: '2026-08-15T00:00:00.000Z',
+      appliedAt: '2026-08-15T00:00:00.000Z',
+      preexistingTables: [],
+    });
+    for (const statement of RELATION_CONSTRAINT_MIGRATION_SQL) {
+      if (!statement.startsWith('UPDATE ') && !statement.startsWith('INSERT ')) canonical.exec(statement);
+    }
+    for (const statement of RUNTIME_TOOL_IDEMPOTENCY_MIGRATION_SQL) canonical.exec(statement);
+    for (const statement of CANDIDATE_VERSION_MIGRATION_SQL) canonical.exec(statement);
+    for (const statement of PRIVACY_MIGRATION_SQL) if (!statement.startsWith('INSERT ')) canonical.exec(statement);
+    for (const statement of PRIVACY_FENCING_MIGRATION_SQL) canonical.exec(statement);
+    for (const statement of SOURCE_REVISION_MIGRATION_SQL) {
+      if (!statement.startsWith('INSERT ') && !statement.startsWith('UPDATE ')) canonical.exec(statement);
+    }
+    for (const statement of PROVIDER_RETRY_COOLDOWN_MIGRATION_SQL) canonical.exec(statement);
+    for (const statement of CINDY_TRUSTED_SOURCE_MIGRATION_SQL) if (!statement.startsWith('INSERT ')) canonical.exec(statement);
+    return schemaIdentityChecksum(captureSchemaIdentity(canonical));
+  } finally {
+    canonical.close();
+  }
+}
+
+export const CINDY_TRUSTED_SOURCE_SCHEMA_CHECKSUM = cindyTrustedSourceSchemaChecksum();
+export const CINDY_TRUSTED_SOURCE_MIGRATION_DESCRIPTOR = deepFreeze(Object.freeze({
+  version: 9,
+  name: 'cindy-trusted-source-receipts',
+  expectedPostSchemaIdentity: 'current-schema-v9' as const,
+  orderedOperations: Object.freeze([
+    Object.freeze({ id: 'cindy-trusted-source-schema' as const, kind: 'sql_batch' as const, statements: CINDY_TRUSTED_SOURCE_MIGRATION_SQL }),
+    Object.freeze({
+      id: 'verify-post-schema' as const,
+      kind: 'assert_database' as const,
+      expectedSchemaIdentityChecksum: CINDY_TRUSTED_SOURCE_SCHEMA_CHECKSUM,
+      checks: Object.freeze(['schema', 'foreign_keys', 'integrity'] as const),
+    }),
+    Object.freeze({
+      id: 'record-migration' as const,
+      kind: 'record_migration' as const,
+      ledgerTable: 'schema_migration' as const,
+      userVersion: 9,
+    }),
+  ]),
+}) satisfies MigrationDescriptor);
+
+export const CINDY_TRUSTED_SOURCE_MIGRATION_CHECKSUM = migrationDescriptorChecksum(CINDY_TRUSTED_SOURCE_MIGRATION_DESCRIPTOR);
 const MIGRATIONS = [
   {
     ...BASELINE_MIGRATION_DESCRIPTOR,
@@ -3301,13 +3431,17 @@ const MIGRATIONS = [
     ...PROVIDER_RETRY_COOLDOWN_MIGRATION_DESCRIPTOR,
     checksum: PROVIDER_RETRY_COOLDOWN_MIGRATION_CHECKSUM,
   },
+  {
+    ...CINDY_TRUSTED_SOURCE_MIGRATION_DESCRIPTOR,
+    checksum: CINDY_TRUSTED_SOURCE_MIGRATION_CHECKSUM,
+  },
 ] as const;
 
 function assertExecutableMigrationDescriptor(descriptor: MigrationDescriptor) {
   if (
     !Number.isInteger(descriptor.version)
     || descriptor.version < 1
-    || !['current-schema-v1', 'current-schema-v2', 'current-schema-v3', 'current-schema-v4', 'current-schema-v5', 'current-schema-v6', 'current-schema-v7', 'current-schema-v8'].includes(descriptor.expectedPostSchemaIdentity)
+    || !['current-schema-v1', 'current-schema-v2', 'current-schema-v3', 'current-schema-v4', 'current-schema-v5', 'current-schema-v6', 'current-schema-v7', 'current-schema-v8', 'current-schema-v9'].includes(descriptor.expectedPostSchemaIdentity)
     || descriptor.orderedOperations.length === 0
   ) {
     throw new DatabaseUpgradeError('migration', '数据库迁移描述符版本或负载无效；已拒绝推进版本。');
@@ -3576,7 +3710,7 @@ export class AppDatabase {
     this.raw = openAppDatabase(path);
     let upgradeBackupPath: string | undefined;
     let upgradeDatabaseInstanceId: string | undefined;
-    const migrations = options.migrationDescriptorForTest
+    const configuredMigrations = options.migrationDescriptorForTest
       ? (() => {
         const descriptor = {
           ...options.migrationDescriptorForTest,
@@ -3587,10 +3721,15 @@ export class AppDatabase {
         return MIGRATIONS.map((migration) => migration.version === descriptor.version ? descriptor : migration);
       })()
       : MIGRATIONS;
+    const targetSchemaVersion = options.targetSchemaVersionForTest ?? CURRENT_SCHEMA_VERSION;
+    if (!Number.isInteger(targetSchemaVersion) || targetSchemaVersion < 1 || targetSchemaVersion > CURRENT_SCHEMA_VERSION) {
+      throw new Error('测试目标 schema 版本无效。');
+    }
+    const migrations = configuredMigrations.filter((migration) => migration.version <= targetSchemaVersion);
     try {
       this.raw.exec('PRAGMA foreign_keys = ON;');
       registerData04SqlFunctions(this.raw);
-      this.runMigrations(path, databaseExisted, options.now ?? (() => new Date()), migrations, (backupPath, instanceId) => {
+      this.runMigrations(path, databaseExisted, options.now ?? (() => new Date()), migrations, targetSchemaVersion, (backupPath, instanceId) => {
         upgradeBackupPath = backupPath;
         upgradeDatabaseInstanceId = instanceId;
       });
@@ -3625,11 +3764,12 @@ export class AppDatabase {
     databaseExisted: boolean,
     now: () => Date,
     migrations: readonly (MigrationDescriptor & { checksum: string })[],
+    expectedSchemaVersion: number,
     onBackupCreated: (path: string, instanceId: string) => void,
   ) {
     for (const migration of migrations) assertExecutableMigrationDescriptor(migration);
     if (
-      migrations.at(-1)?.version !== CURRENT_SCHEMA_VERSION
+      migrations.at(-1)?.version !== expectedSchemaVersion
       || migrations.some((migration, index) => migration.version !== index + 1 || !/^[0-9a-f]{64}$/u.test(migration.checksum))
     ) {
       throw new Error('数据库迁移定义必须连续递增并包含 SHA-256 checksum。');

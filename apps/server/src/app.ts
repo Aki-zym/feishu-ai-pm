@@ -8,6 +8,12 @@ import { z } from 'zod';
 import type { CandidateState, RiskLevel, TaskStatus } from './domain.js';
 import { AUDIT_REPLAY_INTENT, type ReplayCapabilityBinding } from './data04.js';
 import { CandidateVersionConflictError, CandidateVersionRequiredError, CindyIntakeConflictError, CindyIntakeValidationError, PrivacyAuthorizationError, ReplayAuthorizationError, type PmService } from './service.js';
+import {
+  CINDY_SOURCE_KINDS,
+  CINDY_SOURCE_PROVIDERS,
+  CindySourceContractError,
+  deriveCindyAuthContext,
+} from './cindy-source.js';
 import { assertShanghaiCalendarPlanRange } from './shanghai-time.js';
 import {
   candidateActionDtoSchema,
@@ -196,6 +202,7 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
   await app.register(cors, { origin: webOrigin });
   let runtimeShutdownScheduled = false;
   let runtimeRestartScheduled = false;
+  const cindyAuthContext = () => deriveCindyAuthContext(options.cindyIntegrationToken ?? '');
 
   app.addHook('onRequest', async (request, reply) => {
     if (!request.url.startsWith('/api/integrations/cindy/')) return;
@@ -363,23 +370,56 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
       return reply.code(error instanceof z.ZodError ? 400 : 409).send({ error: error instanceof Error ? error.message : '轮次判断写入失败。' });
     }
   });
-  app.post('/api/integrations/cindy/intake', async (request, reply) => {
+  app.post('/api/integrations/cindy/sources', async (request, reply) => {
     try {
       const isoTimestamp = z.string().datetime({ offset: true });
       const body = z.object({
-        window_id: z.string().trim().min(1).max(200),
-        window_start: isoTimestamp,
-        window_end: isoTimestamp,
+        save_request_id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
         sources: z.array(z.object({
-          source_key: z.string().trim().min(1).max(200),
+          client_ref: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+          provider: z.enum(CINDY_SOURCE_PROVIDERS),
+          source_kind: z.enum(CINDY_SOURCE_KINDS),
+          stable_message_id: z.string().min(1).max(500),
           occurred_at: isoTimestamp,
           conversation_key: z.string().trim().min(1).max(500).optional(),
           sender_role: z.string().trim().min(1).max(120).optional(),
           text: z.string().min(1).max(20_000),
-        }).strict()).max(500),
-        proposals: z.array(z.object({
-          action: z.enum(['create_candidate', 'update_task', 'skip', 'needs_owner']),
-          source_keys: z.array(z.string().trim().min(1).max(200)).min(1).max(100),
+          revision: z.object({
+            modified_at: isoTimestamp.optional(),
+            sequence: z.number().int().nonnegative().optional(),
+          }).strict().refine((value) => value.modified_at !== undefined || value.sequence !== undefined, {
+            message: 'revision 至少需要 modified_at 或 sequence。',
+          }).optional(),
+          relations: z.array(z.object({
+            kind: z.enum(['reply_to', 'thread_parent']),
+            client_ref: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u).optional(),
+            source_receipt: z.string().min(32).max(200).optional(),
+          }).strict().refine((value) => Number(Boolean(value.client_ref)) + Number(Boolean(value.source_receipt)) === 1, {
+            message: '关系必须且只能引用 client_ref 或 source_receipt。',
+          })).max(20).optional(),
+        }).strict()).min(1).max(500),
+      }).strict().parse(request.body);
+      return service.saveCindySources(cindyAuthContext(), body);
+    } catch (error) {
+      const status = error instanceof z.ZodError ? 400 : error instanceof CindySourceContractError ? error.statusCode : 409;
+      return reply.code(status).send({
+        error: error instanceof Error ? error.message : 'Cindy 来源保存失败。',
+        error_code: error instanceof CindySourceContractError ? error.errorCode : 'CONFLICT',
+      });
+    }
+  });
+  app.post('/api/integrations/cindy/decisions', async (request, reply) => {
+    try {
+      const isoTimestamp = z.string().datetime({ offset: true });
+      const body = z.object({
+        decision_request_id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
+        window_id: z.string().trim().min(1).max(200),
+        window_start: isoTimestamp,
+        window_end: isoTimestamp,
+        decisions: z.array(z.object({
+          decision_ref: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+          action: z.enum(['create_candidate', 'update_task', 'skip', 'needs_owner', 'retry_later']),
+          source_receipts: z.array(z.string().min(32).max(200)).min(1).max(100),
           task_key: z.string().trim().min(1).max(200).optional(),
           expected_version: z.number().int().nonnegative().optional(),
           title: z.string().trim().min(1).max(160).optional(),
@@ -388,14 +428,15 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
           reason: z.string().trim().max(2_000).optional(),
         }).strict()).max(500),
       }).strict().parse(request.body);
-      return service.processCindyIntake(body);
+      return service.processCindyDecisions(cindyAuthContext(), body);
     } catch (error) {
-      const status = error instanceof z.ZodError || error instanceof CindyIntakeValidationError
-        ? 400
-        : error instanceof CindyIntakeConflictError ? 409 : 409;
+      const status = error instanceof z.ZodError || error instanceof CindyIntakeValidationError ? 400
+        : error instanceof CindySourceContractError ? error.statusCode
+          : error instanceof CindyIntakeConflictError ? 409 : 409;
       const payload: Record<string, unknown> = {
-        error: error instanceof Error ? error.message : 'Cindy 入库失败。',
+        error: error instanceof Error ? error.message : 'Cindy 决策提交失败。',
       };
+      if (error instanceof CindySourceContractError) payload.error_code = error.errorCode;
       if (error instanceof CindyIntakeConflictError) {
         payload.error_code = error.errorCode;
         payload.current_version = error.currentVersion;

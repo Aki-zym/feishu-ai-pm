@@ -25,12 +25,12 @@ describe('Cindy 对话入库接口', () => {
        '补充分区口径', 'low', NULL, 1, NULL, NULL, NULL, 'active', NULL, NULL, 0, ?, ?)`).run(id, timestamp, timestamp);
   }
 
-  async function makeApp() {
-    const database = new AppDatabase(':memory:', false);
-    databases.push(database);
+  async function makeApp(integrationToken = token, existingDatabase?: AppDatabase) {
+    const database = existingDatabase ?? new AppDatabase(':memory:', false);
+    if (!existingDatabase) databases.push(database);
     const config = loadConfig({ NODE_ENV: 'test', DATABASE_URL: ':memory:' });
     const service = new PmService(database, createCindyAdapters(config), config);
-    const app = await buildApp(service, { serveWeb: false, cindyIntegrationToken: token });
+    const app = await buildApp(service, { serveWeb: false, cindyIntegrationToken: integrationToken });
     apps.push(app);
     return { app, database };
   }
@@ -49,6 +49,37 @@ describe('Cindy 对话入库接口', () => {
     sender_role: '策划',
     text: '同时核对活动版本和区服范围。',
   };
+
+  const trustedSource = (overrides: Record<string, unknown> = {}) => ({
+    client_ref: 's1',
+    provider: 'synthetic',
+    source_kind: 'synthetic_message',
+    stable_message_id: 'message-1',
+    occurred_at: '2026-08-24T00:01:00.000Z',
+    conversation_key: 'conversation-1',
+    sender_role: '策划',
+    text: '请补充活动留存数据，确认分区口径。',
+    revision: { sequence: 1 },
+    ...overrides,
+  });
+
+  async function saveSources(app: Awaited<ReturnType<typeof buildApp>>, payload: Record<string, unknown>, integrationToken = token) {
+    return app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/sources',
+      headers: { authorization: `Bearer ${integrationToken}` },
+      payload,
+    });
+  }
+
+  async function submitDecisions(app: Awaited<ReturnType<typeof buildApp>>, payload: Record<string, unknown>, integrationToken = token) {
+    return app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/decisions',
+      headers: { authorization: `Bearer ${integrationToken}` },
+      payload,
+    });
+  }
 
   it('Cindy 任务接口要求 Bearer，并且只返回活动未归档任务', async () => {
     const { app, database } = await makeApp();
@@ -150,220 +181,246 @@ describe('Cindy 对话入库接口', () => {
       .toEqual({ value_json: '{"window_end":"2026-08-24T00:10:00.000Z"}' });
   });
 
-  it('任务快照包含 pending 候选和会话游标，无会话来源不生成 source 或游标', async () => {
+  it('先保存来源后即使 errand 中断，SQLite 仍保留 pending_decision 且请求重放返回同一 receipt', async () => {
     const { app, database } = await makeApp();
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/integrations/cindy/intake',
-      headers: { authorization: `Bearer ${token}` },
-      payload: {
-        window_id: 'window-20260824-snapshot',
-        window_start: '2026-08-24T00:00:00.000Z',
-        window_end: '2026-08-24T00:10:00.000Z',
-        sources: [
-          source,
-          source2,
-          {
-            source_key: 's-no-conversation',
-            occurred_at: '2026-08-24T00:09:00.000Z',
-            text: '无会话来源的候选。',
-          },
-        ],
-        proposals: [
-          { action: 'create_candidate', source_keys: ['s1'], title: '会话候选', describe: '带会话来源。' },
-          { action: 'create_candidate', source_keys: ['s-no-conversation'], title: '无会话候选', describe: '不带会话来源。' },
-        ],
-      },
-    });
-    expect(response.statusCode).toBe(200);
-    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'intake_window_end'").get())
-      .toEqual({ value_json: '{"window_end":"2026-08-24T00:10:00.000Z"}' });
+    const payload = { save_request_id: 'save-interrupt-1', sources: [trustedSource()] };
+    const first = await saveSources(app, payload);
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toMatchObject({ duplicate: false, sources: [{ client_ref: 's1', source_status: 'pending_decision' }] });
+    const receipt = first.json().sources[0].source_receipt as string;
+    expect(receipt).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(database.raw.prepare('SELECT processing_status, receipt_digest, receipt_nonce FROM source_event_revision WHERE processing_status = \'pending_decision\'').get())
+      .toMatchObject({ processing_status: 'pending_decision', receipt_digest: expect.stringMatching(/^[a-f0-9]{64}$/u) });
+    expect(JSON.stringify(database.raw.prepare('SELECT * FROM source_event_revision').get())).not.toContain(receipt);
 
-    const snapshot = await app.inject({
-      method: 'GET',
-      url: '/api/integrations/cindy/tasks',
-      headers: { authorization: `Bearer ${token}` },
-    });
-    expect(snapshot.statusCode).toBe(200);
-    const body = snapshot.json() as {
-      items: Array<Record<string, unknown>>;
-      candidates: Array<Record<string, unknown>>;
-      cursors: Array<Record<string, unknown>>;
-    };
-    expect(body.items.find((item) => item.title === '会话候选')).toBeUndefined();
-    expect(body.candidates.find((item) => item.title === '会话候选')).toMatchObject({
-      title: '会话候选',
-      describe: '带会话来源。',
-      status: 'pending',
-      source: { conversation_key: 'conversation-1' },
-      version: 1,
-    });
-    const noConversation = body.candidates.find((item) => item.title === '无会话候选');
-    expect(noConversation).toMatchObject({ title: '无会话候选', status: 'pending', version: 1 });
-    expect(noConversation).not.toHaveProperty('source');
-    expect(body.cursors).toEqual([{ conversation_key: 'conversation-1', last_occurred_at: source2.occurred_at }]);
-    expect(database.raw.prepare("SELECT COUNT(*) AS count FROM sync_cursor WHERE integration = 'cindy_conversation'").get()).toEqual({ count: 1 });
+    const replay = await saveSources(app, payload);
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json()).toMatchObject({ duplicate: true });
+    expect(replay.json().sources[0].source_receipt).toBe(receipt);
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(1);
   });
 
-  it('窗口幂等、跨窗来源去重，多来源候选只建立一张候选且挂上全部来源', async () => {
+  it('保存请求的幂等 hash 使用规范化后的白名单字段', async () => {
     const { app, database } = await makeApp();
-    const payload = {
-      window_id: 'window-20260824-1',
-      window_start: '2026-08-24T00:00:00.000Z',
-      window_end: '2026-08-24T00:05:00.000Z',
-      sources: [source, source2],
-      proposals: [{
-        action: 'create_candidate' as const,
-        source_keys: ['s1', 's2'],
-        title: '活动留存数据',
-        describe: '补充活动留存数据并确认分区口径。',
-      }],
-    };
-
-    const first = await app.inject({
-      method: 'POST',
-      url: '/api/integrations/cindy/intake',
-      headers: { authorization: `Bearer ${token}` },
-      payload,
+    const first = await saveSources(app, {
+      save_request_id: 'save-canonical-replay',
+      sources: [trustedSource({
+        occurred_at: '2026-08-24T08:01:00+08:00',
+        stable_message_id: ' message-canonical ',
+        text: ' 需要补充任务。 ',
+      })],
     });
     expect(first.statusCode).toBe(200);
-    expect(first.json().duplicate).toBe(false);
-    expect(first.json().proposals[0]).toMatchObject({ action: 'create_candidate' });
-    const candidateId = first.json().proposals[0].candidate_id as string;
-    const candidate = database.raw.prepare('SELECT demand_unit_id FROM candidate_request WHERE id = ?').get(candidateId) as { demand_unit_id: string };
-    expect(database.raw.prepare('SELECT source_key FROM source_demand_unit_source WHERE demand_unit_id = ? ORDER BY sequence').all(candidate.demand_unit_id))
-      .toEqual([{ source_key: 's1' }, { source_key: 's2' }]);
-
-    const duplicate = await app.inject({
-      method: 'POST',
-      url: '/api/integrations/cindy/intake',
-      headers: { authorization: `Bearer ${token}` },
-      payload,
+    const replay = await saveSources(app, {
+      save_request_id: 'save-canonical-replay',
+      sources: [trustedSource({
+        occurred_at: '2026-08-24T00:01:00.000Z',
+        stable_message_id: 'message-canonical',
+        text: '需要补充任务。',
+      })],
     });
-    expect(duplicate.statusCode).toBe(200);
-    expect(duplicate.json()).toMatchObject({ window_id: payload.window_id, duplicate: true });
-    const crossWindow = await app.inject({
-      method: 'POST',
-      url: '/api/integrations/cindy/intake',
-      headers: { authorization: `Bearer ${token}` },
-      payload: {
-        ...payload,
-        window_id: 'window-20260824-2',
-        window_start: '2026-08-24T00:05:00.000Z',
-        window_end: '2026-08-24T00:10:00.000Z',
-      },
-    });
-    expect(crossWindow.statusCode).toBe(200);
-    expect(crossWindow.json()).toMatchObject({ window_id: 'window-20260824-2', duplicate: false });
-    expect(crossWindow.json().proposals[0]).toMatchObject({ candidate_id: candidateId });
-    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(2);
-    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get() as { count: number }).count).toBe(1);
-    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM task').get() as { count: number }).count).toBe(0);
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json()).toMatchObject({ duplicate: true });
+    expect(replay.json().sources[0].source_receipt).toBe(first.json().sources[0].source_receipt);
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(1);
   });
 
-  it('skip 只记录来源处理结果，不建立候选或任务', async () => {
+  it('同 request id 异 payload、同 revision 异 hash 和无 revision 异内容均零写入拒绝', async () => {
     const { app, database } = await makeApp();
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/integrations/cindy/intake',
-      headers: { authorization: `Bearer ${token}` },
-      payload: {
-        window_id: 'window-20260824-skip',
+    const first = await saveSources(app, { save_request_id: 'save-conflict-1', sources: [trustedSource()] });
+    expect(first.statusCode).toBe(200);
+    const before = (database.raw.prepare('SELECT COUNT(*) AS count FROM source_event_revision').get() as { count: number }).count;
+
+    const requestConflict = await saveSources(app, {
+      save_request_id: 'save-conflict-1',
+      sources: [trustedSource({ text: '不同正文。' })],
+    });
+    expect(requestConflict.statusCode).toBe(409);
+    const revisionConflict = await saveSources(app, {
+      save_request_id: 'save-conflict-2',
+      sources: [trustedSource({ text: '不同正文。' })],
+    });
+    expect(revisionConflict.statusCode).toBe(409);
+    expect(revisionConflict.json()).toMatchObject({ error_code: 'CONFLICT' });
+
+    const noRevision = await saveSources(app, {
+      save_request_id: 'save-no-revision-1',
+      sources: [trustedSource({ stable_message_id: 'message-no-revision', revision: undefined })],
+    });
+    expect(noRevision.statusCode).toBe(200);
+    const ambiguous = await saveSources(app, {
+      save_request_id: 'save-no-revision-2',
+      sources: [trustedSource({ stable_message_id: 'message-no-revision', revision: undefined, text: '无法比较的新正文。' })],
+    });
+    expect(ambiguous.statusCode).toBe(409);
+    expect(ambiguous.json()).toMatchObject({ error_code: 'SOURCE_REVISION_AMBIGUOUS' });
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event_revision').get() as { count: number }).count).toBe(before + 1);
+  });
+
+  it('可比较 revision 支持 A→B→A 防回退，并发 A/B 最终只保留更高 revision 为 current', async () => {
+    const { app, database } = await makeApp();
+    const a = await saveSources(app, { save_request_id: 'save-order-a', sources: [trustedSource({ revision: { sequence: 1 } })] });
+    expect(a.statusCode).toBe(200);
+    const receiptA = a.json().sources[0].source_receipt as string;
+    const b = await saveSources(app, { save_request_id: 'save-order-b', sources: [trustedSource({ revision: { sequence: 2 }, text: '第二版正文。' })] });
+    expect(b.statusCode).toBe(200);
+    expect(b.json().sources[0].source_receipt).not.toBe(receiptA);
+    const oldReplay = await saveSources(app, { save_request_id: 'save-order-a-again', sources: [trustedSource({ revision: { sequence: 1 } })] });
+    expect(oldReplay.statusCode).toBe(200);
+    expect(oldReplay.json().sources[0]).toMatchObject({ source_receipt: receiptA, source_status: 'superseded' });
+    const staleUnknown = await saveSources(app, { save_request_id: 'save-order-stale', sources: [trustedSource({ revision: { sequence: 0 }, text: '未知旧版。' })] });
+    expect(staleUnknown.statusCode).toBe(409);
+    expect(staleUnknown.json()).toMatchObject({ error_code: 'STALE_REVISION' });
+
+    const concurrent = await Promise.all([
+      saveSources(app, { save_request_id: 'save-concurrent-3', sources: [trustedSource({ stable_message_id: 'message-concurrent', revision: { sequence: 3 }, text: '版本三。' })] }),
+      saveSources(app, { save_request_id: 'save-concurrent-4', sources: [trustedSource({ stable_message_id: 'message-concurrent', revision: { sequence: 4 }, text: '版本四。' })] }),
+    ]);
+    expect(concurrent.map((response) => response.statusCode).sort()).toEqual([200, 200]);
+    const current = database.raw.prepare(
+      `SELECT revision.provider_revision_sequence
+         FROM cindy_source_identity AS identity
+         JOIN source_event_revision AS revision ON revision.id = identity.current_revision_id
+        WHERE identity.stable_id_hash <> (SELECT stable_id_hash FROM cindy_source_identity ORDER BY created_at LIMIT 1)
+        ORDER BY revision.provider_revision_sequence DESC LIMIT 1`,
+    ).get() as { provider_revision_sequence: number };
+    expect(current.provider_revision_sequence).toBe(4);
+  });
+
+  it('批内关系图先完整校验：合法 reply 保存，未知、重复和成环关系整批零写入', async () => {
+    const { app, database } = await makeApp();
+    const valid = await saveSources(app, {
+      save_request_id: 'save-relations-valid',
+      sources: [
+        trustedSource({ client_ref: 'root', stable_message_id: 'relation-root' }),
+        trustedSource({ client_ref: 'reply', stable_message_id: 'relation-reply', relations: [{ kind: 'reply_to', client_ref: 'root' }] }),
+      ],
+    });
+    expect(valid.statusCode).toBe(200);
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM cindy_source_relation').get() as { count: number }).count).toBe(1);
+    const before = (database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count;
+    const crossBatch = await saveSources(app, {
+      save_request_id: 'save-relations-cross-batch',
+      sources: [trustedSource({
+        stable_message_id: 'cross-batch-relation',
+        relations: [{ kind: 'thread_parent', source_receipt: valid.json().sources[0].source_receipt }],
+      })],
+    });
+    expect(crossBatch.statusCode).toBe(200);
+    const cyclic = await saveSources(app, {
+      save_request_id: 'save-relations-cycle',
+      sources: [
+        trustedSource({ client_ref: 'a', stable_message_id: 'cycle-a', relations: [{ kind: 'reply_to', client_ref: 'b' }] }),
+        trustedSource({ client_ref: 'b', stable_message_id: 'cycle-b', relations: [{ kind: 'reply_to', client_ref: 'a' }] }),
+      ],
+    });
+    expect(cyclic.statusCode).toBe(400);
+    const duplicate = await saveSources(app, {
+      save_request_id: 'save-relations-duplicate',
+      sources: [trustedSource({
+        stable_message_id: 'duplicate-relation',
+        relations: [{ kind: 'reply_to', source_receipt: valid.json().sources[0].source_receipt }, { kind: 'reply_to', source_receipt: valid.json().sources[0].source_receipt }],
+      })],
+    });
+    expect(duplicate.statusCode).toBe(400);
+    const repeatedRef = await saveSources(app, {
+      save_request_id: 'save-relations-repeated-ref',
+      sources: [trustedSource({ client_ref: 'same', stable_message_id: 'same-a' }), trustedSource({ client_ref: 'same', stable_message_id: 'same-b' })],
+    });
+    expect(repeatedRef.statusCode).toBe(400);
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(before + 1);
+  });
+
+  it('retry_later 只能通过 Cindy 决策入口有限推进，第三次后 receipt 失效', async () => {
+    const { app, database } = await makeApp();
+    const saved = await saveSources(app, { save_request_id: 'save-retry-limit', sources: [trustedSource()] });
+    const receipt = saved.json().sources[0].source_receipt as string;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const response = await submitDecisions(app, {
+        decision_request_id: `decision-retry-${attempt}`,
+        window_id: `window-retry-${attempt}`,
         window_start: '2026-08-24T00:00:00.000Z',
-        window_end: '2026-08-24T00:05:00.000Z',
-        sources: [source],
-        proposals: [{ action: 'skip', source_keys: ['s1'], reason: '仅供上下文参考。' }],
-      },
+        window_end: `2026-08-24T00:0${attempt}:00.000Z`,
+        decisions: [{ decision_ref: 'retry', action: 'retry_later', source_receipts: [receipt], reason: '临时中断。' }],
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().decisions[0].source_status).toBe(attempt === 3 ? 'invalid' : 'retryable');
+    }
+    expect(database.raw.prepare('SELECT processing_status, retry_count FROM source_event_revision WHERE receipt_digest IS NOT NULL').get())
+      .toEqual({ processing_status: 'invalid', retry_count: 3 });
+    const denied = await submitDecisions(app, {
+      decision_request_id: 'decision-after-retry-limit', window_id: 'window-after-retry-limit',
+      window_start: '2026-08-24T00:00:00.000Z', window_end: '2026-08-24T00:10:00.000Z',
+      decisions: [{ decision_ref: 'd1', action: 'skip', source_receipts: [receipt] }],
     });
-    expect(response.statusCode).toBe(200);
-    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM task').get() as { count: number }).count).toBe(0);
-    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get() as { count: number }).count).toBe(0);
-    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM correction_event').get() as { count: number }).count).toBe(1);
+    expect(denied.statusCode).toBe(403);
   });
 
-  it('成功提交空窗口时也推进 intake_window_end', async () => {
+  it('receipt 决策只接受当前同 owner 来源；伪造、跨 owner、旧 revision 和 invalid 均零业务写入', async () => {
     const { app, database } = await makeApp();
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/integrations/cindy/intake',
-      headers: { authorization: `Bearer ${token}` },
-      payload: {
-        window_id: 'window-20260824-empty',
-        window_start: '2026-08-24T00:00:00.000Z',
-        window_end: '2026-08-24T00:10:00.000Z',
-        sources: [],
-        proposals: [],
-      },
-    });
-    expect(response.statusCode).toBe(200);
-    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'intake_window_end'").get())
-      .toEqual({ value_json: '{"window_end":"2026-08-24T00:10:00.000Z"}' });
-  });
-
-  it('update_task 使用 expected_version CAS，冲突时不写入来源或任务', async () => {
-    const { app, database } = await makeApp();
-    makeTask(database);
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/integrations/cindy/intake',
-      headers: { authorization: `Bearer ${token}` },
-      payload: {
-        window_id: 'window-20260824-conflict',
-        window_start: '2026-08-24T00:00:00.000Z',
-        window_end: '2026-08-24T00:05:00.000Z',
-        sources: [source],
-        proposals: [{
-          action: 'update_task',
-          source_keys: ['s1'],
-          task_key: 'task-cindy-intake-1',
-          expected_version: 2,
-          next_step: '改用最新分区口径',
-        }],
-      },
-    });
-    expect(response.statusCode).toBe(409);
-    expect(response.json()).toMatchObject({ error_code: 'CONFLICT', current_version: 1 });
-    expect((database.raw.prepare('SELECT title, version, next_step FROM task WHERE id = ?').get('task-cindy-intake-1') as { title: string; version: number; next_step: string }))
-      .toEqual({ title: '活动留存分析', version: 1, next_step: '补充分区口径' });
-    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(0);
-  });
-
-  it('成功 update_task 使用 CAS 更新版本，并在窗口重放时保持幂等', async () => {
-    const { app, database } = await makeApp();
-    makeTask(database);
-    const payload = {
-      window_id: 'window-20260824-update',
+    const saved = await saveSources(app, { save_request_id: 'save-receipt-gates', sources: [trustedSource()] });
+    const receipt = saved.json().sources[0].source_receipt as string;
+    const higher = await saveSources(app, { save_request_id: 'save-receipt-gates-v2', sources: [trustedSource({ revision: { sequence: 2 }, text: '第二版。' })] });
+    const receipt2 = higher.json().sources[0].source_receipt as string;
+    const foreignToken = 'different-cindy-owner-token';
+    const { app: foreignApp } = await makeApp(foreignToken, database);
+    const baseDecision = (sourceReceipt: string, id: string) => ({
+      decision_request_id: id,
+      window_id: id,
       window_start: '2026-08-24T00:00:00.000Z',
       window_end: '2026-08-24T00:05:00.000Z',
-      sources: [source],
-      proposals: [{
-        action: 'update_task' as const,
-        source_keys: ['s1'],
-        task_key: 'task-cindy-intake-1',
-        expected_version: 1,
-        next_step: '改用最新分区口径',
-      }],
-    };
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/integrations/cindy/intake',
-      headers: { authorization: `Bearer ${token}` },
-      payload,
+      decisions: [{ decision_ref: 'd1', action: 'create_candidate', source_receipts: [sourceReceipt], title: '可信候选' }],
     });
-    expect(response.statusCode).toBe(200);
-    expect(response.json().proposals[0]).toMatchObject({ action: 'update_task', version: 2 });
-    expect((database.raw.prepare('SELECT version, next_step FROM task WHERE id = ?').get('task-cindy-intake-1') as { version: number; next_step: string }))
-      .toEqual({ version: 2, next_step: '改用最新分区口径' });
+    expect((await submitDecisions(app, baseDecision('forged_receipt_value_that_is_long_enough_123', 'decision-forged'))).statusCode).toBe(403);
+    expect((await submitDecisions(foreignApp, baseDecision(receipt2, 'decision-foreign'), foreignToken)).statusCode).toBe(403);
+    expect((await submitDecisions(app, baseDecision(receipt, 'decision-old'))).statusCode).toBe(403);
+    database.raw.prepare("UPDATE source_event_revision SET processing_status = 'invalid' WHERE receipt_digest IS NOT NULL AND processing_status = 'pending_decision'").run();
+    expect((await submitDecisions(app, baseDecision(receipt2, 'decision-invalid'))).statusCode).toBe(403);
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get() as { count: number }).count).toBe(0);
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM cindy_decision_request').get() as { count: number }).count).toBe(0);
+  });
 
-    const duplicate = await app.inject({
-      method: 'POST',
-      url: '/api/integrations/cindy/intake',
-      headers: { authorization: `Bearer ${token}` },
-      payload,
+  it('决策成功只消费 receipts；CAS 失败保留已保存来源，成功重放不重复写入', async () => {
+    const { app, database } = await makeApp();
+    makeTask(database);
+    const saved = await saveSources(app, { save_request_id: 'save-update-task', sources: [trustedSource()] });
+    const receipt = saved.json().sources[0].source_receipt as string;
+    const conflictPayload = {
+      decision_request_id: 'decision-update-conflict', window_id: 'window-update-conflict',
+      window_start: '2026-08-24T00:00:00.000Z', window_end: '2026-08-24T00:05:00.000Z',
+      decisions: [{ decision_ref: 'd1', action: 'update_task', source_receipts: [receipt], task_key: 'task-cindy-intake-1', expected_version: 2, next_step: '新口径' }],
+    };
+    const conflict = await submitDecisions(app, conflictPayload);
+    expect(conflict.statusCode).toBe(409);
+    expect(database.raw.prepare('SELECT processing_status FROM source_event_revision WHERE receipt_digest IS NOT NULL ORDER BY revision_number DESC LIMIT 1').get())
+      .toEqual({ processing_status: 'pending_decision' });
+    expect(database.raw.prepare('SELECT version, next_step FROM task WHERE id = ?').get('task-cindy-intake-1')).toEqual({ version: 1, next_step: '补充分区口径' });
+
+    const successPayload = { ...conflictPayload, decision_request_id: 'decision-update-success', window_id: 'window-update-success', decisions: [{ ...conflictPayload.decisions[0], expected_version: 1 }] };
+    const success = await submitDecisions(app, successPayload);
+    expect(success.statusCode).toBe(200);
+    expect(success.json().decisions[0]).toMatchObject({ action: 'update_task', source_status: 'processed', version: 2 });
+    const replay = await submitDecisions(app, successPayload);
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json()).toMatchObject({ duplicate: true });
+    expect(database.raw.prepare('SELECT version, next_step FROM task WHERE id = ?').get('task-cindy-intake-1')).toEqual({ version: 2, next_step: '新口径' });
+  });
+
+  it('认证上下文由服务端派生，body 自报 owner/account 被拒；空 decisions 仍推进窗口', async () => {
+    const { app, database } = await makeApp();
+    const rejected = await saveSources(app, { save_request_id: 'save-auth-body', owner_scope: 'forged', sources: [trustedSource()] });
+    expect(rejected.statusCode).toBe(400);
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(0);
+    const empty = await submitDecisions(app, {
+      decision_request_id: 'decision-empty-window',
+      window_id: 'window-empty',
+      window_start: '2026-08-24T00:00:00.000Z',
+      window_end: '2026-08-24T00:10:00.000Z',
+      decisions: [],
     });
-    expect(duplicate.statusCode).toBe(200);
-    expect(duplicate.json()).toMatchObject({ window_id: payload.window_id, duplicate: true });
-    expect((database.raw.prepare('SELECT version FROM task WHERE id = ?').get('task-cindy-intake-1') as { version: number }).version).toBe(2);
+    expect(empty.statusCode).toBe(200);
+    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'intake_window_end'").get())
+      .toEqual({ value_json: '{"window_end":"2026-08-24T00:10:00.000Z"}' });
   });
 
   it('进度接口支持会话绑定、重复轮次幂等和服务端待确认安全门', async () => {
