@@ -3,7 +3,7 @@
 # 验证矩阵
 
 机器事实源：[`docs/verification-matrix.json`](verification-matrix.json)。当前产品状态见 [当前状态](current-state.md)。
-产品源码快照：日期 `2026-08-15`；等价 commit `null`；算法 `product-source-sha256-v1`；选择器 `apps-workspace-default-include-v1`；文件数 `87`；fingerprint `596b57af001a973add63baca739f19051d3aa923d07e4b854d2ef99e37c71aa4`。
+产品源码快照：日期 `2026-08-15`；等价 commit `null`；算法 `product-source-sha256-v1`；选择器 `apps-workspace-default-include-v1`；文件数 `84`；fingerprint `f0a13267f6e943175337dd3f6f81a8c7dc27c92cf9c7c2577a9ea5312b9255a5`。
 
 ## L0–L6
 
@@ -53,6 +53,7 @@ Path category precedence：docs → release → Feishu/LLM integration → test/
 
 | 验证 ID | 能力 | 目标层级 | 已取得层级 | 证据状态 | Evidence type | Source commit | Run | 真实环境证据 |
 |---|---|---|---|---|---|---|---|---|
+| VER-LOCAL20260824-001-CINDY-SOURCE-L2-20260824 | Cindy 读取后先原子保存可信来源，再以 owner/account-bound opaque source receipt 提交决策 | L2 | L2 | 实际运行证据已取得 | synthetic_local_sqlite_service_plugin_contract | 001b81d81e0114c990a4d1923862a37400ba203b | local-20260824-001-source-receipt-01 | 未取得 |
 | VER-ISSUE85-PROD07-L0-20260816 | PROD-07 日历事实与任务候选分类产品规则合同及合成夹具 | L0 | L0 | 实际运行证据已取得 | static_document_contract | 4e7eebd979bc1c6de89906d4c74e3d5a1ee7ae5c | local-issue85-prod07-contract-r3-20260816 | 未取得 |
 | VER-ISSUE59-QA01-SELECTION-20260816 | QA-01 changed-path → L0-L6 选择、执行清单、skip 语义、exact provenance、integration 普通合并 push 第一父/已合入 PR head/tree 例外与 no-upload 边界 | L4 | L4 | 实际运行证据已取得 | ci_selection_and_evidence_contract | 79ed1142cccceefed7391c605b70752c6610c30d | local-issue59-integration-push-hotfix-20260816-02 | 未取得 |
 | VER-ISSUE66-DEC01-L0-20260816 | DEC-01 M1 产品与治理负责人决策登记及结构化文档合同 | L0 | L0 | 实际运行证据已取得 | static_document_contract | 06f45f0e47edbc8b599fdf4f9bd94afb402f850d | pull_request_94_pending | 未取得 |
@@ -94,6 +95,23 @@ Path category precedence：docs → release → Feishu/LLM integration → test/
 | VER-ISSUE41-FSH03-L4-20260818 | Issue #41 FSH-03 飞书 WebSocket durable inbox-before-ack、幂等去重、重启恢复和来源/主人范围 fencing | L4 | L4 | 实际运行证据已取得 | synthetic_local_sqlite_service_contract_browser_regression | dcf3d01ed6ba6fb2a876afc2f86171ab23a010ad | local-issue41-fsh03-20260818-02 | 未取得 |
 
 ## 证据详情
+
+### VER-LOCAL20260824-001-CINDY-SOURCE-L2-20260824
+
+- 能力：Cindy 读取后先原子保存可信来源，再以 owner/account-bound opaque source receipt 提交决策
+- 实现状态：`implemented_pending_independent_review_and_local_main_merge`
+- 目标层级：`L2`；已取得层级：`L2`
+- 证据状态：`attained`（实际运行证据已取得）
+- 目标真实范围：否；真实环境证据：未取得；scope：`synthetic_local_cindy_source_receipt_contract`
+- Evidence type：`synthetic_local_sqlite_service_plugin_contract`
+- Source commit：`001b81d81e0114c990a4d1923862a37400ba203b`；记录 commit：`local-20260824-001-pending`
+- Provenance：mode=`local_run`；base=`not_applicable`；head=`001b81d81e0114c990a4d1923862a37400ba203b`；merge=`not_applicable`；parents=``；tree=`not_applicable`；run=`local-20260824-001-source-receipt-01`；job=`not_applicable`；environment=Windows local worktree; Node.js 24.19.0; in-memory and temporary-file SQLite; Fastify inject; bundled Cindy plugin runtime; synthetic data only
+- Skip classification：status=`present`；kinds=`capability, platform`；reason=The authorized task is synthetic/local only; real tenant, production data, host attestation, remote writes and installed-package validation are outside scope.
+- Run：`local-20260824-001-source-receipt-01`；时间：2026-08-24；环境：Windows local worktree; Node.js 24.19.0; in-memory and temporary-file SQLite; Fastify inject; bundled Cindy plugin runtime; synthetic data only
+- 命令或场景：npm exec --workspace @ai-pm/server -- vitest run tests/cindy-intake.test.ts tests/cindy-source-migration.test.ts --pool=threads --poolOptions.threads.singleThread=true --no-file-parallelism; npm test -w @ai-pm/server; npm run typecheck -w @ai-pm/server; node --test plugins/cindy-pm-intake/main.test.mjs plugins/cindy-pm-intake/node/worker.test.mjs plugins/cindy-pm-intake/node/pm-runtime.test.mjs plugins/cindy-pm-intake/node/pm-runtime.shutdown.test.mjs; node plugins/cindy-pm-intake/scripts/bundle-pm-runtime.mjs
+- 结果：`passed`；skips：No real Cindy errand, Feishu tenant/account/permissions, MCP provenance attestation, production database/data, remote GitHub validation, installed Windows package L5 or real tenant/provider L6 validation.
+- Evidence path：`apps/server/tests/cindy-intake.test.ts`
+- 限制 / 未验证：Synthetic/local L2 evidence proves SQLite persistence, replay/conflict/revision ordering, receipt fencing, relation atomicity, decision state transitions, authentication body rejection, interruption recovery and legacy migration only. It does not prove real Feishu reads, account identity stability across token rotation, MCP provenance, production data behavior or external delivery.
 
 ### VER-ISSUE85-PROD07-L0-20260816
 

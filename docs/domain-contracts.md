@@ -252,6 +252,7 @@
 - 所有跨对象写入必须在 SQLite 事务内完成，并使用对象声明的 CAS/租约规则。
 - DATA-03 使用连续 schema v4 在 candidate_request.version 上提供候选修订 CAS；候选写入口必须在同一 SQLite 事务内校验 expectedVersion，组操作还必须校验成员版本集合 hash，线程/任务关系操作必须校验对应 thread/task version。缺失或非法 expectedVersion 返回 400，过期版本返回 409 和安全 current DTO；任何候选、线程、任务、审计、通知或关系写入失败都逐值回滚，不自动 winner、不自动重放。
 - source_event→demand_unit→candidate/thread/task 的关系必须使用精确结构化列和受控外键；共享来源歧义保留原行并写入 durable data_integrity_gap，不得静默覆盖、删除或选 winner。
+- Cindy trusted-source schema v9 固定先保存、后判断：save_request_id、稳定身份、provider revision、canonical payload、receipt 摘要和完整关系图在同一 SQLite transaction 内校验并写入；任一非法 client_ref、同 revision 异 hash、低 revision、无 revision 异内容、未知/跨账号/失效 receipt、重复关系或成环都整批零写入。服务端从 Bearer 认证上下文派生 owner scope 与连接账号锚点，body 自报字段拒绝；submit_pm_decisions 只消费 current receipts，不重传 raw sources。旧来源迁移为 legacy_read_only，只有重新读取形成新 current revision 后才能签发 receipt。
 - FSH-03：机器人 WebSocket 回调必须先以 external_id 幂等写入 source_event 并取得 durable receipt，再允许 provider acknowledgement；dedupe identity 绑定 owner_scope、metadata.sourceScope、source_type 和 conversation_id，跨主人/入口/会话碰撞在任何 row 或 metadata mutation 前 fail-closed；兼容重复不得覆盖已提交的渠道 provenance。commit 失败、无效 receipt、foreign owner/source scope 或未授权群必须 fail-closed 并允许重投。重复、并发、乱序和提交后 Runtime job 创建前的重启窗口不得丢来源或重复建立来源；orphan recovery 只扫描明确 bot_supplement/primary 标记且没有未完成分类工作的来源。
 - DATA-04 replay 的服务层授权是强制 invariant：route 的 capability/intent/origin/CSRF 预检不能替代 durable current capability 校验；service 必须以 owner/decision/source scope、固定 intent、token/CSRF hash、expiry、revoked/consumed/replay 状态和原子 CAS 消费独立复核，missing/forged/expired/replayed capability fail-closed 且不得泄漏正文或产生业务写入。
 - DATA-04 replay 必须由一个 canonical decision-scope 校验器贯穿 decision→ordered revision references→source events→demand unit→candidate/task/thread→owner lineage：每个 reference 的 source_event_id/revision_id 必须与实际行、精确 decision 和 revision hash 一致；decision.source_event_id（若声明）必须是有序引用集合中的 canonical primary source；demand_unit、candidate、task、thread、owner 关系必须来自同一来源摄取链。现有但不相干的 same-owner 或 foreign ID 不构成有效绑定；合法多来源决策必须保留完整有序集合。所有 scope/integrity 检查必须在 capability consumption 前完成，错绑、缺失、重复、乱序、篡改或跨主人时 fail-closed，返回有界脱敏错误，不产生业务/审计写入，也不消耗合法 capability。
@@ -285,8 +286,11 @@ Evidence scope：current=manual_runtime_evidence；target=manual_contract_only
 | INVALID_INPUT | failure | 400 | 修正字段/枚举后重试 |
 | UNAUTHORIZED | skipped | 401 | 重新授权或确认主人身份 |
 | SCOPE_MISSING | skipped | 403 | 不调用 provider、不推进游标，补齐 scope 后重试 |
+| INVALID_SOURCE_RECEIPT | failure | 403 | 重新读取并保存当前同 owner 来源，使用新 receipt |
 | NOT_FOUND | failure | 404 | 刷新事实对象 |
 | CONFLICT | failure | 409 | 读取最新事实后按 CAS 重试 |
+| STALE_REVISION | failure | 409 | 保留当前 generation，重新读取 provider 当前 revision |
+| SOURCE_REVISION_AMBIGUOUS | failure | 409 | 重新读取带 modified_at 或 sequence 的来源，或转主人确认 |
 | APPROVAL_REQUIRED | skipped | 409 | 停在主人确认并创建/查看 approval |
 | RATE_LIMITED | failure | 429 | 仅在 Retry-After 通过严格解析时按 backoff+jitter/cooldown 重试；非法值 fail-closed |
 | PROVIDER_UNAVAILABLE | failure | 502 | 保留 job/source 后重试 |

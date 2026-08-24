@@ -4,7 +4,7 @@
 
 真实飞书和 OpenAI-compatible LLM 只有在桌面设置中填写配置并显式打开开关后才会请求外部服务；没有凭证时使用 rule mock。工作区适配器始终只读，PostgreSQL 仍不是 Windows 桌面版的运行依赖。
 
-Cindy 插件通过浏览器本机后台提交提案，服务端只把来源和提案写入 SQLite，并对正式任务更新执行版本 CAS。旧 Feishu/模型扫描入口已停止导出；`apps/server` 仅作为本机任务库服务核心和 Cindy intake 合同的共享实现。
+Cindy 插件通过浏览器本机后台分两步入库：先把最小来源事实原子保存到 SQLite，并取得服务端签发的 opaque `source_receipt`；再只用 receipts 提交结构化判断。owner scope 与连接账号锚点从 Bearer 认证上下文派生，请求 body 不能自报；正式任务更新继续执行版本 CAS。旧 Feishu/模型扫描入口已停止导出；`apps/server` 仅作为本机任务库服务核心和 Cindy intake 合同的共享实现。
 
 主人消息主链使用 `feishu_monitor_target` 保存明确选择的人员和群。人员以对方 `open_id` 为配置真源，服务端内部解析既有 P2P `chat_id`；群聊只持久化真实 `@主人` 消息。每个目标有独立游标和错误状态，机器人补充群仍由单独配置控制。来源同步先检查用户 OAuth scope；缺少权限时安全跳过并保留游标，不重复请求会返回 400 的接口。
 

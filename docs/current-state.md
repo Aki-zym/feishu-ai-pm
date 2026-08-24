@@ -1,5 +1,7 @@
 # 当前状态
 
+> 2026-08-24 Cindy trusted-source candidate（阶段：Windows 桌面成熟化）：入库 errand 读取来源后先调用 `save_pm_sources` 原子保存到 SQLite，由服务端认证上下文绑定 owner/account 并签发 opaque `source_receipt`；后续 `submit_pm_decisions` 只消费 receipts。连续 schema v9 增加稳定身份、provider revision 防回退、请求幂等、批内关系门禁、处理状态和 `legacy_read_only` 前向迁移。本轮 product-source fingerprint 为 `f0a13267f6e943175337dd3f6f81a8c7dc27c92cf9c7c2577a9ea5312b9255a5`，验证记录为 `VER-LOCAL20260824-001-CINDY-SOURCE-L2-20260824`。当前证据仅 synthetic/local；真实 Cindy errand、真实飞书账号、MCP provenance attestation 与生产数据尚未验证。
+
 > 2026-08-18 FSH-03 candidate refresh：PR #108 / Issue #38 及其 docs follow-up 已形成 committed integration snapshot `a487598bcae3630f1c5906c8b384bc8811ee0e29`；当前 live integration tip 为 `635290379de2688187988692ecb619c9c109e100`，本候选已普通重绑该 live tip 并继续实现 FSH-03 durable inbox-before-ack。当前 product-source fingerprint 以本轮 docs 生成结果为准；v1-v7 descriptor/checksum 与行为保持连续。
 
 > 这是仓库中回答“现在是什么”的唯一人读入口。机器入口、生成视图和历史位置由 [文档清单](docs-manifest.json) 声明；测试数字、运行环境和安装包 hash 只以 [验证矩阵](verification-matrix.md) 中的验证 ID 为准。

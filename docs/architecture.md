@@ -86,6 +86,14 @@ CI 在 Pull Request merge ref 上运行，并核对 checkout 的双亲与事件�
 
 ## 数据真源
 
+### Cindy 可信来源 receipt 边界
+
+Cindy 入库现在固定为两步：`save_pm_sources` 先把来源事实提交到 SQLite，服务端再返回 opaque `source_receipt`；`submit_pm_decisions` 只能引用 receipts 和结构化决定，不能重传 raw sources。Bearer 集成令牌在服务端派生单机 owner scope、连接账号锚点和 receipt 校验密钥，请求 body 不接受 owner/account 字段。
+
+schema v9 在既有 `source_event` / `source_event_revision` 之上增加稳定来源身份、处理状态、请求幂等、关系图和 receipt 摘要。receipt 由服务端随机 nonce 与认证密钥生成，数据库只保存 nonce 和 receipt 摘要，不保存可直接使用的 receipt。可比较 provider revision 只允许 RFC3339 `modified_at` 与非负整数 `sequence`，低版本不能恢复为 current；无可比较 revision 的异内容更新 fail-closed。整批关系在同一事务内完成未知引用、重复、跨账号、失效和成环校验，任一失败都在提交前回滚，保持零写入。
+
+旧 `source_event` 和 revision 迁移后默认 `legacy_read_only`，不会自动进入新决策。只有能够从历史 metadata 形成稳定 provider/source kind/message identity 的记录才建立只读身份映射；Cindy 重新读取后在原来源上追加新的 current revision 并签发 receipt。无法形成稳定身份的旧来源继续隔离。
+
 首期采用自有最小领域层，至少包含：
 
 ```text
