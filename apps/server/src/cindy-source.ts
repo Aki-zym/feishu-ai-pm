@@ -95,6 +95,7 @@ type SourceRevisionRow = {
   source_event_id: string;
   owner_scope: string;
   revision_number: number;
+  revision_hash: string;
   processing_status: CindySourceStatus;
   trusted_payload_hash: string | null;
   provider_revision_modified_at_ms: number | null;
@@ -864,6 +865,16 @@ export function saveCindySources(
             `UPDATE source_event_revision SET processing_status = 'superseded'
               WHERE id = ? AND processing_status NOT IN ('revoked','invalid')`,
           ).run(current.id);
+          database.raw.prepare(
+            `UPDATE cindy_owner_decision
+                SET status = 'superseded', version = version + 1, updated_at = ?, last_error = NULL
+              WHERE owner_scope = ? AND account_anchor = ? AND status = 'pending'
+                AND EXISTS (
+                  SELECT 1 FROM cindy_owner_decision_source AS decision_source
+                   WHERE decision_source.decision_id = cindy_owner_decision.id
+                     AND decision_source.source_revision_id = ?
+                )`,
+          ).run(timestamp, auth.ownerScope, auth.accountAnchor, current.id);
         }
       }
 

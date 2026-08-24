@@ -8,6 +8,7 @@ import { deriveCindyAuthContext, saveCindySources } from '../src/cindy-source.js
 import { loadConfig } from '../src/config.js';
 import {
   AppDatabase,
+  CINDY_GROUPED_BATCH_MIGRATION_DESCRIPTOR,
   CINDY_OWNER_CONTEXT_MIGRATION_DESCRIPTOR,
   CINDY_TRUSTED_SOURCE_MIGRATION_DESCRIPTOR,
   CURRENT_SCHEMA_VERSION,
@@ -202,7 +203,7 @@ describe('Cindy trusted source migrations', () => {
     raw.close();
 
     const recovered = new AppDatabase(path, false);
-    expect((recovered.raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(10);
+    expect((recovered.raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(CURRENT_SCHEMA_VERSION);
     expect(recovered.raw.prepare(
       'SELECT sender_ref, display_name, chat_ref, thread_ref, mentioned_owner, sender_is_owner, message_type, owner_reacted FROM source_event_revision',
     ).get()).toMatchObject({
@@ -230,5 +231,39 @@ describe('Cindy trusted source migrations', () => {
     expect(database.raw.prepare('SELECT ingest_state FROM source_event WHERE id = ?').get('legacy-unmapped')).toEqual({ ingest_state: 'legacy_read_only' });
     expect(database.raw.prepare('SELECT COUNT(*) AS count FROM cindy_source_identity WHERE source_event_id = ?').get('legacy-unmapped')).toEqual({ count: 0 });
     database.close();
+  });
+
+  it('v10→v11 grouped batch migration 失败会阻止启动、保持完整 v10，修复后原子迁移', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cindy-source-v11-failure-'));
+    roots.push(root);
+    const path = join(root, 'pm.sqlite');
+    const v10 = new AppDatabase(path, false, { targetSchemaVersionForTest: 10 });
+    v10.raw.prepare("INSERT INTO app_setting(key, value_json, updated_at) VALUES ('v10-marker', '{\"ok\":true}', '2026-08-24T00:00:00.000Z')").run();
+    v10.close();
+
+    const [schemaOperation, ...remainingOperations] = CINDY_GROUPED_BATCH_MIGRATION_DESCRIPTOR.orderedOperations;
+    if (schemaOperation?.kind !== 'sql_batch') throw new Error('v11 migration fixture expects sql_batch first');
+    const failingDescriptor = {
+      ...CINDY_GROUPED_BATCH_MIGRATION_DESCRIPTOR,
+      orderedOperations: [
+        { ...schemaOperation, statements: [...schemaOperation.statements, 'INSERT INTO missing_v11_fault_table(value) VALUES (1);'] },
+        ...remainingOperations,
+      ],
+    };
+    expect(() => new AppDatabase(path, false, { migrationDescriptorForTest: failingDescriptor })).toThrow(DatabaseUpgradeError);
+    await expect(buildAppFromDisk(path, failingDescriptor)).rejects.toThrow(DatabaseUpgradeError);
+
+    const raw = new DatabaseSync(path);
+    expect((raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(10);
+    expect(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cindy_batch'").get()).toBeUndefined();
+    expect(raw.prepare("SELECT value_json FROM app_setting WHERE key = 'v10-marker'").get()).toEqual({ value_json: '{"ok":true}' });
+    raw.close();
+
+    const recovered = new AppDatabase(path, false);
+    expect((recovered.raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(11);
+    expect(recovered.raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cindy_batch'").get())
+      .toEqual({ name: 'cindy_batch' });
+    expect(recovered.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'v10-marker'").get()).toEqual({ value_json: '{"ok":true}' });
+    recovered.close();
   });
 });

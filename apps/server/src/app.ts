@@ -383,22 +383,50 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
   app.post('/api/integrations/cindy/decisions', async (request, reply) => {
     try {
       const isoTimestamp = z.string().datetime({ offset: true });
+      const receipt = z.string().min(32).max(200);
       const body = z.object({
         decision_request_id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
+        batch_id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
         window_id: z.string().trim().min(1).max(200),
         window_start: isoTimestamp,
         window_end: isoTimestamp,
-        decisions: z.array(z.object({
-          decision_ref: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
-          action: z.enum(['create_candidate', 'update_task', 'skip', 'needs_owner', 'retry_later']),
-          source_receipts: z.array(z.string().min(32).max(200)).min(1).max(100),
+        snapshot_receipts: z.array(receipt).min(1).max(100),
+        groups: z.array(z.object({
+          group_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+          action: z.enum(['create_candidate', 'update_task']),
+          anchor_receipt: receipt,
+          field_evidence_receipts: z.array(receipt).max(99),
           task_key: z.string().trim().min(1).max(200).optional(),
-          expected_version: z.number().int().nonnegative().optional(),
+          expected_version: z.number().int().positive().optional(),
           title: z.string().trim().min(1).max(160).optional(),
           describe: z.string().trim().min(1).max(2_000).optional(),
           next_step: z.string().trim().min(1).max(1_000).optional(),
-          reason: z.string().trim().max(2_000).optional(),
-        }).strict()).max(500),
+          reason: z.string().trim().max(500).optional(),
+        }).strict()).max(100),
+        primary_dispositions: z.array(z.object({
+          disposition_ref: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+          source_receipt: receipt,
+          disposition: z.enum(['group', 'skip', 'needs_owner']),
+          primary_group_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u).optional(),
+          owner_decision_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u).optional(),
+          reason: z.string().trim().max(500).optional(),
+        }).strict()).min(1).max(100),
+        shared_context: z.array(z.object({
+          source_receipt: receipt,
+          shared_group_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+        }).strict()).max(500).optional(),
+        owner_decisions: z.array(z.object({
+          decision_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+          reason: z.string().trim().min(1).max(500),
+          options: z.array(z.object({
+            option_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+            action: z.enum(['skip', 'create_candidate', 'append_candidate']),
+            title: z.string().trim().min(1).max(160).optional(),
+            describe: z.string().trim().min(1).max(2_000).optional(),
+            next_step: z.string().trim().min(1).max(1_000).optional(),
+            candidate_key: z.string().trim().min(1).max(200).optional(),
+          }).strict()).min(1).max(10),
+        }).strict()).max(100).optional(),
       }).strict().parse(request.body);
       return service.processCindyDecisions(cindyAuthContext(), body);
     } catch (error) {
@@ -413,6 +441,56 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
         payload.error_code = error.errorCode;
         payload.current_version = error.currentVersion;
       }
+      return reply.code(status).send(payload);
+    }
+  });
+  app.get('/api/owner-decisions', async (request, reply) => {
+    try {
+      const query = z.object({
+        status: z.enum(['pending', 'all']).default('pending'),
+        limit: z.coerce.number().int().min(1).max(100).default(50),
+      }).parse(request.query ?? {});
+      return service.listCindyOwnerDecisions(cindyAuthContext(), query.limit, query.status);
+    } catch (error) {
+      const status = error instanceof z.ZodError ? 400 : error instanceof CindySourceContractError ? error.statusCode : 409;
+      return reply.code(status).send({ error: error instanceof Error ? error.message : '主人决定读取失败。' });
+    }
+  });
+  app.post('/api/owner-decisions/:decisionId/resolve', async (request, reply) => {
+    try {
+      const params = z.object({ decisionId: z.string().min(1).max(200) }).parse(request.params);
+      const body = z.object({
+        decision_request_id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
+        expected_version: z.number().int().positive(),
+        action: z.enum(['skip', 'create_candidate']),
+        option_key: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+      }).strict().parse(request.body);
+      return service.resolveCindyOwnerDecision(cindyAuthContext(), params.decisionId, body);
+    } catch (error) {
+      const status = error instanceof z.ZodError ? 400
+        : error instanceof CindySourceContractError ? error.statusCode
+          : error instanceof CindyIntakeConflictError ? 409 : 409;
+      const payload: Record<string, unknown> = { error: error instanceof Error ? error.message : '主人决定执行失败。' };
+      if (error instanceof CindyIntakeConflictError) payload.current_version = error.currentVersion;
+      if (error instanceof CindySourceContractError) payload.error_code = error.errorCode;
+      return reply.code(status).send(payload);
+    }
+  });
+  app.post('/api/owner-decisions/:decisionId/cancel', async (request, reply) => {
+    try {
+      const params = z.object({ decisionId: z.string().min(1).max(200) }).parse(request.params);
+      const body = z.object({
+        decision_request_id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
+        expected_version: z.number().int().positive(),
+      }).strict().parse(request.body);
+      return service.cancelCindyOwnerDecision(cindyAuthContext(), params.decisionId, body);
+    } catch (error) {
+      const status = error instanceof z.ZodError ? 400
+        : error instanceof CindySourceContractError ? error.statusCode
+          : error instanceof CindyIntakeConflictError ? 409 : 409;
+      const payload: Record<string, unknown> = { error: error instanceof Error ? error.message : '主人决定取消失败。' };
+      if (error instanceof CindyIntakeConflictError) payload.current_version = error.currentVersion;
+      if (error instanceof CindySourceContractError) payload.error_code = error.errorCode;
       return reply.code(status).send(payload);
     }
   });

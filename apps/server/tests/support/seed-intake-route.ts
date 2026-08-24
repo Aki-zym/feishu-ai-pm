@@ -64,19 +64,28 @@ export function registerSeedIntakeRoute(app: FastifyInstance, service: PmService
       const sourceReceipt = saved.sources[0]!.source_receipt;
       const result = service.processCindyDecisions(seedAuth, {
         decision_request_id: `test-seed-decision-${nonce}`,
+        batch_id: `test-seed-batch-${nonce}`,
         window_id: `test-seed-window-${nonce}`,
         window_start: occurredAt,
         window_end: occurredAt,
-        decisions: [{
-          decision_ref: 'candidate',
+        snapshot_receipts: [sourceReceipt],
+        groups: [{
+          group_key: 'candidate',
           action: 'create_candidate',
-          source_receipts: [sourceReceipt],
+          anchor_receipt: sourceReceipt,
+          field_evidence_receipts: [],
           title: body.title,
           ...(body.describe === undefined ? {} : { describe: body.describe }),
           reason: '浏览器 HTML 测试模拟需求。',
         }],
+        primary_dispositions: [{
+          disposition_ref: 'seed',
+          source_receipt: sourceReceipt,
+          disposition: 'group',
+          primary_group_key: 'candidate',
+        }],
       });
-      const candidateId = result.decisions[0]?.candidate_id;
+      const candidateId = result.groups[0]?.candidate_id;
       if (!candidateId) return reply.code(500).send({ error: '模拟需求未生成候选。' });
       return { candidate_id: candidateId, source_receipt: sourceReceipt };
     } catch (error) {

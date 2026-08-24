@@ -75,11 +75,52 @@ describe('Cindy 对话入库接口', () => {
   }
 
   async function submitDecisions(app: Awaited<ReturnType<typeof buildApp>>, payload: Record<string, unknown>, integrationToken = token) {
+    const legacy = Array.isArray(payload.decisions) ? payload.decisions as Array<Record<string, unknown>> : null;
+    const normalized = legacy ? (() => {
+      const snapshotReceipts = [...new Set(legacy.flatMap((decision) => decision.source_receipts as string[]))];
+      const groups = legacy.filter((decision) => ['create_candidate', 'update_task'].includes(String(decision.action))).map((decision) => ({
+        group_key: decision.decision_ref,
+        action: decision.action,
+        anchor_receipt: (decision.source_receipts as string[])[0],
+        field_evidence_receipts: (decision.source_receipts as string[]).slice(1),
+        ...(decision.task_key === undefined ? {} : { task_key: decision.task_key }),
+        ...(decision.expected_version === undefined ? {} : { expected_version: decision.expected_version }),
+        ...(decision.title === undefined ? {} : { title: decision.title }),
+        ...(decision.describe === undefined ? {} : { describe: decision.describe }),
+        ...(decision.next_step === undefined ? {} : { next_step: decision.next_step }),
+        ...(decision.reason === undefined ? {} : { reason: decision.reason }),
+      }));
+      const primaryDispositions = legacy.flatMap((decision) => (decision.source_receipts as string[]).map((sourceReceipt, index) => ({
+        disposition_ref: `${decision.decision_ref}-${index + 1}`,
+        source_receipt: sourceReceipt,
+        disposition: ['create_candidate', 'update_task'].includes(String(decision.action)) ? 'group' : decision.action,
+        ...(['create_candidate', 'update_task'].includes(String(decision.action)) ? { primary_group_key: decision.decision_ref } : {}),
+        ...(decision.action === 'needs_owner' ? { owner_decision_key: `${decision.decision_ref}-owner` } : {}),
+        ...(decision.reason === undefined ? {} : { reason: decision.reason }),
+      })));
+      const ownerDecisions = legacy.filter((decision) => decision.action === 'needs_owner').map((decision) => ({
+        decision_key: `${decision.decision_ref}-owner`,
+        reason: decision.reason ?? '需要主人决定。',
+        options: [
+          { option_key: 'skip', action: 'skip' },
+          { option_key: 'create', action: 'create_candidate', title: decision.title ?? '待主人确认的新候选' },
+        ],
+      }));
+      const { decisions: _decisions, ...base } = payload;
+      return {
+        ...base,
+        batch_id: payload.decision_request_id,
+        snapshot_receipts: snapshotReceipts,
+        groups,
+        primary_dispositions: primaryDispositions,
+        ...(ownerDecisions.length ? { owner_decisions: ownerDecisions } : {}),
+      };
+    })() : payload;
     return app.inject({
       method: 'POST',
       url: '/api/integrations/cindy/decisions',
       headers: { authorization: `Bearer ${integrationToken}` },
-      payload,
+      payload: normalized,
     });
   }
 
@@ -602,7 +643,7 @@ describe('Cindy 对话入库接口', () => {
       decisions: [{ decision_ref: 'create', action: 'create_candidate', source_receipts: [receipt], title: '安全姓名候选' }],
     });
     expect(decision.statusCode).toBe(200);
-    const candidateId = decision.json().decisions[0].candidate_id as string;
+    const candidateId = decision.json().groups[0].candidate_id as string;
     const candidates = await app.inject({ method: 'GET', url: '/api/candidates' });
     expect(candidates.json().items[0]).toMatchObject({ id: candidateId, proposer_name: 'Alice 需求' });
     expect(JSON.stringify(candidates.json())).not.toMatch(/ou_requester_1|oc_conversation_1|private-display|请补充活动留存数据/u);
@@ -672,7 +713,7 @@ describe('Cindy 对话入库接口', () => {
       })),
     });
     expect(decision.statusCode).toBe(200);
-    const candidateIds = decision.json().decisions.map((item: { candidate_id: string }) => item.candidate_id);
+    const candidateIds = decision.json().groups.map((item: { candidate_id: string }) => item.candidate_id);
     const candidates = await app.inject({ method: 'GET', url: '/api/candidates' });
     expect(candidates.statusCode).toBe(200);
     const candidateById = new Map(candidates.json().items.map((item: { id: string; proposer_name: string }) => [item.id, item]));
@@ -694,35 +735,26 @@ describe('Cindy 对话入库接口', () => {
     expect(privateJson).not.toMatch(/\[OBJECT\s+object\]|OU_Technical_Display_123|oc_technical_chat_456/iu);
   });
 
-  it('retry_later 只能通过 Cindy 决策入口有限推进，第三次后 receipt 失效', async () => {
+  it('整批决策失败时不改变已保存来源，后续仍可用同一 receipt 重试', async () => {
     const { app, database } = await makeApp();
-    const saved = await saveSources(app, { save_request_id: 'save-retry-limit', sources: [trustedSource()] });
+    const saved = await saveSources(app, { save_request_id: 'save-batch-retry', sources: [trustedSource()] });
     const receipt = saved.json().sources[0].source_receipt as string;
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      const response = await submitDecisions(app, {
-        decision_request_id: `decision-retry-${attempt}`,
-        window_id: `window-retry-${attempt}`,
-        window_start: '2026-08-24T00:00:00.000Z',
-        window_end: `2026-08-24T00:0${attempt}:00.000Z`,
-        decisions: [{ decision_ref: 'retry', action: 'retry_later', source_receipts: [receipt], reason: '临时中断。' }],
-      });
-      expect(response.statusCode).toBe(200);
-      expect(response.json().decisions[0].source_status).toBe(attempt === 3 ? 'invalid' : 'retryable');
-    }
-    expect(database.raw.prepare('SELECT processing_status, retry_count FROM source_event_revision WHERE receipt_digest IS NOT NULL').get())
-      .toEqual({ processing_status: 'invalid', retry_count: 3 });
-    const denied = await submitDecisions(app, {
-      decision_request_id: 'decision-after-retry-limit', window_id: 'window-after-retry-limit',
+    const failed = await submitDecisions(app, {
+      decision_request_id: 'decision-batch-failed', window_id: 'window-batch-failed',
       window_start: '2026-08-24T00:00:00.000Z', window_end: '2026-08-24T00:10:00.000Z',
-      decisions: [{ decision_ref: 'd1', action: 'skip', source_receipts: [receipt] }],
+      decisions: [{ decision_ref: 'broken', action: 'update_task', source_receipts: [receipt], task_key: 'missing-task', expected_version: 1, next_step: '不会写入' }],
     });
-    expect(denied.statusCode).toBe(403);
-    const reread = await saveSources(app, {
-      save_request_id: 'save-retry-limit-reread',
-      sources: [trustedSource({ revision: { sequence: 2 }, text: '重新读取后的当前版本。' })],
+    expect(failed.statusCode).toBe(409);
+    expect(database.raw.prepare('SELECT processing_status, retry_count FROM source_event_revision WHERE receipt_digest IS NOT NULL').get())
+      .toEqual({ processing_status: 'pending_decision', retry_count: 0 });
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM cindy_batch').get()).toEqual({ count: 0 });
+    const retry = await submitDecisions(app, {
+      decision_request_id: 'decision-batch-retry', window_id: 'window-batch-retry',
+      window_start: '2026-08-24T00:00:00.000Z', window_end: '2026-08-24T00:10:00.000Z',
+      decisions: [{ decision_ref: 'retry-skip', action: 'skip', source_receipts: [receipt], reason: '确认无需建卡。' }],
     });
-    expect(reread.statusCode).toBe(200);
-    expect(reread.json().sources[0]).toMatchObject({ source_status: 'pending_decision', revision: { generation: 2, sequence: 2 } });
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json().dispositions[0]).toMatchObject({ disposition: 'skip', source_status: 'skipped' });
   });
 
   it('receipt 决策只接受当前同 owner 来源；伪造、跨 owner、旧 revision 和 invalid 均零业务写入', async () => {
@@ -746,7 +778,7 @@ describe('Cindy 对话入库接口', () => {
     database.raw.prepare("UPDATE source_event_revision SET processing_status = 'invalid' WHERE receipt_digest IS NOT NULL AND processing_status = 'pending_decision'").run();
     expect((await submitDecisions(app, baseDecision(receipt2, 'decision-invalid'))).statusCode).toBe(403);
     expect((database.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get() as { count: number }).count).toBe(0);
-    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM cindy_decision_request').get() as { count: number }).count).toBe(0);
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM cindy_batch').get() as { count: number }).count).toBe(0);
   });
 
   it('决策成功只消费 receipts；CAS 失败保留已保存来源，成功重放不重复写入', async () => {
@@ -768,7 +800,7 @@ describe('Cindy 对话入库接口', () => {
     const successPayload = { ...conflictPayload, decision_request_id: 'decision-update-success', window_id: 'window-update-success', decisions: [{ ...conflictPayload.decisions[0], expected_version: 1 }] };
     const success = await submitDecisions(app, successPayload);
     expect(success.statusCode).toBe(200);
-    expect(success.json().decisions[0]).toMatchObject({ action: 'update_task', source_status: 'processed', version: 2 });
+    expect(success.json().groups[0]).toMatchObject({ action: 'update_task', source_status: 'processed', version: 2 });
     const replay = await submitDecisions(app, successPayload);
     expect(replay.statusCode).toBe(200);
     expect(replay.json()).toMatchObject({ duplicate: true });
@@ -781,19 +813,20 @@ describe('Cindy 对话入库接口', () => {
       .toEqual({ count: 1 });
   });
 
-  it('认证上下文由服务端派生，body 自报 owner/account 被拒；空 decisions 仍推进窗口', async () => {
+  it('认证上下文由服务端派生，body 自报 owner/account 被拒；完整 skip snapshot 才推进窗口', async () => {
     const { app, database } = await makeApp();
     const rejected = await saveSources(app, { save_request_id: 'save-auth-body', owner_scope: 'forged', sources: [trustedSource()] });
     expect(rejected.statusCode).toBe(400);
     expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(0);
-    const empty = await submitDecisions(app, {
-      decision_request_id: 'decision-empty-window',
-      window_id: 'window-empty',
+    const saved = await saveSources(app, { save_request_id: 'save-window-skip', sources: [trustedSource()] });
+    const skipped = await submitDecisions(app, {
+      decision_request_id: 'decision-skip-window',
+      window_id: 'window-skip',
       window_start: '2026-08-24T00:00:00.000Z',
       window_end: '2026-08-24T00:10:00.000Z',
-      decisions: [],
+      decisions: [{ decision_ref: 'skip', action: 'skip', source_receipts: [saved.json().sources[0].source_receipt] }],
     });
-    expect(empty.statusCode).toBe(200);
+    expect(skipped.statusCode).toBe(200);
     expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'intake_window_end'").get())
       .toEqual({ value_json: '{"window_end":"2026-08-24T00:10:00.000Z"}' });
   });

@@ -56,7 +56,7 @@ describe('浏览器测试模拟需求入口', () => {
     expect(candidate).toEqual({
       title: 'HTML 验收候选',
       describe: '用于检查候选卡片的标题和描述。',
-      background: '浏览器测试需要一条可复现的 pending 候选。',
+      background: '用于检查候选卡片的标题和描述。',
       state: 'pending',
       accepted_task_id: null,
     });
