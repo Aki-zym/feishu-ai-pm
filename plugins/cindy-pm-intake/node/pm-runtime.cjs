@@ -149262,14 +149262,19 @@ function normalizedText(value, field, maxLength) {
   if (!normalized || normalized.length > maxLength) throw new CindySourceContractError("INVALID_INPUT", `${field} \u4E3A\u7A7A\u6216\u8FC7\u957F\u3002`);
   return normalized;
 }
-function visiblePrefix(value, limit) {
-  let Segmenter = Intl.Segmenter;
-  return Segmenter ? [...new Segmenter("zh-CN", { granularity: "grapheme" }).segment(value)].slice(0, limit).map((part) => part.segment).join("") : Array.from(value).slice(0, limit).join("");
+var DISPLAY_NAME_MAX_GRAPHEMES = 80, DISPLAY_NAME_MAX_CODE_UNITS = 160, stringifiedObjectDisplayNamePattern = /^\[\s*object\s+object\s*\]$/iu, feishuTechnicalDisplayNamePattern = /^(?:ou|oc)_[a-z0-9_-]{6,}$/iu;
+function visiblePrefix(value, graphemeLimit, codeUnitLimit) {
+  let output = "", graphemes = 0;
+  for (let part of new Intl.Segmenter("zh-CN", { granularity: "grapheme" }).segment(value)) {
+    if (graphemes >= graphemeLimit || output.length + part.segment.length > codeUnitLimit) break;
+    output += part.segment, graphemes += 1;
+  }
+  return output;
 }
 function sanitizeCindyDisplayName(value) {
   if (typeof value != "string") return "\u9700\u6C42\u65B9";
   let cleaned = value.normalize("NFC").replace(bidiCharacterPattern, "").replace(/[\p{Cc}\p{Cf}]/gu, "").replace(/\s+/gu, " ").trim();
-  return cleaned && visiblePrefix(cleaned, 80) || "\u9700\u6C42\u65B9";
+  return !cleaned || stringifiedObjectDisplayNamePattern.test(cleaned) || feishuTechnicalDisplayNamePattern.test(cleaned) ? "\u9700\u6C42\u65B9" : visiblePrefix(cleaned, DISPLAY_NAME_MAX_GRAPHEMES, DISPLAY_NAME_MAX_CODE_UNITS) || "\u9700\u6C42\u65B9";
 }
 function normalizedTechnicalId(value, field, maxLength = 500) {
   if (typeof value != "string") throw new CindySourceContractError("INVALID_INPUT", `${field} \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\u3002`);

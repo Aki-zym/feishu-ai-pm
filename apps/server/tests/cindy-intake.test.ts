@@ -624,6 +624,75 @@ describe('Cindy 对话入库接口', () => {
     expect(database.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get()).toEqual({ count: 1 });
   });
 
+  it('display name 以完整 grapheme 满足持久化边界，并让对象占位与飞书技术 ID 在私人投影回退', async () => {
+    const { app, database } = await makeApp();
+    const combiningHeavyName = Array.from({ length: 80 }, () => `a${'\u0301'.repeat(5)}`).join('');
+    const displayNames = [combiningHeavyName, '  [OBJECT   object]  ', ' OU_Technical_Display_123 ', 'oc_technical_chat_456'];
+    const saved = await saveSources(app, {
+      save_request_id: 'save-display-name-boundaries',
+      sources: displayNames.map((displayName, index) => trustedSource({
+        client_ref: `display-${index}`,
+        stable_message_id: `display-message-${index}`,
+        display_name: displayName,
+        occurred_at: `2026-08-24T00:0${index + 1}:00.000Z`,
+      })),
+    });
+    expect(saved.statusCode).toBe(200);
+
+    const stored = database.raw.prepare(
+      'SELECT display_name, length(display_name) AS sqlite_length FROM source_event_revision ORDER BY occurred_at, id',
+    ).all() as Array<{ display_name: string; sqlite_length: number }>;
+    const expectedHeavyName = [...new Intl.Segmenter('zh-CN', { granularity: 'grapheme' }).segment(combiningHeavyName.normalize('NFC'))]
+      .slice(0, 32)
+      .map((part) => part.segment)
+      .join('');
+    expect(stored).toHaveLength(4);
+    const firstStored = stored[0]!;
+    expect(firstStored).toEqual({ display_name: expectedHeavyName, sqlite_length: 160 });
+    expect(firstStored.display_name.length).toBe(160);
+    expect([...new Intl.Segmenter('zh-CN', { granularity: 'grapheme' }).segment(firstStored.display_name)]).toHaveLength(32);
+    expect(stored.slice(1)).toEqual([
+      { display_name: '需求方', sqlite_length: 3 },
+      { display_name: '需求方', sqlite_length: 3 },
+      { display_name: '需求方', sqlite_length: 3 },
+    ]);
+
+    const receipts = saved.json().sources.map((source: { source_receipt: string }) => source.source_receipt);
+    const decision = await submitDecisions(app, {
+      decision_request_id: 'decision-display-name-boundaries',
+      window_id: 'window-display-name-boundaries',
+      window_start: '2026-08-24T00:00:00.000Z',
+      window_end: '2026-08-24T00:10:00.000Z',
+      decisions: receipts.map((receipt: string, index: number) => ({
+        decision_ref: `display-${index}`,
+        action: 'create_candidate',
+        source_receipts: [receipt],
+        title: `显示名边界 ${index}`,
+      })),
+    });
+    expect(decision.statusCode).toBe(200);
+    const candidateIds = decision.json().decisions.map((item: { candidate_id: string }) => item.candidate_id);
+    const candidates = await app.inject({ method: 'GET', url: '/api/candidates' });
+    expect(candidates.statusCode).toBe(200);
+    const candidateById = new Map(candidates.json().items.map((item: { id: string; proposer_name: string }) => [item.id, item]));
+    const expectedNames = [expectedHeavyName, '需求方', '需求方', '需求方'];
+    for (const [index, candidateId] of candidateIds.entries()) {
+      expect(candidateById.get(candidateId)).toMatchObject({ proposer_name: expectedNames[index] });
+      const accepted = await app.inject({
+        method: 'POST',
+        url: `/api/candidates/${candidateId}/action`,
+        payload: { action: 'accept', expectedVersion: 1 },
+      });
+      expect(accepted.statusCode).toBe(200);
+      const detail = await app.inject({ method: 'GET', url: `/api/tasks/${accepted.json().task.id}` });
+      expect(detail.statusCode).toBe(200);
+      expect(privateSourceDtoSchema.parse(detail.json().sources[0]).display_name).toBe(expectedNames[index]);
+      expect(JSON.stringify(detail.json())).not.toContain(displayNames[index]);
+    }
+    const privateJson = JSON.stringify(candidates.json());
+    expect(privateJson).not.toMatch(/\[OBJECT\s+object\]|OU_Technical_Display_123|oc_technical_chat_456/iu);
+  });
+
   it('retry_later 只能通过 Cindy 决策入口有限推进，第三次后 receipt 失效', async () => {
     const { app, database } = await makeApp();
     const saved = await saveSources(app, { save_request_id: 'save-retry-limit', sources: [trustedSource()] });

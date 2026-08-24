@@ -160,15 +160,22 @@ function normalizedText(value: string, field: string, maxLength: number) {
   return normalized;
 }
 
-function visiblePrefix(value: string, limit: number) {
-  const Segmenter = Intl.Segmenter;
-  if (Segmenter) {
-    return [...new Segmenter('zh-CN', { granularity: 'grapheme' }).segment(value)]
-      .slice(0, limit)
-      .map((part) => part.segment)
-      .join('');
+const DISPLAY_NAME_MAX_GRAPHEMES = 80;
+// Candidate proposer_name is the strictest downstream projection (160 UTF-16
+// units); staying within it also satisfies SQLite/private-source limits (320).
+const DISPLAY_NAME_MAX_CODE_UNITS = 160;
+const stringifiedObjectDisplayNamePattern = /^\[\s*object\s+object\s*\]$/iu;
+const feishuTechnicalDisplayNamePattern = /^(?:ou|oc)_[a-z0-9_-]{6,}$/iu;
+
+function visiblePrefix(value: string, graphemeLimit: number, codeUnitLimit: number) {
+  let output = '';
+  let graphemes = 0;
+  for (const part of new Intl.Segmenter('zh-CN', { granularity: 'grapheme' }).segment(value)) {
+    if (graphemes >= graphemeLimit || output.length + part.segment.length > codeUnitLimit) break;
+    output += part.segment;
+    graphemes += 1;
   }
-  return Array.from(value).slice(0, limit).join('');
+  return output;
 }
 
 export function sanitizeCindyDisplayName(value: unknown) {
@@ -178,7 +185,10 @@ export function sanitizeCindyDisplayName(value: unknown) {
     .replace(/[\p{Cc}\p{Cf}]/gu, '')
     .replace(/\s+/gu, ' ')
     .trim();
-  return cleaned ? visiblePrefix(cleaned, 80) || '需求方' : '需求方';
+  if (!cleaned || stringifiedObjectDisplayNamePattern.test(cleaned) || feishuTechnicalDisplayNamePattern.test(cleaned)) {
+    return '需求方';
+  }
+  return visiblePrefix(cleaned, DISPLAY_NAME_MAX_GRAPHEMES, DISPLAY_NAME_MAX_CODE_UNITS) || '需求方';
 }
 
 function normalizedTechnicalId(value: unknown, field: string, maxLength = 500) {
