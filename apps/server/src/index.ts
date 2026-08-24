@@ -2,7 +2,7 @@ import { buildApp } from './app.js';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.js';
 import { AppDatabase } from './database.js';
-import { createAdapters } from './integrations.js';
+import { createCindyAdapters } from './integrations.js';
 import { PmService } from './service.js';
 
 const config = loadConfig();
@@ -12,7 +12,7 @@ if (config.database.provider !== 'sqlite') {
 }
 
 const database = new AppDatabase(config.database.sqlitePath);
-const adapters = createAdapters(config);
+const adapters = createCindyAdapters(config);
 const service = new PmService(database, adapters, config);
 const webRoot = fileURLToPath(new URL('../../web/dist/', import.meta.url));
 let app: Awaited<ReturnType<typeof buildApp>>;
@@ -22,7 +22,6 @@ const listenOptions = { port: config.port, host: '127.0.0.1' } as const;
 const shutdown = async () => {
   if (shutdownInProgress) return shutdownInProgress;
   shutdownInProgress = (async () => {
-    await service.stopRuntimeRecovery();
     await app.close();
     database.close();
   })();
@@ -56,7 +55,6 @@ const restart = async () => {
 };
 
 app = await buildRuntimeApp();
-service.startRuntimeRecovery();
 
 await app.listen(listenOptions);
 

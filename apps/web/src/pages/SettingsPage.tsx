@@ -132,9 +132,12 @@ export default function SettingsPage() {
     setIntegrationHealthResource(loadingResource<IntegrationHealth[]>());
     setHealthResource(loadingResource<HealthSnapshot>());
     setAutoScanResource((current) => beginResource(current));
+    const ownerInformationPromise = desktop
+      ? api.get<OwnerInformation>('/api/owner-information')
+      : Promise.resolve<OwnerInformation>({ owner: null, sources: [] });
     void Promise.allSettled([
       api.get<Configuration>('/api/configuration'),
-      api.get<OwnerInformation>('/api/owner-information'),
+      ownerInformationPromise,
       api.get<AutomationPolicy>('/api/automation-policy'),
       api.get<IntegrationHealth[]>('/api/integrations/health'),
       api.get<HealthResponse>('/api/health'),
@@ -577,14 +580,14 @@ export default function SettingsPage() {
         <AsyncState resource={automationPolicyResource} emptyText={null} errorTitle="自动维护设置读取失败" onRetry={loadSettings}>{null}</AsyncState>
       </div>
       <section className="settings-overview" aria-labelledby="connection-overview-title">
-        <div className="settings-overview-heading"><div><h2 id="connection-overview-title">连接总览</h2><p>个人信息流是主入口；机器人只在受限场景下补充。</p></div></div>
+        <div className="settings-overview-heading"><div><h2 id="connection-overview-title">连接总览</h2><p>{desktop ? '个人信息流是主入口；机器人只在受限场景下补充。' : '查看判断模型与本机服务状态。'}</p></div></div>
         <div className="settings-overview-body">
           <div className="settings-overview-items">
-            <div className="settings-overview-item"><span className="overview-icon"><MessageCircle size={18} /></span><div><strong>飞书</strong><span><i className={'status-dot ' + (ownerInformationResource.status === 'error' ? 'status-dot-danger' : !ownerInformation ? 'status-dot-muted' : !ownerAuthorized ? 'status-dot-warning' : feishuHealth && feishuHealth.status === 'ready' ? 'status-dot-safe' : 'status-dot-warning')} />{ownerStatusText}</span><small>{ownerInformationResource.status === 'error' ? '个人信息流状态读取失败，请重试' : !ownerInformation ? '正在读取主人授权状态' : feishuHealth ? `最近检查：${formatTimestamp(feishuHealth.checked_at)}` : ownerInformation.owner?.lastSyncedAt ? `上次同步：${formatTimestamp(ownerInformation.owner.lastSyncedAt)}` : '尚未完成主人同步'}</small></div></div>
+            {desktop && <div className="settings-overview-item"><span className="overview-icon"><MessageCircle size={18} /></span><div><strong>飞书</strong><span><i className={'status-dot ' + (ownerInformationResource.status === 'error' ? 'status-dot-danger' : !ownerInformation ? 'status-dot-muted' : !ownerAuthorized ? 'status-dot-warning' : feishuHealth && feishuHealth.status === 'ready' ? 'status-dot-safe' : 'status-dot-warning')} />{ownerStatusText}</span><small>{ownerInformationResource.status === 'error' ? '个人信息流状态读取失败，请重试' : !ownerInformation ? '正在读取主人授权状态' : feishuHealth ? `最近检查：${formatTimestamp(feishuHealth.checked_at)}` : ownerInformation.owner?.lastSyncedAt ? `上次同步：${formatTimestamp(ownerInformation.owner.lastSyncedAt)}` : '尚未完成主人同步'}</small></div></div>}
             <div className="settings-overview-item"><span className="overview-icon"><FlaskConical size={18} /></span><div><strong>判断模型</strong><span><i className={'status-dot ' + (!configuration ? 'status-dot-muted' : modelHealthy ? 'status-dot-safe' : 'status-dot-warning')} />{modelStatusText}</span><small>{!configuration ? '正在读取模型配置' : modelHealth ? `最近检查：${formatTimestamp(modelHealth.checked_at)}` : desktopConfig?.llm.model || '本地规则降级可用'}</small></div></div>
-            <div className="settings-overview-item"><span className="overview-icon"><UserRound size={18} /></span><div><strong>个人信息来源</strong><span><i className={'status-dot ' + (!ownerInformation ? 'status-dot-muted' : primarySourcesReady ? 'status-dot-safe' : 'status-dot-warning')} />{!ownerInformation ? '正在读取状态' : `${usablePrimarySources} 项可用或受限${platformLimitedPrimarySources ? ` · ${platformLimitedPrimarySources} 项平台限制` : ''}`}</span><small>{!ownerInformation ? '普通私聊、@我、日历和会议' : botSupplement?.enabled && ['ready', 'mock_ready'].includes(botSupplement.status) ? '机器人补充入口已启用' : '机器人补充入口未启用（可选）'}</small></div></div>
+            {desktop && <div className="settings-overview-item"><span className="overview-icon"><UserRound size={18} /></span><div><strong>个人信息来源</strong><span><i className={'status-dot ' + (!ownerInformation ? 'status-dot-muted' : primarySourcesReady ? 'status-dot-safe' : 'status-dot-warning')} />{!ownerInformation ? '正在读取状态' : `${usablePrimarySources} 项可用或受限${platformLimitedPrimarySources ? ` · ${platformLimitedPrimarySources} 项平台限制` : ''}`}</span><small>{!ownerInformation ? '普通私聊、@我、日历和会议' : botSupplement?.enabled && ['ready', 'mock_ready'].includes(botSupplement.status) ? '机器人补充入口已启用' : '机器人补充入口未启用（可选）'}</small></div></div>}
           </div>
-          <button className="primary-button settings-sync-all" type="button" disabled={anySourceSyncing} onClick={() => void listenerAction('sync')}><RefreshCw size={15} className={bulkSyncing ? 'spin' : undefined} />{bulkSyncing ? '同步中…' : '同步全部'}</button>
+          {desktop && <button className="primary-button settings-sync-all" type="button" disabled={anySourceSyncing} onClick={() => void listenerAction('sync')}><RefreshCw size={15} className={bulkSyncing ? 'spin' : undefined} />{bulkSyncing ? '同步中…' : '同步全部'}</button>}
         </div>
       </section>
       <HealthStatusPanel resource={healthResource} onRetry={loadSettings} />
@@ -629,7 +632,7 @@ export default function SettingsPage() {
       </section>
       <div className="security-banner settings-security-banner"><ShieldCheck size={20} /><div><strong>安全边界</strong><span>{configurationResource.status === 'error' ? '配置状态读取失败，请点击上方“重试”；在确认配置前不要把连接状态当作最新结果。' : configuration?.notice ?? '正在读取配置状态…'}</span></div></div>
       <PrivacyLifecyclePanel />
-      <section className="integration-section owner-information-section">
+      {desktop && <section className="integration-section owner-information-section">
         <div className="integration-heading">
           <span className="integration-icon"><UserRound size={19} /></span>
           <div><h2>我的个人信息流</h2><span>按人选择现有个人单聊、按群选择 @我 来源；日历和妙记继续独立增量同步。</span></div>
@@ -676,7 +679,7 @@ export default function SettingsPage() {
           })}
           {!ownerInformation && <div className="source-status-loading">{ownerInformationResource.status === 'error' ? '个人信息流状态读取失败，请重试。' : '正在读取个人信息流状态…'}</div>}
         </div>
-      </section>
+      </section>}
       {desktopConfig && <>
         <div className="connection-panel-grid">
           <section className="integration-section connection-panel">
@@ -762,6 +765,12 @@ export default function SettingsPage() {
           </div>
         </details>
       </>}
+      {!desktop && <details className="settings-disclosure legacy-feishu-panel">
+        <summary><span>遗留飞书接入</span><small>当前浏览器不提供旧版 OAuth</small></summary>
+        <div className="settings-disclosure-content">
+          <p className="integration-note">当前浏览器的飞书接入由 Cindy 的 XD Feishu 提供。旧版主人授权、个人或群聊选择、机器人补充配置仅保留在遗留说明中。</p>
+        </div>
+      </details>}
       <details open className="settings-disclosure settings-danger-zone runtime-shutdown-panel">
         <summary><span>退出后台进程</span><small>关闭本机任务库后台与 4310 端口</small></summary>
         <div className="settings-disclosure-content">

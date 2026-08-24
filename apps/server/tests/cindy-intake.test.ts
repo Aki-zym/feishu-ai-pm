@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { buildApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
 import { AppDatabase } from '../src/database.js';
-import { createAdapters } from '../src/integrations.js';
+import { createCindyAdapters } from '../src/integrations.js';
 import { PmService } from '../src/service.js';
 
 describe('Cindy 对话入库接口', () => {
@@ -29,7 +29,7 @@ describe('Cindy 对话入库接口', () => {
     const database = new AppDatabase(':memory:', false);
     databases.push(database);
     const config = loadConfig({ NODE_ENV: 'test', DATABASE_URL: ':memory:' });
-    const service = new PmService(database, createAdapters(config), config);
+    const service = new PmService(database, createCindyAdapters(config), config);
     const app = await buildApp(service, { serveWeb: false, cindyIntegrationToken: token });
     apps.push(app);
     return { app, database };

@@ -8,42 +8,29 @@ import { z } from 'zod';
 import type { CandidateState, RiskLevel, TaskStatus } from './domain.js';
 import { AUDIT_REPLAY_INTENT, type ReplayCapabilityBinding } from './data04.js';
 import { CandidateVersionConflictError, CandidateVersionRequiredError, CindyIntakeConflictError, CindyIntakeValidationError, PrivacyAuthorizationError, ReplayAuthorizationError, type PmService } from './service.js';
-import { createOperationContext, failedSourceOutcome, operationEnvelope, type SyncSourceName } from './observability.js';
 import { assertShanghaiCalendarPlanRange } from './shanghai-time.js';
 import {
   candidateActionDtoSchema,
   candidateInboxDtoSchema,
   candidateMergeDtoSchema,
   candidateMergeRejectedDtoSchema,
-  candidateReprocessDtoSchema,
-  candidateSourceRetryDtoSchema,
   candidateSplitDtoSchema,
   candidateThreadAssociationDtoSchema,
   correctionActionDtoSchema,
   correctionListDtoSchema,
   dashboardDtoSchema,
   minimalCandidateDtoSchema,
-  sourceScopeSchema,
   taskListDtoSchema,
   threadListDtoSchema,
 } from './source-privacy.js';
 
 const candidateStates = ['pending', 'snoozed', 'ignored', 'accepted'] as const;
 const taskStatuses = ['unplanned', 'planned', 'in_progress', 'waiting', 'review', 'completed', 'archived'] as const;
-const requestIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const seedIntakeBodySchema = z.object({
   title: z.string().trim().min(1).max(160),
   describe: z.string().trim().min(1).max(2_000).optional(),
   background: z.string().trim().min(1).max(8_000).optional(),
 }).strict();
-
-function requestTraceContext(request: FastifyRequest) {
-  const header = (name: string) => {
-    const value = request.headers[name];
-    return typeof value === 'string' && requestIdPattern.test(value) ? value.toLowerCase() : null;
-  };
-  return { traceId: header('x-trace-id'), parentSpanId: header('x-parent-span-id') };
-}
 
 function isLoopbackRequest(request: FastifyRequest) {
   const remoteAddress = request.socket.remoteAddress ?? request.ip;
@@ -77,9 +64,6 @@ function candidateMutationError(error: unknown, fallback: string, current?: unkn
   return { error: message, outcome: 'failure' as const };
 }
 const risks = ['low', 'medium', 'high'] as const;
-type SourceFailureListStatus = 'active' | 'all' | 'open' | 'retrying' | 'resolved' | 'ignored' | 'stale';
-type SourceFailureListRequest = FastifyRequest<{ Querystring: { status?: SourceFailureListStatus } }>;
-type SourceFailureActionRequest = FastifyRequest<{ Params: { id: string } }>;
 
 type BuildAppOptions = {
   webOrigin?: string;
@@ -87,6 +71,8 @@ type BuildAppOptions = {
   webRoot?: string;
   desktopCapability?: LocalActionCapability;
   cindyIntegrationToken?: string;
+  /** Resident Cindy runtime omits the legacy Feishu collection/classification routes. */
+  cindyRuntime?: boolean;
   runtimeShutdown?: () => Promise<void> | void;
   runtimeRestart?: () => Promise<void> | void;
   logger?: boolean;
@@ -337,15 +323,6 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
     return service.clearLogs(query.includeCorrections);
   });
   app.post('/api/diagnostics/cleanup', async () => service.cleanupLogs());
-  app.post('/api/integrations/:key/check', async (request, reply) => {
-    const params = z.object({ key: z.enum(['feishu', 'llm', 'workspace']) }).parse(request.params);
-    try {
-      return await service.testIntegration(params.key);
-    } catch (error) {
-      return reply.code(502).send({ error: error instanceof Error ? error.message : '连接检查失败。' });
-    }
-  });
-  app.get('/api/integrations/health', async () => service.integrationHealth());
   app.get('/api/integrations/cindy/tasks', async () => ({
     items: service.listCindyTasks(),
     candidates: service.listCindyCandidates(),
@@ -556,156 +533,6 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
       return reply.code(status).send({ error: error instanceof Error ? error.message : '备份恢复失败。' });
     }
   });
-  app.post('/api/integrations/feishu/owner/refresh', async (_request, reply) => {
-    try {
-      await service.refreshOwnerIdentity();
-      return service.ownerInformation();
-    } catch (error) {
-      return reply.code(409).send({ error: error instanceof Error ? error.message : '无法读取系统主人身份。' });
-    }
-  });
-  app.get('/api/integrations/feishu/monitoring-scope', async () => service.feishuMonitoringScope());
-  app.post('/api/integrations/feishu/monitoring-scope/refresh', async (_request, reply) => {
-    try {
-      return await service.refreshFeishuMonitoringScope();
-    } catch (error) {
-      return reply.code(409).send({ error: error instanceof Error ? error.message : '无法刷新飞书人员和群聊范围。' });
-    }
-  });
-  app.patch('/api/integrations/feishu/monitoring-scope', async (request, reply) => {
-    try {
-      const body = z.object({
-        personIds: z.array(z.string().min(1).max(160)).max(5000).optional(),
-        personChanges: z.array(z.object({
-          id: z.string().min(1).max(160),
-          selected: z.boolean(),
-        })).max(5000).optional(),
-        groupIds: z.array(z.string().min(1).max(160)).max(50).optional(),
-      }).parse(request.body);
-      return service.updateFeishuMonitoringScope(body);
-    } catch (error) {
-      return reply.code(error instanceof z.ZodError ? 400 : 409).send({ error: error instanceof Error ? error.message : '无法保存飞书监控范围。' });
-    }
-  });
-  app.get('/api/integrations/feishu/people', async (request, reply) => {
-    try {
-      const query = z.object({ query: z.string().max(50).optional().default('') }).parse(request.query);
-      return await service.searchFeishuPeople(query.query);
-    } catch (error) {
-      return reply.code(error instanceof z.ZodError ? 400 : 409).send({ error: error instanceof Error ? error.message : '飞书联系人搜索失败。' });
-    }
-  });
-  app.get('/api/integrations/feishu/oauth/url', async (request, reply) => {
-    try {
-      const query = z.object({ state: z.string().uuid().optional() }).parse(request.query);
-      return await service.feishuAuthorizationUrl(query.state);
-    } catch (error) {
-      return reply.code(409).send({ error: error instanceof Error ? error.message : '无法生成飞书授权地址。' });
-    }
-  });
-  app.post('/api/integrations/feishu/oauth/exchange', async (request, reply) => {
-    const body = z.object({ code: z.string().min(1).max(4096), state: z.string().max(512).optional() }).parse(request.body);
-    try {
-      return await service.completeFeishuOAuth(body.code, body.state);
-    } catch (error) {
-      const diagnostic = error && typeof error === 'object' && 'diagnostic' in error
-        ? (error as { diagnostic?: unknown }).diagnostic
-        : undefined;
-      return reply.code(409).send({ error: error instanceof Error ? error.message : '飞书授权失败。', diagnostic });
-    }
-  });
-  app.post('/api/integrations/feishu/listener/start', async (request, reply) => {
-    if (!requirePrivacyCapability(request, reply, options.desktopCapability, PRIVACY_OWNER_ACTION_INTENT)) return;
-    try {
-      return await service.startFeishu();
-    } catch (error) {
-      return reply.code(409).send({ error: error instanceof Error ? error.message : '无法启动飞书监听。' });
-    }
-  });
-  app.post('/api/integrations/feishu/listener/stop', async (request, reply) => {
-    if (!requirePrivacyCapability(request, reply, options.desktopCapability, PRIVACY_OWNER_ACTION_INTENT)) return;
-    try {
-      return await service.stopFeishu();
-    } catch (error) {
-      return reply.code(409).send({ error: error instanceof Error ? error.message : '无法停止飞书监听。' });
-    }
-  });
-  app.post('/api/integrations/feishu/sync', async (request, reply) => {
-    const requestId = randomUUID();
-    const startedAt = Date.now();
-    const context = requestTraceContext(request);
-    const operationContext = createOperationContext({ requestId, traceId: context.traceId, parentSpanId: context.parentSpanId });
-    try {
-      return await service.syncFeishuOnce(requestId, context, operationContext);
-    } catch (error) {
-      return reply.code(409).send(operationEnvelope({
-        context: operationContext,
-        startedAt,
-        sources: [failedSourceOutcome('feishu', error, Date.now() - startedAt)],
-        release: service.releaseIdentity(),
-      }));
-    }
-  });
-  app.post('/api/integrations/feishu/sources/:kind/sync', async (request, reply) => {
-    const requestId = randomUUID();
-    const startedAt = Date.now();
-    const context = requestTraceContext(request);
-    const operationContext = createOperationContext({ requestId, traceId: context.traceId, parentSpanId: context.parentSpanId });
-    let source: SyncSourceName = 'feishu_source';
-    try {
-      const params = z.object({ kind: z.enum(['owner_dm', 'owner_mentions', 'calendar', 'minutes', 'bot_supplement']) }).parse(request.params);
-      source = params.kind;
-      return await service.syncFeishuSource(params.kind, requestId, context, operationContext);
-    } catch (error) {
-      const isValidation = error instanceof z.ZodError;
-      return reply.code(isValidation ? 400 : 409).send(operationEnvelope({
-        context: operationContext,
-        startedAt,
-        sources: [failedSourceOutcome(source, error, Date.now() - startedAt)],
-        release: service.releaseIdentity(),
-      }));
-    }
-  });
-  app.get('/api/integrations/feishu/calendar', async (request, reply) => {
-    try {
-      const query = z.record(z.string(), z.string()).parse(request.query);
-      return await service.feishuCalendar(query);
-    } catch (error) {
-      return reply.code(409).send({ error: error instanceof Error ? error.message : '飞书日历读取失败。' });
-    }
-  });
-  app.get('/api/integrations/feishu/chats', async (_request, reply) => {
-    try {
-      return await service.feishuChats();
-    } catch (error) {
-      return reply.code(409).send({ error: error instanceof Error ? error.message : '飞书会话读取失败。' });
-    }
-  });
-  app.get('/api/integrations/feishu/messages/search', async (request, reply) => {
-    try {
-      const query = z.record(z.string(), z.string()).parse(request.query);
-      return await service.feishuMessagesSearch(query);
-    } catch (error) {
-      return reply.code(409).send({ error: error instanceof Error ? error.message : '飞书消息搜索失败。' });
-    }
-  });
-  app.get('/api/integrations/feishu/minutes/search', async (request, reply) => {
-    try {
-      const query = z.record(z.string(), z.string()).parse(request.query);
-      return await service.feishuMinutesSearch(query);
-    } catch (error) {
-      return reply.code(409).send({ error: error instanceof Error ? error.message : '会议纪要搜索失败。' });
-    }
-  });
-  app.get('/api/integrations/feishu/minutes/:token/transcript', async (request, reply) => {
-    try {
-      const params = z.object({ token: z.string().min(1).max(512) }).parse(request.params);
-      return await service.feishuMinuteTranscript(params.token);
-    } catch (error) {
-      return reply.code(409).send({ error: error instanceof Error ? error.message : '会议纪要读取失败。' });
-    }
-  });
-
   app.post('/api/configuration/validate', async (request) => {
     const body = z
       .object({ values: z.record(z.string(), z.string().max(4096)).default({}) })
@@ -730,60 +557,6 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
     });
   });
 
-  const sourceFailureQuery = z.object({
-    status: z.enum(['active', 'all', 'open', 'retrying', 'resolved', 'ignored', 'stale']).default('active'),
-  });
-  const listSourceFailures = async (request: SourceFailureListRequest) => {
-    const query = sourceFailureQuery.parse(request.query);
-    return service.listSourceFailures(query.status);
-  };
-  app.get('/api/source-failures', listSourceFailures);
-  // Compatibility alias for clients that name the inbox by its user-facing label.
-  app.get('/api/failed-sources', listSourceFailures);
-
-  const retrySourceFailure = async (request: SourceFailureActionRequest, reply: FastifyReply) => {
-    const params = z.object({ id: z.string().trim().min(1).max(256) }).parse(request.params);
-    const body = z.object({ expectedVersion: z.number().int().positive().optional() }).strict().parse(request.body ?? {});
-    try {
-      return service.retrySourceFailure(params.id, body.expectedVersion);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '失败来源无法重试。';
-      return reply.code(message.includes('不存在') ? 404 : error instanceof CandidateVersionRequiredError ? 400 : 409).send({ error: message });
-    }
-  };
-  const ignoreSourceFailure = async (request: SourceFailureActionRequest, reply: FastifyReply) => {
-    const params = z.object({ id: z.string().trim().min(1).max(256) }).parse(request.params);
-    try {
-      return service.ignoreSourceFailure(params.id);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '失败来源无法归档。';
-      return reply.code(message.includes('不存在') ? 404 : 409).send({ error: message });
-    }
-  };
-  app.post('/api/source-failures/:id/retry', retrySourceFailure);
-  app.post('/api/source-failures/:id/ignore', ignoreSourceFailure);
-  app.post('/api/source-failures/:id/archive', ignoreSourceFailure);
-  app.post('/api/failed-sources/:id/retry', retrySourceFailure);
-  app.post('/api/failed-sources/:id/ignore', ignoreSourceFailure);
-  app.post('/api/failed-sources/:id/archive', ignoreSourceFailure);
-
-  app.post('/api/sources/:sourceEventId/classification/retry', async (request, reply) => {
-    const params = z.object({ sourceEventId: z.string().trim().min(1) }).parse(request.params);
-    const body = z.object({ expectedVersion: z.number().int().positive() }).strict().parse(request.body ?? {});
-    try {
-      return service.retrySourceClassification(
-        params.sourceEventId,
-        undefined,
-        undefined,
-        service.candidateVersionFenceForSource(params.sourceEventId, body.expectedVersion) ?? undefined,
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '来源分类无法重试。';
-      if (message === '来源消息不存在。') return reply.code(404).send({ error: message });
-      return reply.code(409).send(candidateMutationError(error, '来源分类无法重试。', service.candidateVersionDtoForSource(params.sourceEventId)));
-    }
-  });
-
   app.delete('/api/candidates/:id', async (request, reply) => {
     const params = z.object({ id: z.string().min(1) }).parse(request.params);
     const body = z.object({ expectedVersion: z.number().int().positive(), expectedGroupVersionHash: z.string().trim().min(64).max(128).optional() }).strict().parse(request.body ?? {});
@@ -793,19 +566,6 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
       return candidate ? minimalCandidateDtoSchema.parse(candidate) : service.candidateVersionDto(params.id) ?? reply.code(404).send({ error: '候选需求不存在。' });
     } catch (error) {
       return reply.code(409).send(candidateMutationError(error, '候选删除失败。', service.candidateVersionDto(params.id)));
-    }
-  });
-
-  app.post('/api/candidates/:id/source-retry', async (request, reply) => {
-    const params = z.object({ id: z.string().trim().min(1).max(200) }).parse(request.params);
-    const body = z.object({ sourceScope: sourceScopeSchema, expectedVersion: z.number().int().positive() }).strict().parse(request.body ?? {});
-    try {
-      const result = service.retryCandidateSourceClassification(params.id, body.sourceScope, body.expectedVersion);
-      return result
-        ? candidateSourceRetryDtoSchema.parse({ status: result.status, message: result.message })
-        : reply.code(404).send({ error: '来源范围无效。' });
-    } catch (error) {
-      return reply.code(409).send(candidateMutationError(error, '来源分类无法重试。', service.candidateVersionDto(params.id)));
     }
   });
 
@@ -1179,27 +939,6 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
       return service.removeReference(params.id, params.referenceId);
     } catch (error) {
       return reply.code(409).send({ error: error instanceof Error ? error.message : '参考路径解除失败。' });
-    }
-  });
-
-  app.post('/api/candidates/:id/reprocess', async (request, reply) => {
-    const params = z.object({ id: z.string().min(1) }).parse(request.params);
-    const body = z.object({ guidance: z.string().max(1000).optional(), expectedVersion: z.number().int().positive() }).strict().parse(request.body ?? {});
-    const requestId = randomUUID();
-    const traceContext = requestTraceContext(request);
-    const operationContext = createOperationContext({ requestId, traceId: traceContext.traceId, parentSpanId: traceContext.parentSpanId });
-    try {
-      const result = await service.reprocessCandidate(params.id, body.guidance, undefined, body.expectedVersion, operationContext);
-      const candidate = service.publicCandidate(params.id);
-      if (!candidate) throw new Error('候选需求不存在。');
-      return candidateReprocessDtoSchema.parse({
-        candidate,
-        changed: result.changed,
-        message: result.changed ? '候选已重新整理；来源正文仍需主人主动核验。' : '本次重新整理未产生可应用变化。',
-        proposal: result.proposal ? service.publicTaskUpdateProposal(result.proposal.id) : null,
-      });
-    } catch (error) {
-      return reply.code(409).send(candidateMutationError(error, '重新判断失败。', service.candidateVersionDto(params.id)));
     }
   });
 

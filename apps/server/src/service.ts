@@ -42,13 +42,8 @@ import {
 import type { ReturnTypeOfAdapters } from './types.js';
 import type { ClassificationResult, ClassificationUnitResult, DurableEventReceipt, FeishuScopeUpdate, IntegrationCheck } from './integration-contracts.js';
 import { calendarClassificationDraft, classifyCalendarSource, type CalendarClassification } from './calendar-classification.js';
-import { describeFeishuAuthError, FeishuAuthError, LiveFeishuAdapter, feishuScopeUpdateOf, normalizeFeishuScopeUpdate } from './integrations/feishu.js';
-import { FeishuSyncRunner } from './integrations/feishu-sync.js';
-import { FeishuOwnerSyncRunner } from './integrations/feishu-owner-sync.js';
-import { FeishuCalendarSyncRunner } from './integrations/feishu-calendar-sync.js';
-import { FeishuMinutesSyncRunner } from './integrations/feishu-minutes-sync.js';
+import { describeFeishuAuthError, FeishuAuthError, feishuScopeUpdateOf, normalizeFeishuScopeUpdate } from './integrations/feishu.js';
 import { FeishuDocumentContextService, sourceContextRevision } from './integrations/feishu-document-context.js';
-import { FeishuDocumentContextSyncRunner } from './integrations/feishu-document-sync.js';
 import { enforceUntrustedClassificationBoundary, projectUntrustedSenderName, timeRangeFromSource } from './integrations/llm.js';
 import { PmRuntime, sanitizeRuntimeError, type RuntimeJobRow } from './runtime.js';
 import { RuntimeCooldownDeferredError } from './runtime.js';
@@ -699,6 +694,18 @@ type TaskPatch = Partial<{
   note: string;
   expectedVersion: number;
 }>;
+
+// Legacy classification methods are retained only for database compatibility
+// while their adapters are intentionally absent from the resident runtime.
+type ServiceAdapters = ReturnTypeOfAdapters & { classifier?: any };
+type LegacyRunner = {
+  start(): Promise<void> | void;
+  stop(): Promise<void> | void;
+  runAfterCurrent(...args: any[]): Promise<unknown> | unknown;
+};
+type LegacyOwnerRunner = LegacyRunner & {
+  backfillBeforeSource(input: Record<string, unknown>): Promise<{ events: NormalizedSourceEvent[]; complete: boolean; reason?: string }>;
+};
 
 export type CindyIntakeInput = {
   window_id: string;
@@ -2465,12 +2472,12 @@ function candidateAuditSnapshot(candidate: CandidateRow | null) {
 export class PmService {
   private readonly runtime: PmRuntime;
   private readonly retryCoordinator: RetryCoordinator;
-  private readonly feishuSync?: FeishuSyncRunner;
-  private readonly feishuOwnerSync?: FeishuOwnerSyncRunner;
-  private readonly feishuCalendarSync?: FeishuCalendarSyncRunner;
-  private readonly feishuMinutesSync?: FeishuMinutesSyncRunner;
+  private readonly feishuSync?: LegacyRunner;
+  private readonly feishuOwnerSync?: LegacyOwnerRunner;
+  private readonly feishuCalendarSync?: LegacyRunner;
+  private readonly feishuMinutesSync?: LegacyRunner;
   private readonly feishuDocumentContext: FeishuDocumentContextService;
-  private readonly feishuDocumentSync?: FeishuDocumentContextSyncRunner;
+  private readonly feishuDocumentSync?: LegacyRunner;
   private feishuStarted = false;
   private feishuBotStarted = false;
   private feishuLifecycle: Promise<void> = Promise.resolve();
@@ -2482,52 +2489,13 @@ export class PmService {
 
   constructor(
     private readonly database: AppDatabase,
-    private readonly adapters: ReturnTypeOfAdapters,
+    private readonly adapters: ServiceAdapters,
     private readonly config: AppConfig,
   ) {
     const retryCoordinator = new RetryCoordinator({ store: new SqliteRetryCooldownStore(database.raw) });
     this.retryCoordinator = retryCoordinator;
     this.runtime = new PmRuntime(database, { retryCoordinator });
-    const classifier = this.adapters.classifier as typeof this.adapters.classifier & {
-      setRetryCoordinator?: (coordinator: RetryCoordinator) => void;
-    };
-    classifier.setRetryCoordinator?.(retryCoordinator);
-    this.runtime.recoverExpired();
-    this.reconcileRetiredOwnerDecisions();
     this.feishuDocumentContext = new FeishuDocumentContextService(database, adapters.feishu);
-    if (adapters.feishu instanceof LiveFeishuAdapter) {
-      this.feishuSync = new FeishuSyncRunner(
-        config.feishu,
-        database,
-        adapters.feishu,
-        (event, context) => this.ingestSource(event, undefined, {}, context),
-        (level, summary, context) => this.log('integration', level, 'feishu.sync', summary, context),
-        (events, context) => this.ingestSourceBatch(events, undefined, {}, context),
-        (events, context) => this.captureSourceBatch(events, context),
-      );
-      this.feishuOwnerSync = new FeishuOwnerSyncRunner(
-        config.feishu,
-        database,
-        adapters.feishu,
-        (event, context) => this.ingestSource(event, undefined, {}, context),
-        (level, summary, context) => this.log('integration', level, 'feishu.owner_sync', summary, context),
-        undefined,
-        (events, context) => this.ingestSourceBatch(events, undefined, {}, context),
-        (events, context) => this.captureSourceBatch(events, context),
-      );
-      this.feishuCalendarSync = new FeishuCalendarSyncRunner(config.feishu, database, adapters.feishu, (event, context) => this.ingestSource(event, undefined, {}, context), (level, summary, context) => this.log('integration', level, 'feishu.calendar_sync', summary, context));
-      this.feishuMinutesSync = new FeishuMinutesSyncRunner(config.feishu, database, adapters.feishu, (event, context) => this.ingestSource(event, undefined, {}, context), (level, summary, context) => this.log('integration', level, 'feishu.minutes_sync', summary, context));
-      this.feishuDocumentSync = new FeishuDocumentContextSyncRunner(
-        config.feishu,
-        database,
-        this.feishuDocumentContext,
-        async (sourceEventId, context) => {
-          const source = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(sourceEventId) as SourceEventRow | undefined;
-          if (source) await this.classifySourceWithStoredBatch(source, undefined, true, false, context);
-        },
-        (level, summary, context) => this.log('integration', level, 'feishu.document_sync', summary, context),
-      );
-    }
     this.ensureOwnerSourceStates();
     this.cleanupLogs(config.logging.retentionDays);
   }
@@ -2537,7 +2505,7 @@ export class PmService {
    * row must be committed before the provider callback is allowed to return.
    * Semantic classification is scheduled only after that durable receipt.
    */
-  async captureFeishuBotEvent(event: NormalizedSourceEvent): Promise<DurableEventReceipt> {
+  private async legacyCaptureBotEvent(event: NormalizedSourceEvent): Promise<DurableEventReceipt> {
     const normalized = this.adapters.feishu.normalizeSource(event);
     const metadata = normalized.metadata ?? {};
     if (normalized.sourceType !== 'bot_dm' && normalized.sourceType !== 'group') {
@@ -2552,7 +2520,7 @@ export class PmService {
     const persisted = this.persistSourceEvent(normalized);
     const source = persisted.row;
     // The durable source row is committed before this asynchronous work.
-    void this.classifyCapturedSourceWithDiagnostics(source, persisted.deduplicated);
+    void this.legacyClassifyCapturedWithDiagnostics(source, persisted.deduplicated);
     return {
       externalId: source.external_id,
       sourceEventId: source.id,
@@ -2567,9 +2535,9 @@ export class PmService {
       || (this.config.feishu.groupIds.length > 0 && this.config.feishu.groupIds.includes(event.conversationId));
   }
 
-  private async classifyCapturedSourceWithDiagnostics(source: SourceEventRow, deduplicated: boolean) {
+  private async legacyClassifyCapturedWithDiagnostics(source: SourceEventRow, deduplicated: boolean) {
     try {
-      await this.classifySourceWithStoredBatch(source, undefined, deduplicated);
+      await this.legacyClassifyStoredBatch(source, undefined, deduplicated);
     } catch (error) {
       // The source and Runtime job are already durable. Keep diagnostics
       // bounded and let the normal Runtime recovery path retry classification.
@@ -2706,7 +2674,7 @@ export class PmService {
             if (!sourceEventId) throw new Error('Runtime 工作项缺少 sourceEventId。');
             const source = this.database.raw.prepare('SELECT * FROM source_event WHERE id = ?').get(sourceEventId) as SourceEventRow | undefined;
             if (!source) throw new Error('Runtime 工作项关联的来源不存在。');
-            const result = await this.classifyCapturedSourceInternal(source, guidance, true, 0, claimed.id, claimed.lease_owner, [source], operationContext);
+            const result = await this.legacyClassifyCapturedInternal(source, guidance, true, 0, claimed.id, claimed.lease_owner, [source], operationContext);
             this.settleClassificationRuntimeJob(claimed.id, claimed.lease_owner, result, { sourceEventId });
           } else if (claimed.job_type === 'classify_source_batch') {
             if (!this.hasValidClassificationJobRelations(claimed, payload)) throw new Error('Runtime 来源关系不完整，已停止恢复。');
@@ -2717,7 +2685,7 @@ export class PmService {
             const placeholders = sourceEventIds.map(() => '?').join(',');
             const sources = (this.database.raw.prepare(`SELECT * FROM source_event WHERE id IN (${placeholders})`).all(...sourceEventIds) as SourceEventRow[]).sort(stableSourceOrder);
             if (sources.length !== sourceEventIds.length) throw new Error('Runtime 连续消息工作项关联的来源不完整。');
-            const result = await this.classifyCapturedSourceInternal(sources[0]!, guidance, true, 0, claimed.id, claimed.lease_owner, sources, operationContext);
+            const result = await this.legacyClassifyCapturedInternal(sources[0]!, guidance, true, 0, claimed.id, claimed.lease_owner, sources, operationContext);
             this.settleClassificationRuntimeJob(claimed.id, claimed.lease_owner, result, { sourceEventIds });
           } else if (claimed.job_type === 'owner_decision') {
             let decisionId = typeof payload.decisionId === 'string' ? payload.decisionId : null;
@@ -2807,7 +2775,7 @@ export class PmService {
     let recovered = 0;
     for (const source of rows) {
       try {
-        await this.classifySourceWithStoredBatch(source, undefined, true);
+        await this.legacyClassifyStoredBatch(source, undefined, true);
         recovered += 1;
       } catch {
         // The helper persists a retryable Runtime job before returning. Keep
@@ -3078,7 +3046,7 @@ export class PmService {
 
   health(requestId?: string, readiness = this.readiness()) {
     const feishuKind = (this.adapters.feishu as { kind: string }).kind;
-    const classifierKind = (this.adapters.classifier as { kind: string }).kind;
+    const classifierKind = (this.adapters.classifier as { kind?: string } | undefined)?.kind ?? 'disabled';
     const workspaceKind = (this.adapters.workspace as { kind: string }).kind;
     const dependencyState = this.observabilityDependencies();
     const databaseUnavailable = readiness.status === 'not_ready'
@@ -3886,7 +3854,7 @@ export class PmService {
       try {
         this.renewPrivacyLifecycleClaim(claim);
         stopAttempted = true;
-        await this.stopFeishu(claim);
+        await this.legacyStopFeishu(claim);
         const finalized = this.finalizePrivacyLifecycleClaim(claim, () => {
           const now = nowIso();
           this.database.raw.prepare('UPDATE information_source_state SET enabled = 0, updated_at = ?').run(now);
@@ -3903,7 +3871,7 @@ export class PmService {
         if (stopAttempted) {
           try { compensated = this.compensatePrivacyLifecycleClaim(claim, snapshot); } catch (restoreError) { compensationFailures.push(restoreError); }
           if (compensated && snapshot.control.collection_status === 'running') {
-            try { await this.startFeishu({ refreshOwner: false }); } catch (restartError) { compensationFailures.push(restartError); }
+            try { await this.legacyStartFeishu({ refreshOwner: false }); } catch (restartError) { compensationFailures.push(restartError); }
           }
         }
         if (!compensated && stopAttempted && !compensationFailures.length) {
@@ -3974,7 +3942,7 @@ export class PmService {
       try {
         this.renewPrivacyLifecycleClaim(claim);
         externalAttempted = true;
-        await this.stopFeishu(claim);
+        await this.legacyStopFeishu(claim);
         const revoke = (this.adapters.feishu as { revokeAuthorization?: () => Promise<{ localTokensCleared: boolean; providerRevoked: boolean }> }).revokeAuthorization;
         this.renewPrivacyLifecycleClaim(claim);
         const local = revoke ? await revoke.call(this.adapters.feishu) : { localTokensCleared: false, providerRevoked: false };
@@ -4000,7 +3968,7 @@ export class PmService {
             try {
               const adapter = this.adapters.feishu as { restoreAuthorizationState?: (state: unknown) => Promise<void> };
               if (adapter.restoreAuthorizationState) await adapter.restoreAuthorizationState(snapshot.adapterState);
-              if (snapshot.control.collection_status === 'running') await this.startFeishu({ refreshOwner: false });
+              if (snapshot.control.collection_status === 'running') await this.legacyStartFeishu({ refreshOwner: false });
             } catch (restartError) { compensationFailures.push(restartError); }
           }
         }
@@ -4673,7 +4641,7 @@ export class PmService {
       // A throwing stop/revoke implementation may have partially changed
       // runtime state, so compensation is attempted for every call attempt.
       this.renewPrivacyLifecycleClaim(lifecycleClaim);
-      await this.stopFeishu(lifecycleClaim);
+      await this.legacyStopFeishu(lifecycleClaim);
       const revoke = (this.adapters.feishu as { revokeAuthorization?: () => Promise<{ localTokensCleared: boolean; providerRevoked: boolean }> }).revokeAuthorization;
       this.renewPrivacyLifecycleClaim(lifecycleClaim);
       local = revoke ? await revoke.call(this.adapters.feishu) : { localTokensCleared: false, providerRevoked: false };
@@ -4688,7 +4656,7 @@ export class PmService {
         try {
           const adapter = this.adapters.feishu as { restoreAuthorizationState?: (state: unknown) => Promise<void> };
           if (adapter.restoreAuthorizationState) await adapter.restoreAuthorizationState(authorizationSnapshot.adapterState);
-          if (authorizationSnapshot.control.collection_status === 'running') await this.startFeishu({ refreshOwner: false });
+              if (authorizationSnapshot.control.collection_status === 'running') await this.legacyStartFeishu({ refreshOwner: false });
         } catch (restartError) { compensationFailures.push(restartError); }
       }
       try {
@@ -4760,7 +4728,7 @@ export class PmService {
         try {
           const adapter = this.adapters.feishu as { restoreAuthorizationState?: (state: unknown) => Promise<void> };
           if (adapter.restoreAuthorizationState) await adapter.restoreAuthorizationState(authorizationSnapshot.adapterState);
-          if (authorizationSnapshot.control.collection_status === 'running') await this.startFeishu({ refreshOwner: false });
+          if (authorizationSnapshot.control.collection_status === 'running') await this.legacyStartFeishu({ refreshOwner: false });
         } catch (restartError) { rollbackFailures.push(restartError); }
       }
       try {
@@ -4977,7 +4945,7 @@ export class PmService {
     return { ...this.privacyStatus(), retentionRun: result };
   }
 
-  feishuMonitoringScope(): FeishuMonitoringScope {
+  private legacyFeishuMonitoringScope(): FeishuMonitoringScope {
     const owner = this.database.raw.prepare('SELECT open_id, oauth_status, updated_at FROM owner_profile WHERE id = ?').get('primary') as {
       open_id: string;
       oauth_status: string;
@@ -5012,7 +4980,7 @@ export class PmService {
     };
   }
 
-  async refreshFeishuMonitoringScope() {
+  private async legacyRefreshFeishuMonitoringScope() {
     const owner = this.requireAuthorizedOwner();
     const adapter = this.adapters.feishu as {
       listOwnerChats?: (input?: { types?: 'p2p' | 'group' | 'p2p,group'; pageToken?: string; pageSize?: number }) => Promise<unknown>;
@@ -5083,10 +5051,10 @@ export class PmService {
     }
     this.reconcileFeishuMonitoringStates({ peopleDiscovered, groupsDiscovered, discoveryError: null });
     this.log('integration', 'info', 'feishu.monitoring_scope.refreshed', '已刷新可选择的个人和群聊范围。', { peopleDiscovered, groupsDiscovered });
-    return this.feishuMonitoringScope();
+    return this.legacyFeishuMonitoringScope();
   }
 
-  async searchFeishuPeople(query = '') {
+  private async legacySearchFeishuPeople(query = '') {
     const owner = this.requireAuthorizedOwner();
     const adapter = this.adapters.feishu as {
       searchOwnerUsers?: (input?: { query?: string; hasChatted?: boolean; pageToken?: string; pageSize?: number }) => Promise<unknown>;
@@ -5125,7 +5093,7 @@ export class PmService {
       });
       ids.add(targetId);
     }
-    const scope = this.feishuMonitoringScope();
+    const scope = this.legacyFeishuMonitoringScope();
     return {
       items: scope.people.filter((item) => ids.has(item.id)),
       hasMore: Boolean(page.has_more),
@@ -5133,7 +5101,7 @@ export class PmService {
     };
   }
 
-  updateFeishuMonitoringScope(input: {
+  private legacyUpdateFeishuMonitoringScope(input: {
     personIds?: string[];
     personChanges?: Array<{ id: string; selected: boolean }>;
     groupIds?: string[];
@@ -5193,7 +5161,7 @@ export class PmService {
       for (const group of groupChanges) updateGroup.run(desiredGroups.has(group.id) ? 1 : 0, timestamp, owner.openId, group.id);
     });
     this.reconcileFeishuMonitoringStates({ selectionChanged: personSelectionChanged || groupChanges.length > 0 });
-    const scope = this.feishuMonitoringScope();
+    const scope = this.legacyFeishuMonitoringScope();
     this.log('integration', 'info', 'feishu.monitoring_scope.saved', '已保存个人私聊和群聊关注范围。', {
       personCount: scope.selectedPersonCount,
       changedPeople: personChanges.length,
@@ -5351,7 +5319,7 @@ export class PmService {
   }
 
   private reconcileFeishuMonitoringStates(extra: Record<string, unknown> = {}) {
-    const scope = this.feishuMonitoringScope();
+    const scope = this.legacyFeishuMonitoringScope();
     if (!scope.ownerAuthorized) return;
     const timestamp = nowIso();
     const selectionChanged = Boolean(extra.selectionChanged);
@@ -5404,7 +5372,7 @@ export class PmService {
     );
   }
 
-  async refreshOwnerIdentity() {
+  private async legacyRefreshOwnerIdentity() {
     const adapter = this.adapters.feishu as {
       getCurrentUser?: () => Promise<OwnerIdentity>;
       getGrantedScopes?: () => Promise<string[] | undefined>;
@@ -5446,7 +5414,7 @@ export class PmService {
     }
   }
 
-  async ingestSource(event: NormalizedSourceEvent, guidance?: string, options: { retryFailed?: boolean } = {}, operationContext?: OperationContext) {
+  private async legacyIngestSource(event: NormalizedSourceEvent, guidance?: string, options: { retryFailed?: boolean } = {}, operationContext?: OperationContext) {
     // Establish the envelope once at the ingestion boundary.  Downstream
     // classification, owner-decision and Runtime layers must reuse this
     // identity instead of inventing a job-specific trace.
@@ -5454,7 +5422,7 @@ export class PmService {
     const persisted = this.persistSourceEvent(event);
     const backfill = await this.backfillConversationContext(persisted.row, effectiveOperationContext);
     const classificationRow = backfill.rows.find((row) => row.id === persisted.row.id) ?? persisted.row;
-    const classified = await this.classifySourceWithStoredBatch(
+    const classified = await this.legacyClassifyStoredBatch(
       classificationRow,
       guidance,
       persisted.deduplicated,
@@ -5522,7 +5490,7 @@ export class PmService {
   /** Persist sources without starting AI classification. Used only while a
    * paginated Feishu history window is incomplete; the old cursor guarantees
    * a later complete scan will finalize the same durable rows. */
-  async captureSourceBatch(events: NormalizedSourceEvent[], _operationContext?: OperationContext) {
+  private async legacyCaptureSourceBatch(events: NormalizedSourceEvent[], _operationContext?: OperationContext) {
     const persisted = events.map((event) => this.persistSourceEvent(event));
     return {
       messages: persisted.length,
@@ -5535,7 +5503,7 @@ export class PmService {
    * once. Raw Feishu messages remain auditable rows; only the AI judgement is
    * coalesced. Calendar events and minutes are always singleton groups.
    */
-  async ingestSourceBatch(events: NormalizedSourceEvent[], guidance?: string, options: { retryFailed?: boolean } = {}, operationContext?: OperationContext) {
+  private async legacyIngestSourceBatch(events: NormalizedSourceEvent[], guidance?: string, options: { retryFailed?: boolean } = {}, operationContext?: OperationContext) {
     if (!events.length) return {
       messages: 0,
       deduplicated: 0,
@@ -5602,7 +5570,7 @@ export class PmService {
     let classificationFailures = 0;
     for (const group of groups) {
       try {
-        const result = await this.classifyCapturedSourceBatch(group, guidance, options.retryFailed === true, effectiveOperationContext);
+        const result = await this.legacyClassifyCapturedBatch(group, guidance, options.retryFailed === true, effectiveOperationContext);
         candidates.push(...(result.candidates ?? (result.candidate ? [result.candidate] : [])));
         const ids = classificationResultIds(result);
         ids.candidateIds?.forEach((value) => candidateIds.add(value));
@@ -8039,7 +8007,7 @@ export class PmService {
     return selected;
   }
 
-  private classifySourceWithStoredBatch(
+  private legacyClassifyStoredBatch(
     source: SourceEventRow,
     guidance: string | undefined,
     deduplicated: boolean,
@@ -8048,8 +8016,8 @@ export class PmService {
   ) {
     const rows = this.classificationRowsForSource(source);
     return rows.length > 1
-      ? this.classifyCapturedSourceBatch(rows, guidance, retryFailed, operationContext)
-      : this.classifyCapturedSource(source, guidance, deduplicated, 0, retryFailed, operationContext);
+      ? this.legacyClassifyCapturedBatch(rows, guidance, retryFailed, operationContext)
+      : this.legacyClassifyCaptured(source, guidance, deduplicated, 0, retryFailed, operationContext);
   }
 
   /**
@@ -10549,7 +10517,7 @@ export class PmService {
     return completed;
   }
 
-  private async classifyCapturedSource(
+  private async legacyClassifyCaptured(
     sourceRow: SourceEventRow,
     guidance: string | undefined,
     deduplicated: boolean,
@@ -10600,7 +10568,7 @@ export class PmService {
     try {
       const leaseOwner = runtimeJob.lease_owner;
       if (!leaseOwner) throw new Error('Runtime 工作项未取得有效租约。');
-      const result = await this.classifyCapturedSourceInternal(sourceRow, guidance, deduplicated, staleAttempts, runtimeJob.id, leaseOwner, [sourceRow], operationContext);
+      const result = await this.legacyClassifyCapturedInternal(sourceRow, guidance, deduplicated, staleAttempts, runtimeJob.id, leaseOwner, [sourceRow], operationContext);
        this.settleClassificationRuntimeJob(runtimeJob.id, leaseOwner, result, { sourceEventId: sourceRow.id });
        return this.classificationResultWithIds(result);
     } catch (error) {
@@ -10625,7 +10593,7 @@ export class PmService {
     }
   }
 
-  private async classifyCapturedSourceBatch(
+  private async legacyClassifyCapturedBatch(
     rows: SourceEventRow[],
     guidance: string | undefined,
     retryFailed = false,
@@ -10634,7 +10602,7 @@ export class PmService {
     const ordered = [...rows].sort(stableSourceOrder);
     const primary = ordered[0];
     if (!primary) throw new Error('连续消息批次不能为空。');
-    if (ordered.length === 1) return this.classifyCapturedSource(primary, guidance, true, 0, retryFailed, operationContext);
+    if (ordered.length === 1) return this.legacyClassifyCaptured(primary, guidance, true, 0, retryFailed, operationContext);
 
     // Persist the batch job before refreshing any linked documents. A process
     // crash or provider error during refresh therefore remains recoverable.
@@ -10679,7 +10647,7 @@ export class PmService {
     try {
       const leaseOwner = runtimeJob.lease_owner;
       if (!leaseOwner) throw new Error('Runtime 连续消息工作项未取得有效租约。');
-      const result = await this.classifyCapturedSourceInternal(primary, guidance, true, 0, runtimeJob.id, leaseOwner, ordered, operationContext);
+      const result = await this.legacyClassifyCapturedInternal(primary, guidance, true, 0, runtimeJob.id, leaseOwner, ordered, operationContext);
        this.settleClassificationRuntimeJob(runtimeJob.id, leaseOwner, result, { sourceEventIds: sourceIds });
        return this.classificationResultWithIds(result);
     } catch (error) {
@@ -10712,7 +10680,7 @@ export class PmService {
     }
   }
 
-  private async classifyCapturedSourceInternal(
+  private async legacyClassifyCapturedInternal(
     sourceRow: SourceEventRow,
     guidance: string | undefined,
     deduplicated: boolean,
@@ -11066,7 +11034,7 @@ export class PmService {
         if (!(error instanceof ClassificationRevisionChangedError)) throw error;
         if (staleAttempts >= 3) throw new Error('来源在语义判断期间持续更新，请稍后重试。');
         const stalePrimary = error.rows.find((row) => row.id === sourceRow.id) ?? error.rows[0]!;
-        return this.classifyCapturedSourceInternal(stalePrimary, guidance, deduplicated, staleAttempts + 1, runtimeJobId, leaseOwner, error.rows, operationContext);
+        return this.legacyClassifyCapturedInternal(stalePrimary, guidance, deduplicated, staleAttempts + 1, runtimeJobId, leaseOwner, error.rows, operationContext);
       }
       if (runtimeJobId) {
         this.runtime.checkpoint(runtimeJobId, 'classification_persisted', this.classificationRuntimeSummary(semanticResult, {
@@ -11108,7 +11076,7 @@ export class PmService {
         if (!(error instanceof ClassificationRevisionChangedError)) throw error;
         if (staleAttempts >= 3) throw new Error('来源在多需求判断期间持续更新，请稍后重试。');
         const stalePrimary = error.rows.find((row) => row.id === sourceRow.id) ?? error.rows[0]!;
-        return this.classifyCapturedSourceInternal(stalePrimary, guidance, deduplicated, staleAttempts + 1, runtimeJobId, leaseOwner, error.rows, operationContext);
+        return this.legacyClassifyCapturedInternal(stalePrimary, guidance, deduplicated, staleAttempts + 1, runtimeJobId, leaseOwner, error.rows, operationContext);
       }
       if (runtimeJobId) {
         this.runtime.checkpoint(runtimeJobId, 'classification_persisted', this.classificationRuntimeSummary(multiResult, {
@@ -11539,7 +11507,7 @@ export class PmService {
     if (staleSources) {
       if (staleAttempts >= 3) throw new Error('来源在判断期间持续更新，请稍后重试。');
       const stalePrimary = staleSources.find((row) => row.id === sourceRow.id) ?? staleSources[0]!;
-      return this.classifyCapturedSourceInternal(stalePrimary, guidance, deduplicated, staleAttempts + 1, runtimeJobId, leaseOwner, staleSources, operationContext);
+      return this.legacyClassifyCapturedInternal(stalePrimary, guidance, deduplicated, staleAttempts + 1, runtimeJobId, leaseOwner, staleSources, operationContext);
     }
     if (classificationDeferred) {
       if (runtimeJobId) {
@@ -16328,7 +16296,7 @@ export class PmService {
     const waitingTotal = (this.database.raw.prepare(`SELECT COUNT(*) AS count FROM task WHERE ${activeTaskWhere} AND status = 'waiting'`).get() as { count: number }).count;
     const inProgressTotal = (this.database.raw.prepare(`SELECT COUNT(*) AS count FROM task WHERE ${activeTaskWhere} AND status = 'in_progress'`).get() as { count: number }).count;
     const overdueTotal = (this.database.raw.prepare(`SELECT COUNT(*) AS count FROM task WHERE ${activeTaskWhere} AND status IN ('planned','in_progress','review','waiting') AND COALESCE(planned_due_at, schedule_at) < ?`).get(generatedAt) as { count: number }).count;
-    const dataMode = this.adapters.feishu.kind === 'live' || this.adapters.classifier.kind === 'live' ? 'configured' : 'local_mock';
+    const dataMode = this.adapters.feishu.kind === 'live' || this.adapters.classifier?.kind === 'live' ? 'configured' : 'local_mock';
     return {
       candidates: publicCandidates,
       today: publicToday,
@@ -16663,11 +16631,16 @@ export class PmService {
     return result;
   }
 
-  async testIntegration(key: 'feishu' | 'llm' | 'workspace'): Promise<IntegrationCheck> {
+  private async legacyTestIntegration(key: 'feishu' | 'llm' | 'workspace'): Promise<IntegrationCheck> {
     const startedAt = Date.now();
     let result: IntegrationCheck;
     if (key === 'feishu') result = await this.adapters.feishu.testConnection();
-    else if (key === 'llm') result = await this.adapters.classifier.testConnection();
+    else if (key === 'llm') {
+      const classifier = this.adapters.classifier;
+      result = classifier
+        ? await classifier.testConnection()
+        : { ok: false, status: 'not_configured', message: '当前 Cindy resident runtime 未装配分类器。', checkedAt: nowIso() };
+    }
     else {
       const workspaceKind = (this.adapters.workspace as { kind: string }).kind;
       result = {
@@ -16701,19 +16674,19 @@ export class PmService {
     return safeResult;
   }
 
-  async feishuAuthorizationUrl(state?: string) {
+  private async legacyFeishuAuthorizationUrl(state?: string) {
     const adapter = this.adapters.feishu as { buildAuthorizationUrl?: (state?: string) => Promise<string> };
     if (!adapter.buildAuthorizationUrl) throw new Error('当前飞书适配器不支持 OAuth。');
     return { url: await adapter.buildAuthorizationUrl(state) };
   }
 
-  async completeFeishuOAuth(code: string, state?: string) {
+  private async legacyCompleteFeishuOAuth(code: string, state?: string) {
     const adapter = this.adapters.feishu as { exchangeCode?: (code: string, state?: string) => Promise<{ expiresAt: string }> };
     if (!adapter.exchangeCode) throw new Error('当前飞书适配器不支持 OAuth。');
     const resumeAfterOAuth = this.feishuStarted || this.feishuBotStarted;
     const previousOwnerStatus = this.beginOwnerAuthorizationTransition();
     try {
-      await this.stopFeishu();
+      await this.legacyStopFeishu();
     } catch (error) {
       this.restoreOwnerAuthorizationStatus(previousOwnerStatus);
       throw error;
@@ -16724,7 +16697,7 @@ export class PmService {
     } catch (error) {
       this.restoreOwnerAuthorizationStatus(previousOwnerStatus);
       if (resumeAfterOAuth) {
-        try { await this.startFeishu({ refreshOwner: false }); } catch { /* preserve the OAuth error */ }
+        try { await this.legacyStartFeishu({ refreshOwner: false }); } catch { /* preserve the OAuth error */ }
       }
       const diagnostic = error instanceof FeishuAuthError ? error.diagnostic : describeFeishuAuthError(error, 'token_exchange');
       this.log('integration', 'error', 'feishu.oauth.exchange_failed', '飞书授权码换 Token 失败。', {
@@ -16737,12 +16710,12 @@ export class PmService {
     }
     this.log('integration', 'info', 'feishu.oauth.completed', '飞书用户授权完成，令牌已安全保存。', { expiresAtPresent: Boolean(result.expiresAt) });
     try {
-      const ownerInformation = await this.refreshOwnerIdentity();
-      if (resumeAfterOAuth) await this.startFeishu({ refreshOwner: false });
+      const ownerInformation = await this.legacyRefreshOwnerIdentity();
+      if (resumeAfterOAuth) await this.legacyStartFeishu({ refreshOwner: false });
       return { ok: true, tokenSaved: true, ...result, owner: ownerInformation.owner, ownerError: null };
     } catch (error) {
       if (resumeAfterOAuth) {
-        try { await this.startFeishu({ refreshOwner: false }); } catch { /* owner diagnostics remain authoritative */ }
+        try { await this.legacyStartFeishu({ refreshOwner: false }); } catch { /* owner diagnostics remain authoritative */ }
       }
       const diagnostic = error instanceof FeishuAuthError ? error.diagnostic : describeFeishuAuthError(error, 'owner_identity');
       this.log('integration', 'warn', 'feishu.oauth.owner_identity_failed', '飞书令牌已保存，但系统主人身份读取失败。', {
@@ -16790,7 +16763,7 @@ export class PmService {
     this.assertNoActivePrivacyLifecycleClaim();
   }
 
-  startFeishu(options: { refreshOwner?: boolean; syncOnce?: boolean } = {}, lifecycleClaim?: PrivacyLifecycleClaimRow) {
+  private legacyStartFeishu(options: { refreshOwner?: boolean; syncOnce?: boolean } = {}, lifecycleClaim?: PrivacyLifecycleClaimRow) {
     return this.queueFeishuLifecycle(async () => {
       this.assertFeishuLifecycleFence(lifecycleClaim);
       if (this.privacyControl().collection_status === 'stopped') {
@@ -16802,20 +16775,20 @@ export class PmService {
       if (this.feishuStarted) {
         if (refreshOwner) {
           try {
-            await this.refreshOwnerIdentity();
+            await this.legacyRefreshOwnerIdentity();
           } catch {
             // Keep the running supplement listener alive; source health records
             // explain why owner-led polling could not refresh yet.
           }
         }
         const bot = await this.tryStartBotSupplement(adapter, lifecycleClaim);
-        if (options.syncOnce) await this.syncFeishuOnce();
+        if (options.syncOnce) await this.legacySyncFeishuOnce();
         return { ok: true, alreadyStarted: true, resynced: Boolean(options.syncOnce), botSupplementStarted: bot.started } as const;
       }
       try {
         if (refreshOwner) {
           try {
-            await this.refreshOwnerIdentity();
+            await this.legacyRefreshOwnerIdentity();
           } catch {
             // The bot supplement may still start without user OAuth. Owner-led
             // sources remain explicitly marked unauthorized/error.
@@ -16851,7 +16824,7 @@ export class PmService {
     });
   }
 
-  stopFeishu(lifecycleClaim?: PrivacyLifecycleClaimRow) {
+  private legacyStopFeishu(lifecycleClaim?: PrivacyLifecycleClaimRow) {
     return this.queueFeishuLifecycle(async () => {
       this.assertFeishuLifecycleFence(lifecycleClaim);
       const adapter = this.adapters.feishu as { kind?: string; stop?: () => Promise<void> };
@@ -16893,7 +16866,7 @@ export class PmService {
       // The final durable fence must be the last local step before the
       // provider adapter is invoked.
       this.assertFeishuLifecycleFence(lifecycleClaim);
-       await adapter.start((event) => this.captureFeishuBotEvent(event));
+       await adapter.start((event) => this.legacyCaptureBotEvent(event));
       this.feishuBotStarted = true;
       this.markBotSupplementState('partial', null);
       return { started: true } as const;
@@ -16925,7 +16898,7 @@ export class PmService {
     return operation(runner);
   }
 
-  async syncFeishuOnce(requestId?: string, traceContext: { traceId?: string | null; parentSpanId?: string | null } = {}, suppliedContext?: OperationContext) {
+  private async legacySyncFeishuOnce(requestId?: string, traceContext: { traceId?: string | null; parentSpanId?: string | null } = {}, suppliedContext?: OperationContext) {
     const startedAt = Date.now();
     const operationContext = suppliedContext ?? createOperationContext({ requestId: requestId ?? randomUUID(), traceId: traceContext.traceId, parentSpanId: traceContext.parentSpanId });
     if (this.privacyControl().collection_status === 'stopped') {
@@ -16977,7 +16950,7 @@ export class PmService {
     return { ...observable, ...totals };
   }
 
-  async syncFeishuSource(kind: OwnerSourceKind, requestId?: string, traceContext: { traceId?: string | null; parentSpanId?: string | null } = {}, suppliedContext?: OperationContext) {
+  private async legacySyncFeishuSource(kind: OwnerSourceKind, requestId?: string, traceContext: { traceId?: string | null; parentSpanId?: string | null } = {}, suppliedContext?: OperationContext) {
     const startedAt = Date.now();
     const operationContext = suppliedContext ?? createOperationContext({ requestId: requestId ?? randomUUID(), traceId: traceContext.traceId, parentSpanId: traceContext.parentSpanId });
     if (this.privacyControl().collection_status === 'stopped') {
@@ -17028,7 +17001,7 @@ export class PmService {
     throw new Error(`当前尚未提供“${kind}”的独立同步入口。`);
   }
 
-  async feishuCalendar(input: Record<string, unknown> = {}) {
+  private async legacyFeishuCalendar(input: Record<string, unknown> = {}) {
     const adapter = this.adapters.feishu as { primaryCalendar?: () => Promise<unknown>; listCalendarEvents?: (input?: Record<string, unknown>) => Promise<unknown> };
     if (!adapter.primaryCalendar || !adapter.listCalendarEvents) throw new Error('当前飞书适配器不支持日历读取。');
     const calendar = await adapter.primaryCalendar();
@@ -17037,31 +17010,31 @@ export class PmService {
     return { calendar, events };
   }
 
-  async feishuChats() {
+  private async legacyFeishuChats() {
     const adapter = this.adapters.feishu as { listChats?: () => Promise<unknown> };
     if (!adapter.listChats) throw new Error('当前飞书适配器不支持会话读取。');
     return { items: await adapter.listChats() };
   }
 
-  async feishuMessagesSearch(input: Record<string, unknown> = {}) {
+  private async legacyFeishuMessagesSearch(input: Record<string, unknown> = {}) {
     const adapter = this.adapters.feishu as { searchMessages?: (input?: Record<string, unknown>) => Promise<unknown> };
     if (!adapter.searchMessages) throw new Error('当前飞书适配器不支持消息搜索。');
     return adapter.searchMessages(input);
   }
 
-  async feishuMinutesSearch(input: Record<string, unknown> = {}) {
+  private async legacyFeishuMinutesSearch(input: Record<string, unknown> = {}) {
     const adapter = this.adapters.feishu as { searchMinutes?: (input?: Record<string, unknown>) => Promise<unknown> };
     if (!adapter.searchMinutes) throw new Error('当前飞书适配器不支持会议纪要读取。');
     return adapter.searchMinutes(input);
   }
 
-  async feishuMinuteTranscript(token: string) {
+  private async legacyFeishuMinuteTranscript(token: string) {
     const adapter = this.adapters.feishu as { getMinuteTranscript?: (token: string) => Promise<unknown> };
     if (!adapter.getMinuteTranscript) throw new Error('当前飞书适配器不支持会议纪要读取。');
     return adapter.getMinuteTranscript(token);
   }
 
-  integrationHealth() {
+  private legacyIntegrationHealth() {
     return (this.database.raw
       .prepare('SELECT integration, status, message, latency_ms, checked_at FROM integration_health ORDER BY integration')
       .all() as Array<Record<string, unknown>>).map((row) => ({
@@ -18027,7 +18000,8 @@ export class PmService {
   configuration() {
     const missing = (value: string) => (value ? 'configured' : 'not_configured');
     const feishuLive = this.adapters.feishu.kind === 'live';
-    const llmLive = this.adapters.classifier.kind === 'live';
+    const classifier = this.adapters.classifier as typeof this.adapters.classifier | undefined;
+    const llmLive = classifier?.kind === 'live';
     return {
       liveConnectionsEnabled: feishuLive || llmLive,
       notice: feishuLive || llmLive
@@ -18050,8 +18024,8 @@ export class PmService {
         {
           id: 'llm',
           name: '文本判断模型',
-          adapter: this.adapters.classifier.kind,
-          status: this.adapters.classifier.kind === 'rule_mock' ? 'mock_ready' : 'configured',
+          adapter: classifier?.kind ?? 'disabled',
+          status: classifier?.kind === 'rule_mock' ? 'mock_ready' : classifier ? 'configured' : 'not_configured',
           fields: ['LLM_PROVIDER', 'LLM_MODEL', 'LLM_API_BASE', 'LLM_API_KEY'],
         },
         {

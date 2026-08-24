@@ -6,7 +6,7 @@ import { dirname, resolve } from 'node:path';
 import { buildApp } from '../../../apps/server/src/app.ts';
 import { loadConfig } from '../../../apps/server/src/config.ts';
 import { AppDatabase } from '../../../apps/server/src/database.ts';
-import { createAdapters } from '../../../apps/server/src/integrations.ts';
+import { createCindyAdapters } from '../../../apps/server/src/integrations/cindy.ts';
 import { PmService } from '../../../apps/server/src/service.ts';
 
 const DEFAULT_HOST = '127.0.0.1';
@@ -234,7 +234,9 @@ export async function startPmServer({
   try {
     const config = runtimeConfig({ host, port, sqlitePath, token });
     database = new AppDatabase(config.database.sqlitePath);
-    const service = new PmService(database, createAdapters(config), config);
+    // The resident worker receives Cindy proposals. It deliberately does not
+    // construct a legacy semantic adapter or any Feishu scanning adapter.
+    const service = new PmService(database, createCindyAdapters(config), config);
     let stopInFlight = null;
     let stopResult = null;
     let restartInFlight = null;
@@ -277,6 +279,7 @@ export async function startPmServer({
       }
     };
     app = await buildApp(service, {
+      cindyRuntime: true,
       webOrigin: serverUrl(host, port),
       webRoot,
       cindyIntegrationToken: token,

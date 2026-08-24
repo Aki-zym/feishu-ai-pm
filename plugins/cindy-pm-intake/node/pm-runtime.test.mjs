@@ -260,6 +260,31 @@ test('resident runtime does not start the classifier recovery chain', async () =
   }
 });
 
+test('resident runtime exposes Cindy intake and omits legacy Feishu/classifier routes', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cindy-pm-runtime-cindy-routes-'));
+  const runtime = await startPmServer({
+    port: 0,
+    sqlitePath: join(root, 'pm.sqlite'),
+    token: 'test-token',
+  });
+  try {
+    assert.equal((await fetch(`${runtime.url}/api/health`)).status, 200);
+    assert.equal((await fetch(`${runtime.url}/api/dashboard`)).status, 200);
+    for (const path of [
+      '/api/integrations/feishu/listener/start',
+      '/api/integrations/feishu/listener/stop',
+      '/api/integrations/feishu/sync',
+      '/api/integrations/feishu/sources/calendar/sync',
+      '/api/dev/simulate-message',
+    ]) {
+      assert.equal((await fetch(`${runtime.url}${path}`, { method: 'POST' })).status, 404, path);
+    }
+    assert.equal((await fetch(`${runtime.url}/api/integrations/cindy/tasks`)).status, 401);
+  } finally {
+    await runtime.stop();
+  }
+});
+
 test('shutdown still schedules process exit outside the test environment', async () => {
   const root = mkdtempSync(join(tmpdir(), 'cindy-pm-runtime-exit-'));
   const previousNodeEnv = process.env.NODE_ENV;

@@ -289,7 +289,7 @@ test('scan result uses human language for candidates, formal task updates, and e
 });
 
 test('ghost declares schedule support while retaining errand', () => {
-  assert.equal(ghost.version, '0.3.4');
+  assert.equal(ghost.version, '0.4.0');
   assert.equal(ghost.id, 'ai-pm-intake');
   assert.equal(ghost.name, 'TooManyTasks');
   assert.match(ghost.description, /本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台/);
