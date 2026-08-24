@@ -627,7 +627,7 @@ describe('Cindy 对话入库接口', () => {
   it('display name 以完整 grapheme 满足持久化边界，并让对象占位与飞书技术 ID 在私人投影回退', async () => {
     const { app, database } = await makeApp();
     const combiningHeavyName = Array.from({ length: 80 }, () => `a${'\u0301'.repeat(5)}`).join('');
-    const displayNames = [combiningHeavyName, '  [OBJECT   object]  ', ' OU_Technical_Display_123 ', 'oc_technical_chat_456'];
+    const displayNames = [combiningHeavyName, 'a\u0000\u0301', '  [OBJECT   object]  ', ' OU_Technical_Display_123 ', 'oc_technical_chat_456'];
     const saved = await saveSources(app, {
       save_request_id: 'save-display-name-boundaries',
       sources: displayNames.map((displayName, index) => trustedSource({
@@ -646,12 +646,13 @@ describe('Cindy 对话入库接口', () => {
       .slice(0, 32)
       .map((part) => part.segment)
       .join('');
-    expect(stored).toHaveLength(4);
+    expect(stored).toHaveLength(5);
     const firstStored = stored[0]!;
     expect(firstStored).toEqual({ display_name: expectedHeavyName, sqlite_length: 160 });
     expect(firstStored.display_name.length).toBe(160);
     expect([...new Intl.Segmenter('zh-CN', { granularity: 'grapheme' }).segment(firstStored.display_name)]).toHaveLength(32);
     expect(stored.slice(1)).toEqual([
+      { display_name: 'á', sqlite_length: 1 },
       { display_name: '需求方', sqlite_length: 3 },
       { display_name: '需求方', sqlite_length: 3 },
       { display_name: '需求方', sqlite_length: 3 },
@@ -675,7 +676,7 @@ describe('Cindy 对话入库接口', () => {
     const candidates = await app.inject({ method: 'GET', url: '/api/candidates' });
     expect(candidates.statusCode).toBe(200);
     const candidateById = new Map(candidates.json().items.map((item: { id: string; proposer_name: string }) => [item.id, item]));
-    const expectedNames = [expectedHeavyName, '需求方', '需求方', '需求方'];
+    const expectedNames = [expectedHeavyName, 'á', '需求方', '需求方', '需求方'];
     for (const [index, candidateId] of candidateIds.entries()) {
       expect(candidateById.get(candidateId)).toMatchObject({ proposer_name: expectedNames[index] });
       const accepted = await app.inject({

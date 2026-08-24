@@ -149273,7 +149273,7 @@ function visiblePrefix(value, graphemeLimit, codeUnitLimit) {
 }
 function sanitizeCindyDisplayName(value) {
   if (typeof value != "string") return "\u9700\u6C42\u65B9";
-  let cleaned = value.normalize("NFC").replace(bidiCharacterPattern, "").replace(/[\p{Cc}\p{Cf}]/gu, "").replace(/\s+/gu, " ").trim();
+  let cleaned = value.normalize("NFC").replace(bidiCharacterPattern, "").replace(/[\p{Cc}\p{Cf}]/gu, "").normalize("NFC").replace(/\s+/gu, " ").trim();
   return !cleaned || stringifiedObjectDisplayNamePattern.test(cleaned) || feishuTechnicalDisplayNamePattern.test(cleaned) ? "\u9700\u6C42\u65B9" : visiblePrefix(cleaned, DISPLAY_NAME_MAX_GRAPHEMES, DISPLAY_NAME_MAX_CODE_UNITS) || "\u9700\u6C42\u65B9";
 }
 function normalizedTechnicalId(value, field, maxLength = 500) {

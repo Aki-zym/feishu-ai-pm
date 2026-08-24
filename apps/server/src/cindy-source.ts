@@ -183,6 +183,7 @@ export function sanitizeCindyDisplayName(value: unknown) {
   const cleaned = value.normalize('NFC')
     .replace(bidiCharacterPattern, '')
     .replace(/[\p{Cc}\p{Cf}]/gu, '')
+    .normalize('NFC')
     .replace(/\s+/gu, ' ')
     .trim();
   if (!cleaned || stringifiedObjectDisplayNamePattern.test(cleaned) || feishuTechnicalDisplayNamePattern.test(cleaned)) {
