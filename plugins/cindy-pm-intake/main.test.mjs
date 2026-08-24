@@ -26,7 +26,8 @@ function setup({ errandText = '{"accepted":true}', errandResponse = null, errand
   const errandCalls = [];
   const secretCalls = [];
   const cursorWrites = [];
-  const intakePosts = [];
+  const sourcePosts = [];
+  const decisionPosts = [];
   const cindy = {
     onHostMessage(handler) { onHostMessage = handler; },
     node: {
@@ -62,9 +63,13 @@ function setup({ errandText = '{"accepted":true}', errandResponse = null, errand
             cursors: [{ conversation_key: 'conversation-1', cursor: '2026-08-24T00:00:00.000Z' }],
           },
         };
-        if (request.params.path.endsWith('/intake')) {
-          intakePosts.push(request.params.body);
-          return { ok: true, result: { accepted: true, intake_id: 'intake-1' } };
+        if (request.params.path.endsWith('/sources')) {
+          sourcePosts.push(request.params.body);
+          return { ok: true, result: { save_request_id: request.params.body.save_request_id, duplicate: false, sources: [{ client_ref: 's1', source_receipt: 'r'.repeat(43), source_status: 'pending_decision', revision: { generation: 1 } }] } };
+        }
+        if (request.params.path.endsWith('/decisions')) {
+          decisionPosts.push(request.params.body);
+          return { ok: true, result: { decision_request_id: request.params.body.decision_request_id, duplicate: false, decisions: [] } };
         }
         throw new Error(`unexpected node request: ${JSON.stringify(request)}`);
       },
@@ -103,11 +108,11 @@ function setup({ errandText = '{"accepted":true}', errandResponse = null, errand
     Number,
     Error,
   }), { filename: 'main.js' });
-  return { onHostMessage, nodeCalls, sent, errandCalls, secretCalls, cursorWrites, intakePosts };
+  return { onHostMessage, nodeCalls, sent, errandCalls, secretCalls, cursorWrites, sourcePosts, decisionPosts };
 }
 
 test('scan_intake_window starts the fixed intake errand session and returns its result', async () => {
-  const { onHostMessage, nodeCalls, errandCalls, sent, cursorWrites, intakePosts } = setup({
+  const { onHostMessage, nodeCalls, errandCalls, sent, cursorWrites, decisionPosts } = setup({
     errandText: '{"status":"skipped","reason":"empty_window","summary":"窗口无消息，跳过提交。","proposals":[]}',
   });
   onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-scan', args: {} });
@@ -118,7 +123,8 @@ test('scan_intake_window starts the fixed intake errand session and returns its 
   assert.equal(errandCalls[0].callId, 'call-scan');
   assert.match(errandCalls[0].task, /get_pm_tasks/);
   assert.match(errandCalls[0].task, /items、candidates、cursors/);
-  assert.match(errandCalls[0].task, /submit_intake/);
+  assert.match(errandCalls[0].task, /save_pm_sources/);
+  assert.match(errandCalls[0].task, /submit_pm_decisions/);
   assert.match(errandCalls[0].task, /不可信数据/);
   assert.match(errandCalls[0].task, /\/api\/tasks/);
   assert.match(errandCalls[0].task, /CAS/);
@@ -144,12 +150,12 @@ test('scan_intake_window starts the fixed intake errand session and returns its 
   assert.equal(nodeCalls[0].method, 'pm/ensure');
   assert.equal(nodeCalls.some((call) => call.params?.path === '/api/runtime/intake-cursor'), true);
   assert.deepEqual(JSON.parse(JSON.stringify(cursorWrites)), []);
-  assert.deepEqual(JSON.parse(JSON.stringify(intakePosts)), [{
+  assert.deepEqual(JSON.parse(JSON.stringify(decisionPosts)), [{
+    decision_request_id: result.result.window_id,
     window_id: result.result.window_id,
     window_start: result.result.window_start,
     window_end: result.result.window_end,
-    sources: [],
-    proposals: [],
+    decisions: [],
   }]);
 });
 
@@ -218,7 +224,8 @@ test('scan_intake_window skips nested dispatch inside the intake errand session'
   assert.equal(result.ok, true);
   assert.equal(result.result.reason, 'already_in_intake_errand');
   assert.match(result.result.next_action, /get_pm_tasks/);
-  assert.match(result.result.next_action, /submit_intake/);
+  assert.match(result.result.next_action, /save_pm_sources/);
+  assert.match(result.result.next_action, /submit_pm_decisions/);
   assert.match(result.result.next_action, /不要再次调用 scan_intake_window/);
 });
 
@@ -248,7 +255,7 @@ test('scan_intake_window turns a thrown session-occupied error into direct intak
   assert.equal(errandCalls.length, 1);
   assert.equal(result.ok, true);
   assert.equal(result.result.reason, 'intake_errand_busy');
-  assert.match(result.result.next_action, /submit_intake/);
+  assert.match(result.result.next_action, /submit_pm_decisions/);
 });
 
 test('get_pm_tasks exposes task items, pending candidates, and read cursors', async () => {
@@ -289,7 +296,7 @@ test('scan result uses human language for candidates, formal task updates, and e
 });
 
 test('ghost declares schedule support while retaining errand', () => {
-  assert.equal(ghost.version, '0.4.0');
+  assert.equal(ghost.version, '0.5.0');
   assert.equal(ghost.id, 'ai-pm-intake');
   assert.equal(ghost.name, 'TooManyTasks');
   assert.match(ghost.description, /本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台/);
@@ -306,6 +313,9 @@ test('ghost declares schedule support while retaining errand', () => {
   assert.deepEqual(ghost.subscribe.topics, ['turn']);
   assert.deepEqual(ghost.subscribe.hooks, ['will-user-message']);
   assert.ok(ghost.tools.some((tool) => tool.name === 'update_pm_progress'));
+  assert.ok(ghost.tools.some((tool) => tool.name === 'save_pm_sources'));
+  assert.ok(ghost.tools.some((tool) => tool.name === 'submit_pm_decisions'));
+  assert.equal(ghost.tools.some((tool) => tool.name === 'submit_intake'), false);
 });
 
 test('main flow creates a local task-service token through settings before ensuring the resident service', async () => {
@@ -320,67 +330,51 @@ test('main flow creates a local task-service token through settings before ensur
   assert.equal(nodeCalls[1].params.path, '/api/integrations/cindy/tasks');
 });
 
-test('submit_intake posts the declared source and proposal contract', async () => {
+test('save_pm_sources posts the declared source contract before decisions', async () => {
   const { onHostMessage, nodeCalls, sent } = setup();
   const args = {
+    save_request_id: 'save-window-1',
+    sources: [{ client_ref: 's1', provider: 'feishu', source_kind: 'im_message', stable_message_id: 'om_1', occurred_at: '2026-08-24T01:05:00.000Z', text: '新增需求。', revision: { sequence: 1 } }],
+  };
+  onHostMessage({ type: 'tool-call', tool: 'save_pm_sources', callId: 'call-save', args });
+  await waitFor(() => sent.some((message) => message.callId === 'call-save'));
+  const post = nodeCalls.find((call) => call.params?.path?.endsWith('/sources'));
+  assert.equal(post.params.method, 'POST');
+  assert.deepEqual(JSON.parse(JSON.stringify(post.params.body)), args);
+  assert.equal(sent.find((message) => message.callId === 'call-save').result.sources[0].source_status, 'pending_decision');
+});
+
+test('submit_pm_decisions posts receipts only and rejects update_task without CAS fields', async () => {
+  const { onHostMessage, nodeCalls, sent } = setup();
+  const args = {
+    decision_request_id: 'decision-window-1',
     window_id: 'window-1',
     window_start: '2026-08-24T01:00:00.000Z',
     window_end: '2026-08-24T01:10:00.000Z',
-    sources: [{ source_key: 's1', occurred_at: '2026-08-24T01:05:00.000Z', text: '新增需求。' }],
-    proposals: [
-      { action: 'create_candidate', source_keys: ['s1'], title: '新增需求', describe: '需求描述' },
-      { action: 'skip', source_keys: ['s1'], reason: '仅作测试。' },
-      { action: 'update_task', source_keys: ['s1'], task_key: 'task-1', expected_version: 2, next_step: '继续确认。' },
-    ],
+    decisions: [{ decision_ref: 'd1', action: 'create_candidate', source_receipts: ['r'.repeat(43)], title: '新增需求' }],
   };
-  onHostMessage({ type: 'tool-call', tool: 'submit_intake', callId: 'call-submit', args });
-  await waitFor(() => sent.some((message) => message.callId === 'call-submit'));
-  const post = nodeCalls.find((call) => call.params?.path?.endsWith('/intake'));
-  assert.equal(post.params.method, 'POST');
+  onHostMessage({ type: 'tool-call', tool: 'submit_pm_decisions', callId: 'call-decide', args });
+  await waitFor(() => sent.some((message) => message.callId === 'call-decide'));
+  const post = nodeCalls.find((call) => call.params?.path?.endsWith('/decisions'));
   assert.deepEqual(JSON.parse(JSON.stringify(post.params.body)), args);
-  assert.deepEqual(sent.find((message) => message.callId === 'call-submit').result, { accepted: true, intake_id: 'intake-1' });
-});
+  assert.equal(JSON.stringify(post.params.body).includes('stable_message_id'), false);
 
-test('submit_intake rejects update_task without task_key or expected_version', async () => {
-  const { onHostMessage, nodeCalls, sent } = setup();
   onHostMessage({
     type: 'tool-call',
-    tool: 'submit_intake',
+    tool: 'submit_pm_decisions',
     callId: 'call-invalid-update',
     args: {
+      decision_request_id: 'decision-invalid',
       window_id: 'window-1',
       window_start: '2026-08-24T01:00:00.000Z',
       window_end: '2026-08-24T01:10:00.000Z',
-      sources: [{ source_key: 's1', occurred_at: '2026-08-24T01:05:00.000Z', text: '更新已有任务。' }],
-      proposals: [{ action: 'update_task', source_keys: ['s1'], next_step: '缺少 CAS 信息。' }],
+      decisions: [{ decision_ref: 'd1', action: 'update_task', source_receipts: ['r'.repeat(43)], next_step: '缺少 CAS 信息。' }],
     },
   });
   await waitFor(() => sent.some((message) => message.callId === 'call-invalid-update'));
-  assert.equal(nodeCalls.some((call) => call.params?.path?.endsWith('/intake')), false);
   const failure = sent.find((message) => message.callId === 'call-invalid-update');
   assert.equal(failure.ok, false);
   assert.match(failure.message, /task_key/);
-});
-
-test('submit_intake rejects an empty window so the errand must short-circuit', async () => {
-  const { onHostMessage, nodeCalls, sent } = setup();
-  onHostMessage({
-    type: 'tool-call',
-    tool: 'submit_intake',
-    callId: 'call-empty-window',
-    args: {
-      window_id: 'window-empty',
-      window_start: '2026-08-24T01:00:00.000Z',
-      window_end: '2026-08-24T01:10:00.000Z',
-      sources: [],
-      proposals: [],
-    },
-  });
-  await waitFor(() => sent.some((message) => message.callId === 'call-empty-window'));
-  assert.equal(nodeCalls.some((call) => call.params?.path?.endsWith('/intake')), false);
-  const failure = sent.find((message) => message.callId === 'call-empty-window');
-  assert.equal(failure.ok, false);
-  assert.match(failure.message, /empty_window/);
 });
 
 test('update_pm_progress keeps progress oneshot separate from intake errand', async () => {
@@ -407,7 +401,7 @@ test('update_pm_progress keeps progress oneshot separate from intake errand', as
   assert.equal(result.result.mode, 'manual');
   assert.equal(errandCalls.length, 0);
   assert.equal(sent.some((message) => message.type === 'cindy-request' && message.kind === 'oneshot_text'), true);
-  assert.equal(nodeCalls.some((request) => request.params?.path?.endsWith('/intake')), false);
+  assert.equal(nodeCalls.some((request) => request.params?.path?.endsWith('/decisions')), false);
   assert.equal(nodeCalls.some((request) => request.params?.path?.endsWith('/turn-evaluations')), true);
 });
 

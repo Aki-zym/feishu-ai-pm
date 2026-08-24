@@ -23335,13 +23335,13 @@ var require_parse_url = __commonJS({
 var require_form_data = __commonJS({
   "node_modules/light-my-request/lib/form-data.js"(exports2, module2) {
     "use strict";
-    var { randomUUID: randomUUID8 } = require("node:crypto"), { Readable } = require("node:stream"), textEncoder;
+    var { randomUUID: randomUUID9 } = require("node:crypto"), { Readable } = require("node:stream"), textEncoder;
     function isFormDataLike(payload) {
       return payload && typeof payload == "object" && typeof payload.append == "function" && typeof payload.delete == "function" && typeof payload.get == "function" && typeof payload.getAll == "function" && typeof payload.has == "function" && typeof payload.set == "function" && payload[Symbol.toStringTag] === "FormData";
     }
     function formDataToStream(formdata) {
       textEncoder = textEncoder ?? new TextEncoder();
-      let boundary = `----formdata-${randomUUID8()}`, prefix = `--${boundary}\r
+      let boundary = `----formdata-${randomUUID9()}`, prefix = `--${boundary}\r
 Content-Disposition: form-data`;
       let escape2 = (str) => str.replace(/\n/g, "%0A").replace(/\r/g, "%0D").replace(/"/g, "%22"), normalizeLinefeeds = (value) => value.replace(/\r?\n|\r/g, `\r
 `), linebreak = new Uint8Array([13, 10]);
@@ -42927,7 +42927,7 @@ var require_extension = __commonJS({
 var require_websocket = __commonJS({
   "node_modules/ws/lib/websocket.js"(exports2, module2) {
     "use strict";
-    var EventEmitter = require("events"), https = require("https"), http = require("http"), net = require("net"), tls = require("tls"), { randomBytes, createHash: createHash10 } = require("crypto"), { Duplex, Readable } = require("stream"), { URL: URL2 } = require("url"), PerMessageDeflate = require_permessage_deflate(), Receiver = require_receiver(), Sender = require_sender(), { isBlob } = require_validation3(), {
+    var EventEmitter = require("events"), https = require("https"), http = require("http"), net = require("net"), tls = require("tls"), { randomBytes: randomBytes2, createHash: createHash11 } = require("crypto"), { Duplex, Readable } = require("stream"), { URL: URL2 } = require("url"), PerMessageDeflate = require_permessage_deflate(), Receiver = require_receiver(), Sender = require_sender(), { isBlob } = require_validation3(), {
       BINARY_TYPES,
       CLOSE_TIMEOUT,
       EMPTY_BUFFER,
@@ -43313,7 +43313,7 @@ var require_websocket = __commonJS({
         emitErrorAndClose(websocket, err);
         return;
       }
-      let defaultPort = isSecure ? 443 : 80, key = randomBytes(16).toString("base64"), request = isSecure ? https.request : http.request, protocolSet = /* @__PURE__ */ new Set(), perMessageDeflate;
+      let defaultPort = isSecure ? 443 : 80, key = randomBytes2(16).toString("base64"), request = isSecure ? https.request : http.request, protocolSet = /* @__PURE__ */ new Set(), perMessageDeflate;
       if (opts.createConnection = opts.createConnection || (isSecure ? tlsConnect : netConnect), opts.defaultPort = opts.defaultPort || defaultPort, opts.port = parsedUrl.port || defaultPort, opts.host = parsedUrl.hostname.startsWith("[") ? parsedUrl.hostname.slice(1, -1) : parsedUrl.hostname, opts.headers = {
         ...opts.headers,
         "Sec-WebSocket-Version": opts.protocolVersion,
@@ -43389,7 +43389,7 @@ var require_websocket = __commonJS({
           abortHandshake(websocket, socket, "Invalid Upgrade header");
           return;
         }
-        let digest = createHash10("sha1").update(key + GUID).digest("base64");
+        let digest = createHash11("sha1").update(key + GUID).digest("base64");
         if (res.headers["sec-websocket-accept"] !== digest) {
           abortHandshake(websocket, socket, "Invalid Sec-WebSocket-Accept header");
           return;
@@ -43627,7 +43627,7 @@ var require_subprotocol = __commonJS({
 var require_websocket_server = __commonJS({
   "node_modules/ws/lib/websocket-server.js"(exports2, module2) {
     "use strict";
-    var EventEmitter = require("events"), http = require("http"), { Duplex } = require("stream"), { createHash: createHash10 } = require("crypto"), extension = require_extension(), PerMessageDeflate = require_permessage_deflate(), subprotocol = require_subprotocol(), WebSocket = require_websocket(), { CLOSE_TIMEOUT, GUID, kWebSocket } = require_constants3(), keyRegex = /^[+/0-9A-Za-z]{22}==$/, RUNNING = 0, CLOSING = 1, CLOSED = 2, WebSocketServer = class extends EventEmitter {
+    var EventEmitter = require("events"), http = require("http"), { Duplex } = require("stream"), { createHash: createHash11 } = require("crypto"), extension = require_extension(), PerMessageDeflate = require_permessage_deflate(), subprotocol = require_subprotocol(), WebSocket = require_websocket(), { CLOSE_TIMEOUT, GUID, kWebSocket } = require_constants3(), keyRegex = /^[+/0-9A-Za-z]{22}==$/, RUNNING = 0, CLOSING = 1, CLOSED = 2, WebSocketServer = class extends EventEmitter {
       /**
        * Create a `WebSocketServer` instance.
        *
@@ -43874,7 +43874,7 @@ var require_websocket_server = __commonJS({
           "HTTP/1.1 101 Switching Protocols",
           "Upgrade: websocket",
           "Connection: Upgrade",
-          `Sec-WebSocket-Accept: ${createHash10("sha1").update(key + GUID).digest("base64")}`
+          `Sec-WebSocket-Accept: ${createHash11("sha1").update(key + GUID).digest("base64")}`
         ], ws = new this.options.WebSocket(null, void 0, this.options);
         if (protocols.size) {
           let protocol = this.options.handleProtocols ? this.options.handleProtocols(protocols, req) : protocols.values().next().value;
@@ -134265,7 +134265,7 @@ module.exports = __toCommonJS(pm_runtime_entry_exports);
 var import_node_fs4 = require("node:fs"), import_promises2 = require("node:fs/promises"), import_node_child_process = require("node:child_process"), import_node_path5 = require("node:path");
 
 // apps/server/src/app.ts
-var import_node_fs3 = require("node:fs"), import_node_crypto11 = require("node:crypto"), import_promises = require("node:fs/promises"), import_node_path3 = require("node:path"), import_cors = __toESM(require_cors(), 1), import_fastify = __toESM(require_fastify(), 1);
+var import_node_fs3 = require("node:fs"), import_node_crypto12 = require("node:crypto"), import_promises = require("node:fs/promises"), import_node_path3 = require("node:path"), import_cors = __toESM(require_cors(), 1), import_fastify = __toESM(require_fastify(), 1);
 
 // node_modules/zod/v4/classic/external.js
 var external_exports = {};
@@ -145365,7 +145365,7 @@ function canonicalRevisionSetHash(entries) {
 }
 
 // apps/server/src/service.ts
-var import_node_crypto10 = require("node:crypto"), import_node_fs2 = require("node:fs"), import_node_path2 = require("node:path");
+var import_node_crypto11 = require("node:crypto"), import_node_fs2 = require("node:fs"), import_node_path2 = require("node:path");
 
 // apps/server/src/database.ts
 var import_node_fs = require("node:fs"), import_node_crypto2 = require("node:crypto"), import_node_path = require("node:path"), import_node_sqlite = require("node:sqlite");
@@ -145443,7 +145443,7 @@ function projectShanghaiCalendarPlan(startAt, endAt, fallbackAt = null) {
 }
 
 // apps/server/src/database.ts
-var CURRENT_SCHEMA_VERSION = 8;
+var CURRENT_SCHEMA_VERSION = 9;
 function registerData04SqlFunctions(database) {
   database.function("sha256", { deterministic: !0 }, (value) => (0, import_node_crypto2.createHash)("sha256").update(String(value ?? "")).digest("hex"));
 }
@@ -148064,7 +148064,125 @@ var PROVIDER_RETRY_COOLDOWN_SCHEMA_CHECKSUM = providerRetryCooldownSchemaChecksu
       userVersion: 8
     })
   ])
-})), PROVIDER_RETRY_COOLDOWN_MIGRATION_CHECKSUM = migrationDescriptorChecksum(PROVIDER_RETRY_COOLDOWN_MIGRATION_DESCRIPTOR), MIGRATIONS = [
+})), PROVIDER_RETRY_COOLDOWN_MIGRATION_CHECKSUM = migrationDescriptorChecksum(PROVIDER_RETRY_COOLDOWN_MIGRATION_DESCRIPTOR), CINDY_TRUSTED_SOURCE_MIGRATION_SQL = Object.freeze([
+  `ALTER TABLE source_event ADD COLUMN ingest_state TEXT NOT NULL DEFAULT 'legacy_read_only'
+    CHECK (ingest_state IN ('legacy_read_only','trusted_current','revoked','invalid'));`,
+  `ALTER TABLE source_event_revision ADD COLUMN processing_status TEXT NOT NULL DEFAULT 'legacy_read_only'
+    CHECK (processing_status IN ('pending_decision','processed','retryable','skipped','legacy_read_only','superseded','revoked','invalid'));`,
+  "ALTER TABLE source_event_revision ADD COLUMN trusted_payload_hash TEXT CHECK (trusted_payload_hash IS NULL OR length(trusted_payload_hash) = 64);",
+  "ALTER TABLE source_event_revision ADD COLUMN provider_revision_modified_at_ms INTEGER CHECK (provider_revision_modified_at_ms IS NULL OR provider_revision_modified_at_ms >= 0);",
+  "ALTER TABLE source_event_revision ADD COLUMN provider_revision_sequence INTEGER CHECK (provider_revision_sequence IS NULL OR provider_revision_sequence >= 0);",
+  "ALTER TABLE source_event_revision ADD COLUMN receipt_nonce TEXT;",
+  "ALTER TABLE source_event_revision ADD COLUMN receipt_digest TEXT;",
+  "ALTER TABLE source_event_revision ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0 AND retry_count <= 3);",
+  "CREATE UNIQUE INDEX idx_source_event_revision_receipt_digest ON source_event_revision(receipt_digest) WHERE receipt_digest IS NOT NULL;",
+  `CREATE TABLE cindy_source_identity (
+    id TEXT PRIMARY KEY,
+    owner_scope TEXT NOT NULL,
+    account_anchor TEXT NOT NULL,
+    provider TEXT NOT NULL CHECK (provider IN ('feishu','synthetic')),
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('im_message','im_thread_message','im_reaction_context','synthetic_message')),
+    stable_id_hash TEXT NOT NULL CHECK (length(stable_id_hash) = 64),
+    source_event_id TEXT NOT NULL UNIQUE REFERENCES source_event(id) ON DELETE CASCADE,
+    current_revision_id TEXT REFERENCES source_event_revision(id) ON DELETE SET NULL,
+    state TEXT NOT NULL CHECK (state IN ('active','legacy_read_only','revoked','invalid')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(owner_scope, provider, source_kind, stable_id_hash)
+  );`,
+  "CREATE INDEX idx_cindy_source_identity_current ON cindy_source_identity(owner_scope, state, current_revision_id);",
+  `CREATE TABLE cindy_source_relation (
+    source_revision_id TEXT NOT NULL REFERENCES source_event_revision(id) ON DELETE CASCADE,
+    relation_kind TEXT NOT NULL CHECK (relation_kind IN ('reply_to','thread_parent')),
+    target_revision_id TEXT NOT NULL REFERENCES source_event_revision(id) ON DELETE CASCADE,
+    owner_scope TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(source_revision_id, relation_kind, target_revision_id),
+    CHECK (source_revision_id <> target_revision_id)
+  );`,
+  "CREATE INDEX idx_cindy_source_relation_target ON cindy_source_relation(target_revision_id, source_revision_id);",
+  `CREATE TABLE cindy_save_request (
+    owner_scope TEXT NOT NULL,
+    save_request_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
+    response_map_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(owner_scope, save_request_id)
+  );`,
+  `CREATE TABLE cindy_decision_request (
+    owner_scope TEXT NOT NULL,
+    decision_request_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(owner_scope, decision_request_id)
+  );`,
+  `INSERT INTO cindy_source_identity
+    (id, owner_scope, account_anchor, provider, source_kind, stable_id_hash, source_event_id,
+     current_revision_id, state, created_at, updated_at)
+   SELECT 'legacy-cindy-source:' || source_event.id,
+          source_event.owner_scope,
+          'legacy',
+          json_extract(source_event.metadata_json, '$.provider'),
+          json_extract(source_event.metadata_json, '$.sourceKind'),
+          sha256(json_extract(source_event.metadata_json, '$.stableMessageId')),
+          source_event.id,
+          source_event.current_revision_id,
+          'legacy_read_only',
+          source_event.captured_at,
+          source_event.captured_at
+     FROM source_event
+    WHERE json_valid(source_event.metadata_json)
+      AND json_extract(source_event.metadata_json, '$.provider') IN ('feishu','synthetic')
+      AND json_extract(source_event.metadata_json, '$.sourceKind') IN ('im_message','im_thread_message','im_reaction_context','synthetic_message')
+      AND typeof(json_extract(source_event.metadata_json, '$.stableMessageId')) = 'text'
+      AND length(json_extract(source_event.metadata_json, '$.stableMessageId')) > 0
+    ON CONFLICT(owner_scope, provider, source_kind, stable_id_hash) DO NOTHING;`
+]);
+function cindyTrustedSourceSchemaChecksum() {
+  let canonical = new import_node_sqlite.DatabaseSync(":memory:");
+  try {
+    registerData04SqlFunctions(canonical), executeMigrationOperations(canonical, { ...BASELINE_MIGRATION_DESCRIPTOR, checksum: BASELINE_MIGRATION_CHECKSUM }, {
+      databaseInstanceId: "00000000000000000000000000000000",
+      instanceCreatedAt: "2026-08-15T00:00:00.000Z",
+      appliedAt: "2026-08-15T00:00:00.000Z",
+      preexistingTables: []
+    });
+    for (let statement of RELATION_CONSTRAINT_MIGRATION_SQL)
+      !statement.startsWith("UPDATE ") && !statement.startsWith("INSERT ") && canonical.exec(statement);
+    for (let statement of RUNTIME_TOOL_IDEMPOTENCY_MIGRATION_SQL) canonical.exec(statement);
+    for (let statement of CANDIDATE_VERSION_MIGRATION_SQL) canonical.exec(statement);
+    for (let statement of PRIVACY_MIGRATION_SQL) statement.startsWith("INSERT ") || canonical.exec(statement);
+    for (let statement of PRIVACY_FENCING_MIGRATION_SQL) canonical.exec(statement);
+    for (let statement of SOURCE_REVISION_MIGRATION_SQL)
+      !statement.startsWith("INSERT ") && !statement.startsWith("UPDATE ") && canonical.exec(statement);
+    for (let statement of PROVIDER_RETRY_COOLDOWN_MIGRATION_SQL) canonical.exec(statement);
+    for (let statement of CINDY_TRUSTED_SOURCE_MIGRATION_SQL) statement.startsWith("INSERT ") || canonical.exec(statement);
+    return schemaIdentityChecksum(captureSchemaIdentity(canonical));
+  } finally {
+    canonical.close();
+  }
+}
+var CINDY_TRUSTED_SOURCE_SCHEMA_CHECKSUM = cindyTrustedSourceSchemaChecksum(), CINDY_TRUSTED_SOURCE_MIGRATION_DESCRIPTOR = deepFreeze(Object.freeze({
+  version: 9,
+  name: "cindy-trusted-source-receipts",
+  expectedPostSchemaIdentity: "current-schema-v9",
+  orderedOperations: Object.freeze([
+    Object.freeze({ id: "cindy-trusted-source-schema", kind: "sql_batch", statements: CINDY_TRUSTED_SOURCE_MIGRATION_SQL }),
+    Object.freeze({
+      id: "verify-post-schema",
+      kind: "assert_database",
+      expectedSchemaIdentityChecksum: CINDY_TRUSTED_SOURCE_SCHEMA_CHECKSUM,
+      checks: Object.freeze(["schema", "foreign_keys", "integrity"])
+    }),
+    Object.freeze({
+      id: "record-migration",
+      kind: "record_migration",
+      ledgerTable: "schema_migration",
+      userVersion: 9
+    })
+  ])
+})), CINDY_TRUSTED_SOURCE_MIGRATION_CHECKSUM = migrationDescriptorChecksum(CINDY_TRUSTED_SOURCE_MIGRATION_DESCRIPTOR), MIGRATIONS = [
   {
     ...BASELINE_MIGRATION_DESCRIPTOR,
     checksum: BASELINE_MIGRATION_CHECKSUM
@@ -148096,10 +148214,14 @@ var PROVIDER_RETRY_COOLDOWN_SCHEMA_CHECKSUM = providerRetryCooldownSchemaChecksu
   {
     ...PROVIDER_RETRY_COOLDOWN_MIGRATION_DESCRIPTOR,
     checksum: PROVIDER_RETRY_COOLDOWN_MIGRATION_CHECKSUM
+  },
+  {
+    ...CINDY_TRUSTED_SOURCE_MIGRATION_DESCRIPTOR,
+    checksum: CINDY_TRUSTED_SOURCE_MIGRATION_CHECKSUM
   }
 ];
 function assertExecutableMigrationDescriptor(descriptor) {
-  if (!Number.isInteger(descriptor.version) || descriptor.version < 1 || !["current-schema-v1", "current-schema-v2", "current-schema-v3", "current-schema-v4", "current-schema-v5", "current-schema-v6", "current-schema-v7", "current-schema-v8"].includes(descriptor.expectedPostSchemaIdentity) || descriptor.orderedOperations.length === 0)
+  if (!Number.isInteger(descriptor.version) || descriptor.version < 1 || !["current-schema-v1", "current-schema-v2", "current-schema-v3", "current-schema-v4", "current-schema-v5", "current-schema-v6", "current-schema-v7", "current-schema-v8", "current-schema-v9"].includes(descriptor.expectedPostSchemaIdentity) || descriptor.orderedOperations.length === 0)
     throw new DatabaseUpgradeError("migration", "\u6570\u636E\u5E93\u8FC1\u79FB\u63CF\u8FF0\u7B26\u7248\u672C\u6216\u8D1F\u8F7D\u65E0\u6548\uFF1B\u5DF2\u62D2\u7EDD\u63A8\u8FDB\u7248\u672C\u3002");
   let operationIds = /* @__PURE__ */ new Set(), assertionCount = 0, recordCount = 0;
   for (let operation of descriptor.orderedOperations) {
@@ -148276,15 +148398,18 @@ var AppDatabase = class {
     this.databasePath = path, this.transactionFaults = options.transactionFaults, this.privacyBackupFaults = options.privacyBackupFaults;
     let isFileDatabase = path !== ":memory:", databaseExisted = isFileDatabase && pathExistsControlled(path, "ledger");
     this.raw = openAppDatabase(path);
-    let upgradeBackupPath, upgradeDatabaseInstanceId, migrations = options.migrationDescriptorForTest ? (() => {
+    let upgradeBackupPath, upgradeDatabaseInstanceId, configuredMigrations = options.migrationDescriptorForTest ? (() => {
       let descriptor = {
         ...options.migrationDescriptorForTest,
         checksum: migrationDescriptorChecksum(options.migrationDescriptorForTest)
       };
       return MIGRATIONS.map((migration) => migration.version === descriptor.version ? descriptor : migration);
-    })() : MIGRATIONS;
+    })() : MIGRATIONS, targetSchemaVersion = options.targetSchemaVersionForTest ?? CURRENT_SCHEMA_VERSION;
+    if (!Number.isInteger(targetSchemaVersion) || targetSchemaVersion < 1 || targetSchemaVersion > CURRENT_SCHEMA_VERSION)
+      throw new Error("\u6D4B\u8BD5\u76EE\u6807 schema \u7248\u672C\u65E0\u6548\u3002");
+    let migrations = configuredMigrations.filter((migration) => migration.version <= targetSchemaVersion);
     try {
-      this.raw.exec("PRAGMA foreign_keys = ON;"), registerData04SqlFunctions(this.raw), this.runMigrations(path, databaseExisted, options.now ?? (() => /* @__PURE__ */ new Date()), migrations, (backupPath, instanceId) => {
+      this.raw.exec("PRAGMA foreign_keys = ON;"), registerData04SqlFunctions(this.raw), this.runMigrations(path, databaseExisted, options.now ?? (() => /* @__PURE__ */ new Date()), migrations, targetSchemaVersion, (backupPath, instanceId) => {
         upgradeBackupPath = backupPath, upgradeDatabaseInstanceId = instanceId;
       }), ensureCindyProgressTables(this.raw), this.databaseInstanceId = readDatabaseInstanceIdentity(this.raw, "ledger", !0)?.instanceId;
     } catch (error51) {
@@ -148310,9 +148435,9 @@ var AppDatabase = class {
     }
     seedDemoData && this.seed();
   }
-  runMigrations(path, databaseExisted, now, migrations, onBackupCreated) {
+  runMigrations(path, databaseExisted, now, migrations, expectedSchemaVersion, onBackupCreated) {
     for (let migration of migrations) assertExecutableMigrationDescriptor(migration);
-    if (migrations.at(-1)?.version !== CURRENT_SCHEMA_VERSION || migrations.some((migration, index) => migration.version !== index + 1 || !/^[0-9a-f]{64}$/u.test(migration.checksum)))
+    if (migrations.at(-1)?.version !== expectedSchemaVersion || migrations.some((migration, index) => migration.version !== index + 1 || !/^[0-9a-f]{64}$/u.test(migration.checksum)))
       throw new Error("\u6570\u636E\u5E93\u8FC1\u79FB\u5B9A\u4E49\u5FC5\u987B\u8FDE\u7EED\u9012\u589E\u5E76\u5305\u542B SHA-256 checksum\u3002");
     let applicationTables = applicationTableNames(this.raw), isEmptyDatabase = applicationTables.length === 0, inspected = databaseExisted ? inspectDatabaseIdentity(this.raw, "ledger", migrations) : void 0, currentVersion = inspected?.version ?? 0;
     if (!databaseExisted && !isEmptyDatabase)
@@ -149029,8 +149154,431 @@ var AppDatabase = class {
   }
 };
 
-// apps/server/src/calendar-classification.ts
+// apps/server/src/cindy-source.ts
 var import_node_crypto3 = require("node:crypto");
+var CINDY_SOURCE_PROVIDERS = ["feishu", "synthetic"], CINDY_SOURCE_KINDS = ["im_message", "im_thread_message", "im_reaction_context", "synthetic_message"];
+var CindySourceContractError = class extends Error {
+  constructor(errorCode, message, statusCode = errorCode === "INVALID_INPUT" ? 400 : errorCode === "INVALID_SOURCE_RECEIPT" ? 403 : 409) {
+    super(message);
+    this.errorCode = errorCode;
+    this.statusCode = statusCode;
+    this.name = "CindySourceContractError";
+  }
+}, clientRefPattern = /^[A-Za-z0-9_-]{1,64}$/u, requestIdPattern = /^[A-Za-z0-9_-]{1,128}$/u;
+function sha256(value) {
+  return (0, import_node_crypto3.createHash)("sha256").update(value, "utf8").digest("hex");
+}
+function stableJson(value) {
+  if (value === null || typeof value != "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  let record2 = value;
+  return `{${Object.keys(record2).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record2[key])}`).join(",")}}`;
+}
+function normalizedText(value, field, maxLength) {
+  if (typeof value != "string") throw new CindySourceContractError("INVALID_INPUT", `${field} \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\u3002`);
+  let normalized = value.normalize("NFKC").replace(/\r\n?/gu, `
+`).trim();
+  if (!normalized || normalized.length > maxLength) throw new CindySourceContractError("INVALID_INPUT", `${field} \u4E3A\u7A7A\u6216\u8FC7\u957F\u3002`);
+  return normalized;
+}
+function normalizedIso(value, field) {
+  let normalized = normalizedText(value, field, 80), milliseconds = Date.parse(normalized);
+  if (!Number.isFinite(milliseconds)) throw new CindySourceContractError("INVALID_INPUT", `${field} \u4E0D\u662F\u6709\u6548\u65F6\u95F4\u3002`);
+  return { iso: new Date(milliseconds).toISOString(), milliseconds };
+}
+function normalizedRevision(source) {
+  let modified = source.revision?.modified_at === void 0 ? void 0 : normalizedIso(source.revision.modified_at, `${source.client_ref}.revision.modified_at`), sequence = source.revision?.sequence;
+  if (sequence !== void 0 && (!Number.isInteger(sequence) || sequence < 0))
+    throw new CindySourceContractError("INVALID_INPUT", `${source.client_ref}.revision.sequence \u5FC5\u987B\u662F\u975E\u8D1F\u6574\u6570\u3002`);
+  return {
+    comparable: modified !== void 0 || sequence !== void 0,
+    modifiedAt: modified?.iso,
+    modifiedAtMs: modified?.milliseconds ?? null,
+    sequence: sequence ?? null
+  };
+}
+function deriveCindyAuthContext(token) {
+  let secret = token.trim();
+  if (!secret) throw new CindySourceContractError("INVALID_INPUT", "Cindy \u96C6\u6210\u8BA4\u8BC1\u4E0A\u4E0B\u6587\u5C1A\u672A\u914D\u7F6E\u3002");
+  return {
+    // M1 is a single-owner local product. The authenticated plugin route binds
+    // that durable owner scope; the connected-account anchor separates token
+    // contexts without accepting either value from request bodies.
+    ownerScope: "primary",
+    accountAnchor: `cindy_account_${sha256(`account\0${secret}`)}`,
+    receiptSecret: secret
+  };
+}
+function receiptForNonce(auth, nonce) {
+  return (0, import_node_crypto3.createHmac)("sha256", auth.receiptSecret).update(`source-receipt\0${nonce}`, "utf8").digest("base64url");
+}
+function receiptDigest(receipt) {
+  return sha256(`source-receipt-digest\0${receipt}`);
+}
+function identityHash(auth, source) {
+  return sha256(normalizedText(source.stable_message_id, `${source.client_ref}.stable_message_id`, 500));
+}
+function assertProviderKind(source) {
+  if (!(source.provider === "synthetic" ? source.source_kind === "synthetic_message" : source.source_kind !== "synthetic_message")) throw new CindySourceContractError("INVALID_INPUT", `${source.client_ref} \u7684 provider \u4E0E source_kind \u4E0D\u5339\u914D\u3002`);
+}
+function topologicalClientRefs(sources) {
+  let byRef = new Map(sources.map((source) => [source.client_ref, source])), state = /* @__PURE__ */ new Map(), ordered = [], visit = (clientRef) => {
+    let current = state.get(clientRef) ?? 0;
+    if (current === 1) throw new CindySourceContractError("INVALID_INPUT", "\u6279\u5185\u6765\u6E90\u5173\u7CFB\u4E0D\u80FD\u6210\u73AF\u3002");
+    if (current !== 2) {
+      state.set(clientRef, 1);
+      for (let relation of byRef.get(clientRef)?.relations ?? [])
+        relation.client_ref && visit(relation.client_ref);
+      state.set(clientRef, 2), ordered.push(clientRef);
+    }
+  };
+  return sources.forEach((source) => visit(source.client_ref)), ordered;
+}
+function validateInput(input) {
+  if (!requestIdPattern.test(input.save_request_id)) throw new CindySourceContractError("INVALID_INPUT", "save_request_id \u683C\u5F0F\u65E0\u6548\u3002");
+  if (!Array.isArray(input.sources) || input.sources.length < 1 || input.sources.length > 500)
+    throw new CindySourceContractError("INVALID_INPUT", "sources \u6570\u91CF\u5FC5\u987B\u5728 1 \u5230 500 \u4E4B\u95F4\u3002");
+  let refs = /* @__PURE__ */ new Set();
+  for (let source of input.sources) {
+    if (!clientRefPattern.test(source.client_ref) || refs.has(source.client_ref))
+      throw new CindySourceContractError("INVALID_INPUT", "client_ref \u683C\u5F0F\u65E0\u6548\u6216\u5728\u8BF7\u6C42\u5185\u91CD\u590D\u3002");
+    if (refs.add(source.client_ref), assertProviderKind(source), normalizedText(source.stable_message_id, `${source.client_ref}.stable_message_id`, 500), normalizedIso(source.occurred_at, `${source.client_ref}.occurred_at`), normalizedText(source.text, `${source.client_ref}.text`, 2e4), normalizedRevision(source), (source.relations?.length ?? 0) > 20) throw new CindySourceContractError("INVALID_INPUT", `${source.client_ref}.relations \u8FC7\u591A\u3002`);
+  }
+  for (let source of input.sources) {
+    let relationKeys = /* @__PURE__ */ new Set();
+    for (let relation of source.relations ?? []) {
+      if (+!!relation.client_ref + +!!relation.source_receipt !== 1) throw new CindySourceContractError("INVALID_INPUT", "\u6BCF\u4E2A\u5173\u7CFB\u5FC5\u987B\u4E14\u53EA\u80FD\u5F15\u7528 client_ref \u6216 source_receipt\u3002");
+      if (relation.client_ref && (!clientRefPattern.test(relation.client_ref) || !refs.has(relation.client_ref)))
+        throw new CindySourceContractError("INVALID_INPUT", "\u6279\u5185\u5173\u7CFB\u5F15\u7528\u4E86\u672A\u77E5 client_ref\u3002");
+      if (relation.source_receipt && relation.source_receipt.length > 200)
+        throw new CindySourceContractError("INVALID_INPUT", "source_receipt \u683C\u5F0F\u65E0\u6548\u3002");
+      let key = `${relation.kind}:${relation.client_ref ?? relation.source_receipt}`;
+      if (relationKeys.has(key)) throw new CindySourceContractError("INVALID_INPUT", "\u540C\u4E00\u6765\u6E90\u4E0D\u80FD\u91CD\u590D\u58F0\u660E\u76F8\u540C\u5173\u7CFB\u3002");
+      relationKeys.add(key);
+    }
+  }
+  topologicalClientRefs(input.sources);
+}
+function canonicalSaveRequest(input) {
+  return {
+    save_request_id: input.save_request_id,
+    sources: input.sources.map((source) => {
+      let revision = normalizedRevision(source), relations = (source.relations ?? []).map((relation) => ({
+        kind: relation.kind,
+        client_ref: relation.client_ref ?? null,
+        source_receipt: relation.source_receipt ?? null
+      })).sort((left, right) => stableJson(left).localeCompare(stableJson(right)));
+      return {
+        client_ref: source.client_ref,
+        provider: source.provider,
+        source_kind: source.source_kind,
+        stable_message_id: normalizedText(source.stable_message_id, `${source.client_ref}.stable_message_id`, 500),
+        occurred_at: normalizedIso(source.occurred_at, `${source.client_ref}.occurred_at`).iso,
+        conversation_key: source.conversation_key ? normalizedText(source.conversation_key, `${source.client_ref}.conversation_key`, 500) : null,
+        sender_role: source.sender_role ? normalizedText(source.sender_role, `${source.client_ref}.sender_role`, 120) : null,
+        text: normalizedText(source.text, `${source.client_ref}.text`, 2e4),
+        revision: revision.comparable ? {
+          modified_at_ms: revision.modifiedAtMs,
+          sequence: revision.sequence
+        } : null,
+        relations
+      };
+    })
+  };
+}
+function revisionResult(row) {
+  let result = { generation: row.revision_number };
+  return row.provider_revision_modified_at_ms !== null && (result.modified_at = new Date(row.provider_revision_modified_at_ms).toISOString()), row.provider_revision_sequence !== null && (result.sequence = row.provider_revision_sequence), result;
+}
+function sourceReceipt(auth, row) {
+  if (!row.receipt_nonce || !row.receipt_digest) throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "\u6765\u6E90\u6CA1\u6709\u53EF\u7528 receipt\u3002");
+  let receipt = receiptForNonce(auth, row.receipt_nonce);
+  if (receiptDigest(receipt) !== row.receipt_digest) throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "\u6765\u6E90 receipt \u65E0\u6CD5\u901A\u8FC7\u5F53\u524D\u8BA4\u8BC1\u4E0A\u4E0B\u6587\u9A8C\u8BC1\u3002");
+  return receipt;
+}
+function resolveReceiptRow(database, auth, receipt, forDecision = !1) {
+  if (typeof receipt != "string" || receipt.length < 32 || receipt.length > 200)
+    throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "\u6765\u6E90 receipt \u65E0\u6548\u3002");
+  let row = database.raw.prepare(
+    `SELECT revision.*
+       FROM source_event_revision AS revision
+       JOIN cindy_source_identity AS identity ON identity.current_revision_id = revision.id
+       JOIN source_event AS source ON source.id = identity.source_event_id
+      WHERE revision.receipt_digest = ?
+        AND identity.owner_scope = ?
+        AND identity.account_anchor = ?
+        AND identity.state = 'active'
+        AND source.ingest_state = 'trusted_current'`
+  ).get(receiptDigest(receipt), auth.ownerScope, auth.accountAnchor);
+  if (!row || !row.receipt_nonce || receiptForNonce(auth, row.receipt_nonce) !== receipt)
+    throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "\u6765\u6E90 receipt \u672A\u77E5\u3001\u8DE8 owner\u3001\u5DF2\u5931\u6548\u6216\u4E0D\u662F\u5F53\u524D revision\u3002");
+  if (["superseded", "revoked", "invalid", "legacy_read_only"].includes(row.processing_status))
+    throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "\u6765\u6E90 receipt \u5DF2\u5931\u6548\u6216\u4E0D\u53EF\u7528\u4E8E\u5F53\u524D\u64CD\u4F5C\u3002");
+  if (forDecision && !["pending_decision", "retryable"].includes(row.processing_status))
+    throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "\u6765\u6E90 receipt \u5DF2\u5B8C\u6210\u5904\u7406\uFF0C\u4E0D\u80FD\u91CD\u590D\u8FDB\u5165\u51B3\u7B56\u3002");
+  return row;
+}
+function resolveCindyDecisionReceipt(database, auth, receipt) {
+  return resolveReceiptRow(database, auth, receipt, !0);
+}
+function compareRevisionTuple(left, right) {
+  let leftModified = left.modifiedAtMs ?? -1, rightModified = right.modifiedAtMs ?? -1;
+  if (leftModified !== rightModified) return leftModified < rightModified ? -1 : 1;
+  let leftSequence = left.sequence ?? -1, rightSequence = right.sequence ?? -1;
+  return leftSequence === rightSequence ? 0 : leftSequence < rightSequence ? -1 : 1;
+}
+function saveCindySources(database, auth, input, now = /* @__PURE__ */ new Date()) {
+  validateInput(input);
+  let requestHash = sha256(stableJson(canonicalSaveRequest(input)));
+  return database.transaction(() => {
+    let replay = database.raw.prepare(
+      "SELECT request_hash, response_map_json FROM cindy_save_request WHERE owner_scope = ? AND save_request_id = ?"
+    ).get(auth.ownerScope, input.save_request_id);
+    if (replay) {
+      if (replay.request_hash !== requestHash) throw new CindySourceContractError("CONFLICT", "save_request_id \u5DF2\u7ED1\u5B9A\u5230\u4E0D\u540C\u8BF7\u6C42\u3002");
+      let sources2 = JSON.parse(replay.response_map_json).map((item) => {
+        let row = database.raw.prepare("SELECT * FROM source_event_revision WHERE id = ?").get(item.revision_id);
+        if (!row) throw new CindySourceContractError("CONFLICT", "\u4FDD\u5B58\u8BF7\u6C42\u7684\u5E42\u7B49\u8BB0\u5F55\u4E0D\u5B8C\u6574\u3002");
+        return { ...item, source_receipt: sourceReceipt(auth, row) };
+      }).map(({ revision_id: _revisionId, ...item }) => item);
+      return { save_request_id: input.save_request_id, duplicate: !0, sources: sources2 };
+    }
+    let timestamp = now.toISOString(), byRef = new Map(input.sources.map((source) => [source.client_ref, source])), revisionByRef = /* @__PURE__ */ new Map(), outputByRef = /* @__PURE__ */ new Map(), replayItems = /* @__PURE__ */ new Map();
+    for (let clientRef of topologicalClientRefs(input.sources)) {
+      let source = byRef.get(clientRef), normalized = {
+        occurredAt: normalizedIso(source.occurred_at, `${clientRef}.occurred_at`).iso,
+        text: normalizedText(source.text, `${clientRef}.text`, 2e4),
+        conversationKey: source.conversation_key ? normalizedText(source.conversation_key, `${clientRef}.conversation_key`, 500) : null,
+        senderRole: source.sender_role ? normalizedText(source.sender_role, `${clientRef}.sender_role`, 120) : null,
+        revision: normalizedRevision(source)
+      }, relationRows = (source.relations ?? []).map((relation) => {
+        let target = relation.client_ref ? revisionByRef.get(relation.client_ref) : resolveReceiptRow(database, auth, relation.source_receipt);
+        if (!target) throw new CindySourceContractError("INVALID_INPUT", "\u6279\u5185\u5173\u7CFB\u5F15\u7528\u672A\u89E3\u6790\u3002");
+        return { kind: relation.kind, targetRevisionId: target.id };
+      }).sort((left, right) => `${left.kind}:${left.targetRevisionId}`.localeCompare(`${right.kind}:${right.targetRevisionId}`)), trustedPayloadHash = sha256(stableJson({
+        provider: source.provider,
+        source_kind: source.source_kind,
+        stable_id_hash: identityHash(auth, source),
+        occurred_at: normalized.occurredAt,
+        text: normalized.text,
+        conversation_key: normalized.conversationKey,
+        sender_role: normalized.senderRole,
+        revision: {
+          modified_at_ms: normalized.revision.modifiedAtMs,
+          sequence: normalized.revision.sequence
+        },
+        relations: relationRows
+      })), stableIdHash = identityHash(auth, source), identity = database.raw.prepare(
+        `SELECT * FROM cindy_source_identity
+          WHERE owner_scope = ? AND provider = ? AND source_kind = ? AND stable_id_hash = ?`
+      ).get(auth.ownerScope, source.provider, source.source_kind, stableIdHash);
+      if (identity && ["revoked", "invalid"].includes(identity.state))
+        throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "\u6765\u6E90\u8EAB\u4EFD\u5DF2\u64A4\u56DE\u6216\u5931\u6548\u3002");
+      if (identity && identity.state === "active" && identity.account_anchor !== auth.accountAnchor)
+        throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "\u6765\u6E90\u8EAB\u4EFD\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8FDE\u63A5\u8D26\u53F7\u3002");
+      let wasExistingIdentity = !!identity, exact = identity ? database.raw.prepare(
+        `SELECT * FROM source_event_revision
+          WHERE source_event_id = ?
+            AND provider_revision_modified_at_ms IS ?
+            AND provider_revision_sequence IS ?
+            AND trusted_payload_hash IS NOT NULL
+          ORDER BY revision_number DESC LIMIT 1`
+      ).get(identity.source_event_id, normalized.revision.modifiedAtMs, normalized.revision.sequence) : void 0;
+      if (exact) {
+        if (exact.trusted_payload_hash !== trustedPayloadHash)
+          throw normalized.revision.comparable ? new CindySourceContractError("CONFLICT", "\u76F8\u540C provider revision \u5BF9\u5E94\u4E86\u4E0D\u540C canonical payload\u3002") : new CindySourceContractError("SOURCE_REVISION_AMBIGUOUS", "\u6765\u6E90\u6CA1\u6709\u53EF\u6BD4\u8F83 revision\uFF0C\u5F02\u5185\u5BB9\u66F4\u65B0\u5DF2\u5B89\u5168\u62D2\u7EDD\u3002");
+        let status = identity?.current_revision_id === exact.id ? exact.processing_status : "superseded", saved2 = {
+          client_ref: clientRef,
+          source_receipt: sourceReceipt(auth, exact),
+          source_status: status,
+          revision: revisionResult(exact)
+        };
+        revisionByRef.set(clientRef, exact), outputByRef.set(clientRef, saved2), replayItems.set(clientRef, { client_ref: clientRef, source_status: saved2.source_status, revision: saved2.revision, revision_id: exact.id });
+        continue;
+      }
+      let current = identity?.current_revision_id ? database.raw.prepare("SELECT * FROM source_event_revision WHERE id = ?").get(identity.current_revision_id) : void 0;
+      if (identity?.state === "active" && current?.trusted_payload_hash) {
+        if (!normalized.revision.comparable)
+          throw new CindySourceContractError("SOURCE_REVISION_AMBIGUOUS", "\u6765\u6E90\u6CA1\u6709\u53EF\u6BD4\u8F83 revision\uFF0C\u5F02\u5185\u5BB9\u66F4\u65B0\u5DF2\u5B89\u5168\u62D2\u7EDD\u3002");
+        if (current.provider_revision_modified_at_ms !== null || current.provider_revision_sequence !== null) {
+          let comparison = compareRevisionTuple(
+            { modifiedAtMs: normalized.revision.modifiedAtMs, sequence: normalized.revision.sequence },
+            { modifiedAtMs: current.provider_revision_modified_at_ms, sequence: current.provider_revision_sequence }
+          );
+          if (comparison < 0) throw new CindySourceContractError("STALE_REVISION", "\u6765\u6E90 revision \u4F4E\u4E8E\u5F53\u524D generation\u3002");
+          if (comparison === 0) throw new CindySourceContractError("CONFLICT", "\u76F8\u540C provider revision \u5BF9\u5E94\u4E86\u4E0D\u540C canonical payload\u3002");
+        }
+      }
+      let sourceEventId = identity?.source_event_id ?? `source_cindy_${(0, import_node_crypto3.randomUUID)()}`, sourceExternalId = `cindy:${stableIdHash}`, conversationId = `cindy:source:${sha256(normalized.conversationKey ?? stableIdHash)}`, senderId = `cindy:sender:${sha256(normalized.senderRole ?? "unknown")}`, metadataJson = stableJson({
+        accountAnchor: auth.accountAnchor,
+        ownerScope: auth.ownerScope,
+        provider: source.provider,
+        sourceKind: source.source_kind,
+        stableIdHash
+      }), generation = (current?.revision_number ?? 0) + 1, revisionId = `source_revision_cindy_${(0, import_node_crypto3.randomUUID)()}`, nonce = (0, import_node_crypto3.randomBytes)(32).toString("base64url"), receipt = receiptForNonce(auth, nonce), digest = receiptDigest(receipt), revisionHash = canonicalRevisionHash({
+        ownerScope: auth.ownerScope,
+        sourceEventId,
+        revisionNumber: generation,
+        revisionKind: identity ? "edit" : "ingest",
+        externalId: sourceExternalId,
+        sourceType: "manual",
+        conversationId,
+        senderId,
+        senderName: normalized.senderRole ?? "Cindy \u6765\u6E90",
+        content: normalized.text,
+        ownerMentioned: 0,
+        sourceUrl: null,
+        completeness: "complete",
+        discoveryReason: "Cindy \u5DF2\u6388\u6743\u6765\u6E90\u5148\u4FDD\u5B58\u3002",
+        metadataJson,
+        occurredAt: normalized.occurredAt,
+        capturedAt: timestamp
+      });
+      identity ? (database.raw.prepare(
+        `UPDATE source_event
+              SET content = ?, sender_id = ?, sender_name = ?, conversation_id = ?, metadata_json = ?, occurred_at = ?,
+                  captured_at = ?, owner_scope = ?, revision_generation = ?, current_revision_id = ?, ingest_state = 'trusted_current'
+            WHERE id = ?`
+      ).run(
+        normalized.text,
+        senderId,
+        normalized.senderRole ?? "Cindy \u6765\u6E90",
+        conversationId,
+        metadataJson,
+        normalized.occurredAt,
+        timestamp,
+        auth.ownerScope,
+        generation,
+        revisionId,
+        sourceEventId
+      ), current && current.processing_status !== "legacy_read_only" && database.raw.prepare(
+        `UPDATE source_event_revision SET processing_status = 'superseded'
+              WHERE id = ? AND processing_status NOT IN ('revoked','invalid')`
+      ).run(current.id)) : (database.raw.prepare(
+        `INSERT INTO source_event
+            (id, external_id, source_type, conversation_id, sender_id, sender_name, content, owner_mentioned,
+             source_url, completeness, discovery_reason, metadata_json, occurred_at, captured_at,
+             owner_scope, revision_generation, current_revision_id, ingest_state)
+           VALUES (?, ?, 'manual', ?, ?, ?, ?, 0, NULL, 'complete', ?, ?, ?, ?, ?, ?, ?, 'trusted_current')`
+      ).run(
+        sourceEventId,
+        sourceExternalId,
+        conversationId,
+        senderId,
+        normalized.senderRole ?? "Cindy \u6765\u6E90",
+        normalized.text,
+        "Cindy \u5DF2\u6388\u6743\u6765\u6E90\u5148\u4FDD\u5B58\u3002",
+        metadataJson,
+        normalized.occurredAt,
+        timestamp,
+        auth.ownerScope,
+        generation,
+        revisionId
+      ), identity = {
+        id: `cindy_source_${(0, import_node_crypto3.randomUUID)()}`,
+        owner_scope: auth.ownerScope,
+        account_anchor: auth.accountAnchor,
+        provider: source.provider,
+        source_kind: source.source_kind,
+        stable_id_hash: stableIdHash,
+        source_event_id: sourceEventId,
+        current_revision_id: revisionId,
+        state: "active"
+      }), database.raw.prepare(
+        `INSERT INTO source_event_revision
+          (id, source_event_id, revision_number, revision_kind, external_id, source_type, conversation_id,
+           sender_id, sender_name, content, owner_mentioned, source_url, completeness, discovery_reason,
+           metadata_json, occurred_at, captured_at, owner_scope, revision_hash, created_at,
+           processing_status, trusted_payload_hash, provider_revision_modified_at_ms, provider_revision_sequence,
+           receipt_nonce, receipt_digest, retry_count)
+         VALUES (?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 0, NULL, 'complete', ?, ?, ?, ?, ?, ?, ?,
+                 'pending_decision', ?, ?, ?, ?, ?, 0)`
+      ).run(
+        revisionId,
+        sourceEventId,
+        generation,
+        wasExistingIdentity ? "edit" : "ingest",
+        sourceExternalId,
+        conversationId,
+        senderId,
+        normalized.senderRole ?? "Cindy \u6765\u6E90",
+        normalized.text,
+        "Cindy \u5DF2\u6388\u6743\u6765\u6E90\u5148\u4FDD\u5B58\u3002",
+        metadataJson,
+        normalized.occurredAt,
+        timestamp,
+        auth.ownerScope,
+        revisionHash,
+        timestamp,
+        trustedPayloadHash,
+        normalized.revision.modifiedAtMs,
+        normalized.revision.sequence,
+        nonce,
+        digest
+      ), wasExistingIdentity ? database.raw.prepare(
+        `UPDATE cindy_source_identity
+              SET account_anchor = ?, current_revision_id = ?, state = 'active', updated_at = ?
+            WHERE id = ?`
+      ).run(auth.accountAnchor, revisionId, timestamp, identity.id) : database.raw.prepare(
+        `INSERT INTO cindy_source_identity
+            (id, owner_scope, account_anchor, provider, source_kind, stable_id_hash, source_event_id,
+             current_revision_id, state, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
+      ).run(
+        identity.id,
+        auth.ownerScope,
+        auth.accountAnchor,
+        source.provider,
+        source.source_kind,
+        stableIdHash,
+        sourceEventId,
+        revisionId,
+        timestamp,
+        timestamp
+      );
+      for (let relation of relationRows)
+        database.raw.prepare(
+          `INSERT INTO cindy_source_relation
+            (source_revision_id, relation_kind, target_revision_id, owner_scope, created_at)
+           VALUES (?, ?, ?, ?, ?)`
+        ).run(revisionId, relation.kind, relation.targetRevisionId, auth.ownerScope, timestamp);
+      let row = database.raw.prepare("SELECT * FROM source_event_revision WHERE id = ?").get(revisionId), saved = {
+        client_ref: clientRef,
+        source_receipt: receipt,
+        source_status: "pending_decision",
+        revision: revisionResult(row)
+      };
+      revisionByRef.set(clientRef, row), outputByRef.set(clientRef, saved), replayItems.set(clientRef, { client_ref: clientRef, source_status: saved.source_status, revision: saved.revision, revision_id: row.id });
+    }
+    let sources = input.sources.map((source) => outputByRef.get(source.client_ref)), stored = input.sources.map((source) => replayItems.get(source.client_ref));
+    return database.raw.prepare(
+      `INSERT INTO cindy_save_request (owner_scope, save_request_id, request_hash, response_map_json, created_at)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run(auth.ownerScope, input.save_request_id, requestHash, JSON.stringify(stored), timestamp), { save_request_id: input.save_request_id, duplicate: !1, sources };
+  });
+}
+function hashCindyDecisionRequest(value) {
+  return sha256(stableJson(value));
+}
+function cindyDecisionReplay(database, auth, decisionRequestId, requestHash) {
+  let row = database.raw.prepare(
+    "SELECT request_hash, response_json FROM cindy_decision_request WHERE owner_scope = ? AND decision_request_id = ?"
+  ).get(auth.ownerScope, decisionRequestId);
+  if (row) {
+    if (row.request_hash !== requestHash) throw new CindySourceContractError("CONFLICT", "decision_request_id \u5DF2\u7ED1\u5B9A\u5230\u4E0D\u540C\u8BF7\u6C42\u3002");
+    return JSON.parse(row.response_json);
+  }
+}
+function recordCindyDecisionRequest(database, auth, decisionRequestId, requestHash, result, timestamp) {
+  database.raw.prepare(
+    `INSERT INTO cindy_decision_request
+      (owner_scope, decision_request_id, request_hash, response_json, created_at)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(auth.ownerScope, decisionRequestId, requestHash, JSON.stringify(result), timestamp);
+}
+
+// apps/server/src/calendar-classification.ts
+var import_node_crypto4 = require("node:crypto");
 
 // docs/product-rules/PROD-07-calendar-classification.json
 var PROD_07_calendar_classification_default = {
@@ -149564,7 +150112,7 @@ function metadataBoolean(metadata, key) {
   return metadata[key] === !0;
 }
 function sourceReference(externalId) {
-  return `sha256:${(0, import_node_crypto3.createHash)("sha256").update(externalId).digest("hex").slice(0, 16)}`;
+  return `sha256:${(0, import_node_crypto4.createHash)("sha256").update(externalId).digest("hex").slice(0, 16)}`;
 }
 function eventTitle(event) {
   let metadataTitle = metadataString(event.metadata ?? {}, "calendarTitle");
@@ -149640,7 +150188,7 @@ function inputIsStrictlyValid(metadata) {
   let eventType = metadataString(metadata, "eventType"), role = metadataString(metadata, "ownerRole"), ownerResponse = metadataString(metadata, "ownerResponse"), calendarKind = metadataString(metadata, "calendarKind"), status = metadataString(metadata, "status");
   return !!(metadata.calendarInputInvalid !== !0 && eventRules.get(eventType) && roleRules.get(role) && (!ownerResponse || OWNER_RESPONSE_VALUES.has(ownerResponse)) && (!calendarKind || CALENDAR_KIND_VALUES.has(calendarKind)) && (!status || STATUS_VALUES.has(status)));
 }
-function normalizedText(event) {
+function normalizedText2(event) {
   return `${event.content}
 ${eventTitle(event)}`.normalize("NFKC").replace(/[\u0000-\u001F\u007F]/gu, " ").replace(/\s+/gu, " ").trim();
 }
@@ -149688,7 +150236,7 @@ function ownerConfirmation(event, owner, action, deliverable, code, missingSigna
 function classifyCalendarSource(event) {
   let metadata = event.metadata ?? {}, rawEventType = metadataString(metadata, "eventType"), eventType = metadataBoolean(metadata, "isAllDay") ? "all_day" : metadataBoolean(metadata, "isRecurring") ? "recurring" : rawEventType;
   if (!inputIsStrictlyValid(metadata)) return defaultFact(event, rawEventType, !0);
-  let role = metadataString(metadata, "ownerRole"), eventRule = eventRules.get(eventType), roleRule = roleRules.get(role), text = normalizedText(event), owner = firstControlledSignal(text, rules.owner_responsibility_signals, ENGLISH_OWNER_SIGNALS), action = firstControlledSignal(text, rules.explicit_action_verbs, ENGLISH_ACTION_SIGNALS), deliverableOrDeadline = firstControlledSignal(text, rules.deliverable_or_deadline_signals, ENGLISH_DELIVERY_SIGNALS), negative = hasNegativeSemantics(text) || rules.non_signals.some((signal) => hasPhrase(text, signal)), explicitContradiction = negative && !!(owner || action || deliverableOrDeadline), meetingEvidenceRequired = eventType === "meeting_placeholder" || metadataBoolean(metadata, "meetingPlaceholder") || eventType === "minutes_action_item", evidence = hasCanonicalMeetingEvidence(metadata), complete = !!(owner && action && deliverableOrDeadline), meetingEvidenceAllowed = rules.meeting_rule.action_item_sources.some((source) => source === "minutes" || source === "explicit_message") && evidence;
+  let role = metadataString(metadata, "ownerRole"), eventRule = eventRules.get(eventType), roleRule = roleRules.get(role), text = normalizedText2(event), owner = firstControlledSignal(text, rules.owner_responsibility_signals, ENGLISH_OWNER_SIGNALS), action = firstControlledSignal(text, rules.explicit_action_verbs, ENGLISH_ACTION_SIGNALS), deliverableOrDeadline = firstControlledSignal(text, rules.deliverable_or_deadline_signals, ENGLISH_DELIVERY_SIGNALS), negative = hasNegativeSemantics(text) || rules.non_signals.some((signal) => hasPhrase(text, signal)), explicitContradiction = negative && !!(owner || action || deliverableOrDeadline), meetingEvidenceRequired = eventType === "meeting_placeholder" || metadataBoolean(metadata, "meetingPlaceholder") || eventType === "minutes_action_item", evidence = hasCanonicalMeetingEvidence(metadata), complete = !!(owner && action && deliverableOrDeadline), meetingEvidenceAllowed = rules.meeting_rule.action_item_sources.some((source) => source === "minutes" || source === "explicit_message") && evidence;
   if (metadataBoolean(metadata, "isAllDay") || metadataBoolean(metadata, "isRecurring") || negative && !explicitContradiction) return defaultFact(event, eventType);
   if (explicitContradiction) return ownerConfirmation(event, owner, action, deliverableOrDeadline, "confirmation_negative_or_contradictory_signal");
   if (meetingEvidenceRequired && !meetingEvidenceAllowed)
@@ -149732,13 +150280,13 @@ function calendarClassificationDraft(event, classification) {
 }
 
 // apps/server/src/integrations/feishu.ts
-var import_node_crypto5 = require("node:crypto"), lark = __toESM(require_lib3(), 1);
+var import_node_crypto6 = require("node:crypto"), lark = __toESM(require_lib3(), 1);
 
 // apps/server/src/redaction.ts
 var import_node_util = require("node:util"), import_node_url = require("node:url");
 
 // apps/server/src/integrations/llm.ts
-var import_node_crypto4 = require("node:crypto");
+var import_node_crypto5 = require("node:crypto");
 
 // apps/server/src/retry-policy.ts
 var TRANSPORT_ERROR_NAMES = /* @__PURE__ */ new Set(["AbortError", "ECONNRESET", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "FetchError"]), TRANSPORT_ERROR_CODES = /* @__PURE__ */ new Set(["ECONNRESET", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET"]), SAFE_RETRY_TOKEN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$/u, STRICT_RETRY_AT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
@@ -151249,7 +151797,7 @@ var FeishuAuthError = class extends Error {
 };
 
 // apps/server/src/integrations/feishu-document-context.ts
-var import_node_crypto6 = require("node:crypto");
+var import_node_crypto7 = require("node:crypto");
 var MAX_CONTEXT_CHARS = 8e3, FEISHU_DOCUMENT_REFRESH_TTL_MS = 300 * 1e3, MAX_SNAPSHOT_ATTEMPTS = 3;
 function safeErrorText(error51) {
   return redactDiagnosticText(error51 instanceof Error ? error51 : error51 ?? "\u98DE\u4E66\u6587\u6863\u8BFB\u53D6\u5931\u8D25\u3002", 300);
@@ -151296,7 +151844,7 @@ function extractFeishuDocumentLinks(content) {
   return [...links.values()];
 }
 function contextHash(value) {
-  return (0, import_node_crypto6.createHash)("sha256").update(value).digest("hex");
+  return (0, import_node_crypto7.createHash)("sha256").update(value).digest("hex");
 }
 function numericVersion(value) {
   if (!value || !/^\d+$/.test(value)) return null;
@@ -151476,7 +152024,7 @@ var FeishuDocumentContextService = class {
          checked_at = excluded.checked_at,
          updated_at = excluded.updated_at`
     ).run(
-      `ctx_${(0, import_node_crypto6.randomUUID)()}`,
+      `ctx_${(0, import_node_crypto7.randomUUID)()}`,
       sourceEventId,
       context.sourceUrl,
       context.documentId,
@@ -151499,8 +152047,8 @@ var FeishuDocumentContextService = class {
 };
 
 // apps/server/src/runtime.ts
-var import_node_crypto7 = require("node:crypto");
-var systemClock = { now: () => Date.now() }, newId = (prefix) => `${prefix}_${(0, import_node_crypto7.randomUUID)()}`, RuntimeLeaseLostError = class extends Error {
+var import_node_crypto8 = require("node:crypto");
+var systemClock = { now: () => Date.now() }, newId = (prefix) => `${prefix}_${(0, import_node_crypto8.randomUUID)()}`, RuntimeLeaseLostError = class extends Error {
   constructor() {
     super("Runtime \u5DE5\u4F5C\u9879\u5DF2\u53D6\u6D88\u6216\u79DF\u7EA6\u5DF2\u5931\u6548\u3002"), this.name = "RuntimeLeaseLostError";
   }
@@ -151572,7 +152120,7 @@ var defaultTools = [
     }));
   }
   tools = new RuntimeToolRegistry();
-  generation = (0, import_node_crypto7.randomUUID)();
+  generation = (0, import_node_crypto8.randomUUID)();
   clock;
   lifecycle = "running";
   activeControllers = /* @__PURE__ */ new Map();
@@ -151795,7 +152343,7 @@ var defaultTools = [
    * uniqueness at the database level while allowing blocked duplicate rows.
    */
   externalClaimKey(idempotencyKey) {
-    return `runtime-external:${(0, import_node_crypto7.createHash)("sha256").update(idempotencyKey).digest("hex")}`;
+    return `runtime-external:${(0, import_node_crypto8.createHash)("sha256").update(idempotencyKey).digest("hex")}`;
   }
   claimExternalSend(idempotencyKey, toolName, inputHash, timeoutMs, timestamp) {
     let claimJobId = newId("external-claim"), claimKey = this.externalClaimKey(idempotencyKey), lockedUntil = new Date(this.now() + Math.max(1e3, timeoutMs)).toISOString();
@@ -151994,7 +152542,7 @@ var defaultTools = [
     if (jobFenceRequired && !leaseOwner) throw new RuntimeLeaseLostError();
     let normalizedIdempotencyKey = idempotencyKey?.trim() || null, decision = this.tools.authorize(toolName, approved);
     toolName === "external.send" && decision.allowed && !normalizedIdempotencyKey && (decision = { ...decision, allowed: !1, reason: "idempotency_required" });
-    let callId = newId("tool"), timestamp = this.nowIso(), inputHash = (0, import_node_crypto7.createHash)("sha256").update(JSON.stringify(input ?? null)).digest("hex"), externalClaim = null, insertAudit = (claim) => {
+    let callId = newId("tool"), timestamp = this.nowIso(), inputHash = (0, import_node_crypto8.createHash)("sha256").update(JSON.stringify(input ?? null)).digest("hex"), externalClaim = null, insertAudit = (claim) => {
       let duplicate2 = claim?.duplicate ?? !1, auditJobId2 = jobId ?? claim?.claimJobId ?? null, blockedReason = duplicate2 ? "duplicate_idempotency_key" : decision.allowed ? null : decision.reason, insert = jobFenceRequired ? this.database.raw.prepare(
         `INSERT INTO runtime_tool_call
             (id, job_id, tool_name, policy, status, idempotency_key, input_hash, result_json, error, started_at, finished_at)
@@ -152268,21 +152816,21 @@ var defaultTools = [
 };
 
 // apps/server/src/observability.ts
-var import_node_crypto8 = require("node:crypto"), import_node_util2 = require("node:util");
+var import_node_crypto9 = require("node:crypto"), import_node_util2 = require("node:util");
 function createOperationContext(input) {
   return {
-    operation_id: input.operationId ?? (0, import_node_crypto8.randomUUID)(),
+    operation_id: input.operationId ?? (0, import_node_crypto9.randomUUID)(),
     request_id: input.requestId,
-    trace_id: input.traceId ?? (0, import_node_crypto8.randomUUID)(),
+    trace_id: input.traceId ?? (0, import_node_crypto9.randomUUID)(),
     parent_span_id: input.parentSpanId ?? null,
-    span_id: input.spanId ?? (0, import_node_crypto8.randomUUID)()
+    span_id: input.spanId ?? (0, import_node_crypto9.randomUUID)()
   };
 }
 function childOperationContext(parent) {
   return {
     ...parent,
     parent_span_id: parent.span_id,
-    span_id: (0, import_node_crypto8.randomUUID)()
+    span_id: (0, import_node_crypto9.randomUUID)()
   };
 }
 function isOperationContext(value) {
@@ -152446,7 +152994,7 @@ function releaseIdentity(input) {
 }
 function operationEnvelope(input) {
   let completedAtMillis = Date.now(), context = input.context ?? createOperationContext({
-    requestId: input.requestId ?? (0, import_node_crypto8.randomUUID)(),
+    requestId: input.requestId ?? (0, import_node_crypto9.randomUUID)(),
     traceId: input.traceId,
     parentSpanId: input.parentSpanId,
     operationId: input.operationId,
@@ -152689,7 +153237,7 @@ function decideOwnerIntent(input) {
 }
 
 // apps/server/src/source-privacy.ts
-var import_node_crypto9 = require("node:crypto");
+var import_node_crypto10 = require("node:crypto");
 var sourceScopeSchema = external_exports.string().regex(/^src_scope_[a-f0-9]{32}$/u), minimalSourceDtoSchema = external_exports.object({
   source_scope: sourceScopeSchema,
   source_type: external_exports.enum(["bot_dm", "owner_dm", "group", "calendar", "meeting", "manual"]),
@@ -153097,7 +153645,7 @@ var sourceScopeSchema = external_exports.string().regex(/^src_scope_[a-f0-9]{32}
   targetTask: taskDtoSchema.nullable()
 }).strict();
 function sourceScope(taskId, sourceEventId) {
-  return `src_scope_${(0, import_node_crypto9.createHash)("sha256").update(`source-verification:v1:${taskId}:${sourceEventId}`).digest("hex").slice(0, 32)}`;
+  return `src_scope_${(0, import_node_crypto10.createHash)("sha256").update(`source-verification:v1:${taskId}:${sourceEventId}`).digest("hex").slice(0, 32)}`;
 }
 function sourceExcerpt(value) {
   return value.replace(/[\u0000-\u001f\u007f]/gu, " ").replace(/\s+/gu, " ").trim().slice(0, 280);
@@ -153132,7 +153680,7 @@ var CANDIDATE_VERSION_CONFLICT_MESSAGE = "\u5019\u9009\u5DF2\u88AB\u5176\u4ED6\u
   }
 };
 function replayHashEquals(left, right) {
-  return !/^[a-f0-9]{64}$/u.test(left) || !/^[a-f0-9]{64}$/u.test(right) ? !1 : (0, import_node_crypto10.timingSafeEqual)(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+  return !/^[a-f0-9]{64}$/u.test(left) || !/^[a-f0-9]{64}$/u.test(right) ? !1 : (0, import_node_crypto11.timingSafeEqual)(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 function assertReplayCapabilityBinding(binding) {
   if (!binding || typeof binding != "object" || !/^[a-f0-9]{64}$/u.test(binding.tokenHash) || !/^[a-f0-9]{64}$/u.test(binding.csrfTokenHash) || binding.origin !== "app://local")
@@ -153152,7 +153700,7 @@ function isSourceFailureCode(value) {
   return SOURCE_FAILURE_CODES.has(value);
 }
 function sourceFailureId(sourceEventId, sourceRevision2) {
-  return `failure_${(0, import_node_crypto10.createHash)("sha256").update(`${sourceEventId}:${sourceRevision2}`).digest("hex").slice(0, 24)}`;
+  return `failure_${(0, import_node_crypto11.createHash)("sha256").update(`${sourceEventId}:${sourceRevision2}`).digest("hex").slice(0, 24)}`;
 }
 function stableSourceFailureCode(code, error51) {
   let normalized = typeof code == "string" ? code.trim() : "";
@@ -153204,7 +153752,7 @@ function diagnosticBoolean(value) {
   return value === !0 || value === 1;
 }
 function diagnosticInternalId(value) {
-  return typeof value == "string" && /^[A-Za-z0-9:_-]{1,200}$/u.test(value) ? value : `redacted_${(0, import_node_crypto10.createHash)("sha256").update(typeof value == "string" ? value : "").digest("hex").slice(0, 16)}`;
+  return typeof value == "string" && /^[A-Za-z0-9:_-]{1,200}$/u.test(value) ? value : `redacted_${(0, import_node_crypto11.createHash)("sha256").update(typeof value == "string" ? value : "").digest("hex").slice(0, 16)}`;
 }
 function optionalDiagnosticInternalId(value) {
   return value == null ? null : diagnosticInternalId(value);
@@ -153551,7 +154099,7 @@ var PRIVACY_PURGE_TABLES = [
   Object.freeze({ kind: "diagnostics", table: "integration_health", timestamp: "checked_at" })
 ]);
 function privacyHash(value) {
-  return (0, import_node_crypto10.createHash)("sha256").update(JSON.stringify(value)).digest("hex");
+  return (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify(value)).digest("hex");
 }
 var PRIVACY_DELETION_INTENT = "privacy.deletion.hard-delete.v1", PRIVACY_OWNER_ACTION_INTENT = "privacy.owner-action.v1";
 function privacyCapabilityBindingHash(binding) {
@@ -153650,12 +154198,12 @@ var taskStatusValues = [
   thread: taskUpdateThreadSnapshotSchema.nullable(),
   candidate: taskUpdateCandidateSnapshotSchema.nullable(),
   previousCandidateRevisionId: nullableStringSchema.optional().default(null)
-}), INVALID_TASK_UPDATE_SNAPSHOT_ERROR = "\u81EA\u52A8\u66F4\u65B0\u7684\u524D\u7F6E\u5FEB\u7167\u635F\u574F\uFF0C\u4E0D\u80FD\u5B89\u5168\u64A4\u9500\u3002", nowIso = () => (/* @__PURE__ */ new Date()).toISOString(), id = (prefix) => prefix + "_" + (0, import_node_crypto10.randomUUID)();
-function stableJson(value) {
+}), INVALID_TASK_UPDATE_SNAPSHOT_ERROR = "\u81EA\u52A8\u66F4\u65B0\u7684\u524D\u7F6E\u5FEB\u7167\u635F\u574F\uFF0C\u4E0D\u80FD\u5B89\u5168\u64A4\u9500\u3002", nowIso = () => (/* @__PURE__ */ new Date()).toISOString(), id = (prefix) => prefix + "_" + (0, import_node_crypto11.randomUUID)();
+function stableJson2(value) {
   if (value === null || typeof value != "object") return JSON.stringify(value) ?? "null";
-  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson2(item)).join(",")}]`;
   let object2 = value;
-  return `{${Object.keys(object2).sort().map((key) => `${JSON.stringify(key)}:${stableJson(object2[key])}`).join(",")}}`;
+  return `{${Object.keys(object2).sort().map((key) => `${JSON.stringify(key)}:${stableJson2(object2[key])}`).join(",")}}`;
 }
 function draftOnlyApprovalState(status) {
   return status === "awaiting_approval" ? "draft" : status === "rejected" ? "rejected" : "obsolete";
@@ -153727,7 +154275,7 @@ var DERIVED_SOURCE_METADATA_KEYS = /* @__PURE__ */ new Set([
 ]);
 function sourceRevisionMetadataJson(value) {
   let metadata = parseMetadata(value);
-  return stableJson(Object.fromEntries(
+  return stableJson2(Object.fromEntries(
     Object.entries(metadata).filter(([key]) => !DERIVED_SOURCE_METADATA_KEYS.has(key))
   ));
 }
@@ -154270,7 +154818,7 @@ function combinedClassificationRevision(source, contexts) {
   return {
     sourceHash,
     contextHash: contextHash2,
-    revision: (0, import_node_crypto10.createHash)("sha256").update(`${sourceHash}:${contextHash2}`).digest("hex")
+    revision: (0, import_node_crypto11.createHash)("sha256").update(`${sourceHash}:${contextHash2}`).digest("hex")
   };
 }
 function candidateAnalysisJson(draftAnalysis, contexts, sourceHash, contextHash2) {
@@ -154309,7 +154857,7 @@ function candidateAnalysisJson(draftAnalysis, contexts, sourceHash, contextHash2
   return JSON.stringify(analysis);
 }
 function candidateSnapshotRevision(candidate, thread) {
-  return (0, import_node_crypto10.createHash)("sha256").update(JSON.stringify({
+  return (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify({
     candidateId: candidate.id,
     candidateUpdatedAt: candidate.updated_at,
     candidateState: candidate.state,
@@ -154322,7 +154870,7 @@ function candidateSnapshotRevision(candidate, thread) {
   })).digest("hex");
 }
 function candidateGroupVersionHash(candidates) {
-  return (0, import_node_crypto10.createHash)("sha256").update(JSON.stringify([...candidates].map((candidate) => ({ id: candidate.id, version: candidate.version, updatedAt: candidate.updated_at })).sort((left, right) => left.id.localeCompare(right.id)))).digest("hex");
+  return (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify([...candidates].map((candidate) => ({ id: candidate.id, version: candidate.version, updatedAt: candidate.updated_at })).sort((left, right) => left.id.localeCompare(right.id)))).digest("hex");
 }
 function candidatePairVersionHash(current, target) {
   return candidateGroupVersionHash([current, target]);
@@ -154387,15 +154935,15 @@ function explicitMessageKeys(source) {
   ].filter((value) => !!value))];
 }
 function combinedBatchClassificationRevision(sources, contextsBySource) {
-  let ordered = [...sources].sort(stableSourceOrder), sourceEntries = ordered.map((source) => ({ id: source.id, revision: sourceRevision(source) })), contextEntries = ordered.map((source) => ({ id: source.id, revision: sourceContextRevision(contextsBySource.get(source.id) ?? []) })), sourceHash = (0, import_node_crypto10.createHash)("sha256").update(JSON.stringify(sourceEntries)).digest("hex"), contextHash2 = (0, import_node_crypto10.createHash)("sha256").update(JSON.stringify(contextEntries)).digest("hex");
+  let ordered = [...sources].sort(stableSourceOrder), sourceEntries = ordered.map((source) => ({ id: source.id, revision: sourceRevision(source) })), contextEntries = ordered.map((source) => ({ id: source.id, revision: sourceContextRevision(contextsBySource.get(source.id) ?? []) })), sourceHash = (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify(sourceEntries)).digest("hex"), contextHash2 = (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify(contextEntries)).digest("hex");
   return {
     sourceHash,
     contextHash: contextHash2,
-    revision: (0, import_node_crypto10.createHash)("sha256").update(`${sourceHash}:${contextHash2}`).digest("hex")
+    revision: (0, import_node_crypto11.createHash)("sha256").update(`${sourceHash}:${contextHash2}`).digest("hex")
   };
 }
 function guidanceRevision(guidance) {
-  return (0, import_node_crypto10.createHash)("sha256").update(guidance?.slice(0, 2e3) ?? "").digest("hex").slice(0, 16);
+  return (0, import_node_crypto11.createHash)("sha256").update(guidance?.slice(0, 2e3) ?? "").digest("hex").slice(0, 16);
 }
 function aggregateClassificationSource(sources, primary, forcedThreadId) {
   let ordered = [...sources].sort(stableSourceOrder), latest = ordered[ordered.length - 1] ?? primary, metadata = parseMetadata(primary.metadata_json), activeSources = ordered.filter((source) => {
@@ -154868,10 +155416,10 @@ var PmService = class {
     };
     return {
       status: "ok",
-      operation_id: (0, import_node_crypto10.randomUUID)(),
-      request_id: requestId ?? (0, import_node_crypto10.randomUUID)(),
-      trace_id: (0, import_node_crypto10.randomUUID)(),
-      span_id: (0, import_node_crypto10.randomUUID)(),
+      operation_id: (0, import_node_crypto11.randomUUID)(),
+      request_id: requestId ?? (0, import_node_crypto11.randomUUID)(),
+      trace_id: (0, import_node_crypto11.randomUUID)(),
+      span_id: (0, import_node_crypto11.randomUUID)(),
       liveness: { status: "alive" },
       readiness: { status: combinedReadiness.status, reasons: combinedReadiness.reasons.map((reason) => ({ ...reason })) },
       dependencies: dependencyState.dependencies,
@@ -154971,13 +155519,13 @@ var PmService = class {
   }
   lifecycleCapabilityBinding(binding) {
     return binding ? (privacyCapabilityBindingHash(binding), binding) : {
-      tokenHash: (0, import_node_crypto10.createHash)("sha256").update("synthetic-internal-owner-action-token").digest("hex"),
-      csrfTokenHash: (0, import_node_crypto10.createHash)("sha256").update("synthetic-internal-owner-action-csrf").digest("hex"),
+      tokenHash: (0, import_node_crypto11.createHash)("sha256").update("synthetic-internal-owner-action-token").digest("hex"),
+      csrfTokenHash: (0, import_node_crypto11.createHash)("sha256").update("synthetic-internal-owner-action-csrf").digest("hex"),
       origin: "app://local"
     };
   }
   claimPrivacyLifecycle(operationType, expectedVersion, capabilityBinding2, snapshot, mutate) {
-    let ownerOpenId = this.assertPrivacyOwnerAuthorization(), binding = this.lifecycleCapabilityBinding(capabilityBinding2), operationId = id("privacy-lifecycle"), operationToken = (0, import_node_crypto10.randomUUID)().replaceAll("-", ""), now = nowIso(), expiresAt = new Date(Date.parse(now) + PRIVACY_LIFECYCLE_LEASE_MS).toISOString(), durableSnapshot = "adapterState" in snapshot ? { control: snapshot.control, sourceStates: snapshot.sourceStates, owner: snapshot.owner, cursors: snapshot.cursors, monitorTargets: snapshot.monitorTargets } : snapshot;
+    let ownerOpenId = this.assertPrivacyOwnerAuthorization(), binding = this.lifecycleCapabilityBinding(capabilityBinding2), operationId = id("privacy-lifecycle"), operationToken = (0, import_node_crypto11.randomUUID)().replaceAll("-", ""), now = nowIso(), expiresAt = new Date(Date.parse(now) + PRIVACY_LIFECYCLE_LEASE_MS).toISOString(), durableSnapshot = "adapterState" in snapshot ? { control: snapshot.control, sourceStates: snapshot.sourceStates, owner: snapshot.owner, cursors: snapshot.cursors, monitorTargets: snapshot.monitorTargets } : snapshot;
     return this.database.transaction(() => {
       let control = this.privacyControl();
       if (expectedVersion !== void 0 && expectedVersion !== control.version)
@@ -155816,7 +156364,7 @@ var PmService = class {
       "SELECT id, status, requested_at, confirmed_at, completed_at, proof_hash, deleted_record_count FROM privacy_deletion WHERE idempotency_key = ?"
     ).get(input.idempotencyKey);
     if (existing) return { deletionId: existing.id, status: existing.status, confirmationToken: null, requestedAt: existing.requested_at, confirmedAt: existing.confirmed_at, completedAt: existing.completed_at, proofHash: existing.proof_hash, deletedRecordCount: existing.deleted_record_count };
-    let control = this.privacyControl(), deletionId = id("privacy-deletion"), confirmationToken = (0, import_node_crypto10.randomUUID)() + (0, import_node_crypto10.randomUUID)(), now = nowIso();
+    let control = this.privacyControl(), deletionId = id("privacy-deletion"), confirmationToken = (0, import_node_crypto11.randomUUID)() + (0, import_node_crypto11.randomUUID)(), now = nowIso();
     return this.database.transaction(() => {
       this.assertNoActivePrivacyLifecycleClaim(Date.parse(now)), this.database.raw.prepare(
         `INSERT INTO privacy_deletion
@@ -155924,7 +156472,7 @@ var PmService = class {
           };
           visit(taskDir, relativeTaskDir);
         }
-        let quarantine = (0, import_node_path2.join)(root, `.privacy-delete-${(0, import_node_crypto10.randomUUID)().replaceAll("-", "")}`);
+        let quarantine = (0, import_node_path2.join)(root, `.privacy-delete-${(0, import_node_crypto11.randomUUID)().replaceAll("-", "")}`);
         (0, import_node_fs2.mkdirSync)(quarantine);
         let temporary = (0, import_node_path2.join)(quarantine, "tasks");
         (0, import_node_fs2.renameSync)(tasks, temporary), staged.push({ root, original: tasks, temporary });
@@ -156004,7 +156552,7 @@ var PmService = class {
       let reclaimedParent = this.assertNoActivePrivacyLifecycleClaim(nowMs).find((candidate) => candidate.claimed_version === control.version), sourceStates = this.database.raw.prepare(
         `SELECT source_kind, enabled, status, last_success_at, last_error, updated_at
          FROM information_source_state ORDER BY source_kind`
-      ).all(), initialSnapshot = { control, sourceStates }, operationId = id("privacy-lifecycle"), operationToken = (0, import_node_crypto10.randomUUID)().replaceAll("-", ""), claimedVersion = control.version + 1, claimedAt = nowIso(), expiresAt = new Date(Date.now() + 900 * 1e3).toISOString();
+      ).all(), initialSnapshot = { control, sourceStates }, operationId = id("privacy-lifecycle"), operationToken = (0, import_node_crypto11.randomUUID)().replaceAll("-", ""), claimedVersion = control.version + 1, claimedAt = nowIso(), expiresAt = new Date(Date.now() + 900 * 1e3).toISOString();
       if (this.database.raw.prepare(
         `INSERT INTO privacy_lifecycle_claim
          (operation_id, operation_token, operation_type, owner_open_id,
@@ -156680,7 +157228,7 @@ var PmService = class {
     }
   }
   async legacyIngestSource(event, guidance, options = {}, operationContext) {
-    let effectiveOperationContext = operationContext ?? createOperationContext({ requestId: (0, import_node_crypto10.randomUUID)() }), persisted = this.persistSourceEvent(event), backfill = await this.backfillConversationContext(persisted.row, effectiveOperationContext), classificationRow = backfill.rows.find((row) => row.id === persisted.row.id) ?? persisted.row, classified = await this.legacyClassifyStoredBatch(
+    let effectiveOperationContext = operationContext ?? createOperationContext({ requestId: (0, import_node_crypto11.randomUUID)() }), persisted = this.persistSourceEvent(event), backfill = await this.backfillConversationContext(persisted.row, effectiveOperationContext), classificationRow = backfill.rows.find((row) => row.id === persisted.row.id) ?? persisted.row, classified = await this.legacyClassifyStoredBatch(
       classificationRow,
       guidance,
       persisted.deduplicated,
@@ -156754,7 +157302,7 @@ var PmService = class {
       demandUnitIds: [],
       threadIds: []
     };
-    let effectiveOperationContext = operationContext ?? createOperationContext({ requestId: (0, import_node_crypto10.randomUUID)() }), persisted = events.map((event) => this.persistSourceEvent(event)), changedIds = new Set(persisted.filter((item) => item.changed || options.retryFailed === !0 || !metadataText(parseMetadata(item.row.metadata_json), "classificationRevision")).map((item) => item.row.id)), backfilledRows = /* @__PURE__ */ new Map();
+    let effectiveOperationContext = operationContext ?? createOperationContext({ requestId: (0, import_node_crypto11.randomUUID)() }), persisted = events.map((event) => this.persistSourceEvent(event)), changedIds = new Set(persisted.filter((item) => item.changed || options.retryFailed === !0 || !metadataText(parseMetadata(item.row.metadata_json), "classificationRevision")).map((item) => item.row.id)), backfilledRows = /* @__PURE__ */ new Map();
     if (this.feishuOwnerSync) {
       let backfillCandidates = persisted.map((item) => item.row).filter((row) => changedIds.has(row.id) && isMessageSource(row) && looksLikeConversationContinuation(row.content) && !parseMetadata(row.metadata_json).contextOnly).sort(stableSourceOrder), seenConversations = /* @__PURE__ */ new Set();
       for (let row of [...backfillCandidates].reverse())
@@ -156920,7 +157468,7 @@ var PmService = class {
   registerAuditReplayCapability(capability) {
     if (typeof capability.token != "string" || capability.token.length < 32 || typeof capability.csrfToken != "string" || capability.csrfToken.length < 32 || !Number.isFinite(capability.expiresAt) || capability.origin !== "app://local")
       throw new ReplayAuthorizationError("AI \u51B3\u7B56\u56DE\u653E\u80FD\u529B\u51ED\u8BC1\u65E0\u6548\uFF1B\u5DF2\u62D2\u7EDD\u8BBF\u95EE\u3002");
-    let tokenHash = (0, import_node_crypto10.createHash)("sha256").update(capability.token).digest("hex"), csrfTokenHash = (0, import_node_crypto10.createHash)("sha256").update(capability.csrfToken).digest("hex"), now = nowIso(), expiresAt = new Date(capability.expiresAt).toISOString();
+    let tokenHash = (0, import_node_crypto11.createHash)("sha256").update(capability.token).digest("hex"), csrfTokenHash = (0, import_node_crypto11.createHash)("sha256").update(capability.csrfToken).digest("hex"), now = nowIso(), expiresAt = new Date(capability.expiresAt).toISOString();
     return this.database.transaction(() => {
       this.database.raw.prepare(
         `INSERT INTO audit_replay_capability
@@ -157303,7 +157851,7 @@ var PmService = class {
         participantOverlap: item.participantOverlap,
         explicitReference: item.explicitReference
       }
-    })), candidateSetHash = (0, import_node_crypto10.createHash)("sha256").update(JSON.stringify({
+    })), candidateSetHash = (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify({
       candidateSetComplete,
       candidates: candidates.map((candidate) => ({
         candidateKey: candidate.candidateKey,
@@ -157379,7 +157927,7 @@ var PmService = class {
         participantOverlap: item.participantOverlap,
         explicitContinuation: item.explicitContinuation
       }
-    })), candidateSetHash = (0, import_node_crypto10.createHash)("sha256").update(JSON.stringify({
+    })), candidateSetHash = (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify({
       candidateSetComplete,
       candidates: candidates.map((candidate) => ({
         candidateKey: candidate.candidateKey,
@@ -157392,10 +157940,10 @@ var PmService = class {
     return { candidates, candidateSetHash, candidateSetComplete };
   }
   classificationRevisionContext(rows) {
-    let strong = this.strongThreadContext(rows), association = strong ? { candidates: [], candidateSetComplete: !0, candidateSetHash: (0, import_node_crypto10.createHash)("sha256").update(`strong:${strong.thread.id}:${strong.task.id}`).digest("hex") } : this.buildThreadClassificationContext(rows), candidateMerge = strong ? { candidates: [], candidateSetComplete: !0, candidateSetHash: (0, import_node_crypto10.createHash)("sha256").update(`strong-pending:${strong.thread.id}:${strong.task.id}`).digest("hex") } : this.buildCandidateMergeContext(rows);
+    let strong = this.strongThreadContext(rows), association = strong ? { candidates: [], candidateSetComplete: !0, candidateSetHash: (0, import_node_crypto11.createHash)("sha256").update(`strong:${strong.thread.id}:${strong.task.id}`).digest("hex") } : this.buildThreadClassificationContext(rows), candidateMerge = strong ? { candidates: [], candidateSetComplete: !0, candidateSetHash: (0, import_node_crypto11.createHash)("sha256").update(`strong-pending:${strong.thread.id}:${strong.task.id}`).digest("hex") } : this.buildCandidateMergeContext(rows);
     return {
       strong,
-      revision: (0, import_node_crypto10.createHash)("sha256").update(JSON.stringify({
+      revision: (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify({
         strong: strong ? {
           taskId: strong.task.id,
           taskVersion: strong.task.version,
@@ -157885,7 +158433,7 @@ var PmService = class {
          FROM task_source_link
         WHERE task_id = ? AND source_event_id = ? AND demand_unit_id IS NULL`
     ).get(input.gapTaskId, input.sourceEventId)) return null;
-    let idempotencyKey = `integrity-gap:${gap.id}`, deterministicCorrectionId = `corr-integrity-${(0, import_node_crypto10.createHash)("sha256").update(idempotencyKey).digest("hex").slice(0, 32)}`, correctionId = input.correctionEventId ?? deterministicCorrectionId;
+    let idempotencyKey = `integrity-gap:${gap.id}`, deterministicCorrectionId = `corr-integrity-${(0, import_node_crypto11.createHash)("sha256").update(idempotencyKey).digest("hex").slice(0, 32)}`, correctionId = input.correctionEventId ?? deterministicCorrectionId;
     if (!input.correctionEventId) {
       let existing = this.database.raw.prepare(
         "SELECT id FROM correction_event WHERE idempotency_key = ?"
@@ -158364,13 +158912,13 @@ var PmService = class {
       let placeholders = input.orderedRows.map(() => "?").join(","), currentRows = this.database.raw.prepare(`SELECT * FROM source_event WHERE id IN (${placeholders})`).all(...input.orderedRows.map((row) => row.id)).sort(stableSourceOrder);
       if (currentRows.length !== input.orderedRows.length) throw new Error("\u5F85\u5224\u65AD\u7684\u6765\u6E90\u8BB0\u5F55\u5DF2\u7ECF\u4E0D\u5B58\u5728\u3002");
       let currentContextsBySource = new Map(currentRows.map((row) => [row.id, this.feishuDocumentContext.list(row.id)])), currentBaseRevision = currentRows.length === 1 ? combinedClassificationRevision(currentRows[0], currentContextsBySource.get(currentRows[0].id) ?? []) : combinedBatchClassificationRevision(currentRows, currentContextsBySource), currentConfirmedContextRevision = this.classificationRevisionContext(currentRows).revision;
-      if ((currentConfirmedContextRevision ? (0, import_node_crypto10.createHash)("sha256").update(`${currentBaseRevision.revision}:${currentConfirmedContextRevision}`).digest("hex") : currentBaseRevision.revision) !== input.revision) {
+      if ((currentConfirmedContextRevision ? (0, import_node_crypto11.createHash)("sha256").update(`${currentBaseRevision.revision}:${currentConfirmedContextRevision}`).digest("hex") : currentBaseRevision.revision) !== input.revision) {
         staleRows = currentRows;
         return;
       }
       input.candidateFence && this.assertCandidateRuntimeFence(input.orderedRows.map((row) => row.id), input.candidateFence);
       for (let unit of units) {
-        let unitSourceHash = (0, import_node_crypto10.createHash)("sha256").update(JSON.stringify(unit.sourceRows.map((row) => ({ id: row.id, revision: sourceRevision(row) })))).digest("hex"), unitContextRows = unit.sourceRows.flatMap((row) => input.contextsBySource.get(row.id) ?? []), unitContextHash = sourceContextRevision(unitContextRows), unitAnalysis = unit.draft ? candidateAnalysisJson(unit.draft.analysis, unitContextRows, unitSourceHash, unitContextHash) : JSON.stringify({ reason: unit.reason, sourceRevision: unitSourceHash, contextRevision: unitContextHash }), unitState = input.classification.usedFallback ? "provisional" : "ready", unitRow = this.upsertDemandUnit({
+        let unitSourceHash = (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify(unit.sourceRows.map((row) => ({ id: row.id, revision: sourceRevision(row) })))).digest("hex"), unitContextRows = unit.sourceRows.flatMap((row) => input.contextsBySource.get(row.id) ?? []), unitContextHash = sourceContextRevision(unitContextRows), unitAnalysis = unit.draft ? candidateAnalysisJson(unit.draft.analysis, unitContextRows, unitSourceHash, unitContextHash) : JSON.stringify({ reason: unit.reason, sourceRevision: unitSourceHash, contextRevision: unitContextHash }), unitState = input.classification.usedFallback ? "provisional" : "ready", unitRow = this.upsertDemandUnit({
           anchor: unit.anchor,
           unitKey: unit.unitKey,
           unitKind: unit.isDataRequest && unit.draft ? "demand" : "context_only",
@@ -159444,7 +159992,7 @@ var PmService = class {
       ).all(...input.orderedRows.map((row) => row.id)).sort(stableSourceOrder);
       if (liveRows.length !== input.orderedRows.length) throw new Error("\u5F85\u66F4\u65B0\u7684\u6765\u6E90\u8BB0\u5F55\u5DF2\u7ECF\u4E0D\u5B58\u5728\u3002");
       let liveContextsBySource = new Map(liveRows.map((row) => [row.id, this.feishuDocumentContext.list(row.id)])), liveBaseRevision = liveRows.length === 1 ? combinedClassificationRevision(liveRows[0], liveContextsBySource.get(liveRows[0].id) ?? []) : combinedBatchClassificationRevision(liveRows, liveContextsBySource), liveConfirmedContextRevision = this.classificationRevisionContext(liveRows).revision;
-      if ((liveConfirmedContextRevision ? (0, import_node_crypto10.createHash)("sha256").update(`${liveBaseRevision.revision}:${liveConfirmedContextRevision}`).digest("hex") : liveBaseRevision.revision) !== input.revision) throw new ClassificationRevisionChangedError(liveRows);
+      if ((liveConfirmedContextRevision ? (0, import_node_crypto11.createHash)("sha256").update(`${liveBaseRevision.revision}:${liveConfirmedContextRevision}`).digest("hex") : liveBaseRevision.revision) !== input.revision) throw new ClassificationRevisionChangedError(liveRows);
       if (input.candidateFence && this.assertCandidateRuntimeFence(input.orderedRows.map((row) => row.id), input.candidateFence), this.database.raw.prepare(
         `INSERT OR IGNORE INTO ai_decision_log
           (id, source_event_id, source_revision, candidate_id, provider, model, prompt_version, is_data_request, confidence, reason, output_json, used_fallback, http_status, provider_request_id, attempts, structured_mode, input_hash, input_char_count, fallback_mode, latency_ms, created_at)
@@ -159679,7 +160227,7 @@ var PmService = class {
     for (let partition of partitions.values()) {
       let parent = partition.map((_, index) => index), storedBatchMarkers = partition.map((item) => {
         let metadata = parseMetadata(item.row.metadata_json), batchIds = Array.isArray(metadata.classificationBatchSourceIds) ? metadata.classificationBatchSourceIds.filter((value) => typeof value == "string" && !!value).sort() : [];
-        return batchIds.length > 1 ? `batch:${(0, import_node_crypto10.createHash)("sha256").update(JSON.stringify(batchIds)).digest("hex")}` : null;
+        return batchIds.length > 1 ? `batch:${(0, import_node_crypto11.createHash)("sha256").update(JSON.stringify(batchIds)).digest("hex")}` : null;
       }), strongMarkers = partition.map((item) => {
         let markers = threadMarkers(item.row), index = partition.indexOf(item);
         return new Set([markers.rootId, markers.sessionId, markers.threadId, storedBatchMarkers[index]].filter((value) => !!value));
@@ -159763,7 +160311,7 @@ var PmService = class {
     ), this.database.raw.prepare("SELECT * FROM task_update_proposal WHERE idempotency_key = ?").get(input.idempotencyKey);
   }
   ensureRequirementThread(sourceRow, draft, classification, candidateRevisionId, batchRows = [sourceRow], classificationContext = { candidates: [], candidateSetHash: "", candidateSetComplete: !0 }) {
-    let markers = threadMarkers(sourceRow), orderedBatch = [...batchRows].sort(stableSourceOrder), participants = [...new Set(orderedBatch.flatMap((source) => threadParticipants(source)))], batchRevisionEntries = orderedBatch.map((source) => ({ id: source.id, revision: sourceRevision(source) })), revisionHash = orderedBatch.length === 1 ? batchRevisionEntries[0].revision : (0, import_node_crypto10.createHash)("sha256").update(JSON.stringify(batchRevisionEntries)).digest("hex"), revisionKeyFor = (threadId) => `thread-revision:${threadId}:${sourceRow.id}:${revisionHash}`, candidateRevisionDemandUnitId = candidateRevisionId ? this.database.raw.prepare("SELECT demand_unit_id FROM candidate_revision WHERE id = ?").get(candidateRevisionId)?.demand_unit_id ?? null : null, baseThreadVersion = 0, thread = markers.threadId ? this.database.raw.prepare("SELECT * FROM requirement_thread WHERE id = ?").get(markers.threadId) : void 0, relationType = "primary", confidence = 1, evidence = ["\u9996\u6B21\u6765\u6E90\u5EFA\u7ACB\u9700\u6C42\u7EBF\u7A0B\u3002"], associationCandidates = [], threadBeforeUpdate = null, proposalId = null, internalThreadId = metadataText(parseMetadata(sourceRow.metadata_json), "internalRequirementThreadId");
+    let markers = threadMarkers(sourceRow), orderedBatch = [...batchRows].sort(stableSourceOrder), participants = [...new Set(orderedBatch.flatMap((source) => threadParticipants(source)))], batchRevisionEntries = orderedBatch.map((source) => ({ id: source.id, revision: sourceRevision(source) })), revisionHash = orderedBatch.length === 1 ? batchRevisionEntries[0].revision : (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify(batchRevisionEntries)).digest("hex"), revisionKeyFor = (threadId) => `thread-revision:${threadId}:${sourceRow.id}:${revisionHash}`, candidateRevisionDemandUnitId = candidateRevisionId ? this.database.raw.prepare("SELECT demand_unit_id FROM candidate_revision WHERE id = ?").get(candidateRevisionId)?.demand_unit_id ?? null : null, baseThreadVersion = 0, thread = markers.threadId ? this.database.raw.prepare("SELECT * FROM requirement_thread WHERE id = ?").get(markers.threadId) : void 0, relationType = "primary", confidence = 1, evidence = ["\u9996\u6B21\u6765\u6E90\u5EFA\u7ACB\u9700\u6C42\u7EBF\u7A0B\u3002"], associationCandidates = [], threadBeforeUpdate = null, proposalId = null, internalThreadId = metadataText(parseMetadata(sourceRow.metadata_json), "internalRequirementThreadId");
     if (!thread && internalThreadId && (thread = this.database.raw.prepare("SELECT * FROM requirement_thread WHERE id = ?").get(internalThreadId), thread && (relationType = "batch_context", confidence = 1, evidence = ["\u540C\u4E00\u6279\u8FDE\u7EED\u6D88\u606F\u4E2D\u5DF2\u6709\u6765\u6E90\u5DF2\u660E\u786E\u5173\u8054\u8BE5\u9700\u6C42\u7EBF\u7A0B\u3002"])), !thread && markers.rootId && (thread = this.database.raw.prepare(
       `SELECT requirement_thread.* FROM requirement_thread
           JOIN requirement_thread_source ON requirement_thread_source.thread_id = requirement_thread.id
@@ -160002,7 +160550,7 @@ var PmService = class {
     ).all(...ids);
     if (rows.length !== ids.length) return null;
     let ordered = rows.sort(stableSourceOrder), contextsBySource = new Map(ordered.map((row) => [row.id, this.feishuDocumentContext.list(row.id)])), base = ordered.length === 1 ? combinedClassificationRevision(ordered[0], contextsBySource.get(ordered[0].id) ?? []) : combinedBatchClassificationRevision(ordered, contextsBySource), confirmed = this.classificationRevisionContext(ordered).revision;
-    return confirmed ? (0, import_node_crypto10.createHash)("sha256").update(`${base.revision}:${confirmed}`).digest("hex") : base.revision;
+    return confirmed ? (0, import_node_crypto11.createHash)("sha256").update(`${base.revision}:${confirmed}`).digest("hex") : base.revision;
   }
   sourceFailureAudit(record2, action, sourceEventId) {
     let timestamp = nowIso();
@@ -160271,7 +160819,7 @@ var PmService = class {
     return completed && sourceRevision2 && this.resolveSourceFailure(sourceEventIds, sourceRevision2, jobId), completed;
   }
   async legacyClassifyCaptured(sourceRow, guidance, deduplicated, staleAttempts = 0, retryFailed = !1, operationContext) {
-    let contexts = this.feishuDocumentContext.list(sourceRow.id), baseClassificationRevision = combinedClassificationRevision(sourceRow, contexts).revision, confirmedContextRevision = this.classificationRevisionContext(this.classificationRowsForSource(sourceRow)).revision, classificationRevision = confirmedContextRevision ? (0, import_node_crypto10.createHash)("sha256").update(`${baseClassificationRevision}:${confirmedContextRevision}`).digest("hex") : baseClassificationRevision, queuedOwnerTargets = this.isTrustedOwnerSource(sourceRow) ? this.captureOwnerDecisionTargets(sourceRow) : null, initialContext = this.classificationRevisionContext(this.classificationRowsForSource(sourceRow)), candidateFence = this.candidateRuntimeFenceForSources(
+    let contexts = this.feishuDocumentContext.list(sourceRow.id), baseClassificationRevision = combinedClassificationRevision(sourceRow, contexts).revision, confirmedContextRevision = this.classificationRevisionContext(this.classificationRowsForSource(sourceRow)).revision, classificationRevision = confirmedContextRevision ? (0, import_node_crypto11.createHash)("sha256").update(`${baseClassificationRevision}:${confirmedContextRevision}`).digest("hex") : baseClassificationRevision, queuedOwnerTargets = this.isTrustedOwnerSource(sourceRow) ? this.captureOwnerDecisionTargets(sourceRow) : null, initialContext = this.classificationRevisionContext(this.classificationRowsForSource(sourceRow)), candidateFence = this.candidateRuntimeFenceForSources(
       [sourceRow.id],
       initialContext.candidateMerge.candidates.map((candidate) => candidate.candidateId)
     ), runtimeJob = this.runtime.begin({
@@ -160322,7 +160870,7 @@ var PmService = class {
     if (ordered.length === 1) return this.legacyClassifyCaptured(primary, guidance, !0, 0, retryFailed, operationContext);
     let contextsBySource = /* @__PURE__ */ new Map();
     for (let row of ordered) contextsBySource.set(row.id, this.feishuDocumentContext.list(row.id));
-    let baseClassificationRevision = combinedBatchClassificationRevision(ordered, contextsBySource).revision, confirmedContextRevision = this.classificationRevisionContext(ordered).revision, classificationRevision = confirmedContextRevision ? (0, import_node_crypto10.createHash)("sha256").update(`${baseClassificationRevision}:${confirmedContextRevision}`).digest("hex") : baseClassificationRevision, sourceIds = ordered.map((row) => row.id), batchHash = (0, import_node_crypto10.createHash)("sha256").update(JSON.stringify(sourceIds)).digest("hex"), queuedOwnerSource = ordered.every((row) => this.isTrustedOwnerSource(row)) ? ordered.at(-1) ?? null : null, queuedOwnerTargets = queuedOwnerSource ? this.captureOwnerDecisionTargets(queuedOwnerSource) : null, initialContext = this.classificationRevisionContext(ordered), candidateFence = this.candidateRuntimeFenceForSources(
+    let baseClassificationRevision = combinedBatchClassificationRevision(ordered, contextsBySource).revision, confirmedContextRevision = this.classificationRevisionContext(ordered).revision, classificationRevision = confirmedContextRevision ? (0, import_node_crypto11.createHash)("sha256").update(`${baseClassificationRevision}:${confirmedContextRevision}`).digest("hex") : baseClassificationRevision, sourceIds = ordered.map((row) => row.id), batchHash = (0, import_node_crypto11.createHash)("sha256").update(JSON.stringify(sourceIds)).digest("hex"), queuedOwnerSource = ordered.every((row) => this.isTrustedOwnerSource(row)) ? ordered.at(-1) ?? null : null, queuedOwnerTargets = queuedOwnerSource ? this.captureOwnerDecisionTargets(queuedOwnerSource) : null, initialContext = this.classificationRevisionContext(ordered), candidateFence = this.candidateRuntimeFenceForSources(
       sourceIds,
       initialContext.candidateMerge.candidates.map((candidate) => candidate.candidateId)
     ), runtimeJob = this.runtime.begin({
@@ -160434,7 +160982,7 @@ var PmService = class {
       occurredAt: row.occurred_at,
       contextOnly: !0
     }));
-    let startedAt = Date.now(), baseRevision = orderedRows.length === 1 ? combinedClassificationRevision(sourceRow, contexts) : combinedBatchClassificationRevision(orderedRows, contextsBySource), sourceHash = baseRevision.sourceHash, contextHash2 = baseRevision.contextHash, revision = confirmedContext.revision ? (0, import_node_crypto10.createHash)("sha256").update(`${baseRevision.revision}:${confirmedContext.revision}`).digest("hex") : baseRevision.revision;
+    let startedAt = Date.now(), baseRevision = orderedRows.length === 1 ? combinedClassificationRevision(sourceRow, contexts) : combinedBatchClassificationRevision(orderedRows, contextsBySource), sourceHash = baseRevision.sourceHash, contextHash2 = baseRevision.contextHash, revision = confirmedContext.revision ? (0, import_node_crypto11.createHash)("sha256").update(`${baseRevision.revision}:${confirmedContext.revision}`).digest("hex") : baseRevision.revision;
     if (orderedRows.every((row) => parseMetadata(row.metadata_json).classificationRevision === revision)) {
       this.dispatchPendingProposalsForSources(orderedRows.map((row) => row.id), runtimeJobId ?? null, leaseOwner ?? null);
       let ownerSource = [...orderedRows].reverse().find((row) => this.isTrustedOwnerSource(row)), storedIntents = ownerSource ? this.storedOwnerIntents(ownerSource.id) : [];
@@ -160620,7 +161168,7 @@ var PmService = class {
       let placeholders = orderedRows.map(() => "?").join(","), currentRows = this.database.raw.prepare(`SELECT * FROM source_event WHERE id IN (${placeholders})`).all(...orderedRows.map((row) => row.id)).sort(stableSourceOrder);
       if (currentRows.length !== orderedRows.length) throw new Error("\u5F85\u5224\u65AD\u7684\u6765\u6E90\u8BB0\u5F55\u5DF2\u7ECF\u4E0D\u5B58\u5728\u3002");
       let currentContextsBySource = new Map(currentRows.map((row) => [row.id, this.feishuDocumentContext.list(row.id)])), currentBaseRevision = currentRows.length === 1 ? combinedClassificationRevision(currentRows[0], currentContextsBySource.get(currentRows[0].id) ?? []) : combinedBatchClassificationRevision(currentRows, currentContextsBySource), currentClassificationContext = this.classificationRevisionContext(currentRows), currentConfirmedContextRevision = currentClassificationContext.revision;
-      if ((currentConfirmedContextRevision ? (0, import_node_crypto10.createHash)("sha256").update(`${currentBaseRevision.revision}:${currentConfirmedContextRevision}`).digest("hex") : currentBaseRevision.revision) !== revision) {
+      if ((currentConfirmedContextRevision ? (0, import_node_crypto11.createHash)("sha256").update(`${currentBaseRevision.revision}:${currentConfirmedContextRevision}`).digest("hex") : currentBaseRevision.revision) !== revision) {
         staleSources = currentRows;
         return;
       }
@@ -162683,6 +163231,242 @@ var PmService = class {
   listCindyConversationCursors() {
     return this.database.listCindyConversationCursors();
   }
+  saveCindySources(auth, input) {
+    if (this.privacyControl().collection_status === "stopped")
+      throw new CindySourceContractError("CONFLICT", "\u9690\u79C1\u72B6\u6001\u5DF2\u505C\u6B62\u91C7\u96C6\uFF1B\u6765\u6E90\u672A\u5199\u5165\u3002");
+    return saveCindySources(this.database, auth, input);
+  }
+  processCindyDecisions(auth, input) {
+    if (!/^[A-Za-z0-9_-]{1,128}$/u.test(input.decision_request_id))
+      throw new CindySourceContractError("INVALID_INPUT", "decision_request_id \u683C\u5F0F\u65E0\u6548\u3002");
+    if (!input.window_id.trim() || !Number.isFinite(Date.parse(input.window_start)) || !Number.isFinite(Date.parse(input.window_end)))
+      throw new CindySourceContractError("INVALID_INPUT", "\u7A97\u53E3\u8EAB\u4EFD\u6216\u65F6\u95F4\u65E0\u6548\u3002");
+    if (Date.parse(input.window_start) > Date.parse(input.window_end))
+      throw new CindySourceContractError("INVALID_INPUT", "window_start \u4E0D\u80FD\u665A\u4E8E window_end\u3002");
+    let decisionRefs = input.decisions.map((decision) => decision.decision_ref);
+    if (new Set(decisionRefs).size !== decisionRefs.length || decisionRefs.some((value) => !/^[A-Za-z0-9_-]{1,64}$/u.test(value)))
+      throw new CindySourceContractError("INVALID_INPUT", "decision_ref \u683C\u5F0F\u65E0\u6548\u6216\u91CD\u590D\u3002");
+    let allReceipts = input.decisions.flatMap((decision) => decision.source_receipts);
+    if (new Set(allReceipts).size !== allReceipts.length)
+      throw new CindySourceContractError("INVALID_INPUT", "\u540C\u4E00\u6765\u6E90 receipt \u4E0D\u80FD\u5728\u4E00\u4E2A\u51B3\u7B56\u8BF7\u6C42\u4E2D\u91CD\u590D\u6D88\u8D39\u3002");
+    for (let decision of input.decisions) {
+      if (!decision.source_receipts.length || new Set(decision.source_receipts).size !== decision.source_receipts.length)
+        throw new CindySourceContractError("INVALID_INPUT", "\u6BCF\u6761\u51B3\u7B56\u5FC5\u987B\u5F15\u7528\u4E0D\u91CD\u590D\u7684 source_receipts\u3002");
+      if (decision.action === "update_task") {
+        if (!decision.task_key) throw new CindySourceContractError("INVALID_INPUT", "update_task \u5FC5\u987B\u63D0\u4F9B task_key\u3002");
+        if (!Number.isInteger(decision.expected_version) || decision.expected_version < 1)
+          throw new CindySourceContractError("INVALID_INPUT", "update_task \u5FC5\u987B\u63D0\u4F9B\u6B63\u6574\u6570 expected_version\u3002");
+        if (decision.title === void 0 && decision.describe === void 0 && decision.next_step === void 0)
+          throw new CindySourceContractError("INVALID_INPUT", "update_task \u81F3\u5C11\u9700\u8981 title\u3001describe \u6216 next_step\u3002");
+      }
+    }
+    let requestHash = hashCindyDecisionRequest(input), updatedTaskIds = /* @__PURE__ */ new Set(), result = this.database.transaction(() => {
+      let replay = cindyDecisionReplay(this.database, auth, input.decision_request_id, requestHash);
+      if (replay) return { ...replay, duplicate: !0 };
+      let timestamp = nowIso(), resolved = input.decisions.map((decision) => ({
+        decision,
+        revisions: decision.source_receipts.map((receipt) => resolveCindyDecisionReceipt(this.database, auth, receipt))
+      })), sourceRows = /* @__PURE__ */ new Map();
+      for (let item of resolved)
+        for (let revision of item.revisions) {
+          if (sourceRows.has(revision.source_event_id)) continue;
+          let source = this.database.raw.prepare("SELECT * FROM source_event WHERE id = ? AND ingest_state = 'trusted_current'").get(revision.source_event_id);
+          if (!source) throw new CindySourceContractError("INVALID_SOURCE_RECEIPT", "receipt \u5BF9\u5E94\u6765\u6E90\u5DF2\u5931\u6548\u3002");
+          sourceRows.set(source.id, source);
+        }
+      let attachCandidateSources = (demandUnitId, sources) => {
+        let insert = this.database.raw.prepare(
+          `INSERT OR IGNORE INTO source_demand_unit_source
+            (demand_unit_id, source_event_id, source_key, source_role, sequence, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        );
+        sources.forEach((source, index) => insert.run(
+          demandUnitId,
+          source.id,
+          `receipt-ref-${index + 1}`,
+          index === 0 ? "anchor" : "evidence",
+          index,
+          timestamp
+        ));
+      }, decisionResults = [];
+      for (let { decision, revisions } of resolved) {
+        let sources = revisions.map((revision) => sourceRows.get(revision.source_event_id)), anchor = sources[0];
+        if (decision.action === "retry_later") {
+          let finalStatus = "retryable";
+          for (let revision of revisions) {
+            let nextRetry = revision.retry_count + 1;
+            finalStatus = nextRetry >= 3 ? "invalid" : finalStatus, this.database.raw.prepare(
+              `UPDATE source_event_revision
+                  SET processing_status = ?, retry_count = ?
+                WHERE id = ? AND processing_status IN ('pending_decision','retryable')`
+            ).run(nextRetry >= 3 ? "invalid" : "retryable", nextRetry, revision.id), nextRetry >= 3 && (this.database.raw.prepare(
+              "UPDATE cindy_source_identity SET state = 'invalid', updated_at = ? WHERE current_revision_id = ?"
+            ).run(timestamp, revision.id), this.database.raw.prepare(
+              "UPDATE source_event SET ingest_state = 'invalid' WHERE current_revision_id = ?"
+            ).run(revision.id));
+          }
+          decisionResults.push({
+            decision_ref: decision.decision_ref,
+            action: decision.action,
+            source_status: finalStatus,
+            reason: decision.reason
+          });
+          continue;
+        }
+        if (decision.action === "create_candidate") {
+          let sourceIds = sources.map((source) => source.id), placeholders = sourceIds.map(() => "?").join(","), existingCandidate = this.database.raw.prepare(
+            `SELECT candidate_request.*
+               FROM candidate_request
+               LEFT JOIN source_demand_unit_source
+                 ON source_demand_unit_source.demand_unit_id = candidate_request.demand_unit_id
+              WHERE candidate_request.source_event_id IN (${placeholders})
+                 OR source_demand_unit_source.source_event_id IN (${placeholders})
+              ORDER BY candidate_request.created_at ASC, candidate_request.id ASC
+              LIMIT 1`
+          ).get(...sourceIds, ...sourceIds);
+          if (existingCandidate) {
+            let demandUnitId = existingCandidate.demand_unit_id;
+            !demandUnitId && !existingCandidate.accepted_task_id && !existingCandidate.deleted_at && existingCandidate.state !== "accepted" && (demandUnitId = this.ensureCandidateDemandUnitRecord(existingCandidate, timestamp)), demandUnitId && attachCandidateSources(demandUnitId, sources), decisionResults.push({
+              decision_ref: decision.decision_ref,
+              action: decision.action,
+              source_status: "processed",
+              candidate_id: existingCandidate.id
+            });
+          } else {
+            let draft = createManualCandidate(anchor.content, anchor.sender_name, anchor.occurred_at), candidateId = id("cand"), demandUnitId = id("unit"), title = decision.title ?? draft.title, describe3 = decision.describe ?? draft.describe, analysisJson = JSON.stringify({
+              ...draft.analysis,
+              origin: "cindy_receipt_decision",
+              decisionRequestId: input.decision_request_id,
+              decisionRef: decision.decision_ref,
+              reason: decision.reason ?? null
+            });
+            this.database.raw.prepare(
+              `INSERT INTO source_demand_unit
+                (id, anchor_source_event_id, unit_key, unit_kind, state, classification_revision, ai_decision_id,
+                 analysis_json, reason, created_at, updated_at)
+               VALUES (?, ?, ?, 'demand', 'ready', ?, NULL, ?, ?, ?, ?)`
+            ).run(
+              demandUnitId,
+              anchor.id,
+              `cindy:${candidateId}`,
+              `cindy:${input.decision_request_id}`,
+              analysisJson,
+              decision.reason ?? "Cindy receipt \u51B3\u7B56\u3002",
+              timestamp,
+              timestamp
+            ), this.database.raw.prepare(
+              `INSERT INTO candidate_request
+                (id, source_event_id, demand_unit_id, title, proposer_name, background, validation_question, describe,
+                 analysis_json, confidence, state, snoozed_until, accepted_task_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', NULL, NULL, ?, ?)`
+            ).run(
+              candidateId,
+              anchor.id,
+              demandUnitId,
+              title,
+              anchor.sender_name,
+              draft.background,
+              draft.validationQuestion,
+              describe3,
+              analysisJson,
+              timestamp,
+              timestamp
+            ), attachCandidateSources(demandUnitId, sources), decisionResults.push({
+              decision_ref: decision.decision_ref,
+              action: decision.action,
+              source_status: "processed",
+              candidate_id: candidateId
+            });
+          }
+        } else if (decision.action === "update_task") {
+          let task = this.getTask(decision.task_key);
+          if (!task) throw new CindyIntakeConflictError("update_task \u5BF9\u5E94\u7684\u4EFB\u52A1\u4E0D\u5B58\u5728\u3002");
+          if (task.record_state !== "active" || task.deleted_at || task.status === "archived")
+            throw new CindyIntakeConflictError("update_task \u5BF9\u5E94\u7684\u4EFB\u52A1\u5F53\u524D\u4E0D\u53EF\u66F4\u65B0\u3002", task.version);
+          if (task.version !== decision.expected_version)
+            throw new CindyIntakeConflictError("\u4EFB\u52A1\u5DF2\u88AB\u5176\u4ED6\u64CD\u4F5C\u66F4\u65B0\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002", task.version);
+          let next = this.resolveTaskPatch(task, {
+            title: decision.title,
+            describe: decision.describe,
+            nextStep: decision.next_step,
+            expectedVersion: decision.expected_version
+          }), nextVersion = task.version + 1;
+          if (this.database.raw.prepare(
+            `UPDATE task SET title = ?, describe = ?, next_step = ?, version = ?, updated_at = ?
+              WHERE id = ? AND version = ?`
+          ).run(next.title, next.describe, next.nextStep, nextVersion, timestamp, task.id, task.version).changes !== 1) {
+            let current = this.getTask(task.id);
+            throw new CindyIntakeConflictError("\u4EFB\u52A1\u5DF2\u88AB\u5176\u4ED6\u64CD\u4F5C\u66F4\u65B0\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002", current?.version ?? null);
+          }
+          this.database.raw.prepare(
+            `INSERT INTO task_event
+              (id, task_id, event_type, actor_type, visibility, summary, source_event_id, demand_unit_id,
+               before_json, after_json, occurred_at, recorded_at, version)
+             VALUES (?, ?, 'task_cindy_intake_update', 'cindy', 'private', ?, ?, NULL, ?, ?, ?, ?, ?)`
+          ).run(
+            id("evt"),
+            task.id,
+            decision.reason?.trim() || "Cindy receipt \u51B3\u7B56\u66F4\u65B0\u4E86\u4EFB\u52A1\u5B57\u6BB5\u3002",
+            anchor.id,
+            JSON.stringify(taskAuditSnapshot(task)),
+            JSON.stringify({
+              ...taskAuditSnapshot(task),
+              title: next.title,
+              describe: next.describe,
+              next_step: next.nextStep,
+              version: nextVersion,
+              updated_at: timestamp
+            }),
+            anchor.occurred_at,
+            timestamp,
+            nextVersion
+          ), updatedTaskIds.add(task.id), decisionResults.push({
+            decision_ref: decision.decision_ref,
+            action: decision.action,
+            source_status: "processed",
+            task_key: task.id,
+            version: nextVersion
+          });
+        } else {
+          let correctionType = decision.action === "skip" ? "cindy_skip" : "cindy_needs_owner";
+          this.database.raw.prepare(
+            `INSERT INTO correction_event
+              (id, task_id, candidate_id, source_event_id, correction_type, before_json, after_json,
+               created_at, idempotency_key, note)
+             VALUES (?, NULL, NULL, ?, ?, NULL, ?, ?, ?, ?)`
+          ).run(
+            id("correction"),
+            anchor.id,
+            correctionType,
+            JSON.stringify({ action: decision.action, decisionRef: decision.decision_ref, reason: decision.reason ?? null }),
+            timestamp,
+            `cindy-decision:${input.decision_request_id}:${decision.decision_ref}`,
+            decision.reason ?? ""
+          ), decisionResults.push({
+            decision_ref: decision.decision_ref,
+            action: decision.action,
+            source_status: decision.action === "skip" ? "skipped" : "processed",
+            reason: decision.reason
+          });
+        }
+        let nextStatus = decision.action === "skip" ? "skipped" : "processed";
+        for (let revision of revisions)
+          if (this.database.raw.prepare(
+            `UPDATE source_event_revision SET processing_status = ?
+              WHERE id = ? AND processing_status IN ('pending_decision','retryable')`
+          ).run(nextStatus, revision.id).changes !== 1) throw new CindySourceContractError("CONFLICT", "\u6765\u6E90\u5904\u7406\u72B6\u6001\u5DF2\u53D8\u5316\uFF1B\u672C\u6279\u51B3\u7B56\u5DF2\u56DE\u6EDA\u3002");
+      }
+      let storedResult = {
+        decision_request_id: input.decision_request_id,
+        window_id: input.window_id,
+        duplicate: !1,
+        decisions: decisionResults
+      };
+      return this.advanceIntakeWindowCursorUnsafe(input.window_end, timestamp), recordCindyDecisionRequest(this.database, auth, input.decision_request_id, requestHash, storedResult, timestamp), storedResult;
+    });
+    for (let taskId of updatedTaskIds) this.projectTaskMemory(taskId);
+    return result;
+  }
   processCindyIntake(input) {
     let sourceKeys = input.sources.map((source) => source.source_key);
     if (new Set(sourceKeys).size !== sourceKeys.length)
@@ -162725,7 +163509,7 @@ var PmService = class {
       let sourceRows = /* @__PURE__ */ new Map(), conversationCursors = /* @__PURE__ */ new Map();
       for (let source of input.sources) {
         let conversationId = source.conversation_key?.trim() || `cindy:source:${source.source_key}`, persisted = this.persistSourceEventUnsafe({
-          externalId: `cindy:${(0, import_node_crypto10.createHash)("sha256").update(`${conversationId}\0${source.source_key}`).digest("hex")}`,
+          externalId: `cindy:${(0, import_node_crypto11.createHash)("sha256").update(`${conversationId}\0${source.source_key}`).digest("hex")}`,
           sourceType: "manual",
           conversationId,
           senderId: `cindy:${source.sender_role ?? "unknown"}`,
@@ -163091,7 +163875,7 @@ var PmService = class {
         status === "local_snapshot_verified" ? "source.verification.completed" : "source.verification.failed",
         status === "local_snapshot_verified" ? "\u7CFB\u7EDF\u4E3B\u4EBA\u4E3B\u52A8\u6838\u9A8C\u4E86\u4E00\u9879\u672C\u5730\u6765\u6E90\u5FEB\u7167\uFF1B\u53EA\u8FD4\u56DE\u53D7\u63A7\u8131\u654F\u7247\u6BB5\uFF0C\u4E0D\u4EA7\u751F\u5BF9\u5916\u52A8\u4F5C\u3002" : "\u7CFB\u7EDF\u4E3B\u4EBA\u4E3B\u52A8\u6838\u9A8C\u672C\u5730\u6765\u6E90\u5FEB\u7167\u672A\u5B8C\u6210\uFF1B\u53EA\u8BB0\u5F55\u53D7\u63A7\u72B6\u6001\uFF0C\u4E0D\u4EA7\u751F\u5BF9\u5916\u52A8\u4F5C\u3002",
         {
-          relationFingerprint: (0, import_node_crypto10.createHash)("sha256").update(`${taskId}:${relation.sourceEventId}`).digest("hex").slice(0, 16),
+          relationFingerprint: (0, import_node_crypto11.createHash)("sha256").update(`${taskId}:${relation.sourceEventId}`).digest("hex").slice(0, 16),
           sourceType: source.source_type,
           verificationStatus: status,
           verificationReason: reason,
@@ -163511,7 +164295,7 @@ var PmService = class {
     return directory;
   }
   atomicMemoryWrite(path, content) {
-    let temporary = `${path}.${(0, import_node_crypto10.randomUUID)()}.tmp`;
+    let temporary = `${path}.${(0, import_node_crypto11.randomUUID)()}.tmp`;
     (0, import_node_fs2.writeFileSync)(temporary, content, "utf8"), (0, import_node_fs2.renameSync)(temporary, path);
   }
   pathWithin(childPath, parentPath) {
@@ -163676,12 +164460,12 @@ var PmService = class {
         "# \u6765\u6E90\u7D22\u5F15",
         "",
         ...detail.sources.map((source) => {
-          let sourceContent = typeof source.content == "string" ? source.content : "", sourceHash = (0, import_node_crypto10.createHash)("sha256").update(sourceContent).digest("hex");
+          let sourceContent = typeof source.content == "string" ? source.content : "", sourceHash = (0, import_node_crypto11.createHash)("sha256").update(sourceContent).digest("hex");
           return [
             `## ${String(source.occurred_at ?? "\u672A\u77E5\u65F6\u95F4")} \xB7 ${String(source.sender_name ?? "\u672A\u77E5\u53D1\u9001\u4EBA")}`,
             `- \u6765\u6E90\u7C7B\u578B\uFF1A${String(source.source_type ?? "\u672A\u77E5")}`,
             `- \u6765\u6E90\u94FE\u63A5\uFF1A${String(source.source_url ?? "\u65E0")}`,
-            `- \u6765\u6E90\u6807\u8BC6\u54C8\u5E0C\uFF1A${(0, import_node_crypto10.createHash)("sha256").update(String(source.external_id ?? "")).digest("hex").slice(0, 16) || "\u672A\u77E5"}`,
+            `- \u6765\u6E90\u6807\u8BC6\u54C8\u5E0C\uFF1A${(0, import_node_crypto11.createHash)("sha256").update(String(source.external_id ?? "")).digest("hex").slice(0, 16) || "\u672A\u77E5"}`,
             `- \u6B63\u6587\u54C8\u5E0C\uFF1A${sourceHash}`,
             `- \u6B63\u6587\u957F\u5EA6\uFF1A${sourceContent.length}`,
             ""
@@ -163784,7 +164568,7 @@ ${evidenceJson}
 `
         );
       }
-      let checksum = (0, import_node_crypto10.createHash)("sha256").update(`${taskJson}
+      let checksum = (0, import_node_crypto11.createHash)("sha256").update(`${taskJson}
 ${brief}
 ${sources}
 ${artifacts}
@@ -164319,7 +165103,7 @@ ${JSON.stringify(confirmedRevisions)}`).digest("hex");
       throw new Error("\u65E0\u6548\u8BB0\u5F55\u4E0D\u80FD\u751F\u6210\u5BF9\u5916\u52A8\u4F5C\u3002");
     if (task.deleted_at)
       throw new Error("\u56DE\u6536\u7AD9\u4E2D\u7684\u4EFB\u52A1\u4E0D\u80FD\u751F\u6210\u5BF9\u5916\u52A8\u4F5C\u3002");
-    let timestamp = nowIso(), payloadJson = stableJson(payload ?? {}), requestFingerprint = (0, import_node_crypto10.createHash)("sha256").update(`${taskId}
+    let timestamp = nowIso(), payloadJson = stableJson2(payload ?? {}), requestFingerprint = (0, import_node_crypto11.createHash)("sha256").update(`${taskId}
 ${task.version}
 ${actionType}
 ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version}:${requestFingerprint}`, approvalId = `approval_${requestFingerprint}`, outboxId = `outbox_${requestFingerprint}`, draft = this.database.transaction(() => {
@@ -164570,7 +165354,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
     };
   }
   diagnostics(requestId) {
-    let operationId = (0, import_node_crypto10.randomUUID)(), traceId = (0, import_node_crypto10.randomUUID)(), readiness = this.readiness(), counts = { sources: 0, candidates: 0, tasks: 0, logs: 0, decisions: 0, corrections: 0 }, recentErrors = [];
+    let operationId = (0, import_node_crypto11.randomUUID)(), traceId = (0, import_node_crypto11.randomUUID)(), readiness = this.readiness(), counts = { sources: 0, candidates: 0, tasks: 0, logs: 0, decisions: 0, corrections: 0 }, recentErrors = [];
     if (readiness.status !== "not_ready")
       try {
         counts = {
@@ -164594,7 +165378,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
       diagnostic_bundle_version: "obs-01-v1",
       generatedAt: nowIso(),
       operation_id: operationId,
-      request_id: requestId ?? (0, import_node_crypto10.randomUUID)(),
+      request_id: requestId ?? (0, import_node_crypto11.randomUUID)(),
       trace_id: traceId,
       health,
       readiness,
@@ -164826,7 +165610,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
     return runner ? operation(runner) : { skipped: !0, reason: "adapter_unavailable" };
   }
   async legacySyncFeishuOnce(requestId, traceContext = {}, suppliedContext) {
-    let startedAt = Date.now(), operationContext = suppliedContext ?? createOperationContext({ requestId: requestId ?? (0, import_node_crypto10.randomUUID)(), traceId: traceContext.traceId, parentSpanId: traceContext.parentSpanId });
+    let startedAt = Date.now(), operationContext = suppliedContext ?? createOperationContext({ requestId: requestId ?? (0, import_node_crypto11.randomUUID)(), traceId: traceContext.traceId, parentSpanId: traceContext.parentSpanId });
     if (this.privacyControl().collection_status === "stopped") {
       let sources2 = ["owner_messages", "bot_supplement", "calendar", "minutes", "documents"].map((source) => syncSourceOutcome(source, { skipped: !0, reason: "privacy_collection_stopped" }, 0));
       return { ...operationEnvelope({ context: operationContext, startedAt, sources: sources2, release: this.releaseIdentity() }), ...safeSyncTotals(sources2) };
@@ -164863,7 +165647,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
     }), { ...observable, ...totals };
   }
   async legacySyncFeishuSource(kind, requestId, traceContext = {}, suppliedContext) {
-    let startedAt = Date.now(), operationContext = suppliedContext ?? createOperationContext({ requestId: requestId ?? (0, import_node_crypto10.randomUUID)(), traceId: traceContext.traceId, parentSpanId: traceContext.parentSpanId });
+    let startedAt = Date.now(), operationContext = suppliedContext ?? createOperationContext({ requestId: requestId ?? (0, import_node_crypto11.randomUUID)(), traceId: traceContext.traceId, parentSpanId: traceContext.parentSpanId });
     if (this.privacyControl().collection_status === "stopped") {
       let safeSource = syncSourceOutcome(kind, { skipped: !0, reason: "privacy_collection_stopped" }, 0), observable = operationEnvelope({ context: operationContext, startedAt, sources: [safeSource], release: this.releaseIdentity() });
       return { ...observable, ...safeSyncTotals(observable.sources) };
@@ -165171,7 +165955,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
     this.assertCandidateVersion(candidate, boundExpectedVersion), this.assertCandidateActive(candidate);
     let acceptedTask = candidate.accepted_task_id ? this.getTask(candidate.accepted_task_id) : null, sourceRow = this.database.raw.prepare("SELECT * FROM source_event WHERE id = ?").get(candidate.source_event_id);
     if (!sourceRow) throw new Error("\u5019\u9009\u7684\u6765\u6E90\u6D88\u606F\u4E0D\u5B58\u5728\u3002");
-    let initialContexts = this.feishuDocumentContext.list(sourceRow.id), initialRevision = combinedClassificationRevision(sourceRow, initialContexts).revision, recoveredRuntime = recovery ? this.runtime.get(recovery.jobId) : null, recoveredPayload = recoveredRuntime ? parseMetadata(recoveredRuntime.payload_json) : null, effectiveOperationContext = operationContext ?? (recoveredPayload && isOperationContext(recoveredPayload.observability) ? recoveredPayload.observability : null) ?? (recovery ? void 0 : createOperationContext({ requestId: (0, import_node_crypto10.randomUUID)() })), runtimeJob = recovery ? recoveredRuntime : this.runtime.begin({
+    let initialContexts = this.feishuDocumentContext.list(sourceRow.id), initialRevision = combinedClassificationRevision(sourceRow, initialContexts).revision, recoveredRuntime = recovery ? this.runtime.get(recovery.jobId) : null, recoveredPayload = recoveredRuntime ? parseMetadata(recoveredRuntime.payload_json) : null, effectiveOperationContext = operationContext ?? (recoveredPayload && isOperationContext(recoveredPayload.observability) ? recoveredPayload.observability : null) ?? (recovery ? void 0 : createOperationContext({ requestId: (0, import_node_crypto11.randomUUID)() })), runtimeJob = recovery ? recoveredRuntime : this.runtime.begin({
       jobType: "reprocess_candidate",
       payload: {
         candidateId,
@@ -165181,7 +165965,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
         guidance: guidance?.slice(0, 2e3) ?? null,
         ...effectiveOperationContext ? { observability: effectiveOperationContext } : {}
       },
-      idempotencyKey: `reprocess:${candidateId}:${initialRevision}:${(0, import_node_crypto10.createHash)("sha256").update(guidance ?? "").digest("hex").slice(0, 16)}`,
+      idempotencyKey: `reprocess:${candidateId}:${initialRevision}:${(0, import_node_crypto11.createHash)("sha256").update(guidance ?? "").digest("hex").slice(0, 16)}`,
       sourceEventId: candidate.source_event_id,
       taskId: acceptedTask?.id ?? null,
       traceId: effectiveOperationContext?.trace_id ?? null,
@@ -165665,8 +166449,8 @@ function candidateMutationError(error51, fallback, current) {
 var risks = ["low", "medium", "high"], PRIVACY_OWNER_ACTION_INTENT2 = "privacy.owner-action.v1", PRIVACY_DELETION_INTENT2 = "privacy.deletion.hard-delete.v1";
 function capabilityBinding(capability) {
   return {
-    tokenHash: (0, import_node_crypto11.createHash)("sha256").update(capability.token).digest("hex"),
-    csrfTokenHash: (0, import_node_crypto11.createHash)("sha256").update(capability.csrfToken).digest("hex"),
+    tokenHash: (0, import_node_crypto12.createHash)("sha256").update(capability.token).digest("hex"),
+    csrfTokenHash: (0, import_node_crypto12.createHash)("sha256").update(capability.csrfToken).digest("hex"),
     origin: capability.origin
   };
 }
@@ -165682,8 +166466,8 @@ function registerSeedIntakeRoute(app, service) {
     if (normalizedAddress !== "127.0.0.1" && normalizedAddress !== "::1")
       return reply.code(403).send({ error: "\u6A21\u62DF\u9700\u6C42\u5165\u53E3\u53EA\u63A5\u53D7\u672C\u673A\u56DE\u73AF\u8BF7\u6C42\u3002" });
     try {
-      let body = seedIntakeBodySchema.parse(request.body), occurredAt = (/* @__PURE__ */ new Date()).toISOString(), sourceKey = `dev-seed-source-${(0, import_node_crypto11.randomUUID)()}`, background = body.background ?? body.describe ?? body.title, candidateId = service.processCindyIntake({
-        window_id: `dev-seed-window-${(0, import_node_crypto11.randomUUID)()}`,
+      let body = seedIntakeBodySchema.parse(request.body), occurredAt = (/* @__PURE__ */ new Date()).toISOString(), sourceKey = `dev-seed-source-${(0, import_node_crypto12.randomUUID)()}`, background = body.background ?? body.describe ?? body.title, candidateId = service.processCindyIntake({
+        window_id: `dev-seed-window-${(0, import_node_crypto12.randomUUID)()}`,
         window_start: occurredAt,
         window_end: occurredAt,
         sources: [{
@@ -165713,13 +166497,13 @@ async function buildApp(service, input = "http://localhost:5173") {
   options.desktopCapability && service.registerAuditReplayCapability(options.desktopCapability);
   let app = (0, import_fastify.default)({ logger: options.logger ?? process.env.NODE_ENV !== "test" });
   await app.register(import_cors.default, { origin: webOrigin });
-  let runtimeShutdownScheduled = !1, runtimeRestartScheduled = !1;
+  let runtimeShutdownScheduled = !1, runtimeRestartScheduled = !1, cindyAuthContext = () => deriveCindyAuthContext(options.cindyIntegrationToken ?? "");
   if (app.addHook("onRequest", async (request, reply) => {
     if (!request.url.startsWith("/api/integrations/cindy/") || request.method === "OPTIONS") return;
     let expected = options.cindyIntegrationToken?.trim(), authorization = String(request.headers.authorization ?? ""), expectedAuthorization = expected ? `Bearer ${expected}` : "";
-    if (!(!!expectedAuthorization && authorization.length === expectedAuthorization.length && (0, import_node_crypto11.timingSafeEqual)(Buffer.from(authorization, "utf8"), Buffer.from(expectedAuthorization, "utf8"))))
+    if (!(!!expectedAuthorization && authorization.length === expectedAuthorization.length && (0, import_node_crypto12.timingSafeEqual)(Buffer.from(authorization, "utf8"), Buffer.from(expectedAuthorization, "utf8"))))
       return reply.code(401).send({ error: "Cindy \u96C6\u6210\u4EE4\u724C\u65E0\u6548\u6216\u5C1A\u672A\u914D\u7F6E\u3002" });
-  }), app.get("/api/health", async () => service.health((0, import_node_crypto11.randomUUID)())), app.post("/api/runtime/shutdown", async (request, reply) => isLoopbackRequest(request) ? options.runtimeShutdown ? runtimeShutdownScheduled ? reply.code(409).send({ error: "\u540E\u53F0\u8FDB\u7A0B\u5DF2\u7ECF\u5728\u9000\u51FA\u3002" }) : (runtimeShutdownScheduled = !0, reply.code(200).send({ message: "\u672C\u673A\u4EFB\u52A1\u5E93\u540E\u53F0\u5DF2\u6536\u5230\u9000\u51FA\u8BF7\u6C42\uFF0C4310 \u5373\u5C06\u5173\u95ED\u3002" }), setTimeout(() => {
+  }), app.get("/api/health", async () => service.health((0, import_node_crypto12.randomUUID)())), app.post("/api/runtime/shutdown", async (request, reply) => isLoopbackRequest(request) ? options.runtimeShutdown ? runtimeShutdownScheduled ? reply.code(409).send({ error: "\u540E\u53F0\u8FDB\u7A0B\u5DF2\u7ECF\u5728\u9000\u51FA\u3002" }) : (runtimeShutdownScheduled = !0, reply.code(200).send({ message: "\u672C\u673A\u4EFB\u52A1\u5E93\u540E\u53F0\u5DF2\u6536\u5230\u9000\u51FA\u8BF7\u6C42\uFF0C4310 \u5373\u5C06\u5173\u95ED\u3002" }), setTimeout(() => {
     Promise.resolve(options.runtimeShutdown?.()).catch(() => {
     });
   }, 25), reply) : reply.code(409).send({ error: "\u5F53\u524D\u8FD0\u884C\u65B9\u5F0F\u4E0D\u652F\u6301\u5173\u95ED\u540E\u53F0\u8FDB\u7A0B\u3002" }) : reply.code(403).send({ error: "\u540E\u53F0\u5173\u95ED\u63A5\u53E3\u53EA\u63A5\u53D7\u672C\u673A\u8BF7\u6C42\u3002" })), app.post("/api/runtime/restart", async (request, reply) => isLoopbackRequest(request) ? options.runtimeRestart ? runtimeShutdownScheduled ? reply.code(409).send({ error: "\u540E\u53F0\u8FDB\u7A0B\u5DF2\u7ECF\u5728\u9000\u51FA\u3002" }) : runtimeRestartScheduled ? reply.code(409).send({ error: "\u540E\u53F0\u8FDB\u7A0B\u5DF2\u7ECF\u5728\u91CD\u542F\u3002" }) : (runtimeRestartScheduled = !0, reply.code(200).send({ message: "\u672C\u673A\u4EFB\u52A1\u5E93\u540E\u53F0\u5DF2\u6536\u5230\u91CD\u542F\u8BF7\u6C42\uFF0C4310 \u5373\u5C06\u91CD\u65B0\u76D1\u542C\u3002" }), setTimeout(() => {
@@ -165762,7 +166546,7 @@ async function buildApp(service, input = "http://localhost:5173") {
     } catch (error51) {
       return reply.code(error51 instanceof external_exports.ZodError ? 400 : 409).send({ error: error51 instanceof Error ? error51.message : "\u81EA\u52A8\u7EF4\u62A4\u8BBE\u7F6E\u66F4\u65B0\u5931\u8D25\u3002" });
     }
-  }), app.get("/api/diagnostics", async () => service.diagnostics((0, import_node_crypto11.randomUUID)())), app.get("/api/audit/ai-decisions/:id/replay", async (request, reply) => {
+  }), app.get("/api/diagnostics", async () => service.diagnostics((0, import_node_crypto12.randomUUID)())), app.get("/api/audit/ai-decisions/:id/replay", async (request, reply) => {
     let binding = requirePrivacyCapability(request, reply, options.desktopCapability, AUDIT_REPLAY_INTENT);
     if (!binding) return;
     let params = external_exports.object({ id: external_exports.string().min(1).max(200) }).parse(request.params);
@@ -165824,22 +166608,53 @@ async function buildApp(service, input = "http://localhost:5173") {
     } catch (error51) {
       return reply.code(error51 instanceof external_exports.ZodError ? 400 : 409).send({ error: error51 instanceof Error ? error51.message : "\u8F6E\u6B21\u5224\u65AD\u5199\u5165\u5931\u8D25\u3002" });
     }
-  }), app.post("/api/integrations/cindy/intake", async (request, reply) => {
+  }), app.post("/api/integrations/cindy/sources", async (request, reply) => {
     try {
       let isoTimestamp = external_exports.string().datetime({ offset: !0 }), body = external_exports.object({
-        window_id: external_exports.string().trim().min(1).max(200),
-        window_start: isoTimestamp,
-        window_end: isoTimestamp,
+        save_request_id: external_exports.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
         sources: external_exports.array(external_exports.object({
-          source_key: external_exports.string().trim().min(1).max(200),
+          client_ref: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+          provider: external_exports.enum(CINDY_SOURCE_PROVIDERS),
+          source_kind: external_exports.enum(CINDY_SOURCE_KINDS),
+          stable_message_id: external_exports.string().min(1).max(500),
           occurred_at: isoTimestamp,
           conversation_key: external_exports.string().trim().min(1).max(500).optional(),
           sender_role: external_exports.string().trim().min(1).max(120).optional(),
-          text: external_exports.string().min(1).max(2e4)
-        }).strict()).max(500),
-        proposals: external_exports.array(external_exports.object({
-          action: external_exports.enum(["create_candidate", "update_task", "skip", "needs_owner"]),
-          source_keys: external_exports.array(external_exports.string().trim().min(1).max(200)).min(1).max(100),
+          text: external_exports.string().min(1).max(2e4),
+          revision: external_exports.object({
+            modified_at: isoTimestamp.optional(),
+            sequence: external_exports.number().int().nonnegative().optional()
+          }).strict().refine((value) => value.modified_at !== void 0 || value.sequence !== void 0, {
+            message: "revision \u81F3\u5C11\u9700\u8981 modified_at \u6216 sequence\u3002"
+          }).optional(),
+          relations: external_exports.array(external_exports.object({
+            kind: external_exports.enum(["reply_to", "thread_parent"]),
+            client_ref: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u).optional(),
+            source_receipt: external_exports.string().min(32).max(200).optional()
+          }).strict().refine((value) => +!!value.client_ref + +!!value.source_receipt == 1, {
+            message: "\u5173\u7CFB\u5FC5\u987B\u4E14\u53EA\u80FD\u5F15\u7528 client_ref \u6216 source_receipt\u3002"
+          })).max(20).optional()
+        }).strict()).min(1).max(500)
+      }).strict().parse(request.body);
+      return service.saveCindySources(cindyAuthContext(), body);
+    } catch (error51) {
+      let status = error51 instanceof external_exports.ZodError ? 400 : error51 instanceof CindySourceContractError ? error51.statusCode : 409;
+      return reply.code(status).send({
+        error: error51 instanceof Error ? error51.message : "Cindy \u6765\u6E90\u4FDD\u5B58\u5931\u8D25\u3002",
+        error_code: error51 instanceof CindySourceContractError ? error51.errorCode : "CONFLICT"
+      });
+    }
+  }), app.post("/api/integrations/cindy/decisions", async (request, reply) => {
+    try {
+      let isoTimestamp = external_exports.string().datetime({ offset: !0 }), body = external_exports.object({
+        decision_request_id: external_exports.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
+        window_id: external_exports.string().trim().min(1).max(200),
+        window_start: isoTimestamp,
+        window_end: isoTimestamp,
+        decisions: external_exports.array(external_exports.object({
+          decision_ref: external_exports.string().regex(/^[A-Za-z0-9_-]{1,64}$/u),
+          action: external_exports.enum(["create_candidate", "update_task", "skip", "needs_owner", "retry_later"]),
+          source_receipts: external_exports.array(external_exports.string().min(32).max(200)).min(1).max(100),
           task_key: external_exports.string().trim().min(1).max(200).optional(),
           expected_version: external_exports.number().int().nonnegative().optional(),
           title: external_exports.string().trim().min(1).max(160).optional(),
@@ -165848,12 +166663,12 @@ async function buildApp(service, input = "http://localhost:5173") {
           reason: external_exports.string().trim().max(2e3).optional()
         }).strict()).max(500)
       }).strict().parse(request.body);
-      return service.processCindyIntake(body);
+      return service.processCindyDecisions(cindyAuthContext(), body);
     } catch (error51) {
-      let status = error51 instanceof external_exports.ZodError || error51 instanceof CindyIntakeValidationError ? 400 : (error51 instanceof CindyIntakeConflictError, 409), payload = {
-        error: error51 instanceof Error ? error51.message : "Cindy \u5165\u5E93\u5931\u8D25\u3002"
+      let status = error51 instanceof external_exports.ZodError || error51 instanceof CindyIntakeValidationError ? 400 : error51 instanceof CindySourceContractError ? error51.statusCode : (error51 instanceof CindyIntakeConflictError, 409), payload = {
+        error: error51 instanceof Error ? error51.message : "Cindy \u51B3\u7B56\u63D0\u4EA4\u5931\u8D25\u3002"
       };
-      return error51 instanceof CindyIntakeConflictError && (payload.error_code = error51.errorCode, payload.current_version = error51.currentVersion), reply.code(status).send(payload);
+      return error51 instanceof CindySourceContractError && (payload.error_code = error51.errorCode), error51 instanceof CindyIntakeConflictError && (payload.error_code = error51.errorCode, payload.current_version = error51.currentVersion), reply.code(status).send(payload);
     }
   }), app.get("/api/owner-information", async () => service.ownerInformation()), app.get("/api/privacy/status", async () => service.privacyStatus()), app.post("/api/privacy/collection/stop", async (request, reply) => {
     let binding = requirePrivacyCapability(request, reply, options.desktopCapability, PRIVACY_OWNER_ACTION_INTENT2);

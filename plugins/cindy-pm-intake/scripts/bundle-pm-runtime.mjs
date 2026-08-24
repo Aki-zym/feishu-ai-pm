@@ -13,7 +13,11 @@ const runtimeOutput = resolve(root, 'plugins', 'cindy-pm-intake', 'node', 'pm-ru
 const statusSource = resolve(root, 'plugins', 'cindy-pm-intake', 'node', 'macos-status', 'main.swift');
 const statusOutput = resolve(root, 'plugins', 'cindy-pm-intake', 'node', 'macos-status', 'TooManyTasksStatus');
 
-await execFileAsync('npm', ['run', 'build', '-w', '@ai-pm/web'], { cwd: root, stdio: 'inherit' });
+if (process.platform === 'win32') {
+  await execFileAsync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', 'npm run build -w @ai-pm/web'], { cwd: root, stdio: 'inherit' });
+} else {
+  await execFileAsync('npm', ['run', 'build', '-w', '@ai-pm/web'], { cwd: root, stdio: 'inherit' });
+}
 await rm(webTarget, { recursive: true, force: true });
 await mkdir(webTarget, { recursive: true });
 await cp(webSource, webTarget, { recursive: true, force: true });

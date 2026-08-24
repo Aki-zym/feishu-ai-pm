@@ -179,8 +179,8 @@ function scheduleProcessExit() {
  * Start the bundled local task service for the Cindy resident worker.
  *
  * The runtime intentionally does not start Feishu polling or classifier
- * scans. Cindy submits already-reviewed intake proposals through the guarded
- * integration routes; external collection remains outside this resident worker.
+ * scans. Cindy first saves authorized source facts and then submits receipt-only
+ * decisions through guarded integration routes; external collection remains outside this resident worker.
  */
 export async function startPmServer({
   port: requestedPort,
@@ -234,7 +234,7 @@ export async function startPmServer({
   try {
     const config = runtimeConfig({ host, port, sqlitePath, token });
     database = new AppDatabase(config.database.sqlitePath);
-    // The resident worker receives Cindy proposals. It deliberately does not
+    // The resident worker receives Cindy source saves and receipt decisions. It deliberately does not
     // construct a legacy semantic adapter or any Feishu scanning adapter.
     const service = new PmService(database, createCindyAdapters(config), config);
     let stopInFlight = null;

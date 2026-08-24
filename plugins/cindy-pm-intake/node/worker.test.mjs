@@ -238,33 +238,37 @@ test('GET tasks uses the bearer token and Cindy-only loopback path', async () =>
   }
 });
 
-test('POST intake forwards the exact JSON body', async () => {
+test('POST trusted source save forwards the exact JSON body', async () => {
   let receivedBody = '';
   const server = createServer((request, response) => {
     request.setEncoding('utf8');
     request.on('data', (chunk) => { receivedBody += chunk; });
     request.on('end', () => {
       response.setHeader('content-type', 'application/json');
-      response.end(JSON.stringify({ intake_id: 'intake-1', accepted: true }));
+      response.end(JSON.stringify({ save_request_id: 'save-1', sources: [] }));
     });
   });
   const port = await listen(server);
   const body = {
-    window_id: 'window-1',
-    window_start: '2026-08-24T01:00:00.000Z',
-    window_end: '2026-08-24T01:10:00.000Z',
-    sources: [{ source_key: 's1', occurred_at: '2026-08-24T01:05:00.000Z', text: '需要补充任务。' }],
-    proposals: [{ action: 'needs_owner', source_keys: ['s1'], expected_version: 1, reason: '需要确认负责人。' }],
+    save_request_id: 'save-1',
+    sources: [{
+      client_ref: 's1',
+      provider: 'synthetic',
+      source_kind: 'synthetic_message',
+      stable_message_id: 'message-1',
+      occurred_at: '2026-08-24T01:05:00.000Z',
+      text: '需要补充任务。',
+    }],
   };
   try {
     const result = await callWorker({
       jsonrpc: '2.0',
       id: 2,
       method: 'pm/request',
-      params: { baseUrl: `http://127.0.0.1:${port}`, method: 'POST', path: '/api/integrations/cindy/intake', body },
+      params: { baseUrl: `http://127.0.0.1:${port}`, method: 'POST', path: '/api/integrations/cindy/sources', body },
       cindy: { secrets: { pm_token: 'test-token' } },
     });
-    assert.deepEqual(result.result, { intake_id: 'intake-1', accepted: true });
+    assert.deepEqual(result.result, { save_request_id: 'save-1', sources: [] });
     assert.deepEqual(JSON.parse(receivedBody), body);
   } finally {
     await close(server);

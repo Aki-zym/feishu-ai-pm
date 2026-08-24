@@ -4,7 +4,7 @@
   "name": "TooManyTasks",
   "description": "把已授权飞书消息整理为 TooManyTasks 入库候选，并维护当前会话的任务进度。本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台。",
   "whenToUse": "需要扫描已授权飞书消息或把当前会话的实际进展写回任务台时使用；本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台。",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "entry": "main.js",
   "launch": "resident",
   "slots": ["tool", "agent", "node", "cindy", "session-context", "skill", "subscribe"],
@@ -21,40 +21,79 @@
       }
     },
     {
-      "name": "submit_intake",
-      "description": "提交一次任务入库窗口的来源消息和候选提案；只登记候选，不直接创建正式任务。",
+      "name": "save_pm_sources",
+      "description": "读取到飞书消息后立即保存最小来源事实，取得产品签发的 opaque source_receipt；必须在任务语义判断前调用。",
       "parameters": {
         "type": "object",
         "properties": {
-          "window_id": { "type": "string", "minLength": 1, "maxLength": 200 },
-          "window_start": { "type": "string", "minLength": 1, "maxLength": 80 },
-          "window_end": { "type": "string", "minLength": 1, "maxLength": 80 },
+          "save_request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$" },
           "sources": {
             "type": "array",
             "minItems": 1,
             "items": {
               "type": "object",
               "properties": {
-                "source_key": { "type": "string", "minLength": 1, "maxLength": 120 },
+                "client_ref": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+                "provider": { "type": "string", "enum": ["feishu", "synthetic"] },
+                "source_kind": { "type": "string", "enum": ["im_message", "im_thread_message", "im_reaction_context", "synthetic_message"] },
+                "stable_message_id": { "type": "string", "minLength": 1, "maxLength": 500 },
                 "occurred_at": { "type": "string", "minLength": 1, "maxLength": 80 },
-                "conversation_key": { "type": "string", "maxLength": 240 },
+                "conversation_key": { "type": "string", "maxLength": 500 },
                 "sender_role": { "type": "string", "maxLength": 120 },
-                "text": { "type": "string", "minLength": 1, "maxLength": 12000 }
+                "text": { "type": "string", "minLength": 1, "maxLength": 20000 },
+                "revision": {
+                  "type": "object",
+                  "properties": {
+                    "modified_at": { "type": "string", "minLength": 1, "maxLength": 80 },
+                    "sequence": { "type": "integer", "minimum": 0 }
+                  },
+                  "additionalProperties": false
+                },
+                "relations": {
+                  "type": "array",
+                  "maxItems": 20,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "kind": { "type": "string", "enum": ["reply_to", "thread_parent"] },
+                      "client_ref": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+                      "source_receipt": { "type": "string", "minLength": 32, "maxLength": 200 }
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": false
+                  }
+                }
               },
-              "required": ["source_key", "occurred_at", "text"],
+              "required": ["client_ref", "provider", "source_kind", "stable_message_id", "occurred_at", "text"],
               "additionalProperties": false
             }
-          },
-          "proposals": {
+          }
+        },
+        "required": ["save_request_id", "sources"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "submit_pm_decisions",
+      "description": "只用已保存来源的 source_receipt 提交结构化入库判断；不得重传 raw sources。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "decision_request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$" },
+          "window_id": { "type": "string", "minLength": 1, "maxLength": 200 },
+          "window_start": { "type": "string", "minLength": 1, "maxLength": 80 },
+          "window_end": { "type": "string", "minLength": 1, "maxLength": 80 },
+          "decisions": {
             "type": "array",
             "items": {
               "type": "object",
               "properties": {
-                "action": { "type": "string", "enum": ["create_candidate", "update_task", "skip", "needs_owner"] },
-                "source_keys": {
+                "decision_ref": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+                "action": { "type": "string", "enum": ["create_candidate", "update_task", "skip", "needs_owner", "retry_later"] },
+                "source_receipts": {
                   "type": "array",
                   "minItems": 1,
-                  "items": { "type": "string", "minLength": 1, "maxLength": 120 }
+                  "items": { "type": "string", "minLength": 32, "maxLength": 200 }
                 },
                 "task_key": { "type": "string", "maxLength": 200 },
                 "expected_version": { "type": "integer", "minimum": 1 },
@@ -63,18 +102,18 @@
                 "next_step": { "type": "string", "maxLength": 1000 },
                 "reason": { "type": "string", "maxLength": 2000 }
               },
-              "required": ["action", "source_keys"],
+              "required": ["decision_ref", "action", "source_receipts"],
               "additionalProperties": false
             }
           }
         },
-        "required": ["window_id", "window_start", "window_end", "sources", "proposals"],
+        "required": ["decision_request_id", "window_id", "window_start", "window_end", "decisions"],
         "additionalProperties": false
       }
     },
     {
       "name": "scan_intake_window",
-      "description": "扫描已授权飞书消息：优先从上次成功窗口游标开始，最多回看 4 小时；无游标时回看 10 分钟。派发独立 errand 读取消息、获取任务快照并提交入库提案；入库 errand 会话内禁止调用本工具，请直接使用飞书 MCP、get_pm_tasks 和 submit_intake。",
+      "description": "扫描已授权飞书消息：读取后先用 save_pm_sources 可靠保存并取得 receipt，再获取任务快照并用 submit_pm_decisions 提交判断。入库 errand 会话内禁止调用本工具。",
       "parameters": {
         "type": "object",
         "properties": {

@@ -260,7 +260,7 @@ test('resident runtime does not start the classifier recovery chain', async () =
   }
 });
 
-test('resident runtime exposes Cindy intake and omits legacy Feishu/classifier routes', async () => {
+test('resident runtime exposes two-step Cindy intake and omits the raw-source decision route', async () => {
   const root = mkdtempSync(join(tmpdir(), 'cindy-pm-runtime-cindy-routes-'));
   const runtime = await startPmServer({
     port: 0,
@@ -280,6 +280,14 @@ test('resident runtime exposes Cindy intake and omits legacy Feishu/classifier r
       assert.equal((await fetch(`${runtime.url}${path}`, { method: 'POST' })).status, 404, path);
     }
     assert.equal((await fetch(`${runtime.url}/api/integrations/cindy/tasks`)).status, 401);
+    assert.equal((await fetch(`${runtime.url}/api/integrations/cindy/sources`, { method: 'POST' })).status, 401);
+    assert.equal((await fetch(`${runtime.url}/api/integrations/cindy/decisions`, { method: 'POST' })).status, 401);
+    assert.equal((await fetch(`${runtime.url}/api/integrations/cindy/intake`, { method: 'POST' })).status, 401);
+    assert.equal((await fetch(`${runtime.url}/api/integrations/cindy/intake`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: '{}',
+    })).status, 404);
   } finally {
     await runtime.stop();
   }
