@@ -4,7 +4,7 @@
   "product_snapshot": {
     "algorithm": "product-source-sha256-v1",
     "selector": "apps-workspace-default-include-v1",
-    "fingerprint": "45be426a1e1553dd55360a620f45dc306638499b8cbd670b1d22fbe35612199d",
+    "fingerprint": "067062679e06ea577df8095f841444a6476a24ac7b3cf70dac27874d136ee611",
     "file_count": 84,
     "snapshot_as_of": "2026-08-15",
     "equivalent_commit": null
@@ -112,7 +112,7 @@
       "evidence_status": "attained",
       "evidence_type": "synthetic_local_sqlite_service_plugin_renderer_contract",
       "scope": "synthetic_local_cindy_owner_context_contract",
-      "source_commit": "a1142999d6553e2e38b2b245126b782a12fc9a33",
+      "source_commit": "bed8afd418c6742e88bc3d025ce246e390d46479",
       "record_commit": "local-20260824-002-pending",
       "run_id": "local-20260824-002-owner-context-01",
       "run_at": "2026-08-24",
@@ -128,7 +128,7 @@
       "provenance": {
         "mode": "local_run",
         "base_commit": "not_applicable",
-        "head_commit": "a1142999d6553e2e38b2b245126b782a12fc9a33",
+        "head_commit": "bed8afd418c6742e88bc3d025ce246e390d46479",
         "merge_ref": "not_applicable",
         "parents": [],
         "tree": "not_applicable",
@@ -141,7 +141,7 @@
       "real_environment_attained": false,
       "artifact": null,
       "evidence_path": "apps/server/tests/cindy-intake.test.ts",
-      "limitations": "Synthetic/local L2 evidence proves server-derived owner/account scope, raw sender/chat/thread internalization, grapheme-safe display-name sanitization within all persistence/projection bounds, fallback for object placeholders and ou_/oc_ technical IDs, owner reaction whitelist, current receipt relation fencing, isolated thread/reply connected-component limits including current cross-batch receipt ancestors, bounded plain-chat context containing explicit owner evidence, atomic v9→v10 migration recovery and private task source projection. It does not prove real Feishu identities, reaction/thread permissions, MCP provenance attestation, browser E2E, production data, installed Windows lifecycle or external delivery."
+      "limitations": "Synthetic/local L2 evidence proves server-derived owner/account scope, raw sender/chat/thread internalization, post-filter NFC and grapheme-safe display-name sanitization within all persistence/projection bounds, fallback for object placeholders and ou_/oc_ technical IDs, owner reaction whitelist, current receipt relation fencing, isolated thread/reply connected-component limits including current cross-batch receipt ancestors, bounded plain-chat context containing explicit owner evidence, atomic v9→v10 migration recovery and private task source projection. It does not prove real Feishu identities, reaction/thread permissions, MCP provenance attestation, browser E2E, production data, installed Windows lifecycle or external delivery."
     },
     {
       "id": "VER-LOCAL20260824-001-CINDY-SOURCE-L2-20260824",
