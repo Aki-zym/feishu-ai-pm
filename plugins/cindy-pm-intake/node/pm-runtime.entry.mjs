@@ -70,9 +70,9 @@ async function canReachPmEndpoint(url, token) {
       redirect: 'error',
       signal: AbortSignal.timeout(1_500),
     });
-    // A configured local task service returns 200 with the matching token and 401
-    // without it. Both prove that the Cindy endpoint is already reachable.
-    return response.status === 200 || response.status === 401;
+    // Only HTTP 200 proves that the current Cindy token owns the local service.
+    // Any other response keeps the port in the foreign/mismatched state.
+    return response.status === 200;
   } catch {
     return false;
   }

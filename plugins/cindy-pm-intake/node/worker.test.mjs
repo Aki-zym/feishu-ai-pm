@@ -86,7 +86,7 @@ function callWorker(request) {
   });
 }
 
-function callWorkerLines(requests) {
+function callWorkerLines(requests, { foreign = false } = {}) {
   return new Promise((resolve, reject) => {
     const bootstrap = `
       const Module = require('node:module');
@@ -99,7 +99,7 @@ function callWorkerLines(requests) {
             url: 'http://127.0.0.1:4310',
             port: 4310,
             alreadyRunning: false,
-            foreign: false,
+            foreign: ${foreign ? 'true' : 'false'},
             startCount,
             restartCount,
             stop: async () => ({ stopped: true, stopCount: startCount }),
@@ -209,6 +209,20 @@ test('pm/restart uses the runtime restart handle and keeps the worker process al
   assert.equal(results[1].result.startCount, 2);
   assert.equal(results[1].result.restartCount, 1);
   assert.deepEqual(results[2].result, { stopped: true, stopCount: 2 });
+});
+
+test('pm/ensure rejects a port held by a service with a mismatched token', async () => {
+  const results = await callWorkerLines([
+    {
+      jsonrpc: '2.0',
+      id: 23,
+      method: 'pm/ensure',
+      cindy: { secrets: { pm_token: 'cindy-token' } },
+    },
+  ], { foreign: true });
+  assert.equal(results[0].error.code, -32000);
+  assert.match(results[0].error.message, /令牌未验证通过/);
+  assert.match(results[0].error.message, /未接管该服务/);
 });
 
 test('GET tasks uses the bearer token and Cindy-only loopback path', async () => {

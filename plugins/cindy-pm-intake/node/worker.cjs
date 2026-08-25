@@ -36,6 +36,9 @@ async function ensurePm(request) {
   if (!server || typeof server.stop !== 'function') {
     throw new Error('本机任务库启动结果缺少 stop()');
   }
+  if (server.foreign) {
+    throw new Error('本机任务库 127.0.0.1:4310 已被其他进程占用，Cindy 令牌未验证通过；插件未接管该服务，请停止占用进程后重试。');
+  }
   pmServerHandle = server;
   return server;
 }

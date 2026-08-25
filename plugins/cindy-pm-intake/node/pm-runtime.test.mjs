@@ -187,7 +187,7 @@ test('status bar source watches its parent PID and exits when the parent disappe
 
 test('foreign stop returns an explicit error and leaves the foreign listener alive', async () => {
   const foreign = createServer((request, response) => {
-    response.statusCode = request.url === '/api/integrations/cindy/tasks' ? 404 : 200;
+    response.statusCode = request.url === '/api/integrations/cindy/tasks' ? 401 : 200;
     response.end('foreign');
   });
   const port = await listen(foreign);
@@ -198,6 +198,7 @@ test('foreign stop returns an explicit error and leaves the foreign listener ali
       sqlitePath: join(root, 'pm.sqlite'),
       token: 'test-token',
     });
+    assert.equal(runtime.alreadyRunning, false);
     assert.equal(runtime.foreign, true);
     assert.deepEqual(await runtime.stop(), {
       stopped: false,
