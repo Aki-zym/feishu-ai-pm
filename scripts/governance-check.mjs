@@ -6,9 +6,8 @@ const defaultRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 const REQUIRED_CODEOWNER_RULES = [
   '/apps/server/',
-  '/apps/desktop/',
-  '/release/',
   '/apps/web/',
+  '/plugins/cindy-pm-intake/',
   '/docs/security_and_privacy.md',
   '/docs/feishu-integration.md',
   '/apps/server/src/integrations/',

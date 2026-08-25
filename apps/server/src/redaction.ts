@@ -1,6 +1,17 @@
 import { types as nodeTypes } from 'node:util';
 import { URL as NodeUrl } from 'node:url';
-import { sanitizeUntrustedText } from './integrations/llm.js';
+function sanitizeUntrustedText(value: unknown, maxChars = 2_000) {
+  if (typeof value !== 'string') return '';
+  const limit = Number.isFinite(maxChars) ? Math.max(0, Math.floor(maxChars)) : 0;
+  if (!limit) return '';
+  return value
+    .replace(/<\|(?:system|developer|assistant|user|end)\|>/giu, '[不可信标记]')
+    .replace(/(^|\n)\s*(?:system|developer|assistant|user)\s*:/giu, '$1[不可信标记]：')
+    .replace(/\b(?:Bearer\s+|sk-[A-Za-z0-9_-]{8,}|gh[opsu]_[A-Za-z0-9_]+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\S*/giu, '[敏感值]')
+    .replace(/[\u0000-\u001F\u007F]/gu, ' ')
+    .slice(0, limit)
+    .trim();
+}
 
 export const REDACTION_SCHEMA_VERSION = '1';
 

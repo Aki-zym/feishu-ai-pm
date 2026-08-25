@@ -11,7 +11,7 @@ CI 先对完整 `base → merge-ref` diff 使用统一分类器，再选择最�
 | `docs/**`、入口文档 | L0 | docs generate/check/test | 只能证明文档和仓库元数据一致 |
 | tests、fixtures、已明确匹配测试命名的 `scripts/**`、`.github/**`、测试配置 | L1 | docs + check + lifecycle + E2E | 未明确识别的脚本按 unknown/full/high-risk 处理，测试改动不能缩小产品门禁 |
 | QA/证据/CI 控制脚本（`scripts/ci-*`、`evidence-record-policy`、`docs-check`、Playwright evidence/inventory/verifier、`run-ci-command`） | L4 | full + contract replay + exact provenance + manual review | 代码内置 floor，配置只能提高不能降低；不得改成 test-ci-only/docs-only |
-| `apps/server/**`、`apps/url-policy/**`、根运行配置 | L2 | docs + check + lifecycle + E2E | 服务/SQLite/运行配置需执行集成检查 |
+| `apps/server/**`、根运行配置 | L2 | docs + check + lifecycle + E2E | 服务/SQLite/运行配置需执行集成检查 |
 | Feishu 或 LLM integration | L3 | 上述门禁 + contract/replay/scope 或 redaction 证据 | Mock/replay 不等于真实 provider |
 | `apps/web/**` | L4 | 上述门禁 + 两个浏览器 project 的完整 E2E | 浏览器 Mock 不等于 Electron |
 | `apps/desktop/**` | L5 | 上述门禁 + lifecycle + 精确包的 Windows Smoke | Ubuntu CI 不能自行声称 Windows L5 |

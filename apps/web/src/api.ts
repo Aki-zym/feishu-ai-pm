@@ -1,5 +1,3 @@
-import { desktopBridge } from './desktop';
-
 export class ApiRequestError extends Error {
   readonly status: number;
   readonly body: unknown;
@@ -13,16 +11,6 @@ export class ApiRequestError extends Error {
 }
 
 async function request<T>(method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE', url: string, body?: unknown, signal?: AbortSignal): Promise<T> {
-  const desktop = desktopBridge();
-  if (desktop) {
-    const response = await desktop.api.request({ method, url, body });
-    if (response.status < 200 || response.status >= 300) {
-      const errorBody = response.body as { error?: string } | undefined;
-      throw new ApiRequestError(errorBody?.error ?? '请求失败，请稍后重试。', response.status, response.body);
-    }
-    return response.body as T;
-  }
-
   const response = await fetch(url, {
     method,
     signal,

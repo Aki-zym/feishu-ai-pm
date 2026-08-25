@@ -47,7 +47,7 @@ test('policy source and control-plane validators always force full manual review
     'package-lock.json',
     'apps/server/package.json',
     'apps/web/package.json',
-    'apps/desktop/package.json',
+    'plugins/cindy-pm-intake/ghost.json',
     '.github/workflows/ci.yml',
   ]) {
     const plan = selectCiPlan([file]);
@@ -98,10 +98,8 @@ test('policy mutation cannot weaken protected-path classification', () => {
 test('code-owned floors survive critical rule downgrade, removal, and reorder', () => {
   const critical = [
     ['apps/server/src/runtime.ts', 'server', 'L2'],
-    ['apps/server/src/integrations/feishu.ts', 'feishu', 'L3'],
-    ['apps/server/src/integrations/llm.ts', 'llm', 'L3'],
-    ['apps/desktop/src/main.ts', 'desktop', 'L5'],
-    ['release/latest.yml', 'release', 'L5'],
+    ['plugins/cindy-pm-intake/main.js', 'cindy-plugin', 'L3'],
+    ['apps/web/src/App.tsx', 'web', 'L4'],
     ['future/runtime.bin', null, 'L6'],
   ];
   for (const [file, ruleId, minimumLevel] of critical) {
@@ -124,7 +122,7 @@ test('code-owned floors survive critical rule downgrade, removal, and reorder', 
 });
 
 test('category minimum floors cannot be weakened or removed', () => {
-  for (const category of ['server-data-runtime', 'feishu', 'llm', 'desktop', 'release', 'unknown']) {
+  for (const category of ['cindy-plugin', 'server-data-runtime', 'web', 'unknown']) {
     const weakened = structuredClone(selection);
     weakened.categories[category].minimum_level = 'L0';
     assert.match(selectionPolicyErrors(weakened).join('\n'), /安全 floor/);
@@ -141,10 +139,10 @@ test('category minimum floors cannot be weakened or removed', () => {
 
 test('weak policy schema fails closed', () => {
   const missingCategory = structuredClone(selection);
-  delete missingCategory.categories.desktop;
+  delete missingCategory.categories['cindy-plugin'];
   assert.match(selectionPolicyErrors(missingCategory).join('\n'), /categories/);
   const badEvidence = structuredClone(selection);
-  badEvidence.categories.desktop.required_evidence = [''];
+  badEvidence.categories['cindy-plugin'].required_evidence = [''];
   assert.match(selectionPolicyErrors(badEvidence).join('\n'), /evidence/);
   const duplicateRule = structuredClone(selection);
   duplicateRule.path_rules.push({ ...duplicateRule.path_rules[0] });
@@ -201,7 +199,7 @@ test('mixed documentation and test paths fail closed to the full gate', () => {
 });
 
 test('workspace tests remain test/CI-only rather than being mistaken for product source', () => {
-  for (const file of ['apps/server/tests/app.test.ts', 'apps/web/src/App.spec.tsx', 'apps/desktop/__tests__/main.ts']) {
+  for (const file of ['apps/server/tests/app.test.ts', 'apps/web/src/App.spec.tsx', 'plugins/cindy-pm-intake/main.test.mjs']) {
     const plan = selectCiPlan([file]);
     assert.deepEqual(plan.categories, ['test-ci-only']);
     assert.equal(plan.mode, 'full');
@@ -216,12 +214,12 @@ test('empty, absolute, and parent-escaping paths never qualify as docs-only', ()
   }
 });
 
-test('release paths select the full gate and remain visibly classified', () => {
-  for (const file of ['release/latest.yml', 'apps/desktop/electron-builder.yml', '.github/workflows/release.yml']) {
+test('current plugin paths select the plugin contract gate', () => {
+  for (const file of ['plugins/cindy-pm-intake/main.js', 'plugins/cindy-pm-intake/node/worker.cjs']) {
     const plan = selectCiPlan([file]);
     assert.equal(plan.mode, 'full');
-    assert.equal(plan.categories.includes('release'), true);
-    assert.equal(plan.minimumLevel, 'L5');
+    assert.equal(plan.categories.includes('cindy-plugin'), true);
+    assert.equal(plan.minimumLevel, 'L3');
     assert.equal(plan.gates.e2e, true);
   }
 });
@@ -242,22 +240,18 @@ test('unrecognized scripts fail closed instead of inheriting test-ci-only L1', (
     assert.equal(plan.highRisk, true, file);
     assert.equal(plan.manualReviewRequired, true, file);
   }
-  const installer = selectCiPlan(['scripts/desktop-installer-smoke.mjs']);
-  assert.equal(installer.mode, 'full');
-  assert.deepEqual(installer.categories, ['release']);
-  assert.equal(installer.minimumLevel, 'L5');
 });
 
-test('Feishu and LLM paths require contract replay at L3', () => {
-  assert.equal(selectCiPlan(['apps/server/src/integrations/feishu.ts']).minimumLevel, 'L3');
-  assert.equal(selectCiPlan(['apps/server/src/integrations/llm.ts']).minimumLevel, 'L3');
+test('Cindy plugin paths require contract replay at L3', () => {
+  assert.equal(selectCiPlan(['plugins/cindy-pm-intake/main.js']).minimumLevel, 'L3');
+  assert.equal(selectCiPlan(['plugins/cindy-pm-intake/node/worker.cjs']).minimumLevel, 'L3');
 });
 
-test('desktop paths select lifecycle and Windows Smoke as required evidence', () => {
-  const plan = selectCiPlan(['apps/desktop/src/main.ts']);
-  assert.equal(plan.minimumLevel, 'L5');
-  assert.equal(plan.requiredEvidence.includes('lifecycle'), true);
-  assert.equal(plan.requiredEvidence.includes('windows_installer_smoke'), true);
+test('Cindy plugin paths select contract and scope evidence', () => {
+  const plan = selectCiPlan(['plugins/cindy-pm-intake/main.js']);
+  assert.equal(plan.minimumLevel, 'L3');
+  assert.equal(plan.requiredEvidence.includes('contract_replay'), true);
+  assert.equal(plan.requiredEvidence.includes('scope_guard'), true);
 });
 
 test('unknown and mixed paths are high risk and never authorize a broad claim', () => {
@@ -277,19 +271,16 @@ test('the small path matrix reports every requested category', () => {
   assert.equal(classifyPath('.github/workflows/ci.yml'), 'qa-control-plane');
   assert.equal(classifyPath('apps/server/src/index.ts'), 'server-data-runtime');
   assert.equal(classifyPath('apps/web/src/App.tsx'), 'web');
-  assert.equal(classifyPath('apps/desktop/src/main.ts'), 'desktop');
-  assert.equal(classifyPath('release/latest.yml'), 'release');
+  assert.equal(classifyPath('plugins/cindy-pm-intake/main.js'), 'cindy-plugin');
 });
 
-test('workflow disables artifact upload, keeps the post-E2E verifier, and pins remaining actions', async () => {
+test('workflow runs the current plugin, server and web gates', async () => {
   const workflow = await readFile(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
-  assert.doesNotMatch(workflow, /upload-artifact|failure-upload|ci:artifacts:stage|playwright-report|test-results/);
-  assert.match(workflow, /if: always\(\) && steps\.plan\.outputs\.mode == 'full'[\s\S]*run: npm run test:e2e:verify/);
-  assert.doesNotMatch(workflow, /uses:\s+[^\s]+@v\d+/);
-  assert.match(workflow, /actions\/checkout@11d5960a326750d5838078e36cf38b85af677262/);
-  assert.match(workflow, /actions\/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020/);
-  assert.match(workflow, /node scripts\/run-ci-command\.mjs e2e-lifecycle/);
-  assert.match(workflow, /node scripts\/run-ci-command\.mjs e2e/);
+  assert.match(workflow, /npm run typecheck/);
+  assert.match(workflow, /npm run test:plugin/);
+  assert.match(workflow, /npm run test:web:current/);
+  assert.match(workflow, /npm run test:server:current/);
+  assert.doesNotMatch(workflow, /apps\/desktop|electron|desktop:/i);
 });
 
 test('runtime renamed into docs remains a full change when rename detection is disabled', async () => {

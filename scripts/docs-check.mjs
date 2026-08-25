@@ -355,13 +355,7 @@ function validateArtifact(record) {
   }
 
   const rootPackage = readJson('package.json');
-  const desktopPackage = readJson('apps/desktop/package.json');
-  if (rootPackage.version !== desktopPackage.version) addError(`${record.id}: 根版本与 desktop 版本不一致。`);
   if (!artifact.path.includes(rootPackage.version)) addError(`${record.id}: 产物文件名未包含当前产品版本 ${rootPackage.version}。`);
-
-  const latest = readText('release/latest.yml');
-  if (!latest.includes(`version: ${rootPackage.version}`)) addError(`${record.id}: release/latest.yml 版本不一致。`);
-  if (!latest.includes(`size: ${artifact.size_bytes}`)) addError(`${record.id}: release/latest.yml 大小不一致。`);
 }
 
 function localMarkdownTargets(sourceFile, content) {
@@ -510,7 +504,7 @@ function renderVerification() {
     '|---|---|---|---|---|',
     ...Object.entries(verification.selection_policy?.categories ?? {}).map(([category, policy]) => `| ${escapeCell(category)} | ${escapeCell(policy.minimum_level)} | ${escapeCell(policy.risk)} | ${escapeCell((policy.required_evidence ?? []).join(', '))} | ${policy.manual_review_required === true ? 'yes' : 'no'} |`),
     '',
-    'Path category precedence：docs → release → Feishu/LLM integration → test/CI → web → desktop → server/data/runtime → unknown。空 diff、绝对路径、父目录逃逸和无法识别路径不属于 docs-only。',
+    'Path category precedence：docs → QA control → Cindy plugin → test/CI → web → server/data/runtime → unknown。空 diff、绝对路径、父目录逃逸和无法识别路径不属于 docs-only。',
     '',
     '## Skip 与 provenance 合同',
     '',
@@ -551,7 +545,7 @@ function renderVerification() {
     if (record.artifact) {
       lines.push(
         `- Artifact：\`${record.artifact.path}\`，${record.artifact.size_bytes} bytes，SHA-256 \`${record.artifact.sha256}\``,
-        `- 产物状态：${record.artifact.architecture}；签名 ${record.artifact.signature}；仓库分发 ${record.artifact.repository_distribution}；GitHub Release ${record.artifact.github_release}`,
+        `- 产物状态：${record.artifact.architecture}；签名 ${record.artifact.signature}；仓库分发 ${record.artifact.repository_distribution}`,
       );
     }
     lines.push('');
@@ -561,9 +555,8 @@ function renderVerification() {
     '',
     '- “目标层级”只表示计划达到哪里；只有“已取得层级”和“证据状态”才能说明已经得到什么证据。',
     '- `not_run` 明确表示未取得证据；`historical_documented_claim` 只是历史声明、未独立复验，二者都不能显示为真实环境证据已取得。',
-    '- Artifact 的 hash 只证明该产物的完整性或身份；没有绑定该精确 hash 的实际 Windows 安装运行，不能显示为已取得 L5 Smoke。',
-    '- Mock、契约、回放、浏览器 E2E、构建产物和旧包 Smoke 均不能写成 L6 真实连接验证。',
-    '- 安装包必须以精确 hash 关联 Smoke；同名版本的其他 hash 不能互相替代。',
+    '- Artifact 的 hash 只证明该产物的完整性或身份；不能替代插件、server 或 web 的实际运行证据。',
+    '- Mock、契约、回放、浏览器 E2E 和构建产物均不能写成真实外部连接验证。',
     '- 历史测试数字保留在 CHANGELOG / QA；入口文档只引用验证 ID。',
   );
   return `${lines.join('\n')}\n`;

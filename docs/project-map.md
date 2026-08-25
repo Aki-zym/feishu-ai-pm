@@ -2,18 +2,16 @@
 
 先读 [当前状态](current-state.md)。本页只说明“去哪里找”；对象级数据权威、状态机和错误合同以 [领域合同](domain-contracts.md) 为准。
 
+现行用户入口：Cindy 插件 → 本机后台 `http://127.0.0.1:4310` → 浏览器。浏览器设置页管理本机任务库运行选项；旧 Electron/EXE 与 OAuth 设置页仅保留为遗留实现和验证索引。
+
 | 区域 | 作用 | 主要实现入口 | 稳定合同 | 测试与证据入口 | 变化时复核的文档 |
 |---|---|---|---|---|---|
-| Windows 桌面壳 | Electron 生命周期、受限 IPC、本机配置与安装 | `apps/desktop/src/`、`apps/desktop/electron-builder.yml` | `docs/architecture.md`、`docs/security_and_privacy.md` | `apps/desktop/src/*.test.ts`、`scripts/desktop-installer-smoke.mjs` | 使用指南、架构、安全、当前状态、验证矩阵 |
 | React 界面 | 工作台、候选、任务、日历、设置与日志 | `apps/web/src/` | `docs/implementation_brief.md`、`docs/user-guide.md` | `apps/web/src/*.test.ts`、`tests/e2e/` | 使用指南、QA；用户流程改变时更新当前状态 |
 | 服务与领域行为 | API、候选/任务、Runtime、主人判断和审计 | `apps/server/src/app.ts`、`service.ts`、`runtime.ts`、`domain.ts` | `docs/architecture.md`、相关 ADR | `apps/server/tests/` | 架构、安全、实施说明；能力状态改变时更新当前状态 |
 | 当前本地数据层 | SQLite schema、迁移与本地事实记录 | `apps/server/src/database.ts` | `docs/architecture.md`、`docs/security_and_privacy.md` | server 数据库/迁移测试 | 架构、安全；未来数据库方向只记录开放决策 |
-| 飞书适配 | OAuth、P2P/群、日历、妙记和文档上下文 | `apps/server/src/integrations/feishu*.ts` | `docs/feishu-integration.md`、`docs/security_and_privacy.md` | `apps/server/tests/feishu*.test.ts` | 飞书接入、安全、使用指南、验证矩阵 |
-| LLM 分类 | OpenAI-compatible/DeepSeek 分阶段结构与本地校验 | `apps/server/src/integrations/llm.ts` | `docs/implementation_brief.md`、`docs/adr/0006-staged-semantic-classification.md` | `apps/server/tests/llm.test.ts`、回放测试 | 实施说明、架构、安全、验证矩阵 |
-| 任务记忆与 reference | SQLite 派生投影、只读工作目录引用 | `apps/server/src/integrations/workspace.ts`、`service.ts` | `docs/architecture.md`、`docs/security_and_privacy.md` | Runtime/thread memory 与 workspace 测试 | 架构、安全、使用指南 |
+| 任务记忆与 reference | SQLite 派生投影、只读工作目录引用 | `apps/server/src/service.ts` | `docs/architecture.md`、`docs/security_and_privacy.md` | Runtime/thread memory 与 workspace 测试 | 架构、安全、使用指南 |
 | 浏览器 E2E 与 QA | 人工构造数据的跨页面路径、选层和历史验收记录 | `tests/e2e/`、`docs/qa/`、`docs/test-selection.md` | `docs/verification-matrix.json`、`scripts/ci-selection-policy.mjs`、`scripts/evidence-record-policy.mjs` | Playwright inventory/verifier、CI selection、提交内 QA 记录 | 验证矩阵；逐次数字只进入 QA 历史 |
 | 完全本地 exact verification | 隔离 worktree 内的 Git 重算选层、canonical gates、严格 schema、generation/lock/CAS 发布、脱敏日志和可重验 evidence | `scripts/ci-plan.mjs`、`scripts/local-verification.mjs` | `docs/local-verification-schema.json`、`docs/local-verification.md` | `scripts/ci-plan.test.mjs`、`scripts/local-verification.test.mjs` | 测试选层、验证矩阵、当前状态和 cutover SOP |
-| Windows 产物 | EXE、blockmap、latest.yml 与 LFS | `release/`、`package.json` | `AGENTS.md`、Issue #62 | 产物 hash、Windows 隔离安装 Smoke | 当前状态、验证矩阵、使用指南、CHANGELOG |
 | 文档治理 | 唯一 current、地图、验证证据和历史 | `docs/current-state.md`、`docs/docs-manifest.json`、`docs/verification-matrix.json` | `AGENTS.md` | `npm run docs:check` | README、AGENTS、docs/README 与受影响的稳定合同 |
 | 领域合同 | 术语、事实层权威、状态机、CAS、错误/outcome 与 ADR 关系 | `docs/domain-contracts.json`、`docs/domain-contracts.md` | `scripts/domain-contracts-check.mjs` | 当前状态、架构、安全、开放决策、README |
 

@@ -35,6 +35,8 @@ node_modules/
 .next/
 .vite/
 dist/
+!plugins/cindy-pm-intake/web-dist/
+!plugins/cindy-pm-intake/web-dist/**
 build/
 release/
 secrets/

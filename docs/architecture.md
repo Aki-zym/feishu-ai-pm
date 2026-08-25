@@ -6,6 +6,10 @@ PRIV-001 v6 并发约束：active claim 默认阻止冲突 update，过期只能
 
 M1 的产品与治理决策以 [DEC-01](decision-register.md) 为唯一登记入口：SQLite、draft-only、上海自然日和日历候选责任门、隐私删除顺序、PR/独立复核及真实试点 gate 均不可由实现者自行改写。来源事实、生成摘要和文件活动继续保持不同语义；当前证据不替代 L5/L6 真实环境验收。
 
+## 当前用户入口
+
+现行使用从 Cindy 插件开始：插件连接 XD Feishu 并启动本机后台，浏览器访问 `http://127.0.0.1:4310`。浏览器设置页只提供本机任务库运行管理，不提供旧飞书 OAuth 首配；当前用户流程不经过 Electron 或 Windows EXE。后文保留的桌面、安装包和 OAuth 细节属于遗留实现与验证记录。
+
 PROD-07 进一步固定日历入口的语义：日历事件先作为来源事实/提醒保存；运行时仅当 `explicit_owner_responsibility + action + deliverable_or_deadline` 三项同时成立时才允许进入 `candidate_review`，否则走 `calendar_fact` 或责任不明的 `owner_confirmation`。过滤为非任务不删除来源；会议占位不单独推断 action item，纪要或明确消息必须重新提供可追溯依据。路由解释只保留固定代码、有限证据字段和来源引用，不暴露原始日历 payload、参会人目录或正文。
 
 ## 推荐主链
@@ -22,7 +26,7 @@ PROD-07 进一步固定日历入口的语义：日历事件先作为来源事实
 
 `candidate_merge` 只处理尚未接受的候选；`thread_association` 处理来源与已有正式任务的归属。两者分别建模，避免候选归并破坏正式任务更新链。
 
-## 推荐主链
+## 历史来源主链（遗留 OAuth/机器人合同）
 
 ```text
 系统主人 OAuth 个人信息流
@@ -48,7 +52,7 @@ PROD-07 进一步固定日历入口的语义：日历事件先作为来源事实
 
 飞书企业自建应用负责 OAuth、权限和 API；机器人不再是主要交互媒介。完整裁决见 [ADR 0002](adr/0002-owner-information-first.md)。
 
-## Windows 桌面运行方式
+## Windows 桌面运行方式（遗留维护路径）
 
 ```text
 Electron React renderer
@@ -58,7 +62,7 @@ Fastify inject / PmService（不监听固定本地端口）
 SQLite / 飞书适配器 / LLM 适配器 / 只读工作区
 ```
 
-Fastify继续用于浏览器开发、自动测试和未来需要的飞书回调入口；正式 EXE 内部不要求用户单独启动 Web 服务。桌面数据库和加密配置均存放在当前 Windows 用户的应用数据目录。
+Fastify继续用于浏览器开发、自动测试和未来需要的飞书回调入口；正式 EXE 内部不要求用户单独启动 Web 服务。桌面数据库和加密配置均存放在当前 Windows 用户的应用数据目录。本节仅记录遗留桌面端的实现与验证；现行入口由 Cindy 插件启动本机后台并由浏览器访问 `http://127.0.0.1:4310`。
 
 正式服务端与 Electron 使用的 `buildApp` 默认只装配产品 API，不注册 `/api/dev/simulate-message`。该开发夹具只能由自动测试在创建 App 时显式开启，不能通过 `NODE_ENV`、内存数据库、浏览器模式或 renderer 开关隐式获得。正式人工补录走 `/api/corrections`，沿用来源、候选、幂等与主人确认主链。
 
@@ -72,9 +76,9 @@ Playwright 的桌面宽屏和 Pixel 7 项目分别连接独立的本地 Fastify 
 
 ### CI 选择与失败日志边界
 
-Pull Request CI 先使用 [测试选层与证据门禁](test-selection.md) 对完整 `base → merge-ref` diff 分类，再选择最低 L0–L6 目标。只有全部路径明确为纯文档时才缩短为 L0 文档门禁；测试、脚本、依赖、CI、server/data/runtime、Feishu/LLM、web、desktop 和 release 变化继续执行完整源码检查、生命周期探针和浏览器 E2E。mixed、unknown、绝对路径、父目录逃逸和空 diff 一律 fail-closed 到完整门禁，并标记人工复核，不能用窄证据授权 broad L5/L6。changed-path 选择只决定本轮门禁，不改变 L0–L6 的证据含义，也不能替代产品源码 fingerprint 检查。
+Pull Request CI 先使用 [测试选层与证据门禁](test-selection.md) 对完整 `base → merge-ref` diff 分类，再选择最低 L0–L6 目标。只有全部路径明确为纯文档时才缩短为 L0 文档门禁；测试、脚本、依赖、CI、server/data/runtime、Feishu/LLM、web 和 release 变化继续执行完整源码检查、生命周期探针和浏览器 E2E。mixed、unknown、绝对路径、父目录逃逸和空 diff 一律 fail-closed 到完整门禁，并标记人工复核，不能用窄证据授权 broad L5/L6。changed-path 选择只决定本轮门禁，不改变 L0–L6 的证据含义，也不能替代产品源码 fingerprint 检查。
 
-CI 在 Pull Request merge ref 上运行，并核对 checkout 的双亲与事件中的 base/head，不能用 head-only 结果代替组合结果。完整门禁只构建一次 web/server/desktop；测试专用 server 装配继续直接运行源码，浏览器服务消费本轮 web 构建，并在启动前核对当前 commit、源码状态与 web/server 完整产物树 hash，避免重复构建或误用旧文件。各测试包必须由测试运行器报告至少一条通过测试，不使用 `passWithNoTests` 把缺失或全跳过测试写成通过。
+CI 在 Pull Request merge ref 上运行，并核对 checkout 的双亲与事件中的 base/head，不能用 head-only 结果代替组合结果。完整门禁只构建一次 web/server；测试专用 server 装配继续直接运行源码，浏览器服务消费本轮 web 构建，并在启动前核对当前 commit、源码状态与 web/server 完整产物树 hash，避免重复构建或误用旧文件。各测试包必须由测试运行器报告至少一条通过测试，不使用 `passWithNoTests` 把缺失或全跳过测试写成通过。
 
 每条当前证据还必须遵守 `evidence_contract`：exact CI 绑定 base/head/merge-ref/parents/tree/run/job/environment/command；四个 SHA 字段必须为完整对象标识，parents 严格为 `[base, head]`，attained exact evidence 的 source 必须等于 head；对象可用时还会读取 merge-ref 实际 parents/tree 和 source/head 对象，但本地 checker 不证明 GitHub Actions run/job 的存在、SUCCESS、event、head_sha 或 merge checkout，最终授权仍需 PR body/Lead 远端核验。记录与 provenance 的 run/environment/command 必须交叉一致；local run 明确 CI 字段为 `not_applicable` 且 parents 精确为空数组；未运行记录使用 `not_run` sentinel。provenance/skip 对象拒绝未知字段，`capability`/`platform` skip 与 `not_executed` 分开，后者必定 fail-closed。Artifact hash 只证明身份，不等同 Windows Smoke；synthetic/Mock/replay/browser 最高 L4，真实租户/provider 的 L6 必须另有实际授权运行。
 

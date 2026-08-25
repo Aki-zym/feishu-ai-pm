@@ -4,6 +4,10 @@ PRIV-001 v6 的 active claim 会阻止冲突主人状态推进；lease 过期只
 
 > 2026-08-17 PRIV-001 schema-v6 amendment：v5 schema/descriptor/checksum 不改写。跨进程 stop/start/revoke/hard-delete 统一使用持久 operation claim/fencing token 与版本 CAS；backup cleanup intent 在破坏性删除前记录受管 artifact identity/path/hash，partial finalize 可枚举、验证并恢复。证据仅 synthetic/local，不代表真实 Feishu/provider 或 Windows L5/L6。
 
+## 当前使用入口
+
+当前用户流程：Cindy 插件连接 XD Feishu → 启动本机后台 → 浏览器访问 `http://127.0.0.1:4310`。浏览器设置页只管理本机任务库运行选项；当前使用不包含 Electron、Windows EXE 或旧飞书 OAuth 设置页。本文后续涉及桌面、安装包和 OAuth 的内容属于遗留安全合同与历史验证，供审计和维护参考。
+
 ## 测试证据边界
 
 CI 只消费完整 changed-path diff，并按 [测试选层与证据门禁](test-selection.md) fail-closed 选择最低验证层级。控制 CI 选层和证据校验的 protected control-plane 路径由代码内置，不能通过修改 `verification-matrix.json` 自身降级为 docs-only；其 schema、受控证据名称、exact parents/tree/source 和 record↔provenance 交叉绑定均需机器校验。unknown、mixed、绝对路径和父目录逃逸不能被标成 docs-only；窄的 synthetic/Mock/replay 结果不能授权 broad L5/L6。证据记录必须绑定 source 与 exact provenance，明确区分 capability/platform 限制和 `not_executed`；后者不能写成通过。Artifact SHA-256 只证明产物身份，不代表安装运行或真实用户数据处理。测试夹具仍不得读取真实 `%APPDATA%`、真实用户数据库、聊天原文、token、真实 Feishu/LLM/provider 或生产数据。exact merge-ref 的本地 checker 只验证 Git 对象；可选 GitHub 远端 verifier 必须实际确认 run/job 为 pull_request + completed/success、head SHA、merge-ref 和 `[base,head]` parents/tree。私有仓库远端核验只在显式 token 或 `GITHUB_TOKEN`/`GH_TOKEN` 存在时发送 Bearer header，token 不落盘、不回显；apiBase 只允许受控的 https://api.github.com 根地址，重定向或 foreign host 直接不可用；无 token 的公共仓库仍可请求，401/403/404、网络或权限不可用时结果固定为 `unavailable`，不能伪装为通过。

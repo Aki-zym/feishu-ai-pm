@@ -426,26 +426,3 @@ export type Notification = {
   task_title: string | null;
   candidate_title: string | null;
 };
-
-export type FeishuMonitorTarget = {
-  id: string;
-  kind: 'person' | 'group';
-  name: string;
-  secondaryLabel: string | null;
-  selected: boolean;
-  readPolicy: 'incoming_only' | 'owner_mentions';
-  accessStatus: 'unknown' | 'readable' | 'restricted' | 'not_found' | 'error';
-  lastDiscoveredAt: string | null;
-  lastSuccessAt: string | null;
-  lastError: string | null;
-};
-
-export type FeishuMonitoringScope = {
-  ownerAuthorized: boolean;
-  people: FeishuMonitorTarget[];
-  groups: FeishuMonitorTarget[];
-  selectedPersonCount: number;
-  selectedGroupCount: number;
-  limits: { people: number; groups: number };
-  updatedAt: string | null;
-};

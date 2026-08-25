@@ -24,7 +24,23 @@ export type CandidateTimeStatus = 'explicit' | 'relative_resolved' | 'inferred' 
 /** Calendar text is parsed by code; this is the model's semantic role for it. */
 export type CandidateTimeSemantic = 'deadline' | 'start' | 'window' | 'reference' | 'unknown';
 export type CandidateSourceRole = 'owner_delivery' | 'background' | 'constraint' | 'process_question' | 'unknown';
-import type { CalendarClassification } from './calendar-classification.js';
+
+export type CalendarClassificationRoute = 'calendar_fact' | 'candidate_review' | 'owner_confirmation';
+export type CalendarClassification = {
+  route: CalendarClassificationRoute;
+  sourceRetained: true;
+  candidateCreated: boolean;
+  requiresOwnerConfirmation: boolean;
+  explanationCode: string;
+  evidenceFields: {
+    ownerResponsibility?: string;
+    action?: string;
+    deliverableOrDeadline?: string;
+    sourceReference: string;
+    missingSignalCode?: string;
+  };
+  correctionScope: 'current_event_only';
+};
 
 /**
  * The semantic action of the current message relative to a demand thread.

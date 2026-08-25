@@ -1,7 +1,5 @@
-import type { CandidateAnalysis, CandidateDraft, CandidateMergeDecision, MessageActionDecision, NormalizedSourceEvent, OwnerIdentity, OwnerIntentDecision, ThreadAssociationDecision } from './domain.js';
-import type { CalendarClassification } from './calendar-classification.js';
+import type { CalendarClassification, CandidateAnalysis, CandidateDraft, CandidateMergeDecision, MessageActionDecision, NormalizedSourceEvent, OwnerIdentity, OwnerIntentDecision, ThreadAssociationDecision } from './domain.js';
 import type { RetryFailureMetadata } from './retry-policy.js';
-import type { OperationContext } from './observability.js';
 export type { ProviderRetrySignal } from './retry-policy.js';
 
 export type ClassificationUnitResult = {
@@ -26,51 +24,6 @@ export type DurableEventReceipt = {
   sourceEventId: string;
   deduplicated: boolean;
   capturedAt: string;
-};
-
-/**
- * A scope response has three states.  `omitted` is intentionally different
- * from `set([])`: an omitted scope keeps the last verified local authorization
- * gates, while an explicit empty set clears them.
- */
-export type FeishuScopeUpdate =
-  | { kind: 'omitted' }
-  | { kind: 'set'; scopes: string[] };
-
-export type TokenVaultSnapshot = {
-  generation: number;
-  /** All rotating OAuth state captured under one vault lock. */
-  accessToken: string | null;
-  refreshToken: string | null;
-  expiresAt: string | null;
-  grantedScopes: string | null;
-};
-
-export type TokenVaultAtomicResult = {
-  accepted: boolean;
-  generation: number;
-};
-
-export type TokenVaultRefreshLease = {
-  status: 'acquired' | 'busy' | 'completed' | 'failed';
-  generation: number;
-  snapshot: TokenVaultSnapshot;
-  /** Durable phase used to distinguish safe claim takeover from an uncertain provider exchange. */
-  phase?: 'claimed' | 'provider_started' | 'response_pending' | 'retryable_failed' | 'recovery_required' | 'completed';
-  leaseId?: string;
-  /** Durable owner identity and fencing token; never contains token material. */
-  ownerId?: string;
-  fencingToken?: number;
-  /** SHA-256 fingerprint of the presented refresh token, or null. */
-  tokenFingerprint?: string | null;
-  resultExpiresAt?: string | null;
-};
-
-export type TokenVaultRefreshLeaseResult = {
-  status: 'completed' | 'failed';
-  generation: number;
-  expiresAt?: string | null;
-  phase?: 'retryable_failed' | 'recovery_required';
 };
 
 export type ClassificationResult = {
@@ -136,54 +89,6 @@ export type ClassificationResult = {
   };
 };
 
-export type ClassificationOptions = {
-  signal?: AbortSignal;
-  operationContext?: OperationContext;
-  /**
-   * Runtime-owned fence for durable provider cooldown writes. A provider may
-   * emit a retry signal while a job is being cancelled or its lease replaced;
-   * the adapter must not let that stale callback advance shared cooldown.
-   */
-  retryCooldownGuard?: () => boolean;
-};
-
-export interface TokenVault {
-  get(key: string): Promise<string | null>;
-  set(key: string, value: string): Promise<void>;
-  /** Optional atomic replacement used for rotating OAuth refresh tokens. */
-  setMany?(values: Record<string, string>): Promise<void>;
-  /** Read all rotating OAuth state under one vault lock. */
-  readSnapshot?(): Promise<TokenVaultSnapshot>;
-  /**
-   * Atomically apply a token update only when the generation is unchanged.
-   * `null` deletes a key; an empty string is a real value and must be kept
-   * (notably for an explicitly empty granted-scope response).
-   */
-  setManyAtomic?(
-    values: Record<string, string | null>,
-    expectedGeneration: number,
-    refreshFence?: {
-      identityKey: string;
-      leaseId: string;
-      fencingToken: number;
-      tokenFingerprint: string | null;
-      /** When present, completion is published under the same vault lock/journal. */
-      resultExpiresAt?: string | null;
-    },
-  ): Promise<TokenVaultAtomicResult>;
-  /** Acquire a durable, cross-process, per-identity refresh lease. */
-  acquireRefreshLease?(identityKey: string, waitForResult?: boolean, reuseCurrentResult?: boolean): Promise<TokenVaultRefreshLease>;
-  /** Extend a lease while the provider request is still in flight. */
-  renewRefreshLease?(
-    identityKey: string,
-    leaseId: string,
-    fencingToken?: number,
-    phase?: 'claimed' | 'provider_started' | 'response_pending',
-  ): Promise<boolean>;
-  /** Publish a bounded, non-secret refresh result and release the lease. */
-  releaseRefreshLease?(identityKey: string, leaseId: string, result: TokenVaultRefreshLeaseResult, fencingToken?: number): Promise<void>;
-}
-
 export interface FeishuAuthAdapter {
   readonly kind: 'disabled' | 'mock' | 'live';
   buildAuthorizationUrl(state?: string): Promise<string>;
@@ -217,8 +122,6 @@ export interface FeishuMessageAdapter {
 export interface FeishuOwnerInformationAdapter {
   readonly kind: 'disabled' | 'mock' | 'live';
   getCurrentUser(): Promise<OwnerIdentity>;
-  /** Tri-state persisted provider scope result; omitted preserves local gates. */
-  getGrantedScopeUpdate?(): Promise<FeishuScopeUpdate>;
   primaryCalendar(): Promise<unknown>;
   listCalendarEvents(input?: Record<string, unknown>): Promise<unknown>;
   /** Read one calendar event with optional attendee details using user OAuth. */
@@ -259,15 +162,6 @@ export type FeishuAdapter = FeishuAuthAdapter &
   FeishuOwnerInformationAdapter &
   FeishuIdentityAdapter &
   FeishuOutboxAdapter;
-
-export interface LegacySemanticAdapter {
-  readonly kind: 'rule_mock' | 'live';
-  readonly provider: string;
-  readonly model: string;
-  readonly promptVersion: string;
-  classify(event: NormalizedSourceEvent, guidance?: string, options?: ClassificationOptions): Promise<ClassificationResult>;
-  testConnection(): Promise<IntegrationCheck>;
-}
 
 export type WorkspaceEntry = {
   relativePath: string;

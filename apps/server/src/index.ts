@@ -8,7 +8,7 @@ import { PmService } from './service.js';
 const config = loadConfig();
 
 if (config.database.provider !== 'sqlite') {
-  throw new Error('当前 Windows 桌面版使用 SQLite；PostgreSQL 仍属于未来部署选项。');
+  throw new Error('当前本机任务库使用 SQLite；PostgreSQL 仍属于未来部署选项。');
 }
 
 const database = new AppDatabase(config.database.sqlitePath);

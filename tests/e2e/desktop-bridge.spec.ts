@@ -74,43 +74,12 @@ const initialConfig = (overrides: Partial<SetupConfig['feishu']> = {}): SetupCon
 });
 
 test.describe('L4 本地 browser bridge Mock（不等于 Electron L5）', () => {
-  test('首次配置会保留并规范化用户填写的 DeepSeek Provider', async ({ page }) => {
+  test('桌面桥接配置未完成时仍进入任务台，不显示旧首配页', async ({ page }) => {
     await installBrowserBridgeMock(page, initialConfig());
 
     await page.goto('/');
-    await expect(page.getByRole('heading', { name: '配置 TooManyTasks' })).toBeVisible();
-    await expect(page.getByLabel('Provider')).toHaveValue('deepseek');
-    await page.getByLabel('Provider').fill('  deepseek  ');
-    await page.getByText('飞书权限开通指南', { exact: true }).click();
-    await page.getByRole('button', { name: '填入程序的 OAuth scope' }).click();
-    await page.getByRole('button', { name: '保存并进入连接检查' }).click();
-
-    const saved = await page.evaluate(() => ({
-      provider: (window as any).__savedSetupConfig?.llm?.provider,
-      model: (window as any).__savedSetupConfig?.llm?.model,
-      oauthScopes: (window as any).__savedSetupConfig?.feishu?.oauthScopes,
-      relaunchCalls: (window as any).__setupRelaunchCalls,
-    }));
-    expect(saved.provider).toBe('deepseek');
-    expect(saved.model).toBe('deepseek-v4-flash');
-    expect(saved.oauthScopes).toContain('docx:document:readonly');
-    expect(saved.relaunchCalls).toBe(1);
-  });
-
-  test('首次配置选择安全模拟模式会明确关闭真实飞书连接', async ({ page }) => {
-    await installBrowserBridgeMock(page, initialConfig({
-      appId: 'cli_test',
-      externalEnabled: true,
-      oauthScopes: 'offline_access',
-      scanEnabled: true,
-      groupIds: ['oc_optional'],
-    }));
-
-    await page.goto('/');
-    await page.getByRole('button', { name: '先用安全模拟模式' }).click();
-    const saved = await page.evaluate(() => (window as any).__savedSetupConfig);
-    expect(saved.llm.provider).toBe('rule_mock');
-    expect(saved.feishu.externalEnabled).toBe(false);
-    expect(saved.feishu.scanEnabled).toBe(false);
+    await expect(page.getByRole('heading', { name: '工作台' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: '配置 TooManyTasks' })).toHaveCount(0);
+    await expect(page.getByText('连接我的飞书', { exact: true })).toHaveCount(0);
   });
 });

@@ -4,9 +4,8 @@
 # Core server and data/runtime behavior
 /apps/server/ @guanchen-dotcom
 
-# Desktop shell, IPC and release configuration
-/apps/desktop/ @guanchen-dotcom
-/release/ @guanchen-dotcom
+# Cindy plugin runtime and local integration entry
+/plugins/cindy-pm-intake/ @guanchen-dotcom
 
 # Web UI
 /apps/web/ @guanchen-dotcom

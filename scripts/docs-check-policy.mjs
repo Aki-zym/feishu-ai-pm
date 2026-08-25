@@ -202,8 +202,7 @@ function canonical(value) {
 function packageProjection(bytes) {
   const source = JSON.parse(bytes.toString('utf8'));
   const scriptNames = [
-    'dev', 'build', 'start', 'desktop:start', 'desktop:dist',
-    'desktop:dist:smoke', 'desktop:smoke:installer',
+    'dev', 'build', 'start', 'test:plugin', 'test:server:current', 'test:web:current', 'test:current', 'typecheck', 'check',
   ];
   const projection = {};
   for (const key of ['version', 'main', 'workspaces', 'engines', 'dependencies', 'devDependencies', 'overrides', 'resolutions', 'allowScripts']) {

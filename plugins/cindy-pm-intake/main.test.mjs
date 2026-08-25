@@ -342,16 +342,16 @@ test('scan result uses human language for candidates, formal task updates, and e
   assert.equal(result.result.summary, '新建 1 张候选；已更新正式任务：正式任务 A、正式任务 B。');
 });
 
-test('ghost declares schedule support while retaining errand', () => {
-  assert.equal(ghost.version, '0.4.3');
+test('ghost keeps resident errand support only', () => {
+  assert.equal(ghost.version, '0.4.4');
   assert.equal(ghost.id, 'ai-pm-intake');
   assert.equal(ghost.name, 'TooManyTasks');
   assert.match(ghost.description, /本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台/);
   assert.match(ghost.whenToUse, /本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台/);
   assert.equal(ghost.launch, 'resident');
-  assert.deepEqual(Object.keys(ghost.agent).sort(), ['errand', 'schedule']);
+  assert.deepEqual(Object.keys(ghost.agent).sort(), ['errand']);
   assert.equal(ghost.agent.errand, true);
-  assert.equal(ghost.agent.schedule, true);
+  assert.equal('schedule' in ghost.agent, false);
   const scanTool = ghost.tools.find((tool) => tool.name === 'scan_intake_window');
   assert.match(scanTool.description, /入库 errand 会话内禁止调用本工具/);
   assert.deepEqual(scanTool.parameters.properties.trigger.enum, ['manual', 'schedule']);

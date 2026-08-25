@@ -16,9 +16,11 @@ jobs:
           node-version: "24"
           cache: npm
       - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
       - name: Plugin tests
-        run: node --test plugins/cindy-pm-intake/main.test.mjs plugins/cindy-pm-intake/settings.test.mjs plugins/cindy-pm-intake/node/worker.test.mjs plugins/cindy-pm-intake/node/pm-runtime.test.mjs plugins/cindy-pm-intake/node/pm-runtime.shutdown.test.mjs
+        run: npm run test:plugin
       - name: Web tests
-        run: npm test -w @ai-pm/web
-      - name: Server intake and runtime tests
-        run: npm test -w @ai-pm/server -- tests/cindy-intake.test.ts tests/runtime-shutdown.test.ts tests/seed-intake-route.test.ts
+        run: npm run test:web:current
+      - name: Server intake, runtime, seed, logs and app tests
+        run: npm run test:server:current

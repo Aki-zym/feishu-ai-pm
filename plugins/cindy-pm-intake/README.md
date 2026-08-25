@@ -23,13 +23,13 @@ errand 提示要求工作线程使用当前已授权的飞书 MCP 读取窗口�
 
 在插件设置中保存本机任务库地址，默认值为 `http://127.0.0.1:4310`，并保存与本机任务库服务一致的 `pm_token`。设置页和 Node Worker 都校验本机 HTTP 回环地址，任务接口保持在 `/api/integrations/cindy/` 前缀下，自动扫描开关使用 `/api/runtime/auto-scan`。intake 会话保持只读，只授权飞书 MCP，不开 shell、工作区写入或飞书写接口。
 
-入库 errand、自动化扫描和进度 oneshot 的配置请在插件详情「AI 代办」中手动保存为折扣路由 `codex/gpt-5.6-luna`、思考强度 `high`。插件详情「AI 代办」权限选「自动审核」(`auto`)，不要选只读 `plan` 或完全访问 `bypassPermissions`。请勿选择原价 `gpt-5.6-luna`。Cindy 草稿默认可能显示 `fable5`，首次使用时需改一次；插件不会静默修改 Cindy 的全局默认模型。
+入库 errand、常驻扫描和进度 oneshot 的配置请在插件详情「AI 代办」中手动保存为折扣路由 `codex/gpt-5.6-luna`、思考强度 `high`。插件详情「AI 代办」权限选「自动审核」(`auto`)，不要选只读 `plan` 或完全访问 `bypassPermissions`。请勿选择原价 `gpt-5.6-luna`。Cindy 草稿默认可能显示 `fable5`，首次使用时需改一次；插件不会静默修改 Cindy 的全局默认模型。
 
 Node Worker 的 `pm/restart` 调用当前 `startPmServer` 句柄的 `restart()`，关闭并重新监听同一配置，不调度 `process.exit(0)`；任务台浏览器的 `POST /api/runtime/restart` 使用同一条运行时重启链路。`pm/stop` 和 `POST /api/runtime/shutdown` 继续关闭当前 worker 自有实例，并按运行环境处理进程退出。
 
 ## 自动扫描与重启
 
-插件声明 `agent.schedule` 能力。常驻插件线程每 10 分钟触发一次 `scan_intake_window({ trigger: "schedule" })`；每轮先读取 `GET /api/runtime/auto-scan`，只有 `enabled: true` 才派发入库 errand。启用自动扫描开关后，Cindy 保持运行且开关打开，每 10 分钟自动扫。关闭开关只停止本产品自动流程；正在运行的扫描会自然收口，Cindy 退出后不会继续触发自动扫描。
+插件使用常驻 `setInterval` 每 10 分钟触发一次 `scan_intake_window({ trigger: "schedule" })`；每轮先读取 `GET /api/runtime/auto-scan`，只有 `enabled: true` 才派发入库 errand。启用自动扫描开关后，Cindy 保持运行且开关打开，每 10 分钟自动扫。关闭开关只停止本产品自动流程；正在运行的扫描会自然收口，Cindy 退出后不会继续触发自动扫描。
 
 常驻扫描返回 `enabled: false` 时直接返回 `skipped auto_scan_disabled`，不会派发 errand。手动调用 `scan_intake_window({ trigger: "manual" })` 始终扫描。当前已经处于入库 errand 会话时，或宿主返回 BUSY/会话占用，插件返回 `skipped` 指引当前 Agent 直接使用已授权飞书 MCP、`get_pm_tasks` 和 `submit_intake`，并停止继续调用 `scan_intake_window`；已有扫描正在运行时，本轮触发会跳过。
 

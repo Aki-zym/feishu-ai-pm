@@ -31,6 +31,54 @@ describe('本机服务入口', () => {
     expect(response.json()).toMatchObject({ status: 'ok', mode: 'local-shell', externalConnections: false });
   });
 
+  it('看板通知接口保持可用', async () => {
+    const { app } = await makeApp();
+    const response = await app.inject({ method: 'GET', url: '/api/notifications?unreadOnly=true&limit=20' });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ items: [] });
+  });
+
+  it('日志与诊断路由复用服务层实现', async () => {
+    const { app } = await makeApp();
+
+    const logs = await app.inject({ method: 'GET', url: '/api/logs?level=info&limit=5' });
+    expect(logs.statusCode).toBe(200);
+    expect(logs.json()).toEqual(expect.objectContaining({
+      logs: expect.any(Array),
+      decisions: expect.any(Array),
+      health: expect.any(Array),
+      corrections: expect.any(Array),
+    }));
+
+    const invalidLogs = await app.inject({ method: 'GET', url: '/api/logs?level=invalid' });
+    expect(invalidLogs.statusCode).toBe(400);
+
+    const diagnostics = await app.inject({ method: 'GET', url: '/api/diagnostics' });
+    expect(diagnostics.statusCode).toBe(200);
+    expect(diagnostics.json()).toEqual(expect.objectContaining({
+      diagnosticBundleVersion: expect.any(String),
+      health: expect.any(Object),
+      counts: expect.any(Object),
+    }));
+
+    const cleanup = await app.inject({ method: 'POST', url: '/api/diagnostics/cleanup' });
+    expect(cleanup.statusCode).toBe(200);
+    expect(cleanup.json()).toEqual(expect.objectContaining({
+      logs: expect.any(Number),
+      decisions: expect.any(Number),
+      health: expect.any(Number),
+    }));
+
+    const cleared = await app.inject({ method: 'DELETE', url: '/api/logs?includeCorrections=false' });
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json()).toEqual(expect.objectContaining({
+      logs: expect.any(Number),
+      decisions: expect.any(Number),
+      health: expect.any(Number),
+      corrections: 0,
+    }));
+  });
+
   it('生产装配保留 loopback seed，旧 simulate-message 与 Feishu sync 均无路由', async () => {
     const { app, database } = await makeApp();
     const oldRoute = await app.inject({ method: 'POST', url: '/api/dev/simulate-message', payload: { content: 'old' } });
