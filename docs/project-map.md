@@ -9,7 +9,7 @@
 | React 界面 | 工作台、候选、任务、日历、设置与日志 | `apps/web/src/` | `docs/implementation_brief.md`、`docs/user-guide.md` | `apps/web/src/*.test.ts`、`tests/e2e/` | 使用指南、QA；用户流程改变时更新当前状态 |
 | 服务与领域行为 | API、候选/任务、Runtime、主人判断和审计 | `apps/server/src/app.ts`、`service.ts`、`runtime.ts`、`domain.ts` | `docs/architecture.md`、相关 ADR | `apps/server/tests/` | 架构、安全、实施说明；能力状态改变时更新当前状态 |
 | 当前本地数据层 | SQLite schema、迁移与本地事实记录 | `apps/server/src/database.ts` | `docs/architecture.md`、`docs/security_and_privacy.md` | server 数据库/迁移测试 | 架构、安全；未来数据库方向只记录开放决策 |
-| 任务记忆与 reference | SQLite 派生投影、只读工作目录引用 | `apps/server/src/integrations/workspace.ts`、`service.ts` | `docs/architecture.md`、`docs/security_and_privacy.md` | Runtime/thread memory 与 workspace 测试 | 架构、安全、使用指南 |
+| 任务记忆与 reference | SQLite 派生投影、只读工作目录引用 | `apps/server/src/service.ts` | `docs/architecture.md`、`docs/security_and_privacy.md` | Runtime/thread memory 与 workspace 测试 | 架构、安全、使用指南 |
 | 浏览器 E2E 与 QA | 人工构造数据的跨页面路径、选层和历史验收记录 | `tests/e2e/`、`docs/qa/`、`docs/test-selection.md` | `docs/verification-matrix.json`、`scripts/ci-selection-policy.mjs`、`scripts/evidence-record-policy.mjs` | Playwright inventory/verifier、CI selection、提交内 QA 记录 | 验证矩阵；逐次数字只进入 QA 历史 |
 | 完全本地 exact verification | 隔离 worktree 内的 Git 重算选层、canonical gates、严格 schema、generation/lock/CAS 发布、脱敏日志和可重验 evidence | `scripts/ci-plan.mjs`、`scripts/local-verification.mjs` | `docs/local-verification-schema.json`、`docs/local-verification.md` | `scripts/ci-plan.test.mjs`、`scripts/local-verification.test.mjs` | 测试选层、验证矩阵、当前状态和 cutover SOP |
 | 文档治理 | 唯一 current、地图、验证证据和历史 | `docs/current-state.md`、`docs/docs-manifest.json`、`docs/verification-matrix.json` | `AGENTS.md` | `npm run docs:check` | README、AGENTS、docs/README 与受影响的稳定合同 |

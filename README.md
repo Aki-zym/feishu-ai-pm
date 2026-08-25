@@ -33,4 +33,4 @@
 - 不自动回复飞书、不拉群、不替你宣布完成。
 - 数据、令牌和聊天原文留在本机。
 
-系统组成见 [架构边界](docs/architecture.md)，令牌和删除规则见 [安全与隐私](docs/security_and_privacy.md)。协作见 [CONTRIBUTING](CONTRIBUTING.md)。
+现行入口和使用方式见 [文档入口](docs/README.md) 与 [使用和验收指南](docs/user-guide.md)；令牌和删除规则见 [安全与隐私](docs/security_and_privacy.md)。协作见 [CONTRIBUTING](CONTRIBUTING.md)。
