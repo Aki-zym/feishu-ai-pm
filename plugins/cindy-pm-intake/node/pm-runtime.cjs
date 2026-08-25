@@ -166612,13 +166612,12 @@ function runtimeConfig({ host, port, sqlitePath, token }) {
 }
 async function canReachPmEndpoint(url2, token) {
   try {
-    let response = await fetch(`${url2}${INTEGRATION_PATH}`, {
+    return (await fetch(`${url2}${INTEGRATION_PATH}`, {
       method: "GET",
       headers: token ? { authorization: `Bearer ${token}` } : {},
       redirect: "error",
       signal: AbortSignal.timeout(1500)
-    });
-    return response.status === 200 || response.status === 401;
+    })).status === 200;
   } catch {
     return !1;
   }
