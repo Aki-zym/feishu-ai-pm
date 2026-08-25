@@ -1,11 +1,19 @@
-# 飞书接入与任务后台
+# TooManyTasks 本机服务
 
-本目录是本地 Fastify API 和 PM 领域服务，负责 SQLite 事实库、受控人工补录、候选确认、任务详情、审批、真实适配器和集成状态。正式服务不注册开发模拟消息路由；模拟收件只存在于显式测试装配，用于内存 SQLite 的 Mock/契约验证。测试装配必须显式声明 `testOnly`，并由入口 fail-closed 校验 `test + sqlite :memory:`。
+本目录提供 4310 本机 Fastify API、Cindy 插件入库边界、浏览器任务台 API 和 SQLite 任务库。当前产品路径分为三条：
 
-真实飞书和 OpenAI-compatible LLM 只有在桌面设置中填写配置并显式打开开关后才会请求外部服务；没有凭证时使用 rule mock。工作区适配器始终只读，PostgreSQL 仍不是 Windows 桌面版的运行依赖。
+- Cindy 插件通过 `GET /api/integrations/cindy/tasks` 读取任务快照，通过 `POST /api/integrations/cindy/intake` 提交来源与提案；服务端完成来源去重、窗口幂等、候选写入和任务版本 CAS。
+- 浏览器任务台使用候选、任务、日历、通知、纠错和设置接口；设置页管理自动扫描开关、入库窗口游标、开发者 seed、后台重启和退出。
+- SQLite 保存 source_event、candidate_request、task、cursor、候选来源边和运行状态，作为任务与候选的持久化真源。
 
-Cindy 插件通过浏览器本机后台提交提案，服务端只把来源和提案写入 SQLite，并对正式任务更新执行版本 CAS。旧 Feishu/模型扫描入口已停止导出；`apps/server` 仅作为本机任务库服务核心和 Cindy intake 合同的共享实现。
+服务端只监听 `127.0.0.1`。Cindy 集成接口要求 `Authorization: Bearer <CINDY_INTEGRATION_TOKEN>`；runtime 和开发者 seed 接口仅接受 loopback 请求。退出接口关闭当前 HTTP 服务，生产进程随后退出；重启接口关闭并重新监听同一端口，SQLite 连接保持打开。
 
-主人消息主链使用 `feishu_monitor_target` 保存明确选择的人员和群。人员以对方 `open_id` 为配置真源，服务端内部解析既有 P2P `chat_id`；群聊只持久化真实 `@主人` 消息。每个目标有独立游标和错误状态，机器人补充群仍由单独配置控制。来源同步先检查用户 OAuth scope；缺少权限时安全跳过并保留游标，不重复请求会返回 400 的接口。
+旧 Feishu OAuth、LLM 分类器、轮询同步、模拟消息路由和 Electron 入口已从当前服务路径移除。Cindy 使用已授权的飞书 MCP 读取消息，插件将结果以提案提交给本机服务。
 
-候选收件箱支持 `deleted=active|only|all`、软删除和恢复。删除只归档候选通知并保留来源、审计、需求线程和正式任务关联；回收站候选不能继续接受或重新整理。
+开发验证：
+
+```bash
+npm run typecheck
+npm test
+npm run build
+```

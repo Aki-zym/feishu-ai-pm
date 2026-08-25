@@ -51,18 +51,34 @@ const openIssue52Task = async (page: Page, taskId: string) => {
 const candidateCardById = (page: Page, candidateId: string) =>
   page.locator(`article.candidate-card[data-candidate-id="${candidateId}"]`);
 
-const seedPendingCandidate = async (page: Page, title: string) => {
+type SeededCandidate = {
+  id: string;
+  title: string;
+  accepted_task_id: string | null;
+};
+
+const seedPendingCandidate = async (page: Page, title: string, fields: { describe?: string; background?: string } = {}) => {
   const response = await page.request.post('/api/dev/seed-intake', {
     data: {
       title,
-      describe: `${title} 的浏览器验收描述。`,
-      background: `${title} 的浏览器验收背景。`,
+      describe: fields.describe ?? `${title} 的浏览器验收描述。`,
+      background: fields.background ?? `${title} 的浏览器验收背景。`,
     },
   });
   expect(response.ok()).toBeTruthy();
   const body = await response.json() as { candidate_id?: string };
   expect(body.candidate_id).toEqual(expect.any(String));
   return body.candidate_id as string;
+};
+
+const seedCandidate = async (page: Page, title: string, fields: { describe?: string; background?: string } = {}): Promise<SeededCandidate> => {
+  const id = await seedPendingCandidate(page, title, fields);
+  const response = await page.request.get('/api/candidates');
+  expect(response.ok()).toBeTruthy();
+  const body = await response.json() as { items: SeededCandidate[] };
+  const candidate = body.items.find((item) => item.id === id);
+  expect(candidate).toBeDefined();
+  return candidate as SeededCandidate;
 };
 
 const issue57Candidate = {
@@ -622,26 +638,11 @@ test('Issue #52 切换失败时清空 A，并在前进后退后只操作当前�
 
 test('候选收件箱可以显示并接受需求', async ({ page }, testInfo) => {
   const marker = `${testInfo.project.name}-${testInfo.retry}-${Date.now().toString(36)}`;
-  const created = await page.request.post('/api/dev/simulate-message', {
-    data: {
-      externalId: `e2e-candidate-accept-${marker}`,
-      sourceType: 'owner_dm',
-      conversationId: `e2e-candidate-accept-${marker}`,
-      senderId: 'e2e-candidate-accept-requester',
-      senderName: 'E2E 候选提出人',
-      content: `E2E-${marker}：请分析活动参与和留存，并建立一项待确认任务。`,
-      occurredAt: new Date().toISOString(),
-      completeness: 'complete',
-      discoveryReason: 'E2E 验证候选接受流程。',
-    },
-  });
-  expect(created.ok()).toBeTruthy();
-  const body = await created.json() as { candidate: { id: string; title: string } | null };
-  expect(body.candidate).not.toBeNull();
+  const candidate = await seedCandidate(page, `E2E-${marker}：请分析活动参与和留存，并建立一项待确认任务。`);
 
   await page.goto('/candidates');
   await expect(page.getByRole('heading', { name: '候选收件箱' })).toBeVisible();
-  const candidateCard = candidateCardById(page, body.candidate!.id);
+  const candidateCard = candidateCardById(page, candidate.id);
   await expect(candidateCard).toBeVisible();
   await candidateCard.getByRole('button', { name: '接受为正式任务' }).click();
   await expect(page.getByText(/已建立正式任务/)).toBeVisible();
@@ -979,54 +980,9 @@ test('AI 主人判断挂在对应候选卡片内，未关联判断才显示在�
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
-test('候选固定展示时间和四项解释，并如实显示飞书文档受限状态', async ({ page }) => {
-  const marker = Date.now().toString(36);
-  const created = await page.request.post('/api/dev/simulate-message', {
-    data: {
-      externalId: `e2e-candidate-evidence-${marker}`,
-      sourceType: 'owner_dm',
-      conversationId: `e2e-evidence-${marker}`,
-      senderId: 'e2e-requester',
-      senderName: 'E2E 需求方',
-      content: `E2E-${marker}：请在下周三前分析活动留存，背景在 https://example.feishu.cn/docx/doc-${marker}`,
-      occurredAt: '2026-08-11T04:00:00.000Z',
-    },
-  });
-  const candidate = (await created.json()).candidate as { id: string; title: string };
-  await page.goto('/candidates');
-  expect(candidate.title).toContain(`E2E-${marker}`);
-  const card = candidateCardById(page, candidate.id);
-  await expect(card).toBeVisible();
-  await expect(card).not.toContainText(`E2E-${marker}`);
-  for (const label of ['时间范围', '背景', '希望验证', 'Describe', '为什么被识别']) {
-    await expect(card.getByText(label, { exact: true })).toBeVisible();
-  }
-  const timeRange = card.locator('.candidate-facts > div').filter({ hasText: '时间范围' });
-  await expect(timeRange).toContainText('2026/08/19');
-  await expect(timeRange).not.toContainText('下周三');
-  await expect(card.getByText('没有读取权限')).toBeVisible();
-  await expect(card.getByText('关联的文档背景')).toBeVisible();
-});
-
 test('候选可以移入回收站、从回收站恢复，并回到原来的状态', async ({ page }) => {
   const marker = Date.now().toString(36);
-  const created = await page.request.post('/api/dev/simulate-message', {
-    data: {
-      externalId: `e2e-candidate-trash-${marker}`,
-      sourceType: 'owner_dm',
-      conversationId: `e2e-candidate-trash-${marker}`,
-      senderId: 'e2e-candidate-trash-requester',
-      senderName: 'E2E 候选提出人',
-      content: `E2E-${marker}：请分析活动参与和留存，先作为候选需求等待确认。`,
-      occurredAt: new Date().toISOString(),
-      completeness: 'complete',
-      discoveryReason: 'E2E 验证候选回收站流程。',
-    },
-  });
-  expect(created.ok()).toBeTruthy();
-  const body = await created.json() as { candidate: { id: string; title: string } | null };
-  expect(body.candidate).not.toBeNull();
-  const candidate = body.candidate!;
+  const candidate = await seedCandidate(page, `E2E-${marker}：请分析活动参与和留存，先作为候选需求等待确认。`);
 
   await page.goto('/candidates');
   const card = candidateCardById(page, candidate.id);
@@ -1053,24 +1009,10 @@ test('候选可以移入回收站、从回收站恢复，并回到原来的状�
 
 test('候选操作按钮在桌面和窄屏保持可读且不产生横向溢出', async ({ page }) => {
   const marker = Date.now().toString(36);
-  const created = await page.request.post('/api/dev/simulate-message', {
-    data: {
-      externalId: `e2e-candidate-layout-${marker}`,
-      sourceType: 'owner_dm',
-      conversationId: `e2e-candidate-layout-${marker}`,
-      senderId: 'e2e-candidate-layout-requester',
-      senderName: 'E2E 布局提出人',
-      content: `E2E-${marker}：请分析活动参与和留存，候选卡需要保持按钮可操作。`,
-      occurredAt: new Date().toISOString(),
-      completeness: 'complete',
-    },
-  });
-  expect(created.ok()).toBeTruthy();
-  const body = await created.json() as { candidate: { id: string; title: string } | null };
-  expect(body.candidate).not.toBeNull();
+  const candidate = await seedCandidate(page, `E2E-${marker}：请分析活动参与和留存，候选卡需要保持按钮可操作。`);
 
   await page.goto('/candidates');
-  const card = candidateCardById(page, body.candidate!.id);
+  const card = candidateCardById(page, candidate.id);
   await expect(card).toBeVisible();
   const actions = card.locator('.candidate-actions');
   await expect(actions).toBeVisible();
@@ -1088,7 +1030,7 @@ test('候选操作按钮在桌面和窄屏保持可读且不产生横向溢出',
 
   await card.getByRole('button', { name: '忽略' }).click();
   await page.getByRole('button', { name: '已忽略', exact: true }).click();
-  const ignoredCard = candidateCardById(page, body.candidate!.id);
+  const ignoredCard = candidateCardById(page, candidate.id);
   await expect(ignoredCard).toBeVisible();
   const restoreButton = ignoredCard.getByRole('button', { name: '恢复到稍后再议' });
   await expect(restoreButton).toBeVisible();
@@ -1103,22 +1045,7 @@ test('候选操作按钮在桌面和窄屏保持可读且不产生横向溢出',
 test('Issue #11 两个候选的重新整理指导语互不串用', async ({ page }) => {
   const marker = Date.now().toString(36);
   const createCandidate = async (suffix: string) => {
-    const response = await page.request.post('/api/dev/simulate-message', {
-      data: {
-        externalId: `e2e-guidance-${marker}-${suffix}`,
-        sourceType: 'owner_dm',
-        conversationId: `e2e-guidance-${marker}-${suffix}`,
-        senderId: `e2e-guidance-requester-${suffix}`,
-        senderName: `E2E 指导语提出人 ${suffix}`,
-        content: `E2E-${marker}-${suffix}：请分析活动参与和留存。`,
-        occurredAt: new Date().toISOString(),
-        completeness: 'complete',
-      },
-    });
-    expect(response.ok()).toBeTruthy();
-    const body = await response.json() as { candidate: { id: string; title: string } | null };
-    expect(body.candidate).not.toBeNull();
-    return body.candidate!;
+    return seedCandidate(page, `E2E-${marker}-${suffix}：请分析活动参与和留存。`);
   };
 
   const first = await createCandidate('A');
@@ -1290,23 +1217,7 @@ test('Issue #13 低置信建议必须确认，也可明确保留为两件事', a
 
 test('候选任务可以安排私人计划、删除并从回收站恢复', async ({ page }, testInfo) => {
   const marker = Date.now().toString(36);
-  const captured = await page.request.post('/api/dev/simulate-message', {
-    data: {
-      externalId: `e2e-task-lifecycle-${marker}`,
-      sourceType: 'owner_dm',
-      conversationId: `e2e-conversation-${marker}`,
-      senderId: 'e2e-requester',
-      senderName: 'E2E 测试提出人',
-      content: `E2E-${marker}：请用数据分析活动参与和留存，并整理成一个待确认任务。`,
-      occurredAt: new Date().toISOString(),
-      completeness: 'complete',
-      discoveryReason: 'E2E 验证个人信息来源进入统一候选链。',
-    },
-  });
-  expect(captured.ok()).toBeTruthy();
-  const capturedBody = await captured.json() as { candidate: { id: string; title: string } | null };
-  expect(capturedBody.candidate).not.toBeNull();
-  const candidate = capturedBody.candidate!;
+  const candidate = await seedCandidate(page, `E2E-${marker}：请用数据分析活动参与和留存，并整理成一个待确认任务。`);
 
   await page.goto('/candidates');
   const candidateCard = candidateCardById(page, candidate.id);
@@ -1393,90 +1304,6 @@ test('候选任务可以安排私人计划、删除并从回收站恢复', async
   expect(afterDetail.deleted_at).toBeNull();
   expect(afterDetail.planned_start_at).toBeNull();
   expect(afterDetail.planned_due_at).toBeNull();
-});
-
-test('同一需求可持续补充，拒绝不改任务，确认后版本和任务记忆同步更新', async ({ page }, testInfo) => {
-  const marker = Date.now().toString(36);
-  const conversationId = `e2e-thread-${marker}`;
-  const send = async (suffix: string, content: string) => {
-    const response = await page.request.post('/api/dev/simulate-message', {
-      data: {
-        externalId: `e2e-thread-${marker}-${suffix}`,
-        sourceType: 'owner_dm',
-        conversationId,
-        senderId: 'e2e-thread-requester',
-        senderName: 'E2E 持续需求方',
-        content,
-        occurredAt: new Date().toISOString(),
-        completeness: 'complete',
-        discoveryReason: 'E2E 验证同一需求的持续更新。',
-        metadata: suffix === 'initial' ? undefined : { parentId: `e2e-thread-${marker}-initial` },
-      },
-    });
-    expect(response.ok()).toBeTruthy();
-    return response.json() as Promise<{ candidate: { id: string; title: string; accepted_task_id: string | null } | null }>;
-  };
-
-  const initial = await send('initial', `E2E-${marker}：请用数据验证活动参与和留存，并建立一项正式任务。`);
-  expect(initial.candidate).not.toBeNull();
-  await page.goto('/candidates');
-  const initialCard = candidateCardById(page, initial.candidate!.id);
-  await expect(initialCard).toBeVisible();
-  await initialCard.getByRole('button', { name: '接受为正式任务' }).click();
-  await expect(page.getByText(/已建立正式任务/)).toBeVisible();
-
-  let taskId = '';
-  await expect.poll(async () => {
-    const candidates = await (await page.request.get('/api/candidates')).json() as { items: Array<{ id: string; accepted_task_id: string | null }> };
-    taskId = candidates.items.find((item) => item.id === initial.candidate!.id)?.accepted_task_id ?? '';
-    return taskId;
-  }).not.toBe('');
-  const before = await (await page.request.get(`/api/tasks/${taskId}`)).json() as {
-    version: number;
-    memory_projection: { state: string; projection_version: number };
-  };
-  expect(before.memory_projection).toMatchObject({ state: 'ready', projection_version: before.version });
-
-  await send('rejected', `补充：E2E-${marker} 请继续用数据分析付费维度，计划在2030年8月15日前完成。`);
-  await expect.poll(async () => {
-    const detail = await (await page.request.get(`/api/tasks/${taskId}`)).json() as { update_proposals: Array<{ state: string }> };
-    return detail.update_proposals.filter((proposal) => proposal.state === 'awaiting_approval').length;
-  }).toBe(1);
-  await page.goto(`/tasks?task=${taskId}`);
-  await page.getByRole('button', { name: /持续更新/ }).click();
-  const rejectedProposal = page.locator('article.proposal-awaiting_approval');
-  await expect(rejectedProposal).toHaveCount(1);
-  await rejectedProposal.getByRole('button', { name: '拒绝这条更新' }).click();
-  await expect(page.getByText('这条后续更新已拒绝；正式任务、需求线程和任务记忆保持原样。')).toBeVisible();
-  const afterReject = await (await page.request.get(`/api/tasks/${taskId}`)).json() as {
-    version: number;
-    memory_projection: { state: string; projection_version: number };
-  };
-  expect(afterReject.version).toBe(before.version);
-  expect(afterReject.memory_projection.projection_version).toBe(before.memory_projection.projection_version);
-
-  await send('approved', `补充：E2E-${marker} 请继续用数据分析设备维度，计划在2030年8月16日前完成。`);
-  await expect.poll(async () => {
-    const detail = await (await page.request.get(`/api/tasks/${taskId}`)).json() as { update_proposals: Array<{ state: string }> };
-    return detail.update_proposals.filter((proposal) => proposal.state === 'awaiting_approval').length;
-  }).toBe(1);
-  await page.goto(`/tasks?task=${taskId}`);
-  await page.getByRole('button', { name: /持续更新/ }).click();
-  const approvedProposal = page.locator('article.proposal-awaiting_approval');
-  await expect(approvedProposal).toHaveCount(1);
-  await approvedProposal.getByRole('button', { name: '确认这条更新' }).click();
-  await expect(page.getByText('后续更新已写入正式任务和需求线程，任务记忆也已刷新。')).toBeVisible();
-  await expect.poll(async () => {
-    const detail = await (await page.request.get(`/api/tasks/${taskId}`)).json() as {
-      version: number;
-      memory_projection: { state: string; projection_version: number };
-    };
-    return { version: detail.version, memoryState: detail.memory_projection.state, memoryVersion: detail.memory_projection.projection_version };
-  }).toEqual({ version: before.version + 1, memoryState: 'ready', memoryVersion: before.version + 1 });
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-  if (process.env.CAPTURE_ISSUE9_QA) {
-    await page.screenshot({ path: testInfo.outputPath('issue9-continuous-update.png'), fullPage: true });
-  }
 });
 
 test('长更新、记忆失败与 Runtime 失败在桌面和手机端都可恢复且不横向溢出', async ({ page }, testInfo) => {
@@ -1876,14 +1703,14 @@ test('Issue #11 可编辑任务、监督 AI 修改、暂停维护并安全管理
   }
 });
 
-test('集成设置明确连接边界，且不暴露开发消息夹具', async ({ page }) => {
+test('任务台设置只展示浏览器任务台所需控制项', async ({ page }) => {
   let legacyOwnerInformationCalls = 0;
   await page.route('**/api/owner-information', async (route) => {
     legacyOwnerInformationCalls += 1;
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ owner: null, sources: [] }) });
   });
   await page.goto('/settings');
-  await expect(page.getByRole('heading', { name: '集成设置' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '任务台设置' })).toBeVisible();
   await expect(page.getByText('当前使用本地规则或 Mock，不会访问飞书或外部模型。')).toBeVisible();
   await expect(page.getByText('开发者工具', { exact: true })).toBeVisible();
   await expect(page.getByText('退出后台进程', { exact: true })).toBeVisible();
@@ -1891,9 +1718,9 @@ test('集成设置明确连接边界，且不暴露开发消息夹具', async ({
   await expect(page.getByRole('heading', { name: '我的个人信息流' })).toHaveCount(0);
   await expect(page.locator('article.source-status-row')).toHaveCount(0);
   await expect(page.getByRole('button', { name: '重新同步' })).toHaveCount(0);
-  await expect(page.getByText('遗留飞书接入', { exact: true })).toBeVisible();
-  await page.getByText('遗留飞书接入', { exact: true }).click();
-  await expect(page.getByText('当前浏览器的飞书接入由 Cindy 的 XD Feishu 提供。旧版主人授权、个人或群聊选择、机器人补充配置仅保留在遗留说明中。', { exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '飞书连接' })).toHaveCount(0);
+  await expect(page.getByLabel('OAuth 回调地址')).toHaveCount(0);
+  await expect(page.getByText('遗留飞书接入', { exact: true })).toHaveCount(0);
   await expect(page.getByRole('checkbox', { name: '每 10 分钟自动扫描新任务' })).toBeVisible();
   await expect(page.getByRole('button', { name: '模拟一条需求（浏览器测试）' })).toBeVisible();
   await expect(page.getByRole('button', { name: '模拟收到消息' })).toHaveCount(0);
@@ -1936,7 +1763,7 @@ test('设置页可以即时保存每 10 分钟自动扫描开关', async ({ page
   const toggle = page.getByRole('checkbox', { name: '每 10 分钟自动扫描新任务' });
   await expect(toggle).toBeVisible();
   await expect(toggle).not.toBeChecked();
-  await expect(page.getByText('打开后还需在 Cindy 插件设置里保存过自动化；关闭后定时即使触发也不入库。手动扫描不受影响。', { exact: true })).toBeVisible();
+  await expect(page.getByText('Cindy 保持开启且插件常驻时，打开本开关后每 10 分钟自动扫描新任务；关闭本开关后，常驻线程继续运行但不执行扫描。手动扫描不受影响。', { exact: true })).toBeVisible();
   await expect(page.getByText('入库扫描模型请到 Cindy 插件详情「AI 代办」里改：推荐折扣路由 codex/gpt-5.6-luna、思考强度 high、权限 自动审核。草稿默认可能是 fable5，改完要保存。', { exact: true })).toBeVisible();
 
   await toggle.check();
@@ -2267,169 +2094,6 @@ test.skip('同步全部全部失败时明确显示 failure 错误状态', async 
   await expect(page.getByText(/当前配置跳过|统一同步完成/)).toHaveCount(0);
 });
 
-test('桌面授权会先保存当前 scope，再打开飞书授权页', async ({ page }, testInfo) => {
-  await page.addInitScript(() => {
-    const initial = {
-      setupComplete: true,
-      launchAtLogin: false,
-      logRetentionDays: 30,
-      feishu: {
-        appId: 'cli_test',
-        externalEnabled: true,
-        domain: 'feishu',
-        eventMode: 'websocket',
-        oauthRedirectUri: 'http://127.0.0.1:4311/oauth/feishu/callback',
-        oauthScopes: '',
-        scanEnabled: false,
-        scanIntervalSeconds: 60,
-        groupIds: [],
-      },
-      llm: { provider: 'rule_mock', model: '', apiBase: '', timeoutMs: 30000, maxRetries: 2 },
-      workspace: { readEnabled: false, allowedPaths: [] },
-      secretState: {
-        feishuAppSecret: true,
-        feishuUserAccessToken: false,
-        feishuRefreshToken: false,
-        llmApiKey: false,
-        feishuUserToken: false,
-      },
-    };
-    (window as any).__savedDesktopConfig = null;
-    (window as any).__feishuAuthorizeCalls = 0;
-    (window as any).__copiedPermissionText = '';
-    Object.defineProperty(navigator, 'clipboard', {
-      configurable: true,
-      value: { writeText: async (value: string) => { (window as any).__copiedPermissionText = value; } },
-    });
-    (window as any).aiPmDesktop = {
-      api: {
-        request: async ({ method, url, body }: { method: string; url: string; body?: unknown }) => {
-          const response = await fetch(url, {
-            method,
-            headers: body === undefined ? undefined : { 'content-type': 'application/json' },
-            body: body === undefined ? undefined : JSON.stringify(body),
-          });
-          return { status: response.status, body: await response.json() };
-        },
-      },
-      app: { info: async () => ({ version: 'test', platform: 'win32', packaged: true }), relaunch: async () => undefined },
-      config: {
-        get: async () => initial,
-        save: async (input: any) => {
-          const { secrets: _secrets, ...saved } = input;
-          (window as any).__savedDesktopConfig = saved;
-          return saved;
-        },
-      },
-      feishu: { authorize: async () => { (window as any).__feishuAuthorizeCalls += 1; return { opened: true }; } },
-      workspace: { pickDirectory: async () => null },
-      diagnostics: { export: async () => ({ saved: false }) },
-    };
-  });
-  await page.goto('/#/settings');
-  await expect(page.getByRole('button', { name: '只校验输入格式' })).toHaveCount(0);
-  await expect(page.getByText('浏览器开发模式：仅校验格式')).toHaveCount(0);
-  await expect(page.getByRole('heading', { name: '飞书连接' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: '判断模型' })).toBeVisible();
-  await expect(page.getByText('本机与工作目录', { exact: true })).toBeVisible();
-  await expect(page.getByLabel('OAuth 回调地址')).toBeVisible();
-  await expect(page.getByLabel('OAuth 权限范围（空格分隔）')).toBeVisible();
-  await expect(page.locator('details.feishu-permission-guide')).not.toHaveAttribute('open', '');
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-  if (process.env.CAPTURE_SETTINGS_QA) {
-    await page.screenshot({ path: testInfo.outputPath(`settings-${testInfo.project.name}-collapsed-native.png`), fullPage: true });
-  }
-  await page.getByText('飞书权限开通指南', { exact: true }).click();
-  await expect(page.getByRole('img', { name: '飞书开放平台权限管理与批量导入权限示意图' })).toBeVisible();
-  const permissionJson = page.getByLabel('飞书批量导入权限 JSON');
-  await expect(permissionJson).toContainText('"tenant"');
-  await expect(permissionJson).toContainText('"user"');
-  await expect(permissionJson).toContainText('docx:document:readonly');
-  await page.getByRole('button', { name: '复制 JSON' }).click();
-  await expect(page.getByText('已复制；请粘贴到飞书开放平台的批量导入窗口。')).toBeVisible();
-  await page.getByRole('button', { name: '填入程序的 OAuth scope' }).click();
-  await expect(page.locator('details.feishu-permission-guide')).toHaveAttribute('open', '');
-  await page.getByRole('button', { name: '保存并开始授权' }).click();
-  await expect(page.getByText('当前配置已保存，并已打开飞书授权页面；请只使用最新打开的这一页。')).toBeVisible();
-  const saved = await page.evaluate(() => ({
-    scope: (window as any).__savedDesktopConfig?.feishu?.oauthScopes,
-    authorizeCalls: (window as any).__feishuAuthorizeCalls,
-  }));
-  expect(saved.scope).toContain('im:message.group_msg:get_as_user');
-  expect(saved.scope).not.toContain('search:message');
-  expect(saved.scope).toContain('calendar:calendar:readonly');
-  expect(saved.scope).toContain('minutes:minutes.transcript:export');
-  expect(saved.scope).toContain('docx:document:readonly');
-  expect(saved.scope).toContain('wiki:node:read');
-  expect(saved.authorizeCalls).toBe(1);
-  expect(await page.evaluate(() => (window as any).__copiedPermissionText)).toContain('"tenant"');
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-  if (process.env.CAPTURE_SETTINGS_QA) {
-    await page.screenshot({ path: testInfo.outputPath(`settings-${testInfo.project.name}-expanded-native.png`), fullPage: true });
-  }
-  await page.setViewportSize(testInfo.project.name.includes('mobile') ? { width: 320, height: 568 } : { width: 1100, height: 720 });
-  await expect(page.getByRole('heading', { name: '飞书连接' })).toBeVisible();
-  await expect(page.getByLabel('OAuth 回调地址')).toBeVisible();
-  await expect(page.getByLabel('OAuth 权限范围（空格分隔）')).toBeVisible();
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-  if (process.env.CAPTURE_SETTINGS_QA) {
-    await page.screenshot({ path: testInfo.outputPath(`settings-${testInfo.project.name}-expanded-narrow.png`), fullPage: true });
-  }
-  await page.getByText('飞书权限开通指南', { exact: true }).click();
-  await expect(page.locator('details.feishu-permission-guide')).not.toHaveAttribute('open', '');
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-  if (process.env.CAPTURE_SETTINGS_QA) {
-    await page.screenshot({ path: testInfo.outputPath(`settings-${testInfo.project.name}-collapsed-narrow.png`), fullPage: true });
-  }
-});
-
-test('日志中心支持日期筛选、保留期清理和一键删除入口', async ({ page }) => {
-  await page.goto('/logs');
-  await expect(page.getByRole('heading', { name: '日志与纠错' })).toBeVisible();
-  await expect(page.getByLabel('开始日期')).toBeVisible();
-  await expect(page.getByLabel('结束日期')).toBeVisible();
-  await expect(page.getByRole('button', { name: '清理到期日志' })).toBeVisible();
-  await expect(page.getByRole('button', { name: '一键删除日志' })).toBeVisible();
-});
-
-test('Issue #58 日志中心展示受控运行事件且不泄漏原始字段', async ({ page }) => {
-  await page.route('**/api/health', async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({
-        liveness: { status: 'alive' },
-        readiness: { status: 'not_ready', reasons: [{ code: 'SECRET_CANARY_REASON_58', message: 'SECRET_CANARY_HEALTH_MESSAGE_58' }] },
-      }),
-    });
-  });
-  await page.route('**/api/logs*', async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({
-        logs: [
-          { id: 'log-1', category: 'runtime', level: 'error', event_type: 'feishu.sync.completed', summary: 'SECRET_CANARY_LOG_SUMMARY', context_json: 'SECRET_CANARY_CONTEXT', created_at: '2026-08-16T00:00:00.000Z' },
-          { id: 'log-2', category: 'runtime', level: 'info', event_type: 'SECRET_CANARY_EVENT', summary: 'SECRET_CANARY_UNKNOWN', created_at: 'SECRET_CANARY_TIME' },
-        ],
-        decisions: [{ id: 'refresh_token app_secret client_secret Bearer plain-error invalid-id', provider: 'refresh_token', model: 'app_secret', prompt_version: 'client_secret', used_fallback: 'false', fallback_mode: 'plain-error', input_char_count: 'invalid-id', unknown_field: 'SECRET_CANARY_UNKNOWN_FIELD' }],
-        health: [{ integration: 'refresh_token', status: 'app_secret', message: 'client_secret Bearer plain-error', latency_ms: 'invalid-id', checked_at: 'SECRET_CANARY_HEALTH_TIME' }],
-        corrections: [{ id: 'refresh_token', correction_type: 'invalid-id', note: 'plain-error Bearer', candidate_id: 'client_secret', task_id: 'app_secret', created_at: 'SECRET_CANARY_CORRECTION_TIME' }],
-      }),
-    });
-  });
-  await page.goto('/logs');
-  await expect(page.getByRole('heading', { name: '运行事件' })).toBeVisible();
-  await expect(page.locator('section.log-section strong').filter({ hasText: '信息源同步已结束' })).toBeVisible();
-  await expect(page.getByText('未提供连接', { exact: true })).toBeVisible();
-  await expect(page.getByText('连接状态暂未提供安全说明。', { exact: true })).toBeVisible();
-  await expect(page.getByText('已记录 / 已记录', { exact: true })).toBeVisible();
-  await expect(page.getByText('未提供安全说明', { exact: true })).toBeVisible();
-  await expect(page.getByText('当前原因', { exact: true })).toBeVisible();
-  await expect(page.getByText('健康状态暂时无法确认。', { exact: true })).toBeVisible();
-  await expect(page.getByText('当前没有后端报告的降级原因', { exact: false })).toHaveCount(0);
-  await expect(page.getByText(/refresh_token|app_secret|client_secret|Bearer|plain-error|SECRET_CANARY/u)).toHaveCount(0);
-});
 
 test('Issue #51 任务读取失败不会显示为空', async ({ page }) => {
   test.info().annotations.push({
@@ -2549,9 +2213,9 @@ test('Issue #51 设置分区独立失败，配置失败不阻塞其他状态', a
   await page.goto('/settings');
   await expect(page.getByRole('alert')).toContainText('配置状态读取失败');
   await expect(page.getByRole('heading', { name: '我的个人信息流' })).toHaveCount(0);
-  await expect(page.getByText('遗留飞书接入', { exact: true })).toBeVisible();
+  await expect(page.getByText('遗留飞书接入', { exact: true })).toHaveCount(0);
   await expect(page.getByRole('heading', { name: 'AI 如何维护我的任务' })).toBeVisible();
-  await expect(page.getByText('还没有连接检查记录')).toBeVisible();
+  await expect(page.getByText('还没有组件检查记录')).toBeVisible();
 });
 
 test('Issue #51 刷新失败保留上次成功数据并标记陈旧', async ({ page }) => {

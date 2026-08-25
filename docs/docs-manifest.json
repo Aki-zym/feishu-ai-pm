@@ -21,10 +21,10 @@
     "pr86_current_base": "integration/m1-test-20260815",
     "pr86_current_base_commit": "ebe682aeae067bbf08a6f38ea39de17adceb9ac0",
     "stage_id": "M1",
-    "stage_name": "Windows 桌面成熟化",
-    "carrier": "Windows Electron EXE",
+    "stage_name": "Cindy 插件与浏览器任务台",
+    "carrier": "Cindy 插件 + 127.0.0.1:4310 + SQLite",
     "product_version": "0.2.0",
-    "current_artifact_verification_id": "VER-PACKAGE-020"
+    "current_artifact_verification_id": null
   },
   "historical_milestones": [
     {
@@ -101,7 +101,7 @@
     },
     {
       "id": "release-evidence",
-      "pattern": "^(release/|apps/desktop/electron-builder\\.yml$|package\\.json$)",
+      "pattern": "^(plugins/cindy-pm-intake/|package\\.json$)",
       "requires_any": [
         "docs/current-state.md",
         "docs/verification-matrix.json"

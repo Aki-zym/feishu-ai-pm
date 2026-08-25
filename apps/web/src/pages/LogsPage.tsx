@@ -1,7 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Download, Eraser, FilePlus2, ScrollText, ShieldCheck } from 'lucide-react';
+import { Eraser, FilePlus2, ScrollText, ShieldCheck } from 'lucide-react';
 import { api } from '../api';
-import { desktopBridge } from '../desktop';
 import { HealthStatusPanel } from '../components/HealthStatusPanel';
 import { normalizeHealth, normalizeLogResponse, type HealthSnapshot, type SafeLogResponse } from '../observability';
 import { beginResourceRequest, failureResource, isLatestResourceRequest, loadingResource, successResource, type ResourceState } from '../resource-state';
@@ -24,8 +23,6 @@ export default function LogsPage() {
   const [manualSender, setManualSender] = useState('人工补录');
   const [healthResource, setHealthResource] = useState<ResourceState<HealthSnapshot>>(loadingResource);
   const loadGenerationRef = useRef({ current: 0 });
-  const desktop = desktopBridge();
-
   const load = useCallback(async () => {
     const request = beginResourceRequest(loadGenerationRef.current);
     const query = new URLSearchParams({ limit: '200' });
@@ -59,12 +56,6 @@ export default function LogsPage() {
     fallbacks: data?.decisions.filter((row) => row.used_fallback).length ?? 0,
     corrections: data?.corrections.length ?? 0,
   }), [data]);
-  const exportDiagnostics = async () => {
-    if (!desktop) return;
-    const result = await desktop.diagnostics.export();
-    setMessage(result.saved ? '脱敏诊断包已导出。' : '已取消导出。');
-  };
-
   const cleanupExpiredLogs = async () => {
     await api.post('/api/diagnostics/cleanup', {});
     setMessage('已按设置中的保留天数清理到期日志。');
@@ -115,9 +106,7 @@ export default function LogsPage() {
         <label className="log-correlation-field"><span>operation_id</span><input value={operationId} onChange={(event) => setOperationId(event.target.value)} placeholder="可选 UUID" /></label>
         <label className="log-correlation-field"><span>trace_id</span><input value={traceId} onChange={(event) => setTraceId(event.target.value)} placeholder="可选 UUID" /></label>
         <label className="log-correlation-field"><span>事件类型</span><input value={eventType} onChange={(event) => setEventType(event.target.value)} placeholder="例如 feishu.sync.completed" /></label>
-        {desktop
-          ? <button className="secondary-button" type="button" onClick={() => void exportDiagnostics()}><Download size={15} />导出脱敏诊断包</button>
-          : <span className="integration-note">浏览器入口暂不提供脱敏诊断包导出。</span>}
+        <span className="integration-note">浏览器入口暂不提供脱敏诊断包导出。</span>
         <button className="quiet-button" type="button" onClick={() => void cleanupExpiredLogs()}><Eraser size={15} />清理到期日志</button>
         <button className="quiet-button" type="button" onClick={() => void deleteDiagnosticLogs()}><Eraser size={15} />一键删除日志</button>
       </div>

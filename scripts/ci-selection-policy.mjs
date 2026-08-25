@@ -4,7 +4,7 @@ const normalizePath = (file) => file.replaceAll('\\', '/').replace(/^\.\//, '');
 
 const selection = JSON.parse(readFileSync(new URL('../docs/verification-matrix.json', import.meta.url), 'utf8')).selection_policy;
 const REQUIRED_CATEGORIES = Object.freeze([
-  'docs-only', 'test-ci-only', 'qa-control-plane', 'server-data-runtime', 'feishu', 'llm', 'web', 'desktop', 'release', 'unknown',
+  'docs-only', 'test-ci-only', 'qa-control-plane', 'cindy-plugin', 'server-data-runtime', 'web', 'unknown',
 ]);
 const ALLOWED_LEVELS = Object.freeze(['L0', 'L1', 'L2', 'L3', 'L4', 'L5', 'L6']);
 const ALLOWED_RISKS = Object.freeze(['low', 'medium', 'high']);
@@ -12,38 +12,32 @@ const ALLOWED_CATEGORY_KEYS = Object.freeze(new Set(['minimum_level', 'risk', 'r
 const ALLOWED_PATH_RULE_KEYS = Object.freeze(new Set(['id', 'category', 'prefixes', 'exact', 'regex']));
 const CONTROLLED_EVIDENCE = Object.freeze(new Set([
   'docs_check', 'unit_inventory', 'service_integration', 'exact_provenance', 'contract_replay',
-  'scope_guard', 'redaction', 'browser_e2e', 'lifecycle', 'windows_installer_smoke', 'artifact_hash', 'path_review',
+  'scope_guard', 'redaction', 'browser_e2e', 'path_review',
 ]));
 
 // The JSON policy is a reviewable source of detail, not the final safety
 // authority.  Keep the required rule order, selectors, and category floors
 // in code so an edit to verification-matrix.json cannot silently downgrade a
-// runtime, integration, desktop, release, or unknown path to docs-only.
+// runtime, plugin, web, or unknown path to docs-only.
 const CANONICAL_CATEGORY_FLOORS = Object.freeze({
   'docs-only': Object.freeze({ minimum_level: 'L0', risk: 'low', required_evidence: Object.freeze(['docs_check']) }),
   'test-ci-only': Object.freeze({ minimum_level: 'L1', risk: 'medium', required_evidence: Object.freeze(['unit_inventory', 'exact_provenance']) }),
   'qa-control-plane': Object.freeze({ minimum_level: 'L4', risk: 'high', required_evidence: Object.freeze(['unit_inventory', 'contract_replay', 'exact_provenance']), manual_review_required: true }),
   'server-data-runtime': Object.freeze({ minimum_level: 'L2', risk: 'high', required_evidence: Object.freeze(['unit_inventory', 'service_integration', 'exact_provenance']), manual_review_required: true }),
-  feishu: Object.freeze({ minimum_level: 'L3', risk: 'high', required_evidence: Object.freeze(['contract_replay', 'scope_guard', 'exact_provenance']), manual_review_required: true }),
-  llm: Object.freeze({ minimum_level: 'L3', risk: 'high', required_evidence: Object.freeze(['contract_replay', 'redaction', 'exact_provenance']), manual_review_required: true }),
+  'cindy-plugin': Object.freeze({ minimum_level: 'L3', risk: 'high', required_evidence: Object.freeze(['contract_replay', 'scope_guard', 'exact_provenance']), manual_review_required: true }),
   web: Object.freeze({ minimum_level: 'L4', risk: 'high', required_evidence: Object.freeze(['unit_inventory', 'browser_e2e', 'exact_provenance']), manual_review_required: true }),
-  desktop: Object.freeze({ minimum_level: 'L5', risk: 'high', required_evidence: Object.freeze(['unit_inventory', 'lifecycle', 'windows_installer_smoke', 'exact_provenance']), manual_review_required: true }),
-  release: Object.freeze({ minimum_level: 'L5', risk: 'high', required_evidence: Object.freeze(['artifact_hash', 'windows_installer_smoke', 'exact_provenance']), manual_review_required: true }),
   unknown: Object.freeze({ minimum_level: 'L6', risk: 'high', required_evidence: Object.freeze(['path_review', 'exact_provenance']), manual_review_required: true }),
 });
 
 const CANONICAL_PATH_RULES = Object.freeze([
   Object.freeze({ id: 'docs', category: 'docs-only', prefixes: Object.freeze(['docs/']), exact: Object.freeze(['AGENTS.md', 'README.md', 'CHANGELOG.md', 'LICENSE', 'NOTICE']) }),
-  Object.freeze({ id: 'release', category: 'release', prefixes: Object.freeze(['release/']), exact: Object.freeze(['apps/desktop/electron-builder.yml', 'scripts/desktop-installer-smoke.mjs']), regex: '^\\.github/workflows/[^/]*release[^/]*$' }),
-  Object.freeze({ id: 'feishu', category: 'feishu', prefixes: Object.freeze(['apps/server/src/integrations/feishu']) }),
-  Object.freeze({ id: 'llm', category: 'llm', prefixes: Object.freeze(['apps/server/src/integrations/llm']) }),
   Object.freeze({ id: 'qa-control', category: 'qa-control-plane', prefixes: Object.freeze(['scripts/ci-plan', 'scripts/ci-selection-policy', 'scripts/evidence-record-policy', 'scripts/local-verification', 'scripts/docs-check', 'scripts/ci-log-policy', 'scripts/playwright-evidence-policy', 'scripts/playwright-inventory', 'scripts/playwright-results-verify', 'scripts/verify-github-provenance', 'scripts/run-ci-command', 'scripts/run-vitest-inventory', 'scripts/docs-generate', 'scripts/domain-contracts-check', 'scripts/decision-register-check', 'scripts/e2e-build-provenance', 'scripts/test-e2e-lifecycle']), exact: Object.freeze(['.github/workflows/ci.yml']) }),
   Object.freeze({ id: 'script-runtime', category: 'server-data-runtime', exact: Object.freeze(['scripts/start-e2e-servers.mjs']) }),
   Object.freeze({ id: 'script-tests', category: 'test-ci-only', exact: Object.freeze(['scripts/capture-ui.mjs']) }),
   Object.freeze({ id: 'tests-and-ci', category: 'test-ci-only', prefixes: Object.freeze(['tests/']), regex: '(?:^|/)(?:__fixtures__|__mocks__|__tests__|e2e|fixtures?|mocks?|specs?|tests?)(?:/|$)|(?:^|/)(?:eslint|jest|prettier|vitest|playwright)\\.config\\.[cm]?[jt]$|(?:^|\\.)(?:bench|benchmark|cy|fixture|mock|spec|stories|story|test)\\.[cm]?[jt]sx?$' }),
   Object.freeze({ id: 'web', category: 'web', prefixes: Object.freeze(['apps/web/']) }),
-  Object.freeze({ id: 'desktop', category: 'desktop', prefixes: Object.freeze(['apps/desktop/']) }),
-  Object.freeze({ id: 'server', category: 'server-data-runtime', prefixes: Object.freeze(['apps/server/', 'apps/url-policy/']), exact: Object.freeze(['.env.example', 'package-lock.json', 'package.json', 'tsconfig.base.json']) }),
+  Object.freeze({ id: 'cindy-plugin', category: 'cindy-plugin', prefixes: Object.freeze(['plugins/cindy-pm-intake/']) }),
+  Object.freeze({ id: 'server', category: 'server-data-runtime', prefixes: Object.freeze(['apps/server/']), exact: Object.freeze(['.env.example', 'package-lock.json', 'package.json', 'tsconfig.base.json']) }),
 ]);
 
 // These are deliberately code-owned. A change to the policy source or its
@@ -62,7 +56,6 @@ const PROTECTED_EXACT_PATHS = Object.freeze(new Set([
   'package-lock.json',
   'apps/server/package.json',
   'apps/web/package.json',
-  'apps/desktop/package.json',
 ]));
 const PROTECTED_PREFIXES = Object.freeze([
   '.github/workflows/',
@@ -84,6 +77,7 @@ const PROTECTED_PREFIXES = Object.freeze([
   'scripts/test-e2e-lifecycle',
   'scripts/ci-log-policy',
   'scripts/playwright-evidence-policy',
+  'plugins/cindy-pm-intake/',
 ]);
 
 const LEVEL_ORDER = Object.freeze(ALLOWED_LEVELS);

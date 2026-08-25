@@ -2,10 +2,12 @@
 
 ## 唯一当前入口
 
-- [当前状态](current-state.md)：唯一“现在是什么”，包含源码基线、阶段、主链、开放问题、安装包对应关系和验证 ID。
+当前产品入口是 Cindy 插件、`apps/server` 本机服务和 `apps/web` 浏览器任务台。旧桌面壳、安装包和旧分类链仅保留在历史记录中，不属于当前运行路径。
+
+- [当前状态](current-state.md)：唯一“现在是什么”，包含源码基线、阶段、主链、开放问题和验证 ID。
 - [项目地图](project-map.md)：按工作区域找到实现、稳定合同、测试位置和文档影响。
 - [验证矩阵](verification-matrix.md)：L0–L6、commit、run、环境、result、skips、evidence type 和 artifact hash。
-- [Windows L5 发布门禁](release-l5.md)：版本化 manifest、签名授权、精确安装包 Smoke 和升级/回退边界。
+- [运行清单](release-manifest.json)：Cindy 插件、本机 server、web 与 SQLite 的当前运行合同。
 - [测试选层与证据门禁](test-selection.md)：changed-path 分类、最低层级、skip 语义和 exact provenance 合同。
 - [Agent 测试 SOP](qa/agent-test-sop.md)：协作 Agent 的选层、执行清单和 fail-closed 顺序。
 - [完全本地 exact verification](local-verification.md)：本地 runner、证据 schema、验证命令和后续 Actions cutover 边界。
@@ -20,8 +22,7 @@ README、AGENTS 和本页不再复制当前测试数字、安装包 hash 或历�
 - `architecture.md`：系统组成、数据真源和自动化边界。
 - `domain-contracts.md`：Issue #64 统一术语、数据权威、状态机、CAS/恢复、错误目录和 ADR supersession。
 - `security_and_privacy.md`：令牌、聊天原文、隐私生命周期、硬删除证明和 GitHub 安全要求。
-- `feishu-integration.md`：主人 OAuth、按人员/群聊选择范围、权限与真实租户边界。
-- `user-guide.md`：Windows 安装、首次授权、选人选群和验收步骤。
+- `user-guide.md`：Cindy 插件、本机浏览器任务台、人工补录和验收步骤。
 - `diagnostics.md`：运行日志与诊断包字段、递归脱敏版本和禁止内容。
 - `../CHANGELOG.md`：用户可见历史；逐次验证数字另存 `qa/`。
 - `github_collaboration.md`：开发者如何协作。

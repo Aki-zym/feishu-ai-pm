@@ -36,7 +36,7 @@ const TEST_COUNTS_KEYS = new Set(['total', 'passed', 'failed', 'skipped']);
 const RESULT_KEYS = new Set(['passed', 'failed', 'skipped', 'zeroTest']);
 const LOG_KEYS = new Set(['path', 'sha256', 'bytes']);
 const ARTIFACT_KEYS = new Set(['path', 'sha256', 'sizeBytes']);
-const ENVIRONMENT_KEYS = new Set(['os', 'arch', 'node', 'npm', 'git', 'runner', 'realProvider', 'productionData', 'windowsL5']);
+const ENVIRONMENT_KEYS = new Set(['os', 'arch', 'node', 'npm', 'git', 'runner', 'realProvider', 'productionData']);
 const PUBLICATION_KEYS = new Set(['generation', 'evidencePath', 'pointerPath', 'currentPointerDirectory', 'rootSlotPath', 'previousGeneration', 'candidateFingerprint', 'payloadDigest']);
 const RECOVERY_MANIFEST_KEYS = new Set(['schemaVersion', 'kind', 'epoch', 'sourceDirectory', 'sourceDigest', 'createdAt', 'snapshots']);
 const RECOVERY_SNAPSHOT_KEYS = new Set(['name', 'sourcePath', 'snapshotPath', 'sha256', 'sizeBytes', 'sourceMetadata', 'snapshotMetadata']);
@@ -736,11 +736,6 @@ async function readJson(repo, path) {
 
 export async function deriveCounts(repo, spec, output) {
   if (spec.counts) return spec.counts;
-  if (['windows-manifest', 'windows-l5-harness', 'windows-smoke-build', 'windows-smoke'].includes(spec.id)) {
-    return spec.exitCode === 0
-      ? { total: 1, passed: 1, failed: 0, skipped: 0 }
-      : { total: 1, passed: 0, failed: 1, skipped: 0 };
-  }
   if (spec.countFile) {
     const report = await readJson(repo, spec.countFile);
     if (report?.packages) return report.packages.reduce((sum, item) => ({
@@ -927,22 +922,10 @@ export function defaultCommands(plan, platform = process.platform) {
   const commands = [];
   if (plan.gates.docs) commands.push({ id: 'docs-check', ...nodeCommand(['scripts/docs-check-run.mjs']), requiresTests: false, artifacts: ['docs/verification-matrix.md'] });
   if (!plan.gates.check) return commands;
-  commands.push({ id: 'ci-policy-test', ...nodeCommand(['--test', 'scripts/ci-selection-policy.test.mjs', 'scripts/ci-log-policy.test.mjs', 'scripts/evidence-record-policy.test.mjs', 'scripts/ci-plan.test.mjs', 'scripts/local-verification.test.mjs']), requiresTests: true });
-  commands.push({ id: 'runtime-check', command: 'npm', displayCommand: 'npm run check:runtime', args: ['run', 'check:runtime'], requiresTests: true, requiresEvidence: true, countFile: 'ci-artifacts/vitest-inventory.json', artifacts: ['ci-artifacts/vitest-inventory.json', 'ci-artifacts/e2e-build-provenance.json'] });
-  commands.push({ id: 'lifecycle', ...nodeCommand(['scripts/test-e2e-lifecycle.mjs']), requiresTests: true });
-  commands.push({ id: 'playwright-inventory', ...nodeCommand(['scripts/playwright-inventory.mjs']), requiresTests: true, requiresEvidence: true, countFile: 'tmp/ci-reports/playwright-inventory.json', artifacts: ['tmp/ci-reports/playwright-inventory.json', 'ci-artifacts/playwright-inventory-summary.txt'] });
-  commands.push({ id: 'playwright-e2e', command: 'npm', displayCommand: 'npm run test:e2e', args: ['run', 'test:e2e'], env: { E2E_EVIDENCE: '1', E2E_REUSE_BUILD: '1' }, requiresTests: true, requiresEvidence: true, countFile: 'tmp/ci-reports/playwright-results.json', artifacts: ['tmp/ci-reports/playwright-results.json'] });
-  commands.push({ id: 'playwright-verify', ...nodeCommand(['scripts/playwright-results-verify.mjs']), requiresTests: true, requiresEvidence: true, countFile: 'tmp/ci-reports/playwright-execution.json', artifacts: ['tmp/ci-reports/playwright-execution.json', 'ci-artifacts/playwright-execution-summary.txt'] });
-  if (plan.minimumLevel === 'L5' || plan.minimumLevel === 'L6') {
-    if (platform !== 'win32') {
-      commands.push({ id: 'windows-l5', command: 'n/a', displayCommand: 'Windows L5 local gate', args: [], requiresTests: true, skipReason: 'Windows L5 requires a Windows runner.' });
-    } else {
-      commands.push({ id: 'windows-manifest', command: 'npm', displayCommand: 'npm run release:manifest:check -- --verify-artifact', args: ['run', 'release:manifest:check', '--', '--verify-artifact'], requiresTests: true, requiresEvidence: true, artifacts: ['docs/release-manifest.json'] });
-      commands.push({ id: 'windows-l5-harness', command: 'npm', displayCommand: 'npm run release:l5:harness', args: ['run', 'release:l5:harness'], requiresTests: true, requiresEvidence: true, artifacts: ['ci-artifacts/release-l5-harness.json'] });
-      commands.push({ id: 'windows-smoke-build', command: 'npm', displayCommand: 'npm run desktop:dist:smoke', args: ['run', 'desktop:dist:smoke'], requiresTests: true, requiresEvidence: true, artifacts: ['tmp/smoke-release/Feishu-AI-PM-0.2.0-x64-Setup.exe'] });
-      commands.push({ id: 'windows-smoke', command: 'npm', displayCommand: 'npm run desktop:smoke:installer', args: ['run', 'desktop:smoke:installer'], requiresTests: true, requiresEvidence: true, artifacts: ['ci-artifacts/desktop-installer-smoke.json'] });
-    }
-  }
+  commands.push({ id: 'typecheck', command: 'npm', displayCommand: 'npm run typecheck', args: ['run', 'typecheck'], requiresTests: false });
+  commands.push({ id: 'plugin-tests', command: 'npm', displayCommand: 'npm run test:plugin', args: ['run', 'test:plugin'], requiresTests: true });
+  commands.push({ id: 'server-current-tests', command: 'npm', displayCommand: 'npm run test:server:current', args: ['run', 'test:server:current'], requiresTests: true });
+  commands.push({ id: 'web-current-tests', command: 'npm', displayCommand: 'npm run test:web:current', args: ['run', 'test:web:current'], requiresTests: true });
   return commands;
 }
 
@@ -965,7 +948,7 @@ function safeEnvironment(repo) {
     } catch { return 'unavailable'; }
   })();
   const gitVersion = (() => { try { return git(repo, ['--version']); } catch { return 'unavailable'; } })();
-  return { os: process.platform, arch: process.arch, node: process.version, npm: npmVersion, git: gitVersion, runner: 'local-orca', realProvider: false, productionData: false, windowsL5: process.platform === 'win32' };
+  return { os: process.platform, arch: process.arch, node: process.version, npm: npmVersion, git: gitVersion, runner: 'local-orca', realProvider: false, productionData: false };
 }
 
 export function candidateFingerprint({ provenance, changedPaths, plan }) {
@@ -1019,7 +1002,7 @@ export async function validateLocalEvidence(record, { repo = defaultRepoRoot, re
   }
   const environment = record.environment;
   addUnknownKeys(add, environment, ENVIRONMENT_KEYS, 'environment');
-  if (!environment || environment.realProvider !== false || environment.productionData !== false || environment.runner !== 'local-orca' || typeof environment.windowsL5 !== 'boolean' || environment.windowsL5 !== (environment.os === 'win32')) add('environment boundary is invalid');
+  if (!environment || environment.realProvider !== false || environment.productionData !== false || environment.runner !== 'local-orca') add('environment boundary is invalid');
   if (verifyGit && environment?.os !== process.platform) add('environment.os does not match the validating runner');
   const planRecord = record.plan;
   addUnknownKeys(add, planRecord, PLAN_KEYS, 'plan');

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import {
   Archive,
   Bot,
@@ -13,8 +13,6 @@ import {
 } from 'lucide-react';
 import { NavLink, Outlet } from 'react-router-dom';
 import TaskDrawer from './TaskDrawer';
-import { desktopBridge } from '../desktop';
-import { externalLinkFeedbackMessage } from '../external-links';
 
 const navigation = [
   { to: '/', label: '工作台', icon: LayoutDashboard, end: true },
@@ -22,16 +20,12 @@ const navigation = [
   { to: '/tasks', label: '全部任务', icon: CheckSquare2 },
   { to: '/calendar', label: '排期日历', icon: CalendarDays },
   { to: '/archive', label: '归档与回收站', icon: Archive },
-  { to: '/settings', label: '集成设置', icon: Settings },
+  { to: '/settings', label: '设置', icon: Settings },
   { to: '/logs', label: '日志与纠错', icon: ScrollText },
 ];
 
 export default function AppShell() {
   const [menuOpen, setMenuOpen] = useState(false);
-  const [externalLinkNotice, setExternalLinkNotice] = useState<{ error: boolean; message: string } | null>(null);
-  useEffect(() => desktopBridge()?.externalLinks?.onResult((result) => {
-    setExternalLinkNotice({ error: !result.opened, message: externalLinkFeedbackMessage(result) });
-  }), []);
   return (
     <div className="app-shell">
       <header className="mobile-header">
@@ -82,10 +76,6 @@ export default function AppShell() {
       </aside>
 
       {menuOpen && <button className="sidebar-backdrop" aria-label="关闭导航" onClick={() => setMenuOpen(false)} />}
-      {externalLinkNotice && <div className={`external-link-notice ${externalLinkNotice.error ? 'external-link-notice-error' : ''}`} role={externalLinkNotice.error ? 'alert' : 'status'}>
-        <span>{externalLinkNotice.message}</span>
-        <button type="button" aria-label="关闭链接提示" onClick={() => setExternalLinkNotice(null)}><X size={15} /></button>
-      </div>}
       <main className="main-content"><Outlet /></main>
       <TaskDrawer />
     </div>

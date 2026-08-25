@@ -1,7 +1,7 @@
 ---
 id: ADR-0002-electron
 title: Windows 桌面载体采用 Electron
-status: accepted
+status: deprecated
 date: 2026-08-09
 owner: 桌面负责人
 scope: Windows M1 载体
@@ -10,6 +10,8 @@ evidence: [VER-PACKAGE-020]
 ---
 
 # ADR 0002-E：Windows 桌面载体采用 Electron
+
+> 2026-08-25 起已废弃。当前产品入口是 Cindy 插件、`apps/server` 和 `apps/web`；本记录仅保留历史决策背景。
 
 状态：已接受
 

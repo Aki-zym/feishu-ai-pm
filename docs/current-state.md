@@ -1,5 +1,7 @@
 # 当前状态
 
+> 当前运行入口（2026-08-25）：Cindy 插件 `plugins/cindy-pm-intake` 通过 `127.0.0.1:4310` 拉起 `apps/server`，浏览器使用 `apps/web` 任务台，SQLite 是任务、候选与运行状态真源。旧桌面壳、安装包和旧 Feishu/LLM 分类链只作为历史证据保留。
+
 > 2026-08-18 FSH-03 candidate refresh：PR #108 / Issue #38 及其 docs follow-up 已形成 committed integration snapshot `a487598bcae3630f1c5906c8b384bc8811ee0e29`；当前 live integration tip 为 `635290379de2688187988692ecb619c9c109e100`，本候选已普通重绑该 live tip 并继续实现 FSH-03 durable inbox-before-ack。当前 product-source fingerprint 以本轮 docs 生成结果为准；v1-v7 descriptor/checksum 与行为保持连续。
 
 > 这是仓库中回答“现在是什么”的唯一人读入口。机器入口、生成视图和历史位置由 [文档清单](docs-manifest.json) 声明；测试数字、运行环境和安装包 hash 只以 [验证矩阵](verification-matrix.md) 中的验证 ID 为准。
@@ -29,7 +31,8 @@ Issue #39 FSH-01（验证 ID `VER-ISSUE39-FSH01-L3-20260816`）的 owner message
 - 产品阶段：`M1：本机任务库与 Cindy 插件入口维护`。
 - Issue #29 的 owner_decision 退休闭环验证 ID 为 `VER-ISSUE29-OWNER-RETIREMENT-L2-20260816`；证据仅限 synthetic SQLite/service L2，不代表真实 provider、飞书租户、生产数据或 Windows L5/L6。
 - 当前使用入口：Cindy 插件 + 本机后台 + 浏览器，默认地址为 `http://127.0.0.1:4310`。
-- Windows Electron EXE 属于遗留载体，用于安装包证据和维护验证；React 网页界面继续由浏览器入口提供。
+- 当前浏览器流程由 Cindy 插件启动本机后台，浏览器设置页只管理本机任务库运行选项，不提供旧飞书 OAuth 首配，也不经过 Electron 或 Windows EXE。
+- Windows Electron EXE 属于遗留载体，仅用于安装包证据和维护验证；React 网页界面继续由浏览器入口提供。
 - 产品版本：`0.2.0`。
 - server Vitest 门禁固定使用 single-thread threads pool、`--no-file-parallelism` 与单 worker；默认 5 秒 test timeout 仍保留，不通过提高 timeout 掩盖迁移或 worker 收尾问题。JSON 报告只有在子进程真实 zero exit、无失败测试且至少有一项通过时才算通过。
 

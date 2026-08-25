@@ -4,7 +4,7 @@ import { inventoryPackagePasses, parseInventoryArgs, parseVitestFileParallelism,
 
 test('inventory defaults to every workspace', () => {
   const selection = parseInventoryArgs([]);
-  assert.deepEqual(selection.workspaces.map(({ name }) => name), ['server', 'web', 'desktop']);
+  assert.deepEqual(selection.workspaces.map(({ name }) => name), ['server', 'web']);
   assert.equal(selection.target, undefined);
 });
 

@@ -19,9 +19,9 @@
 
 - 一项工作对应一个 Issue、一个分支和一个 Pull Request。
 - 不直接向 `main` 推送未审阅改动。
-- 每个可验证里程碑提交前必须检查并同步人读文档：至少更新 `README.md` 当前状态；按影响更新 `docs/user-guide.md`、`docs/architecture.md`、`docs/feishu-integration.md`、`docs/security_and_privacy.md` 和相关 ADR。没有变化的文档要在 PR 清单中明确标记“不适用”，不能默认遗漏。
+- README 只保留痛点、能力、用法和文档入口；当前实现、阶段和验证数字只写 `docs/current-state.md`。能力或用法变化才改 README，不要把 Issue 清单或验证数字写回首页。
+- 每个可验证里程碑提交前必须检查并同步人读文档：当前实现只更新 `docs/current-state.md`；按影响更新 `docs/user-guide.md`、`docs/architecture.md`、`docs/feishu-integration.md`、`docs/security_and_privacy.md` 和相关 ADR。没有变化的文档要在 PR 清单中明确标记“不适用”，不能默认遗漏。
 - 修改产品行为、权限、数据留存或对外动作时，必须同步更新对应文档和验收标准。
-- Windows 安装包通过 Git LFS 提交到 `release/`；只跟踪正式安装 EXE、blockmap 和 `latest.yml`，`win-unpacked/` 与构建调试文件继续忽略。每次需要用户试用的里程碑都要重新生成并冒烟验证，在 PR 中记录文件名、SHA-256、是否已发布到 GitHub Release，以及该安装包对应的 commit。
 - 不提交真实密钥、访问令牌、聊天原文、生产数据库、日志或个人绝对路径。
 - 对非技术项目负责人沟通时，先说明用户能看到的结果，再说明必要的技术细节。
 

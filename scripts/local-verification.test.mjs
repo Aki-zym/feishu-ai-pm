@@ -41,18 +41,15 @@ test('local count extraction understands Node test runner summaries', () => {
   assert.deepEqual(extractCounts('ℹ tests 8\nℹ pass 7\nℹ fail 1\nℹ skipped 0\nℹ todo 0\n', false), { total: 8, passed: 7, failed: 1, skipped: 0 });
 });
 
-test('operational Windows gates count the gate result, not nested check summaries', async () => {
-  assert.deepEqual(await deriveCounts(process.cwd(), { id: 'windows-smoke-build', exitCode: 0 }, 'ℹ tests 42\nℹ pass 41\nℹ skipped 1\n'), { total: 1, passed: 1, failed: 0, skipped: 0 });
+test('current test gates count their runner summaries', async () => {
+  assert.deepEqual(await deriveCounts(process.cwd(), { id: 'plugin-tests', exitCode: 0 }, 'ℹ tests 42\nℹ pass 41\nℹ skipped 1\n'), { total: 42, passed: 41, failed: 0, skipped: 1 });
 });
 
-test('local plan keeps Windows L5 explicit when desktop/release paths require it', () => {
-  const plan = { gates: { docs: true, check: true }, minimumLevel: 'L5' };
-  const linux = defaultCommands(plan, 'linux');
-  assert.equal(linux.at(-1).id, 'windows-l5');
-  assert.equal(linux.at(-1).status, undefined);
-  assert.match(linux.at(-1).skipReason, /Windows runner/);
-  const windows = defaultCommands(plan, 'win32').map(({ id }) => id);
-  assert.deepEqual(windows.slice(-4), ['windows-manifest', 'windows-l5-harness', 'windows-smoke-build', 'windows-smoke']);
+test('local plan uses the Cindy plugin, server and web gates on every platform', () => {
+  const plan = { gates: { docs: true, check: true } };
+  const expected = ['docs-check', 'typecheck', 'plugin-tests', 'server-current-tests', 'web-current-tests'];
+  assert.deepEqual(defaultCommands(plan, 'linux').map(({ id }) => id), expected);
+  assert.deepEqual(defaultCommands(plan, 'win32').map(({ id }) => id), expected);
 });
 
 test('playwright execution counts aggregate project failures and skips', async () => {
@@ -61,7 +58,7 @@ test('playwright execution counts aggregate project failures and skips', async (
   await mkdir(join(root, 'tmp', 'ci-reports'), { recursive: true });
   await writeFile(reportPath, JSON.stringify({ projects: {
     web: { discovered: 3, executed: 3, passed: 2, failed: 1, skipped: 0 },
-    desktop: { discovered: 2, executed: 1, passed: 1, failed: 0, skipped: 1 },
+    mobile: { discovered: 2, executed: 1, passed: 1, failed: 0, skipped: 1 },
   }}));
   try {
     assert.deepEqual(await deriveCounts(root, { id: 'playwright-verify', countFile: 'tmp/ci-reports/playwright-execution-counts-test.json' }, ''), { total: 5, passed: 3, failed: 1, skipped: 1 });
@@ -78,7 +75,7 @@ function validRecord(root, runId = 'local-20260817T010203Z-deadbeef') {
   const log = 'docs check passed\n';
   const logPath = `ci-artifacts/local-verification/generations/${generation}/${runId}/docs-check.log`;
   const command = { id: 'docs-check', command: 'node scripts/docs-check-run.mjs', cwd: '<repo>', startedAt: '2026-08-17T01:02:03.000Z', finishedAt: '2026-08-17T01:02:04.000Z', exitCode: 0, status: 'passed', requiresTests: false, observedBytes: Buffer.byteLength(log), truncated: false, counts: { total: 0, passed: 0, failed: 0, skipped: 0 }, log: { path: logPath, sha256: hash(log), bytes: Buffer.byteLength(log) }, artifacts: [], missingArtifacts: [], requiresEvidence: false };
-  const record = { schemaVersion: 1, kind: 'local_exact_verification', mode: 'local_exact', runId, generation, startedAt: '2026-08-17T01:02:03.000Z', finishedAt: '2026-08-17T01:02:04.000Z', provenance, finalProvenance: provenance, changedPaths, plan, commands: [command], results: { passed: 1, failed: 0, skipped: 0, zeroTest: 0 }, environment: { os: 'win32', arch: 'x64', node: 'v24', npm: '11', git: '2.54', runner: 'local-orca', realProvider: false, productionData: false, windowsL5: true }, artifacts: [], candidateFingerprint: candidateFingerprint({ provenance, changedPaths, plan }), publication: { generation, evidencePath: `ci-artifacts/local-verification/generations/${generation}/${runId}/evidence.json`, pointerPath: `ci-artifacts/local-verification/pointers/${generation}.json`, currentPointerDirectory: 'ci-artifacts/local-verification/pointers', rootSlotPath: `ci-artifacts/local-verification/root-slots/${generation}.json`, previousGeneration: null, candidateFingerprint: candidateFingerprint({ provenance, changedPaths, plan }), payloadDigest: null } };
+  const record = { schemaVersion: 1, kind: 'local_exact_verification', mode: 'local_exact', runId, generation, startedAt: '2026-08-17T01:02:03.000Z', finishedAt: '2026-08-17T01:02:04.000Z', provenance, finalProvenance: provenance, changedPaths, plan, commands: [command], results: { passed: 1, failed: 0, skipped: 0, zeroTest: 0 }, environment: { os: 'linux', arch: 'x64', node: 'v24', npm: '11', git: '2.54', runner: 'local-orca', realProvider: false, productionData: false }, artifacts: [], candidateFingerprint: candidateFingerprint({ provenance, changedPaths, plan }), publication: { generation, evidencePath: `ci-artifacts/local-verification/generations/${generation}/${runId}/evidence.json`, pointerPath: `ci-artifacts/local-verification/pointers/${generation}.json`, currentPointerDirectory: 'ci-artifacts/local-verification/pointers', rootSlotPath: `ci-artifacts/local-verification/root-slots/${generation}.json`, previousGeneration: null, candidateFingerprint: candidateFingerprint({ provenance, changedPaths, plan }), payloadDigest: null } };
   record.payloadDigest = evidenceDigest(record);
   record.publication.payloadDigest = record.payloadDigest;
   return { record, log, path: join(root, command.log.path) };
@@ -159,7 +156,7 @@ test('empty diff is always full L6 high-risk manual and fail-closed', () => {
   });
 });
 
-test('validator rejects injected fields, changed-path shrinkage, desktop docs-only substitution, and total/pass mismatch', async () => {
+test('validator rejects injected fields, changed-path shrinkage, plugin substitution, and total/pass mismatch', async () => {
   const root = process.cwd();
   const valid = validRecord(root, 'local-20260817T010205Z-cafebabe');
   const unknown = structuredClone(valid.record);
@@ -172,11 +169,11 @@ test('validator rejects injected fields, changed-path shrinkage, desktop docs-on
   pathShrink.publication.payloadDigest = pathShrink.payloadDigest;
   assert.match((await validateLocalEvidence(pathShrink, { repo: root, verifyGit: false })).join('\\n'), /plan does not match|commands must exactly cover/);
 
-  const desktopDocs = structuredClone(valid.record);
-  desktopDocs.changedPaths = ['apps/desktop/src/main.ts'];
-  desktopDocs.payloadDigest = evidenceDigest(desktopDocs);
-  desktopDocs.publication.payloadDigest = desktopDocs.payloadDigest;
-  assert.match((await validateLocalEvidence(desktopDocs, { repo: root, verifyGit: false })).join('\\n'), /plan does not match|commands must exactly cover/);
+  const pluginDocs = structuredClone(valid.record);
+  pluginDocs.changedPaths = ['plugins/cindy-pm-intake/main.js'];
+  pluginDocs.payloadDigest = evidenceDigest(pluginDocs);
+  pluginDocs.publication.payloadDigest = pluginDocs.payloadDigest;
+  assert.match((await validateLocalEvidence(pluginDocs, { repo: root, verifyGit: false })).join('\\n'), /plan does not match|commands must exactly cover/);
 
   const countMismatch = structuredClone(valid.record);
   countMismatch.commands[0].counts = { total: 1, passed: 0, failed: 0, skipped: 1 };

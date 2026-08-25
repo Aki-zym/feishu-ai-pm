@@ -59,6 +59,18 @@ CI、清单、CODEOWNERS、第二人审查都挂在 PR 上。直接 push 等于�
 
 发现有人（含自己）直接 push 了业务改动：立刻补 PR 说明或 Revert，并检查保护规则是否被关掉。
 
+## RACI 与权限
+
+| 工作 | 产品主人 | 开发者/Worker | 独立 Reviewer | QA/证据负责人 | 发布负责人 | Merge authority（Lead/维护者） |
+|---|---|---|---|---|---|---|
+| 确认 Issue 范围、用户结果和未决产品选择 | A/R |  |  |  |  |  |
+| 实现与本地回归 |  | A/R |  |  |  |  |
+| 证据层级、changed-path、provenance 和未运行项 |  |  |  | A/R |  |  |
+| 独立复核安全、边界和验收 |  |  | A/R |  |  |  |
+| 标记 Ready |  |  |  |  |  | A/R |
+| 合入 integration/m1-test-20260815 |  |  |  |  |  | A/R |
+| 构建、签名、发布 Release |  |  |  |  | A/R |  |
+
 ## 最小规则
 
 1. 所有人（含 owner / admin）在分支开发，经 PR 合入 `main`。禁止日常 `git push origin main`。
@@ -67,3 +79,22 @@ CI、清单、CODEOWNERS、第二人审查都挂在 PR 上。直接 push 等于�
 4. 热修也从生产对应提交开 `hotfix/` 分支走 PR。允许快审，不允许直接推主干。
 5. 先开 Issue 声明在做什么；小团队不认领，谁提谁做。
 6. 只有保护规则把仓库锁死时，才允许短暂关闭「管理员不能绕过」。修好后立即打开，并留下 Issue 记录。
+
+## 可恢复 SOP
+
+1. **恢复现场**：读取 worktree、Issue、PR 和当前检查结果。
+2. **主人确认 Issue**：确认范围、用户结果和未决选择。
+3. **隔离工作区**：在独立分支或 worktree 中继续操作。
+4. **选择证据层级**：按 changed-path 选择当前门禁和证据上限。
+5. **实现**：只改合同范围内的代码、脚本和文档。
+6. **同步文档影响**：更新当前状态、控制面和证据说明。
+7. **写 handoff**：记录已运行、未运行、证据位置和回退方式。
+8. **创建 Draft PR**：关联 Issue，等待 CI 与复核。
+9. **独立复核**：检查安全边界、公开功能和验收结果。
+10. **主人合入、另行发布**：主人完成合入决定，发布动作单独确认。
+
+## GitHub 配置查询边界
+
+GitHub 配置查询只读；2026-08-25T12:00:00+08:00 查询 `branches/integration%2Fm1-test-20260815/protection`、`branches/main/protection` 和 `rulesets`。HTTP 403 时记录平台限制，不推断未返回的配置事实。
+
+CODEOWNERS 只负责路径路由，不能声称已形成两人独立复核。`Ready`、`merge`、`release`、`draft-only` 和不能 rebase 或 force-push 的限制继续由 PR 与主人确认共同约束。

@@ -4,8 +4,7 @@ import { api, ApiRequestError } from '../api';
 import { AsyncState } from '../components/AsyncState';
 import { candidateStateText, formatDate } from '../format';
 import { beginResource, beginResourceMutation, beginResourceRequest, failureResource, isLatestResourceMutation, isLatestResourceRequest, loadingResource, mutationRefreshFailure, MUTATION_REFRESH_FAILURE_MESSAGE, successResource, type ResourceMutation, type ResourceState } from '../resource-state';
-import { externalLinkFeedbackMessage, requestExternalLinkOpen } from '../external-links';
-import type { Candidate, CandidateEvidenceBasis, CandidateMergeSource, CandidateSourceRole, CandidateState, PendingOwnerAction, SourceFailure, Task } from '../types';
+import type { Candidate, CandidateEvidenceBasis, CandidateMergeSource, CandidateSourceRole, CandidateState, PendingOwnerAction, Task } from '../types';
 
 const filters: { value: CandidateState | 'all'; label: string }[] = [
   { value: 'all', label: '全部' },
@@ -59,18 +58,6 @@ const processingStateText: Record<NonNullable<Candidate['processing_state']>, st
   incomplete_context: '背景可能不完整',
   recovered: '已自动恢复',
   failed_visible: 'AI 整理失败',
-};
-
-const sourceFailureStatusText: Record<SourceFailure['status'], string> = {
-  open: '等待主人重试',
-  retrying: '正在恢复',
-  resolved: '已恢复',
-  ignored: '已归档',
-  stale: '记录已陈旧',
-};
-
-const sourceFailureStageText: Record<SourceFailure['stage'], string> = {
-  classification: 'AI 分类',
 };
 
 const ownerActionText: Record<PendingOwnerAction['action'], string> = {
@@ -202,7 +189,6 @@ function CandidateMergeSourceRow({
 export default function CandidatesPage() {
   type CandidatePayload = { items: Candidate[]; ownerActions?: PendingOwnerAction[] };
   const [resource, setResource] = useState<ResourceState<CandidatePayload>>(loadingResource);
-  const [sourceFailures, setSourceFailures] = useState<SourceFailure[]>([]);
   const [filter, setFilter] = useState<CandidateView>('pending');
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
@@ -210,7 +196,6 @@ export default function CandidatesPage() {
   const [correctionId, setCorrectionId] = useState('');
   const [correctionType, setCorrectionType] = useState<'false_positive' | 'wrong_fields' | 'describe_incomplete'>('false_positive');
   const [replacementValue, setReplacementValue] = useState('');
-  const [guidanceByCandidate, setGuidanceByCandidate] = useState<Record<string, string>>({});
   const [threadSelections, setThreadSelections] = useState<Record<string, string>>({});
   const [mergePrimarySelections, setMergePrimarySelections] = useState<Record<string, string>>({});
   const requestGenerationRef = useRef({ current: 0 });
@@ -228,14 +213,10 @@ export default function CandidatesPage() {
     listAbortRef.current = controller;
     const requestIdentity = beginResourceRequest(requestGenerationRef.current);
     setResource((current) => beginResource(current));
-    const request = Promise.all([
-      api.get<{ items: Candidate[]; ownerActions?: PendingOwnerAction[] }>('/api/candidates?deleted=all', controller.signal),
-      api.get<{ items: SourceFailure[] }>('/api/source-failures?status=all', controller.signal),
-    ])
-      .then(([data, failureData]) => {
+    const request = api.get<{ items: Candidate[]; ownerActions?: PendingOwnerAction[] }>('/api/candidates?deleted=all', controller.signal)
+      .then((data) => {
         if (!controller.signal.aborted && isLatestResourceRequest(requestGenerationRef.current, requestIdentity)) {
           setResource(successResource(data, data.items.length === 0));
-          setSourceFailures(failureData.items);
         }
       });
     return request.then(() => true).catch((reason: unknown) => {
@@ -289,15 +270,6 @@ export default function CandidatesPage() {
     return { grouped, unassigned };
   }, [items, pendingOwnerActions]);
 
-  const activeSourceFailures = useMemo(
-    () => sourceFailures.filter((item) => item.status === 'open' || item.status === 'retrying' || item.status === 'stale'),
-    [sourceFailures],
-  );
-  const handledSourceFailures = useMemo(
-    () => sourceFailures.filter((item) => item.status === 'resolved' || item.status === 'ignored'),
-    [sourceFailures],
-  );
-  const hasSourceFailureHistory = activeSourceFailures.length > 0 || handledSourceFailures.length > 0;
   const controlsDisabled = Boolean(busy) || resource.status === 'stale';
   const applyCanonicalCandidates = useCallback((payload: unknown) => {
     const updates = mutationCandidates(payload);
@@ -346,45 +318,6 @@ export default function CandidatesPage() {
     applyCandidateConflict(reason);
     return reason instanceof Error ? reason.message : fallback;
   }, [applyCandidateConflict]);
-
-  const retrySourceFailure = async (failure: SourceFailure) => {
-    const mutation = beginMutation(failure.id, failure.id + ':retry');
-    invalidateReads();
-    setBusy(failure.id + ':retry');
-    setMessage('');
-    setError('');
-    try {
-      const result = await api.post<{ status?: string; message?: string }>(`/api/source-failures/${encodeURIComponent(failure.id)}/retry`, {});
-      if (isCurrentMutation(mutation)) {
-        setMessage(result.message || '已加入 AI 自动重试队列。');
-        await load();
-      }
-    } catch (reason) {
-      if (isCurrentMutation(mutation)) setError(reason instanceof Error ? reason.message : '失败来源重试失败。');
-    } finally {
-      if (isCurrentMutation(mutation)) setBusy('');
-    }
-  };
-
-  const ignoreSourceFailure = async (failure: SourceFailure) => {
-    if (!window.confirm('归档后不会再次出现在待处理失败来源中；来源和审计记录仍会保留。确定归档吗？')) return;
-    const mutation = beginMutation(failure.id, failure.id + ':ignore');
-    invalidateReads();
-    setBusy(failure.id + ':ignore');
-    setMessage('');
-    setError('');
-    try {
-      const result = await api.post<{ message?: string }>(`/api/source-failures/${encodeURIComponent(failure.id)}/archive`, {});
-      if (isCurrentMutation(mutation)) {
-        setMessage(result.message || '失败来源已归档。');
-        await load();
-      }
-    } catch (reason) {
-      if (isCurrentMutation(mutation)) setError(reason instanceof Error ? reason.message : '失败来源归档失败。');
-    } finally {
-      if (isCurrentMutation(mutation)) setBusy('');
-    }
-  };
 
   const remove = async (candidate: Candidate) => {
     const grouped = (candidate.merge_group?.candidateCount ?? 0) > 1;
@@ -520,51 +453,6 @@ export default function CandidatesPage() {
     }
   };
 
-  const reprocess = async (candidate: Candidate) => {
-    const mutation = beginMutation(candidate.id, candidate.id + ':reprocess');
-    invalidateReads();
-    setBusy(candidate.id + ':reprocess');
-    setMessage('');
-    setError('');
-    try {
-      const guidance = guidanceByCandidate[candidate.id]?.trim();
-      const result = await api.post('/api/candidates/' + candidate.id + '/reprocess', { guidance: guidance || undefined, expectedVersion: candidate.version });
-      if (isCurrentMutation(mutation)) setMessage('已重新整理当前候选，并保留新的 AI 判断记录。');
-      if (isCurrentMutation(mutation)) setGuidanceByCandidate((current) => {
-        const next = { ...current };
-        delete next[candidate.id];
-        return next;
-      });
-      if (isCurrentMutation(mutation)) await refreshAfterMutation(mutation, result);
-    } catch (reason) {
-      if (isCurrentMutation(mutation)) setError(mutationError(reason, '重新整理失败。'));
-    } finally {
-      if (isCurrentMutation(mutation)) setBusy('');
-    }
-  };
-
-  const retrySourceClassification = async (candidate: Candidate) => {
-    const mutation = beginMutation(candidate.id, candidate.id + ':source-retry');
-    invalidateReads();
-    setBusy(candidate.id + ':source-retry');
-    setMessage('');
-    setError('');
-    try {
-      const result = await api.post<{ status: string; message: string }>(
-        `/api/candidates/${encodeURIComponent(candidate.id)}/source-retry`,
-        { sourceScope: candidate.source_scope, expectedVersion: candidate.version },
-      );
-      if (isCurrentMutation(mutation)) {
-        setMessage(result.message || '已加入 AI 自动重试队列。');
-        await refreshAfterMutation(mutation, result);
-      }
-    } catch (reason) {
-      if (isCurrentMutation(mutation)) setError(mutationError(reason, '来源分类重试失败。'));
-    } finally {
-      if (isCurrentMutation(mutation)) setBusy('');
-    }
-  };
-
   const confirmCandidateMerge = async (candidate: Candidate) => {
     const suggestion = candidate.merge_group?.suggestion;
     if (!suggestion?.targetCandidateId) return;
@@ -684,35 +572,6 @@ export default function CandidatesPage() {
       </div>
       {message && <div className="success-banner">{message}</div>}
       {error && <div className="error-banner">{error}</div>}
-      {hasSourceFailureHistory && <section className="source-failure-inbox" aria-label="失败来源收件箱">
-        <div className="source-failure-heading">
-          <div><strong>失败来源收件箱（{activeSourceFailures.length}）</strong><span>来源已保存，但 AI 整理没有完成。这里不显示聊天正文，只提供脱敏诊断和主人确认后的本地重试。</span></div>
-        </div>
-        {activeSourceFailures.length > 0
-          ? <div className="source-failure-list">
-            {activeSourceFailures.map((failure) => <article className={`source-failure-card source-failure-${failure.status}`} key={failure.id}>
-              <div className="source-failure-card-main">
-                <div className="source-failure-card-title"><strong>{sourceTypeText[failure.source_type] ?? '授权来源'}</strong><span>{formatDate(failure.occurred_at)}</span><em>{sourceFailureStatusText[failure.status]}</em></div>
-                <div className="source-failure-facts">
-                  <span>阶段：{sourceFailureStageText[failure.stage]}</span>
-                  <span>错误码：<code>{failure.error_code}</code></span>
-                  <span>尝试：{failure.attempts}/{failure.max_attempts}</span>
-                  {failure.job_status && <span>Runtime：{failure.job_status}</span>}
-                </div>
-                <p>{failure.stale ? '来源或其背景已经变化，这条失败记录不会覆盖新版本。' : failure.error_message}</p>
-              </div>
-              <div className="source-failure-actions">
-                {failure.retryable && !failure.stale && <button className="secondary-button" type="button" disabled={Boolean(busy)} onClick={() => void retrySourceFailure(failure)}><RotateCcw size={15} />重试</button>}
-                {failure.status !== 'ignored' && failure.status !== 'resolved' && <button className="quiet-button" type="button" disabled={Boolean(busy)} onClick={() => void ignoreSourceFailure(failure)}>归档</button>}
-              </div>
-            </article>)}
-          </div>
-          : <p className="source-failure-empty">当前没有待处理失败来源。</p>}
-        {handledSourceFailures.length > 0 && <details className="source-failure-history">
-          <summary>查看已处理失败来源（{handledSourceFailures.length}）</summary>
-          <ul>{handledSourceFailures.map((failure) => <li key={failure.id}><span>{sourceTypeText[failure.source_type] ?? '授权来源'} · {formatDate(failure.occurred_at)}</span><strong>{sourceFailureStatusText[failure.status]}</strong><code>{failure.error_code}</code></li>)}</ul>
-        </details>}
-      </section>}
       {ownerActionsByCandidate.unassigned.length > 0 && <section className="candidate-context-warning" aria-label="尚未关联需求的主人动作">
         <strong>有 {ownerActionsByCandidate.unassigned.length} 个 AI 判断尚未找到对应需求</strong>
         {ownerActionsByCandidate.unassigned.slice(0, 5).map((action) => <span key={action.id}>
@@ -776,12 +635,6 @@ export default function CandidatesPage() {
                   {candidate.processing_error && <span>{candidate.processing_error}</span>}
                   {candidate.context_state === 'possibly_incomplete' && <span>{candidate.context_reason || '对话背景可能不完整。'}</span>}
                 </div>
-                {(candidate.processing_state === 'failed_visible' || candidate.processing_state === 'retry_waiting') && <button
-                  className="quiet-button"
-                  type="button"
-                  disabled={Boolean(busy)}
-                  onClick={() => void retrySourceClassification(candidate)}
-                >重新尝试整理</button>}
               </div>}
               {candidate.context_state === 'possibly_incomplete' && candidate.processing_state === 'ready' && <div className="candidate-context-warning">
                 <strong>对话背景可能不完整</strong><span>{candidate.context_reason || '系统未能取得这条消息之前的全部上下文。'}</span>
@@ -835,13 +688,7 @@ export default function CandidatesPage() {
             {candidate.deleted_at ? <div className="candidate-trash-state"><span>已于 {formatDate(candidate.deleted_at)} 移入回收站；{candidate.accepted_task_id ? '对应正式任务也已同步进入回收站，' : ''}来源和关联仍保留。</span><button className="secondary-button" disabled={controlsDisabled} onClick={() => void restore(candidate)}><RotateCcw size={16} />{candidate.accepted_task_id ? '恢复候选和任务' : '恢复候选'}</button></div> : correctionId === candidate.id && <div className="correction-box">
               <label><span>纠错类型</span><select disabled={controlsDisabled} value={correctionType} onChange={(event) => setCorrectionType(event.target.value as typeof correctionType)}><option value="false_positive">这不是需求</option><option value="wrong_fields">提出人或字段错误</option><option value="describe_incomplete">describe 不完整</option></select></label>
               {correctionType !== 'false_positive' && <label><span>{correctionType === 'wrong_fields' ? '正确的提出人' : '完整 describe'}</span><textarea disabled={controlsDisabled} value={replacementValue} onChange={(event) => setReplacementValue(event.target.value)} placeholder={correctionType === 'wrong_fields' ? '例如：旭阳' : '用一句话说明任务背景、判断问题和边界'} /></label>}
-              <div className="correction-actions"><button className="secondary-button" disabled={controlsDisabled || (correctionType !== 'false_positive' && !replacementValue.trim())} onClick={() => void submitCorrection(candidate)}>记录纠错</button><button className="quiet-button" disabled={controlsDisabled} onClick={() => void reprocess(candidate)}><Sparkles size={14} />重新整理</button></div>
-              <input
-                className="correction-guidance"
-                value={guidanceByCandidate[candidate.id] ?? ''}
-                onChange={(event) => setGuidanceByCandidate((current) => ({ ...current, [candidate.id]: event.target.value }))}
-                placeholder="可选：告诉模型这次应补充什么"
-              />
+              <div className="correction-actions"><button className="secondary-button" disabled={controlsDisabled || (correctionType !== 'false_positive' && !replacementValue.trim())} onClick={() => void submitCorrection(candidate)}>记录纠错</button></div>
             </div>}
             {!candidate.deleted_at && candidate.state === 'ignored' && <button className="quiet-button restore-button" disabled={controlsDisabled} onClick={() => act(candidate, 'snooze')}><RotateCcw size={16} />恢复到稍后再议</button>}
           </article>

@@ -58,27 +58,21 @@
     "levels": ["L0", "L1", "L2", "L3", "L4", "L5", "L6"],
     "path_rules": [
       {"id": "docs", "category": "docs-only", "prefixes": ["docs/"], "exact": ["AGENTS.md", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE"]},
-      {"id": "release", "category": "release", "prefixes": ["release/"], "exact": ["apps/desktop/electron-builder.yml", "scripts/desktop-installer-smoke.mjs"], "regex": "^\\.github/workflows/[^/]*release[^/]*$"},
-      {"id": "feishu", "category": "feishu", "prefixes": ["apps/server/src/integrations/feishu"]},
-      {"id": "llm", "category": "llm", "prefixes": ["apps/server/src/integrations/llm"]},
       {"id": "qa-control", "category": "qa-control-plane", "prefixes": ["scripts/ci-plan", "scripts/ci-selection-policy", "scripts/evidence-record-policy", "scripts/local-verification", "scripts/docs-check", "scripts/ci-log-policy", "scripts/playwright-evidence-policy", "scripts/playwright-inventory", "scripts/playwright-results-verify", "scripts/verify-github-provenance", "scripts/run-ci-command", "scripts/run-vitest-inventory", "scripts/docs-generate", "scripts/domain-contracts-check", "scripts/decision-register-check", "scripts/e2e-build-provenance", "scripts/test-e2e-lifecycle"], "exact": [".github/workflows/ci.yml"]},
       {"id": "script-runtime", "category": "server-data-runtime", "exact": ["scripts/start-e2e-servers.mjs"]},
       {"id": "script-tests", "category": "test-ci-only", "exact": ["scripts/capture-ui.mjs"]},
       {"id": "tests-and-ci", "category": "test-ci-only", "prefixes": ["tests/"], "regex": "(?:^|/)(?:__fixtures__|__mocks__|__tests__|e2e|fixtures?|mocks?|specs?|tests?)(?:/|$)|(?:^|/)(?:eslint|jest|prettier|vitest|playwright)\\.config\\.[cm]?[jt]$|(?:^|\\.)(?:bench|benchmark|cy|fixture|mock|spec|stories|story|test)\\.[cm]?[jt]sx?$"},
       {"id": "web", "category": "web", "prefixes": ["apps/web/"]},
-      {"id": "desktop", "category": "desktop", "prefixes": ["apps/desktop/"]},
-      {"id": "server", "category": "server-data-runtime", "prefixes": ["apps/server/", "apps/url-policy/"], "exact": [".env.example", "package-lock.json", "package.json", "tsconfig.base.json"]}
+      {"id": "cindy-plugin", "category": "cindy-plugin", "prefixes": ["plugins/cindy-pm-intake/"]},
+      {"id": "server", "category": "server-data-runtime", "prefixes": ["apps/server/"], "exact": [".env.example", "package-lock.json", "package.json", "tsconfig.base.json"]}
     ],
     "categories": {
       "docs-only": {"minimum_level": "L0", "risk": "low", "required_evidence": ["docs_check"]},
       "test-ci-only": {"minimum_level": "L1", "risk": "medium", "required_evidence": ["unit_inventory", "exact_provenance"]},
       "qa-control-plane": {"minimum_level": "L4", "risk": "high", "required_evidence": ["unit_inventory", "contract_replay", "exact_provenance"], "manual_review_required": true},
       "server-data-runtime": {"minimum_level": "L2", "risk": "high", "required_evidence": ["unit_inventory", "service_integration", "exact_provenance"], "manual_review_required": true},
-      "feishu": {"minimum_level": "L3", "risk": "high", "required_evidence": ["contract_replay", "scope_guard", "exact_provenance"], "manual_review_required": true},
-      "llm": {"minimum_level": "L3", "risk": "high", "required_evidence": ["contract_replay", "redaction", "exact_provenance"], "manual_review_required": true},
+      "cindy-plugin": {"minimum_level": "L3", "risk": "high", "required_evidence": ["contract_replay", "scope_guard", "exact_provenance"], "manual_review_required": true},
       "web": {"minimum_level": "L4", "risk": "high", "required_evidence": ["unit_inventory", "browser_e2e", "exact_provenance"], "manual_review_required": true},
-      "desktop": {"minimum_level": "L5", "risk": "high", "required_evidence": ["unit_inventory", "lifecycle", "windows_installer_smoke", "exact_provenance"], "manual_review_required": true},
-      "release": {"minimum_level": "L5", "risk": "high", "required_evidence": ["artifact_hash", "windows_installer_smoke", "exact_provenance"], "manual_review_required": true},
       "unknown": {"minimum_level": "L6", "risk": "high", "manual_review_required": true, "required_evidence": ["path_review", "exact_provenance"]}
     },
     "mixed_paths": {"minimum_level": "max(category.minimum_level)", "risk": "high", "manual_review_required": true, "claim_authorized": false},

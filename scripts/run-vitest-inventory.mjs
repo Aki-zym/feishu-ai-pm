@@ -14,14 +14,13 @@ const TEST_FILE = /(?:^|\.)(?:bench|benchmark|cy|fixture|mock|spec|stories|story
 const workspaces = Object.freeze([
   { name: 'server', package: '@ai-pm/server', directory: 'apps/server' },
   { name: 'web', package: '@ai-pm/web', directory: 'apps/web' },
-  { name: 'desktop', package: '@ai-pm/desktop', directory: 'apps/desktop' },
 ]);
 const workspaceByName = new Map(workspaces.map((workspace) => [workspace.name, workspace]));
 
 const normalizePath = (value) => value.replaceAll('\\', '/').replace(/^\.\//, '');
 
 function usageError(message) {
-  throw new Error(`${message} Usage: npm test [-- --workspace server|web|desktop [--file <workspace-relative-test-file>]]`);
+  throw new Error(`${message} Usage: npm test [-- --workspace server|web [--file <workspace-relative-test-file>]]`);
 }
 
 export function parseVitestTestTimeout(env = process.env) {
