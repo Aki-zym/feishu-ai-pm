@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { cp, mkdir, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { dirname, extname, isAbsolute, relative, resolve } from 'node:path';
+import { createServer } from 'node:net';
+import { basename, dirname, extname, isAbsolute, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -56,56 +57,200 @@ function processIsAlive(pid) {
   }
 }
 
-async function clearDeadBundleLock(lockPath) {
-  try {
-    const owner = JSON.parse(await readFile(lockPath, 'utf8'));
-    if (owner.root === root && !processIsAlive(owner.pid)) {
-      await rm(lockPath, { force: true });
-      return true;
-    }
-  } catch {
-    // An unreadable lock is not safe to remove automatically.
-  }
-  return false;
+function bundleLockError(code, message) {
+  return Object.assign(new Error(message), { code });
 }
 
-export async function withBundleLock(action, options = {}) {
+function parseLegacyLock(value, lockPath) {
+  try {
+    const owner = JSON.parse(value);
+    if (!owner || typeof owner !== 'object' || Array.isArray(owner)
+      || owner.root !== root || !Number.isInteger(owner.pid) || owner.pid <= 0
+      || typeof owner.token !== 'string' || !owner.token
+      || typeof owner.created_at !== 'string' || !Number.isFinite(Date.parse(owner.created_at))) {
+      throw new Error('invalid owner identity');
+    }
+    return owner;
+  } catch {
+    throw bundleLockError('BUNDLE_LOCK_UNSAFE_METADATA', `bundle lock metadata is unreadable, malformed, or belongs to another root: ${lockPath}`);
+  }
+}
+
+function endpointForLockPath(lockPath) {
+  const key = createHash('sha256').update(resolve(lockPath)).digest('hex').slice(0, 32);
+  if (process.platform === 'win32') return `\\\\.\\pipe\\cindy-pm-runtime-${key}`;
+  return { host: '127.0.0.1', port: 49_152 + (Number.parseInt(key.slice(0, 8), 16) % 16_384), exclusive: true };
+}
+
+async function listenForBundleLease(lockPath) {
+  const server = createServer((socket) => socket.destroy());
+  const endpoint = endpointForLockPath(lockPath);
+  try {
+    await new Promise((resolveListen, rejectListen) => {
+      const onError = (error) => rejectListen(error);
+      server.once('error', onError);
+      server.listen(endpoint, () => {
+        server.off('error', onError);
+        resolveListen();
+      });
+    });
+    return server;
+  } catch (error) {
+    if (server.listening) await closeBundleEndpoint(server);
+    if (error?.code === 'EADDRINUSE') return null;
+    throw error;
+  }
+}
+
+async function closeBundleEndpoint(server) {
+  await new Promise((resolveClose, rejectClose) => {
+    server.close((error) => error ? rejectClose(error) : resolveClose());
+  });
+}
+
+async function assertNoRecoveryArtifacts(lockPath) {
+  const prefix = `${basename(lockPath)}.recovery-`;
+  const artifacts = (await readdir(dirname(lockPath))).filter((entry) => entry.startsWith(prefix));
+  if (artifacts.length > 0) {
+    throw bundleLockError(
+      'BUNDLE_LOCK_UNSAFE_METADATA',
+      `bundle lock has an unfinished ownership recovery and requires manual inspection: ${artifacts.join(', ')}`,
+    );
+  }
+}
+
+async function restoreClaimedLock(quarantinePath, lockPath, claimedText) {
+  try {
+    await writeFile(lockPath, claimedText, { encoding: 'utf8', flag: 'wx' });
+    await rm(quarantinePath);
+  } catch (error) {
+    throw bundleLockError(
+      'BUNDLE_LOCK_UNSAFE_METADATA',
+      `bundle lock identity changed during stale recovery and could not be restored safely: ${error?.code ?? 'unknown'}`,
+    );
+  }
+}
+
+async function recoverLegacyLockWhileEndpointHeld(lockPath) {
+  await assertNoRecoveryArtifacts(lockPath);
+  let observedText;
+  try {
+    observedText = await readFile(lockPath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return 'ready';
+    throw bundleLockError('BUNDLE_LOCK_UNSAFE_METADATA', `bundle lock metadata cannot be read safely: ${lockPath}`);
+  }
+  const observedOwner = parseLegacyLock(observedText, lockPath);
+  if (processIsAlive(observedOwner.pid)) return 'busy';
+
+  const quarantinePath = `${lockPath}.recovery-${randomUUID()}`;
+  try {
+    await rename(lockPath, quarantinePath);
+  } catch (error) {
+    throw bundleLockError('BUNDLE_LOCK_UNSAFE_METADATA', `bundle lock changed before stale recovery could claim it atomically: ${error?.code ?? 'unknown'}`);
+  }
+  let claimedText;
+  try {
+    claimedText = await readFile(quarantinePath, 'utf8');
+  } catch (error) {
+    await restoreClaimedLock(quarantinePath, lockPath, observedText);
+    throw bundleLockError('BUNDLE_LOCK_UNSAFE_METADATA', `claimed stale bundle lock became unreadable: ${error?.code ?? 'unknown'}`);
+  }
+  if (claimedText !== observedText) {
+    await restoreClaimedLock(quarantinePath, lockPath, claimedText);
+    throw bundleLockError('BUNDLE_LOCK_UNSAFE_METADATA', 'bundle lock owner identity changed during stale recovery');
+  }
+  await rm(quarantinePath);
+  return 'ready';
+}
+
+async function createBundleOwnerMarker(lockPath, token) {
+  const ownerText = JSON.stringify({ pid: process.pid, root, token, created_at: new Date().toISOString() });
+  try {
+    await writeFile(lockPath, ownerText, { encoding: 'utf8', flag: 'wx' });
+  } catch (error) {
+    throw bundleLockError(
+      'BUNDLE_LOCK_UNSAFE_METADATA',
+      `bundle lock path was replaced before ownership could be published safely: ${error?.code ?? 'unknown'}`,
+    );
+  }
+  return ownerText;
+}
+
+async function removeOwnedBundleMarker(lockPath, ownerText, token) {
+  const quarantinePath = `${lockPath}.recovery-${token}`;
+  try {
+    await rename(lockPath, quarantinePath);
+  } catch (error) {
+    throw bundleLockError(
+      'BUNDLE_LOCK_UNSAFE_METADATA',
+      `bundle lock owner marker could not be claimed for release: ${error?.code ?? 'unknown'}`,
+    );
+  }
+  let claimedText;
+  try {
+    claimedText = await readFile(quarantinePath, 'utf8');
+  } catch (error) {
+    await restoreClaimedLock(quarantinePath, lockPath, ownerText);
+    throw bundleLockError('BUNDLE_LOCK_UNSAFE_METADATA', `claimed bundle lock owner marker became unreadable: ${error?.code ?? 'unknown'}`);
+  }
+  if (claimedText !== ownerText) {
+    await restoreClaimedLock(quarantinePath, lockPath, claimedText);
+    throw bundleLockError('BUNDLE_LOCK_UNSAFE_METADATA', 'bundle lock release rejected because the owner identity changed');
+  }
+  await rm(quarantinePath);
+}
+
+const leaseStates = new WeakMap();
+
+export async function acquireBundleLease(options = {}) {
   const lockPath = options.lockPath ?? bundleLockPath;
   const timeoutMs = options.timeoutMs ?? 60_000;
   const retryMs = options.retryMs ?? 50;
   const startedAt = Date.now();
-  const token = randomUUID();
-  let handle;
-  while (!handle) {
-    try {
-      const candidate = await open(lockPath, 'wx');
-      try {
-        await candidate.writeFile(JSON.stringify({ pid: process.pid, root, token, created_at: new Date().toISOString() }), 'utf8');
-        handle = candidate;
-      } catch (error) {
-        await candidate.close();
-        await rm(lockPath, { force: true });
-        throw error;
-      }
-    } catch (error) {
-      if (error?.code !== 'EEXIST') throw error;
-      if (await clearDeadBundleLock(lockPath)) continue;
-      if (Date.now() - startedAt >= timeoutMs) {
-        throw new Error(`bundle lock remained busy for ${timeoutMs}ms: ${lockPath}`);
-      }
+  while (Date.now() - startedAt < timeoutMs) {
+    const server = await listenForBundleLease(lockPath);
+    if (!server) {
       await delay(retryMs);
+      continue;
+    }
+    try {
+      const legacyState = await recoverLegacyLockWhileEndpointHeld(lockPath);
+      if (legacyState === 'busy') {
+        await closeBundleEndpoint(server);
+        await delay(retryMs);
+        continue;
+      }
+      const token = randomUUID();
+      const ownerText = await createBundleOwnerMarker(lockPath, token);
+      const lease = Object.freeze({ token, endpoint: endpointForLockPath(lockPath) });
+      leaseStates.set(lease, { server, lockPath, ownerText });
+      return lease;
+    } catch (error) {
+      await closeBundleEndpoint(server);
+      throw error;
     }
   }
+  throw bundleLockError('BUNDLE_LOCK_TIMEOUT', `bundle lock remained busy for ${timeoutMs}ms: ${lockPath}`);
+}
+
+export async function releaseBundleLease(lease) {
+  const state = lease && typeof lease === 'object' ? leaseStates.get(lease) : undefined;
+  if (!state) throw bundleLockError('BUNDLE_LOCK_NOT_OWNER', 'bundle lock release rejected because the lease is not owned by this caller');
+  leaseStates.delete(lease);
+  try {
+    await removeOwnedBundleMarker(state.lockPath, state.ownerText, lease.token);
+  } finally {
+    await closeBundleEndpoint(state.server);
+  }
+}
+
+export async function withBundleLock(action, options = {}) {
+  const lease = await acquireBundleLease(options);
   try {
     return await action();
   } finally {
-    await handle.close();
-    try {
-      const owner = JSON.parse(await readFile(lockPath, 'utf8'));
-      if (owner.token === token) await rm(lockPath, { force: true });
-    } catch {
-      // A missing lock is already released; a replaced lock belongs to another process.
-    }
+    await releaseBundleLease(lease);
   }
 }
 
