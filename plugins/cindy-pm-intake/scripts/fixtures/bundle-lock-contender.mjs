@@ -36,4 +36,3 @@ try {
   process.send({ type: 'error', pid: process.pid, code: error?.code, message: error?.message });
   process.exitCode = 1;
 }
-
