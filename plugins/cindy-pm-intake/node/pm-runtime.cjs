@@ -155513,7 +155513,7 @@ var PmService = class {
         ).run(nowIso(), control.version).changes !== 1) throw new Error("\u9690\u79C1\u72B6\u6001\u5DF2\u88AB\u5176\u4ED6\u64CD\u4F5C\u66F4\u65B0\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002");
       }), stopAttempted = !1;
       try {
-        if (this.renewPrivacyLifecycleClaim(claim), stopAttempted = !0, await this.legacyStopFeishu(claim), !this.finalizePrivacyLifecycleClaim(claim, () => {
+        if (this.renewPrivacyLifecycleClaim(claim), stopAttempted = !0, await this.stopFeishu(claim), !this.finalizePrivacyLifecycleClaim(claim, () => {
           let now = nowIso();
           this.database.raw.prepare("UPDATE information_source_state SET enabled = 0, updated_at = ?").run(now), this.database.raw.prepare(
             `INSERT INTO privacy_audit_event (id, event_type, operation_id, record_count, created_at)
@@ -155592,7 +155592,7 @@ var PmService = class {
         ).run(nowIso(), control.version).changes !== 1) throw new Error("\u9690\u79C1\u72B6\u6001\u5DF2\u88AB\u5176\u4ED6\u64CD\u4F5C\u66F4\u65B0\uFF0C\u8BF7\u5237\u65B0\u540E\u91CD\u8BD5\u3002");
       }), externalAttempted = !1;
       try {
-        this.renewPrivacyLifecycleClaim(claim), externalAttempted = !0, await this.legacyStopFeishu(claim);
+        this.renewPrivacyLifecycleClaim(claim), externalAttempted = !0, await this.stopFeishu(claim);
         let revoke = this.adapters.feishu.revokeAuthorization;
         this.renewPrivacyLifecycleClaim(claim);
         let local = revoke ? await revoke.call(this.adapters.feishu) : { localTokensCleared: !1, providerRevoked: !1 };
@@ -156119,7 +156119,7 @@ var PmService = class {
     }
     let local;
     try {
-      this.renewPrivacyLifecycleClaim(lifecycleClaim), await this.legacyStopFeishu(lifecycleClaim);
+      this.renewPrivacyLifecycleClaim(lifecycleClaim), await this.stopFeishu(lifecycleClaim);
       let revoke = this.adapters.feishu.revokeAuthorization;
       this.renewPrivacyLifecycleClaim(lifecycleClaim), local = revoke ? await revoke.call(this.adapters.feishu) : { localTokensCleared: !1, providerRevoked: !1 };
     } catch (error51) {
@@ -156375,7 +156375,7 @@ var PmService = class {
     });
     return { ...this.privacyStatus(), retentionRun: result };
   }
-  legacyFeishuMonitoringScope() {
+  feishuMonitoringScope() {
     let owner = this.database.raw.prepare("SELECT open_id, oauth_status, updated_at FROM owner_profile WHERE id = ?").get("primary");
     if (!owner?.open_id || owner.oauth_status !== "authorized")
       return {
@@ -156402,7 +156402,7 @@ var PmService = class {
       updatedAt: rows[0]?.updated_at ?? owner.updated_at
     };
   }
-  async legacyRefreshFeishuMonitoringScope() {
+  async refreshFeishuMonitoringScope() {
     let owner = this.requireAuthorizedOwner(), adapter = this.adapters.feishu;
     if (!adapter.listOwnerChats) throw new Error("\u5F53\u524D\u98DE\u4E66\u9002\u914D\u5668\u4E0D\u652F\u6301\u4F1A\u8BDD\u8303\u56F4\u53D1\u73B0\u3002");
     let discover = async (types) => {
@@ -156456,9 +156456,9 @@ var PmService = class {
         discoveredAt: groupDiscovery.discoveredAt
       }), groupsDiscovered += 1);
     }
-    return this.reconcileFeishuMonitoringStates({ peopleDiscovered, groupsDiscovered, discoveryError: null }), this.log("integration", "info", "feishu.monitoring_scope.refreshed", "\u5DF2\u5237\u65B0\u53EF\u9009\u62E9\u7684\u4E2A\u4EBA\u548C\u7FA4\u804A\u8303\u56F4\u3002", { peopleDiscovered, groupsDiscovered }), this.legacyFeishuMonitoringScope();
+    return this.reconcileFeishuMonitoringStates({ peopleDiscovered, groupsDiscovered, discoveryError: null }), this.log("integration", "info", "feishu.monitoring_scope.refreshed", "\u5DF2\u5237\u65B0\u53EF\u9009\u62E9\u7684\u4E2A\u4EBA\u548C\u7FA4\u804A\u8303\u56F4\u3002", { peopleDiscovered, groupsDiscovered }), this.feishuMonitoringScope();
   }
-  async legacySearchFeishuPeople(query = "") {
+  async searchFeishuPeople(query = "") {
     let owner = this.requireAuthorizedOwner(), adapter = this.adapters.feishu;
     if (!adapter.searchOwnerUsers) throw new Error("\u5F53\u524D\u98DE\u4E66\u9002\u914D\u5668\u4E0D\u652F\u6301\u8054\u7CFB\u4EBA\u641C\u7D22\u3002");
     let normalizedQuery = query.trim();
@@ -156482,12 +156482,12 @@ var PmService = class {
       ids.add(targetId);
     }
     return {
-      items: this.legacyFeishuMonitoringScope().people.filter((item) => ids.has(item.id)),
+      items: this.feishuMonitoringScope().people.filter((item) => ids.has(item.id)),
       hasMore: !!page.has_more,
       notice: firstText(page, "notice") || null
     };
   }
-  legacyUpdateFeishuMonitoringScope(input) {
+  updateFeishuMonitoringScope(input) {
     let owner = this.requireAuthorizedOwner(), groupIdsProvided = input.groupIds !== void 0, groupIds = [...new Set((input.groupIds ?? []).map((value) => value.trim()).filter(Boolean))];
     if (groupIds.length > maxFeishuMonitorGroups) throw new Error(`\u9996\u7248\u6700\u591A\u9009\u62E9 ${maxFeishuMonitorGroups} \u4E2A\u7FA4\u804A\u3002`);
     let available = this.database.raw.prepare("SELECT id, target_kind, enabled, manual_excluded FROM feishu_monitor_target WHERE owner_open_id = ?").all(owner.openId), availablePeople = new Set(available.filter((item) => item.target_kind === "person").map((item) => item.id)), availableGroups = new Set(available.filter((item) => item.target_kind === "group").map((item) => item.id)), legacyPersonIds = input.personIds ? [...new Set(input.personIds.map((value) => value.trim()).filter(Boolean))] : null;
@@ -156518,7 +156518,7 @@ var PmService = class {
       let updateGroup = this.database.raw.prepare("UPDATE feishu_monitor_target SET selection_version = selection_version + 1, enabled = ?, updated_at = ? WHERE owner_open_id = ? AND target_kind = 'group' AND id = ?");
       for (let group of groupChanges) updateGroup.run(desiredGroups.has(group.id) ? 1 : 0, timestamp, owner.openId, group.id);
     }), this.reconcileFeishuMonitoringStates({ selectionChanged: personSelectionChanged || groupChanges.length > 0 });
-    let scope = this.legacyFeishuMonitoringScope();
+    let scope = this.feishuMonitoringScope();
     return this.log("integration", "info", "feishu.monitoring_scope.saved", "\u5DF2\u4FDD\u5B58\u4E2A\u4EBA\u79C1\u804A\u548C\u7FA4\u804A\u5173\u6CE8\u8303\u56F4\u3002", {
       personCount: scope.selectedPersonCount,
       changedPeople: personChanges.length,
@@ -156629,7 +156629,7 @@ var PmService = class {
     return targetId;
   }
   reconcileFeishuMonitoringStates(extra = {}) {
-    let scope = this.legacyFeishuMonitoringScope();
+    let scope = this.feishuMonitoringScope();
     if (!scope.ownerAuthorized) return;
     let timestamp = nowIso(), selectionChanged = !!extra.selectionChanged, update = (kind, targets, summary, discoveredCount) => {
       let existing = this.database.raw.prepare(
@@ -156660,7 +156660,7 @@ var PmService = class {
       scope.groups.length
     );
   }
-  async legacyRefreshOwnerIdentity() {
+  async refreshOwnerIdentity() {
     let adapter = this.adapters.feishu;
     if (!adapter.getCurrentUser) throw new Error("\u5F53\u524D\u98DE\u4E66\u9002\u914D\u5668\u4E0D\u652F\u6301\u7CFB\u7EDF\u4E3B\u4EBA\u8EAB\u4EFD\u8BFB\u53D6\u3002");
     let refreshSequence = ++this.ownerRefreshSequence;
@@ -164632,7 +164632,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
       return { logs, decisions, health, corrections };
     });
   }
-  async legacyTestIntegration(key) {
+  async testIntegration(key) {
     let startedAt = Date.now(), result;
     if (key === "feishu") result = await this.adapters.feishu.testConnection();
     else if (key === "llm") {
@@ -164662,17 +164662,17 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
       latencyMs: Date.now() - startedAt
     }), safeResult;
   }
-  async legacyFeishuAuthorizationUrl(state) {
+  async feishuAuthorizationUrl(state) {
     let adapter = this.adapters.feishu;
     if (!adapter.buildAuthorizationUrl) throw new Error("\u5F53\u524D\u98DE\u4E66\u9002\u914D\u5668\u4E0D\u652F\u6301 OAuth\u3002");
     return { url: await adapter.buildAuthorizationUrl(state) };
   }
-  async legacyCompleteFeishuOAuth(code, state) {
+  async completeFeishuOAuth(code, state) {
     let adapter = this.adapters.feishu;
     if (!adapter.exchangeCode) throw new Error("\u5F53\u524D\u98DE\u4E66\u9002\u914D\u5668\u4E0D\u652F\u6301 OAuth\u3002");
     let resumeAfterOAuth = this.feishuStarted || this.feishuBotStarted, previousOwnerStatus = this.beginOwnerAuthorizationTransition();
     try {
-      await this.legacyStopFeishu();
+      await this.stopFeishu();
     } catch (error51) {
       throw this.restoreOwnerAuthorizationStatus(previousOwnerStatus), error51;
     }
@@ -164695,7 +164695,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
     }
     this.log("integration", "info", "feishu.oauth.completed", "\u98DE\u4E66\u7528\u6237\u6388\u6743\u5B8C\u6210\uFF0C\u4EE4\u724C\u5DF2\u5B89\u5168\u4FDD\u5B58\u3002", { expiresAtPresent: !!result.expiresAt });
     try {
-      let ownerInformation = await this.legacyRefreshOwnerIdentity();
+      let ownerInformation = await this.refreshOwnerIdentity();
       return resumeAfterOAuth && await this.legacyStartFeishu({ refreshOwner: !1 }), { ok: !0, tokenSaved: !0, ...result, owner: ownerInformation.owner, ownerError: null };
     } catch (error51) {
       if (resumeAfterOAuth)
@@ -164747,7 +164747,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
       if (this.feishuStarted) {
         if (refreshOwner)
           try {
-            await this.legacyRefreshOwnerIdentity();
+            await this.refreshOwnerIdentity();
           } catch {
           }
         let bot = await this.tryStartBotSupplement(adapter, lifecycleClaim);
@@ -164756,7 +164756,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
       try {
         if (refreshOwner)
           try {
-            await this.legacyRefreshOwnerIdentity();
+            await this.refreshOwnerIdentity();
           } catch {
           }
         this.feishuSync?.start(), this.feishuOwnerSync?.start(), this.feishuCalendarSync?.start(), this.feishuMinutesSync?.start(), this.feishuDocumentSync?.start(), this.feishuStarted = !0;
@@ -164780,7 +164780,7 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
       }
     });
   }
-  legacyStopFeishu(lifecycleClaim) {
+  stopFeishu(lifecycleClaim) {
     return this.queueFeishuLifecycle(async () => {
       this.assertFeishuLifecycleFence(lifecycleClaim);
       let adapter = this.adapters.feishu, wasStarted = this.feishuStarted || this.feishuBotStarted;
@@ -164900,33 +164900,33 @@ ${payloadJson}`).digest("hex"), idempotencyKey = `draft:${taskId}:${task.version
     }
     throw new Error(`\u5F53\u524D\u5C1A\u672A\u63D0\u4F9B\u201C${kind}\u201D\u7684\u72EC\u7ACB\u540C\u6B65\u5165\u53E3\u3002`);
   }
-  async legacyFeishuCalendar(input = {}) {
+  async feishuCalendar(input = {}) {
     let adapter = this.adapters.feishu;
     if (!adapter.primaryCalendar || !adapter.listCalendarEvents) throw new Error("\u5F53\u524D\u98DE\u4E66\u9002\u914D\u5668\u4E0D\u652F\u6301\u65E5\u5386\u8BFB\u53D6\u3002");
     let calendar = await adapter.primaryCalendar(), primary = calendar.calendars?.[0]?.calendar?.calendar_id, events = await adapter.listCalendarEvents({ ...input, calendarId: input.calendarId ?? primary });
     return { calendar, events };
   }
-  async legacyFeishuChats() {
+  async feishuChats() {
     let adapter = this.adapters.feishu;
     if (!adapter.listChats) throw new Error("\u5F53\u524D\u98DE\u4E66\u9002\u914D\u5668\u4E0D\u652F\u6301\u4F1A\u8BDD\u8BFB\u53D6\u3002");
     return { items: await adapter.listChats() };
   }
-  async legacyFeishuMessagesSearch(input = {}) {
+  async feishuMessagesSearch(input = {}) {
     let adapter = this.adapters.feishu;
     if (!adapter.searchMessages) throw new Error("\u5F53\u524D\u98DE\u4E66\u9002\u914D\u5668\u4E0D\u652F\u6301\u6D88\u606F\u641C\u7D22\u3002");
     return adapter.searchMessages(input);
   }
-  async legacyFeishuMinutesSearch(input = {}) {
+  async feishuMinutesSearch(input = {}) {
     let adapter = this.adapters.feishu;
     if (!adapter.searchMinutes) throw new Error("\u5F53\u524D\u98DE\u4E66\u9002\u914D\u5668\u4E0D\u652F\u6301\u4F1A\u8BAE\u7EAA\u8981\u8BFB\u53D6\u3002");
     return adapter.searchMinutes(input);
   }
-  async legacyFeishuMinuteTranscript(token) {
+  async feishuMinuteTranscript(token) {
     let adapter = this.adapters.feishu;
     if (!adapter.getMinuteTranscript) throw new Error("\u5F53\u524D\u98DE\u4E66\u9002\u914D\u5668\u4E0D\u652F\u6301\u4F1A\u8BAE\u7EAA\u8981\u8BFB\u53D6\u3002");
     return adapter.getMinuteTranscript(token);
   }
-  legacyIntegrationHealth() {
+  integrationHealth() {
     return this.database.raw.prepare("SELECT integration, status, message, latency_ms, checked_at FROM integration_health ORDER BY integration").all().map((row) => ({
       ...row,
       message: redactDiagnosticText(row.message, 300)

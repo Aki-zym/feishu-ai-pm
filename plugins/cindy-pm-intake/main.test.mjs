@@ -19,7 +19,7 @@ function waitFor(predicate, timeoutMs = 1000) {
   });
 }
 
-function setup({ errandText = '{"accepted":true}', errandResponse = null, errandError = null, autoScanEnabled = false, intakeWindowEnd = null, progressMode = 'manual', progressEnabled = true, progressModelText = '{"decision":"no_update","reason":"无变化","evidence":[]}' } = {}) {
+function setup({ errandText = '{"accepted":true}', errandResponse = null, errandError = null, errandGate = null, autoScanEnabled = false, intakeWindowEnd = null, progressMode = 'manual', progressEnabled = true, progressModelText = '{"decision":"no_update","reason":"无变化","evidence":[]}' } = {}) {
   let onHostMessage;
   const nodeCalls = [];
   const sent = [];
@@ -27,6 +27,7 @@ function setup({ errandText = '{"accepted":true}', errandResponse = null, errand
   const secretCalls = [];
   const cursorWrites = [];
   const intakePosts = [];
+  const intervals = [];
   const cindy = {
     onHostMessage(handler) { onHostMessage = handler; },
     node: {
@@ -72,6 +73,7 @@ function setup({ errandText = '{"accepted":true}', errandResponse = null, errand
     agent: {
       async errand(request) {
         errandCalls.push(request);
+        if (errandGate) await errandGate;
         if (errandError) throw errandError;
         return errandResponse || { ok: true, status: 'done', jobId: 'job-1', sessionId: 'session-intake', text: errandText };
       },
@@ -95,15 +97,21 @@ function setup({ errandText = '{"accepted":true}', errandResponse = null, errand
       }
       return { json: async () => ({ pmBaseUrl: 'http://127.0.0.1:4310', progressMode, progressEnabled }) };
     },
-    setInterval,
-    clearInterval,
+    setInterval(callback, delay) {
+      const timer = { callback, delay };
+      intervals.push(timer);
+      return timer;
+    },
+    clearInterval(timer) {
+      if (timer) timer.cleared = true;
+    },
     setTimeout,
     Date,
     JSON,
     Number,
     Error,
   }), { filename: 'main.js' });
-  return { onHostMessage, nodeCalls, sent, errandCalls, secretCalls, cursorWrites, intakePosts };
+  return { onHostMessage, nodeCalls, sent, errandCalls, secretCalls, cursorWrites, intakePosts, intervals };
 }
 
 test('scan_intake_window starts the fixed intake errand session and returns its result', async () => {
@@ -195,12 +203,58 @@ test('schedule scan runs when the product auto-scan switch is enabled', async ()
   assert.equal(errandCalls.length, 1);
 });
 
+test('schedule scan skips the round when the errand host reports BUSY', async () => {
+  const { onHostMessage, errandCalls, sent } = setup({
+    autoScanEnabled: true,
+    errandResponse: { ok: false, errorCode: 'BUSY', message: '已有 intake session occupied' },
+  });
+  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-schedule-busy', args: { trigger: 'schedule' } });
+  await waitFor(() => sent.some((message) => message.callId === 'call-schedule-busy'));
+  const result = sent.find((message) => message.callId === 'call-schedule-busy');
+  assert.equal(errandCalls.length, 1);
+  assert.equal(result.result.reason, 'intake_scan_busy');
+  assert.match(result.result.summary, /跳过/);
+});
+
 test('manual scan runs even when the product auto-scan switch is disabled', async () => {
   const { onHostMessage, nodeCalls, errandCalls, sent } = setup({ autoScanEnabled: false });
   onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-manual-off', args: { trigger: 'manual' } });
   await waitFor(() => sent.some((message) => message.callId === 'call-manual-off'));
   assert.equal(errandCalls.length, 1);
   assert.equal(nodeCalls.some((call) => call.params?.path === '/api/runtime/auto-scan'), false);
+});
+
+test('resident scan loop skips a round when auto-scan is disabled', async () => {
+  const { intervals, nodeCalls, errandCalls } = setup({ autoScanEnabled: false });
+  const timer = intervals.find((item) => item.delay === 10 * 60 * 1000);
+  assert.ok(timer);
+  await timer.callback();
+  assert.equal(errandCalls.length, 0);
+  assert.equal(nodeCalls.some((call) => call.params?.path === '/api/runtime/auto-scan'), true);
+});
+
+test('resident scan loop dispatches a schedule scan when auto-scan is enabled', async () => {
+  const { intervals, nodeCalls, errandCalls } = setup({ autoScanEnabled: true });
+  const timer = intervals.find((item) => item.delay === 10 * 60 * 1000);
+  assert.ok(timer);
+  await timer.callback();
+  assert.equal(errandCalls.length, 1);
+  assert.equal(errandCalls[0].sessionKey, 'intake');
+  assert.equal(nodeCalls.some((call) => call.params?.path === '/api/runtime/auto-scan'), true);
+});
+
+test('resident scan loop skips a round while another intake scan is running', async () => {
+  let release;
+  const errandGate = new Promise((resolve) => { release = resolve; });
+  const { intervals, errandCalls } = setup({ autoScanEnabled: true, errandGate });
+  const timer = intervals.find((item) => item.delay === 10 * 60 * 1000);
+  assert.ok(timer);
+  const first = timer.callback();
+  await waitFor(() => errandCalls.length === 1);
+  await timer.callback();
+  assert.equal(errandCalls.length, 1);
+  release();
+  await first;
 });
 
 test('scan_intake_window skips nested dispatch inside the intake errand session', async () => {
@@ -289,7 +343,7 @@ test('scan result uses human language for candidates, formal task updates, and e
 });
 
 test('ghost declares schedule support while retaining errand', () => {
-  assert.equal(ghost.version, '0.4.0');
+  assert.equal(ghost.version, '0.4.1');
   assert.equal(ghost.id, 'ai-pm-intake');
   assert.equal(ghost.name, 'TooManyTasks');
   assert.match(ghost.description, /本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台/);

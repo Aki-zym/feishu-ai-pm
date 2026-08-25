@@ -29,9 +29,9 @@ Node Worker 的 `pm/restart` 调用当前 `startPmServer` 句柄的 `restart()`�
 
 ## 自动扫描与重启
 
-插件声明 `agent.schedule` 能力。设置页的「启用自动扫描」开关打开后，先 `PUT /api/runtime/auto-scan` 写入 `enabled: true`，再打开预填自动化面板；用户需要在面板中选择配置并亲手保存。预填间隔可能被主机抬到 30 分钟，用户可在面板中改回 10 分钟。关闭开关只停止本产品自动流程；Cindy 自动化条目可能仍在，到点会空跑短路。Cindy 必须保持运行，自动扫描才会触发。
+插件声明 `agent.schedule` 能力。常驻插件线程每 10 分钟触发一次 `scan_intake_window({ trigger: "schedule" })`；每轮先读取 `GET /api/runtime/auto-scan`，只有 `enabled: true` 才派发入库 errand。启用自动扫描开关后，Cindy 保持运行且开关打开，每 10 分钟自动扫。关闭开关只停止本产品自动流程；正在运行的扫描会自然收口，Cindy 退出后不会继续触发自动扫描。
 
-自动化面板调用 `scan_intake_window({ trigger: "schedule" })`。插件在扫描前读取 `GET /api/runtime/auto-scan`；返回 `enabled: false` 时直接返回 `skipped auto_scan_disabled`，不会派发 errand。手动调用 `scan_intake_window({ trigger: "manual" })` 始终扫描。当前已经处于入库 errand 会话时，或宿主返回 BUSY/会话占用，插件返回 `skipped` 指引当前 Agent 直接使用已授权飞书 MCP、`get_pm_tasks` 和 `submit_intake`，并停止继续调用 `scan_intake_window`。
+常驻扫描返回 `enabled: false` 时直接返回 `skipped auto_scan_disabled`，不会派发 errand。手动调用 `scan_intake_window({ trigger: "manual" })` 始终扫描。当前已经处于入库 errand 会话时，或宿主返回 BUSY/会话占用，插件返回 `skipped` 指引当前 Agent 直接使用已授权飞书 MCP、`get_pm_tasks` 和 `submit_intake`，并停止继续调用 `scan_intake_window`；已有扫描正在运行时，本轮触发会跳过。
 
 设置页的「重启本机任务库」调用 `pm/restart` 并传 `scheduleExit: false`，运行时内部以无退出方式重启；任务台浏览器的「退出后台进程」继续保留。
 

@@ -625,7 +625,7 @@ export default function SettingsPage() {
         </div>
         <AsyncState resource={autoScanResource} emptyText={null} loadingText="正在读取自动扫描设置…" errorTitle="自动扫描设置读取失败" onRetry={loadSettings}>
           <label className="check-row connection-toggle"><input type="checkbox" aria-label="每 10 分钟自动扫描新任务" checked={Boolean(autoScanResource.data?.enabled)} disabled={!autoScanResource.data || autoScanSaving} onChange={(event) => void changeAutoScan(event.target.checked)} /><span>每 10 分钟自动扫描新任务</span></label>
-          <p className="integration-note">打开后还需在 Cindy 插件设置里保存过自动化；关闭后定时即使触发也不入库。手动扫描不受影响。</p>
+          <p className="integration-note">Cindy 保持开启且插件常驻时，打开本开关后每 10 分钟自动扫描新任务；关闭本开关后，常驻线程继续运行但不执行扫描。手动扫描不受影响。</p>
           <p className="integration-note">入库扫描模型请到 Cindy 插件详情「AI 代办」里改：推荐折扣路由 <code>codex/gpt-5.6-luna</code>、思考强度 <code>high</code>、权限 <code>自动审核</code>。草稿默认可能是 <code>fable5</code>，改完要保存。</p>
           {autoScanMessage && <div className={autoScanError ? 'error-banner settings-feedback' : 'success-banner settings-feedback'} role={autoScanError ? 'alert' : 'status'}>{autoScanMessage}</div>}
         </AsyncState>
