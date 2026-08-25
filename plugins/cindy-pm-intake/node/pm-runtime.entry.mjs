@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
-import { dirname, resolve } from 'node:path';
+import { execFileSync, spawn } from 'node:child_process';
+import { basename, dirname, resolve } from 'node:path';
 
 import { buildApp } from '../../../apps/server/src/app.ts';
 import { loadConfig } from '../../../apps/server/src/config.ts';
@@ -142,6 +142,36 @@ function statusBarBinaryPath() {
     : DEFAULT_STATUS_BAR_BINARY;
 }
 
+function killExistingStatusBars(binaryPath) {
+  const binaryName = basename(binaryPath);
+  if (process.env.NODE_ENV === 'test' && typeof globalThis.__CINDY_PM_STATUS_KILL_EXISTING === 'function') {
+    globalThis.__CINDY_PM_STATUS_KILL_EXISTING(binaryName);
+    return;
+  }
+  if (process.platform !== 'darwin' || binaryName !== 'TooManyTasksStatus' || typeof process.getuid !== 'function') return;
+
+  let output = '';
+  try {
+    output = execFileSync(
+      'pgrep',
+      ['-x', '-u', String(process.getuid()), binaryName],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+  } catch {
+    return;
+  }
+
+  for (const value of output.split(/\s+/)) {
+    const pid = Number(value);
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch {
+      // The old status item may have exited between pgrep and kill.
+    }
+  }
+}
+
 function startStatusBar(url) {
   const binaryPath = statusBarBinaryPath();
   const runtimePlatform = process.env.NODE_ENV === 'test'
@@ -149,6 +179,7 @@ function startStatusBar(url) {
     : process.platform;
   if (runtimePlatform !== 'darwin' || !existsSync(binaryPath)) return null;
   try {
+    killExistingStatusBars(binaryPath);
     const spawnProcess = process.env.NODE_ENV === 'test' && typeof globalThis.__CINDY_PM_STATUS_SPAWN === 'function'
       ? globalThis.__CINDY_PM_STATUS_SPAWN
       : spawn;

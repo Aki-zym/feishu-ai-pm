@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -117,6 +117,72 @@ test('status bar skips non-darwin and stop kills the spawned child', async () =>
     if (previousSpawn === undefined) delete globalThis.__CINDY_PM_STATUS_SPAWN;
     else globalThis.__CINDY_PM_STATUS_SPAWN = previousSpawn;
   }
+});
+
+test('status bar startup clears an orphaned same-name child before spawning', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cindy-pm-runtime-status-bar-orphan-'));
+  const previousPlatform = process.env.CINDY_PM_STATUS_PLATFORM;
+  const previousBinary = process.env.CINDY_PM_STATUS_BINARY;
+  const previousSpawn = globalThis.__CINDY_PM_STATUS_SPAWN;
+  const previousKillExisting = globalThis.__CINDY_PM_STATUS_KILL_EXISTING;
+  const statusProcesses = [];
+  const killExistingCalls = [];
+  process.env.CINDY_PM_STATUS_PLATFORM = 'darwin';
+  process.env.CINDY_PM_STATUS_BINARY = join(import.meta.dirname, 'pm-runtime.cjs');
+  globalThis.__CINDY_PM_STATUS_KILL_EXISTING = (binaryName) => {
+    killExistingCalls.push(binaryName);
+    for (const child of statusProcesses) {
+      if (child.alive) child.kill();
+    }
+  };
+  globalThis.__CINDY_PM_STATUS_SPAWN = () => {
+    const child = {
+      alive: true,
+      once() {},
+      unref() {},
+      kill() { this.alive = false; },
+    };
+    statusProcesses.push(child);
+    return child;
+  };
+  try {
+    const first = await startPmServer({
+      port: 0,
+      sqlitePath: join(root, 'first.sqlite'),
+      token: 'test-token',
+    });
+    await first.stop();
+    // Simulate the old status item surviving its parent worker.
+    statusProcesses[0].alive = true;
+
+    const second = await startPmServer({
+      port: 0,
+      sqlitePath: join(root, 'second.sqlite'),
+      token: 'test-token',
+    });
+    assert.deepEqual(killExistingCalls, ['pm-runtime.cjs', 'pm-runtime.cjs']);
+    assert.equal(statusProcesses[0].alive, false);
+    assert.equal(statusProcesses[1].alive, true);
+    assert.equal(statusProcesses.filter((child) => child.alive).length, 1);
+    await second.stop();
+  } finally {
+    if (previousPlatform === undefined) delete process.env.CINDY_PM_STATUS_PLATFORM;
+    else process.env.CINDY_PM_STATUS_PLATFORM = previousPlatform;
+    if (previousBinary === undefined) delete process.env.CINDY_PM_STATUS_BINARY;
+    else process.env.CINDY_PM_STATUS_BINARY = previousBinary;
+    if (previousSpawn === undefined) delete globalThis.__CINDY_PM_STATUS_SPAWN;
+    else globalThis.__CINDY_PM_STATUS_SPAWN = previousSpawn;
+    if (previousKillExisting === undefined) delete globalThis.__CINDY_PM_STATUS_KILL_EXISTING;
+    else globalThis.__CINDY_PM_STATUS_KILL_EXISTING = previousKillExisting;
+  }
+});
+
+test('status bar source watches its parent PID and exits when the parent disappears', () => {
+  const source = readFileSync(join(import.meta.dirname, 'macos-status', 'main.swift'), 'utf8');
+  assert.match(source, /private let parentPID: pid_t/);
+  assert.match(source, /getppid\(\)/);
+  assert.match(source, /checkParentProcess/);
+  assert.match(source, /NSApp\.terminate\(nil\)/);
 });
 
 test('foreign stop returns an explicit error and leaves the foreign listener alive', async () => {

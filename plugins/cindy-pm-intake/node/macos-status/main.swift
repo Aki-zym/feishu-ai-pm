@@ -1,16 +1,20 @@
 import AppKit
+import Darwin
 import Foundation
 
 final class StatusItemController: NSObject {
     private let taskBoardURL: URL
     private let statusItem: NSStatusItem
     private let shutdownItem: NSMenuItem
+    private let parentPID: pid_t
+    private var parentMonitor: Timer?
     private var shutdownInFlight = false
 
     init(taskBoardURL: URL) {
         self.taskBoardURL = taskBoardURL
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         self.shutdownItem = NSMenuItem()
+        self.parentPID = getppid()
         super.init()
 
         if let button = statusItem.button {
@@ -38,6 +42,26 @@ final class StatusItemController: NSObject {
         shutdownItem.target = self
         menu.addItem(shutdownItem)
         statusItem.menu = menu
+
+        parentMonitor = Timer.scheduledTimer(
+            timeInterval: 1.0,
+            target: self,
+            selector: #selector(checkParentProcess(_:)),
+            userInfo: nil,
+            repeats: true
+        )
+    }
+
+    deinit {
+        parentMonitor?.invalidate()
+    }
+
+    @objc private func checkParentProcess(_ timer: Timer) {
+        guard getppid() == parentPID else {
+            timer.invalidate()
+            NSApp.terminate(nil)
+            return
+        }
     }
 
     @objc private func openTaskBoard(_ sender: Any?) {
