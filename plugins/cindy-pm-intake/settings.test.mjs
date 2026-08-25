@@ -19,7 +19,6 @@ async function loadSettings({ autoScanEnabled = false } = {}) {
   ]);
   const calls = [];
   const nodeCalls = [];
-  const scheduleCalls = [];
   const context = vm.createContext({
     BroadcastChannel: class { postMessage(message) { calls.push({ url: 'broadcast', message }); } },
     URL,
@@ -38,18 +37,12 @@ async function loadSettings({ autoScanEnabled = false } = {}) {
           return { ok: true, result: { url: 'http://127.0.0.1:4310', port: 4310 } };
         },
       },
-      agent: {
-        requestSchedule: async (request) => {
-          scheduleCalls.push(request);
-          return { ok: true };
-        },
-      },
     },
     console,
   });
   vm.runInContext(settingsSource, context, { filename: 'settings.js' });
   await new Promise((resolve) => setTimeout(resolve, 0));
-  return { elements, calls, nodeCalls, scheduleCalls };
+  return { elements, calls, nodeCalls };
 }
 
 test('settings rejects non-loopback pmBaseUrl before writing configuration', async () => {
@@ -80,24 +73,19 @@ test('settings restarts the local task library through pm/restart without the st
   assert.equal(elements.get('status').textContent, '本机任务库已重启');
 });
 
-test('settings opens the 10-minute scan schedule after enabling the switch', async () => {
-  const { elements, nodeCalls, scheduleCalls } = await loadSettings();
+test('settings enables the resident 10-minute scan loop without opening an automation panel', async () => {
+  const { elements, nodeCalls } = await loadSettings();
   elements.get('autoScan').checked = true;
   await elements.get('autoScan').onchange();
   const update = nodeCalls.find((request) => request.method === 'pm/request' && request.params.method === 'PUT');
   assert.ok(update);
   assert.equal(update.params.path, '/api/runtime/auto-scan');
   assert.deepEqual(JSON.parse(JSON.stringify(update.params.body)), { enabled: true });
-  assert.equal(scheduleCalls.length, 1);
-  assert.equal(scheduleCalls[0].name, 'TooManyTasks 每 10 分钟入库扫描');
-  assert.match(scheduleCalls[0].prompt, /scan_intake_window/);
-  assert.match(scheduleCalls[0].prompt, /trigger.*schedule/);
-  assert.equal(scheduleCalls[0].intervalMs, 10 * 60 * 1000);
-  assert.match(elements.get('status').textContent, /请确认并保存/);
+  assert.match(elements.get('status').textContent, /Cindy 保持运行且开关打开，每 10 分钟自动扫/);
 });
 
 test('settings writes false when the auto-scan switch is disabled', async () => {
-  const { elements, nodeCalls, scheduleCalls } = await loadSettings({ autoScanEnabled: true });
+  const { elements, nodeCalls } = await loadSettings({ autoScanEnabled: true });
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(elements.get('autoScan').checked, true);
   elements.get('autoScan').checked = false;
@@ -105,11 +93,10 @@ test('settings writes false when the auto-scan switch is disabled', async () => 
   const update = nodeCalls.find((request) => request.method === 'pm/request' && request.params.method === 'PUT');
   assert.ok(update);
   assert.deepEqual(JSON.parse(JSON.stringify(update.params.body)), { enabled: false });
-  assert.equal(scheduleCalls.length, 0);
-  assert.match(elements.get('status').textContent, /关闭只停止本产品自动流程|已关闭本产品自动扫描/);
+  assert.match(elements.get('status').textContent, /已关闭本产品自动扫描|当前正在运行的扫描会自然收口/);
 });
 
-test('settings explains the required discounted Luna route and manual save', () => {
+test('settings explains the resident scan loop and required discounted Luna route', () => {
   assert.match(settingsHtml, /AI 代办/);
   assert.match(settingsHtml, /codex\/gpt-5\.6-luna/);
   assert.match(settingsHtml, /思考强度选择 <code>high<\/code>/);
@@ -118,9 +105,8 @@ test('settings explains the required discounted Luna route and manual save', () 
   assert.match(settingsHtml, /Cindy 草稿默认可能是 <code>fable5<\/code>/);
   assert.match(settingsHtml, /改一次并保存/);
   assert.match(settingsHtml, /不会静默修改 Cindy 的全局默认模型/);
-  assert.match(settingsHtml, /关闭只停止本产品自动流程/);
-  assert.match(settingsHtml, /Cindy 自动化条目可能仍在/);
-  assert.match(settingsHtml, /到点会空跑短路/);
+  assert.match(settingsHtml, /Cindy 保持运行且开关打开，每 10 分钟自动扫/);
+  assert.doesNotMatch(settingsHtml, /打开自动化面板/);
   assert.match(settingsHtml, /本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台/);
 });
 
@@ -138,14 +124,4 @@ test('settings exposes active and automatic progress modes', async () => {
   assert.equal(JSON.parse(save.options.body).progressEnabled, false);
   assert.equal(JSON.parse(save.options.body).progressMode, 'manual');
   void progressRadio;
-});
-
-test('schedule request leaves model routing to the plugin AI errand settings', async () => {
-  const { elements, scheduleCalls } = await loadSettings();
-  elements.get('autoScan').checked = true;
-  await elements.get('autoScan').onchange();
-  assert.equal('model' in scheduleCalls[0], false);
-  assert.equal('provider' in scheduleCalls[0], false);
-  assert.equal('effort' in scheduleCalls[0], false);
-  assert.equal('permissionMode' in scheduleCalls[0], false);
 });

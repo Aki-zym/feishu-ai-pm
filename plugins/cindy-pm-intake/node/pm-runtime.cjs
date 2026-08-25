@@ -166676,10 +166676,37 @@ function noOpRestart(errorCode, message) {
 function statusBarBinaryPath() {
   return typeof process.env.CINDY_PM_STATUS_BINARY == "string" && process.env.CINDY_PM_STATUS_BINARY.trim() ? (0, import_node_path5.resolve)(process.env.CINDY_PM_STATUS_BINARY) : DEFAULT_STATUS_BAR_BINARY;
 }
+function killExistingStatusBars(binaryPath) {
+  let binaryName = (0, import_node_path5.basename)(binaryPath);
+  if (process.env.NODE_ENV === "test" && typeof globalThis.__CINDY_PM_STATUS_KILL_EXISTING == "function") {
+    globalThis.__CINDY_PM_STATUS_KILL_EXISTING(binaryName);
+    return;
+  }
+  if (process.platform !== "darwin" || binaryName !== "TooManyTasksStatus" || typeof process.getuid != "function") return;
+  let output = "";
+  try {
+    output = (0, import_node_child_process.execFileSync)(
+      "pgrep",
+      ["-x", "-u", String(process.getuid()), binaryName],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
+    );
+  } catch {
+    return;
+  }
+  for (let value of output.split(/\s+/)) {
+    let pid = Number(value);
+    if (!(!Number.isInteger(pid) || pid <= 0 || pid === process.pid))
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {
+      }
+  }
+}
 function startStatusBar(url2) {
   let binaryPath = statusBarBinaryPath();
   if ((process.env.NODE_ENV === "test" && process.env.CINDY_PM_STATUS_PLATFORM || process.platform) !== "darwin" || !(0, import_node_fs4.existsSync)(binaryPath)) return null;
   try {
+    killExistingStatusBars(binaryPath);
     let child = (process.env.NODE_ENV === "test" && typeof globalThis.__CINDY_PM_STATUS_SPAWN == "function" ? globalThis.__CINDY_PM_STATUS_SPAWN : import_node_child_process.spawn)(binaryPath, [url2], { stdio: "ignore" });
     return child.once?.("error", () => {
     }), child.unref?.(), child;

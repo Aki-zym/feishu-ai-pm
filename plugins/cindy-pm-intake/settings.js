@@ -1,6 +1,5 @@
 const byId = (id) => document.getElementById(id);
 const DEFAULT_PM_BASE_URL = 'http://127.0.0.1:4310';
-const AUTO_SCAN_INTERVAL_MS = 10 * 60 * 1000;
 
 function isLoopbackUrl(value) {
   try {
@@ -39,23 +38,6 @@ async function restartPm() {
     timeoutMs: 30000,
   });
   if (!restarted || restarted.ok !== true) throw new Error(restarted?.message || '本机任务库重启失败');
-}
-
-async function requestAutoScanSchedule() {
-  const host = cindyHost();
-  if (!host?.agent || typeof host.agent.requestSchedule !== 'function') {
-    throw new Error('当前宿主没有可用的自动化面板');
-  }
-  const result = await host.agent.requestSchedule({
-    name: 'TooManyTasks 每 10 分钟入库扫描',
-    prompt: [
-      '调用 ai-pm-intake 插件的 scan_intake_window 工具，参数为 {"trigger":"schedule"}。',
-      '只扫描当前时间往前 10 分钟的已授权飞书消息。',
-      '窗口没有消息时输出 skipped empty_window，不提交入库。',
-    ].join('\n'),
-    intervalMs: AUTO_SCAN_INTERVAL_MS,
-  });
-  if (!result || result.ok !== true) throw new Error(result?.message || '自动化面板打开失败');
 }
 
 async function requestAutoScanState() {
@@ -159,16 +141,15 @@ byId('restart').onclick = async () => {
 byId('autoScan').onchange = async () => {
   const status = byId('status');
   const enabled = byId('autoScan').checked;
-  status.textContent = enabled ? '正在打开自动化面板…' : '正在关闭本产品自动扫描…';
+  status.textContent = enabled ? '正在启用常驻自动扫描…' : '正在关闭本产品自动扫描…';
   try {
     await updateAutoScanState(enabled);
     if (enabled) {
-      await requestAutoScanSchedule();
-      status.textContent = '自动化面板已打开，请确认并保存 10 分钟扫描';
+      status.textContent = '已启用：Cindy 保持运行且开关打开，每 10 分钟自动扫';
     } else {
-      status.textContent = '已关闭本产品自动扫描；Cindy 自动化条目可能仍在，到点会空跑短路';
+      status.textContent = '已关闭本产品自动扫描；当前正在运行的扫描会自然收口';
     }
   } catch (error) {
-    status.textContent = error instanceof Error ? error.message : '自动化面板打开失败';
+    status.textContent = error instanceof Error ? error.message : '自动扫描开关保存失败';
   }
 };

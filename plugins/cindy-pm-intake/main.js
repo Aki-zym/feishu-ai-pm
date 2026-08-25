@@ -8,6 +8,8 @@ const TASK_CANDIDATE_CHAR_BUDGET = 12000;
 const RECENT_TURN_TTL_MS = 10 * 60 * 1000;
 let settingsCache = null;
 let ensureInFlight = null;
+let intakeScanInFlight = null;
+let autoScanLoopStarted = false;
 const pendingTurnsBySession = new Map();
 const recentAutomaticTurns = new Map();
 const automaticInputsInFlight = new Set();
@@ -166,6 +168,16 @@ function directIntakeInstruction(window, reason) {
       ? '入库 errand 当前已占用，已跳过嵌套派发。'
       : '当前已在入库 errand 会话中，已跳过嵌套派发。',
     next_action: '请直接使用当前已授权的飞书 MCP 读取本次扫描窗口，调用 get_pm_tasks 获取 items、candidates、cursors，再调用 submit_intake 提交 sources 和 proposals；不要再次调用 scan_intake_window。',
+    proposals: [],
+  };
+}
+
+function intakeScanBusyResult(window) {
+  return {
+    ...window,
+    status: 'skipped',
+    reason: 'intake_scan_busy',
+    summary: '已有入库扫描正在运行，本轮自动扫描已跳过。',
     proposals: [],
   };
 }
@@ -751,6 +763,97 @@ function handleTurnEnd(msg) {
   }).catch((error) => reportFailure('自动模式收口失败', error));
 }
 
+async function scanIntakeWindow(args = {}, callId = null) {
+  const trigger = args?.trigger ?? 'manual';
+  if (trigger !== 'manual' && trigger !== 'schedule') {
+    throw new Error('scan_intake_window 的 trigger 只能是 manual 或 schedule');
+  }
+  const fallbackWindow = createWindow();
+  if (isInsideIntakeErrand(args)) return directIntakeInstruction(fallbackWindow, 'already_in_intake_errand');
+  if (intakeScanInFlight) return intakeScanBusyResult(fallbackWindow);
+
+  const pending = (async () => {
+    await ensurePm();
+    const cursor = await pmRequest('GET', '/api/runtime/intake-cursor');
+    const window = createWindow(cursor?.window_end ?? null);
+    if (trigger === 'schedule') {
+      const autoScan = await pmRequest('GET', '/api/runtime/auto-scan');
+      if (autoScan && autoScan.enabled === false) {
+        return {
+          ...window,
+          status: 'skipped',
+          reason: 'auto_scan_disabled',
+          summary: '本产品自动扫描已关闭，跳过本次 errand。',
+          proposals: [],
+        };
+      }
+    }
+    let result;
+    try {
+      result = await runErrand(window, callId);
+    } catch (error) {
+      if (isBusyErrandResult(error)) {
+        return trigger === 'schedule'
+          ? intakeScanBusyResult(window)
+          : directIntakeInstruction(window, 'intake_errand_busy');
+      }
+      throw error;
+    }
+    if (!result || result.ok !== true) {
+      if (isBusyErrandResult(result)) {
+        return trigger === 'schedule'
+          ? intakeScanBusyResult(window)
+          : directIntakeInstruction(window, 'intake_errand_busy');
+      }
+      throw new Error(result?.message || '任务入库 errand 未完成');
+    }
+    const errand = parseErrandResult(result.text);
+    const status = errand?.status || result.status || 'done';
+    const reason = errand?.reason || null;
+    let intakeResult = null;
+    if (reason === 'empty_window') {
+      intakeResult = await pmRequest('POST', '/api/integrations/cindy/intake', {
+        window_id: window.window_id,
+        window_start: window.window_start,
+        window_end: window.window_end,
+        sources: [],
+        proposals: [],
+      });
+    }
+    return {
+      ...window,
+      status,
+      reason,
+      summary: readableIntakeSummary(status, reason, errand?.proposals || []),
+      model_summary: errand?.summary || '',
+      proposals: errand?.proposals || [],
+      intake_result: intakeResult,
+      job_id: result.jobId || null,
+      session_id: result.sessionId || null,
+      errand_text: safeText(result.text, 64000),
+    };
+  })();
+  intakeScanInFlight = pending;
+  try {
+    return await pending;
+  } finally {
+    if (intakeScanInFlight === pending) intakeScanInFlight = null;
+  }
+}
+
+function runScheduledIntakeScan() {
+  return scanIntakeWindow({ trigger: 'schedule' }).catch((error) => {
+    reportFailure('自动扫描失败', error);
+    return null;
+  });
+}
+
+function startAutomaticScanLoop() {
+  if (autoScanLoopStarted || typeof setInterval !== 'function') return;
+  autoScanLoopStarted = true;
+  setInterval(runScheduledIntakeScan, INTAKE_WINDOW_MS);
+}
+
 async function handleToolCall(msg) {
   if (msg.tool === 'update_pm_progress') {
     try {
@@ -775,97 +878,12 @@ async function handleToolCall(msg) {
     return;
   }
   if (msg.tool === 'scan_intake_window') {
-    const trigger = msg.args?.trigger ?? 'manual';
-    if (trigger !== 'manual' && trigger !== 'schedule') {
-      throw new Error('scan_intake_window 的 trigger 只能是 manual 或 schedule');
-    }
-    const fallbackWindow = createWindow();
-    if (isInsideIntakeErrand(msg.args)) {
-      cindy.send({
-        type: 'tool-result',
-        callId: msg.callId,
-        ok: true,
-        result: directIntakeInstruction(fallbackWindow, 'already_in_intake_errand'),
-      });
-      return;
-    }
-    await ensurePm();
-    const cursor = await pmRequest('GET', '/api/runtime/intake-cursor');
-    const window = createWindow(cursor?.window_end ?? null);
-    if (trigger === 'schedule') {
-      const autoScan = await pmRequest('GET', '/api/runtime/auto-scan');
-      if (autoScan && autoScan.enabled === false) {
-        cindy.send({
-          type: 'tool-result',
-          callId: msg.callId,
-          ok: true,
-          result: {
-            ...window,
-            status: 'skipped',
-            reason: 'auto_scan_disabled',
-            summary: '本产品自动扫描已关闭，跳过本次 errand。',
-            proposals: [],
-          },
-        });
-        return;
-      }
-    }
-    let result;
-    try {
-      result = await runErrand(window, msg.callId);
-    } catch (error) {
-      if (isBusyErrandResult(error)) {
-        cindy.send({
-          type: 'tool-result',
-          callId: msg.callId,
-          ok: true,
-          result: directIntakeInstruction(window, 'intake_errand_busy'),
-        });
-        return;
-      }
-      throw error;
-    }
-    if (!result || result.ok !== true) {
-      if (isBusyErrandResult(result)) {
-        cindy.send({
-          type: 'tool-result',
-          callId: msg.callId,
-          ok: true,
-          result: directIntakeInstruction(window, 'intake_errand_busy'),
-        });
-        return;
-      }
-      throw new Error(result?.message || '任务入库 errand 未完成');
-    }
-    const errand = parseErrandResult(result.text);
-    const status = errand?.status || result.status || 'done';
-    const reason = errand?.reason || null;
-    let intakeResult = null;
-    if (reason === 'empty_window') {
-      intakeResult = await pmRequest('POST', '/api/integrations/cindy/intake', {
-        window_id: window.window_id,
-        window_start: window.window_start,
-        window_end: window.window_end,
-        sources: [],
-        proposals: [],
-      });
-    }
+    const result = await scanIntakeWindow(msg.args || {}, msg.callId);
     cindy.send({
       type: 'tool-result',
       callId: msg.callId,
       ok: true,
-      result: {
-        ...window,
-        status,
-        reason,
-        summary: readableIntakeSummary(status, reason, errand?.proposals || []),
-        model_summary: errand?.summary || '',
-        proposals: errand?.proposals || [],
-        intake_result: intakeResult,
-        job_id: result.jobId || null,
-        session_id: result.sessionId || null,
-        errand_text: safeText(result.text, 64000),
-      },
+      result,
     });
     return;
   }
@@ -901,3 +919,5 @@ new BroadcastChannel('cindy-pm-intake').onmessage = (event) => {
   if (event.data && event.data.type === 'settings-changed') settingsCache = null;
   if (event.data && event.data.type === 'settings-changed') pendingTurnsBySession.clear();
 };
+
+startAutomaticScanLoop();
