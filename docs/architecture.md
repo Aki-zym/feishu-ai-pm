@@ -8,15 +8,19 @@ M1 的产品与治理决策以 [DEC-01](decision-register.md) 为唯一登记入
 
 ## 当前用户入口
 
-现行使用从 Cindy 插件开始：插件连接 XD Feishu 并启动本机后台，浏览器访问 `http://127.0.0.1:4310`。浏览器设置页只提供本机任务库运行管理，不提供旧飞书 OAuth 首配；当前用户流程不经过 Electron 或 Windows EXE。后文保留的桌面、安装包和 OAuth 细节属于遗留实现与验证记录。
+现行使用从独立 TooManyTasks 开始：`apps/server` 监听 `127.0.0.1:4310`，管理 Aily 应用配置、用户 OAuth、TokenStore、官方 SDK、扫描窗口、SQLite 和浏览器任务台。Cindy 插件只从共享私有配置目录读取自动生成的本机集成令牌，触发扫描并派固定 intake errand；Cindy 只结合 Aily 派生摘要和本地任务快照做最终任务判断。当前用户流程不经过 Cindy 宿主 OAuth、XD Feishu、现有飞书 MCP、ChatD 或 Electron/Windows EXE；后文保留的旧 OAuth、桌面、安装包细节属于遗留实现与验证记录。
 
 PROD-07 进一步固定日历入口的语义：日历事件先作为来源事实/提醒保存；运行时仅当 `explicit_owner_responsibility + action + deliverable_or_deadline` 三项同时成立时才允许进入 `candidate_review`，否则走 `calendar_fact` 或责任不明的 `owner_confirmation`。过滤为非任务不删除来源；会议占位不单独推断 action item，纪要或明确消息必须重新提供可追溯依据。路由解释只保留固定代码、有限证据字段和来源引用，不暴露原始日历 payload、参会人目录或正文。
 
 ## 推荐主链
 
 ```text
-飞书 / 日历 / 妙记 / 人工来源
-  → 原始来源耐久保存
+插件定时器或手动命令
+  → Cindy Worker 调用 TooManyTasks 本机扫描 API
+  → apps/server 官方 Aily SDK
+  → Aily 按窗口检索飞书并生成派生摘要
+  → Cindy 读取本地任务快照并提交入库提案
+  → SQLite 原始/派生来源耐久保存
   → 单条候选生成
   → 待确认候选归并与主人主体识别
   → 高置信自动归并 / 低置信主人确认
@@ -62,7 +66,7 @@ Fastify inject / PmService（不监听固定本地端口）
 SQLite / 飞书适配器 / LLM 适配器 / 只读工作区
 ```
 
-Fastify继续用于浏览器开发、自动测试和未来需要的飞书回调入口；正式 EXE 内部不要求用户单独启动 Web 服务。桌面数据库和加密配置均存放在当前 Windows 用户的应用数据目录。本节仅记录遗留桌面端的实现与验证；现行入口由 Cindy 插件启动本机后台并由浏览器访问 `http://127.0.0.1:4310`。
+Fastify继续用于浏览器开发、自动测试和未来需要的飞书回调入口；正式 EXE 内部不要求用户单独启动 Web 服务。桌面数据库和加密配置均存放在当前 Windows 用户的应用数据目录。本节仅记录遗留桌面端的实现与验证；现行入口由用户独立启动 TooManyTasks，Cindy 插件只连接 `http://127.0.0.1:4310`。
 
 正式服务端与 Electron 使用的 `buildApp` 默认只装配产品 API，不注册 `/api/dev/simulate-message`。该开发夹具只能由自动测试在创建 App 时显式开启，不能通过 `NODE_ENV`、内存数据库、浏览器模式或 renderer 开关隐式获得。正式人工补录走 `/api/corrections`，沿用来源、候选、幂等与主人确认主链。
 

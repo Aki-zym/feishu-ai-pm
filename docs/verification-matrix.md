@@ -3,7 +3,7 @@
 # 验证矩阵
 
 机器事实源：[`docs/verification-matrix.json`](verification-matrix.json)。当前产品状态见 [当前状态](current-state.md)。
-产品源码快照：日期 `2026-08-15`；等价 commit `null`；算法 `product-source-sha256-v1`；选择器 `apps-workspace-default-include-v1`；文件数 `87`；fingerprint `596b57af001a973add63baca739f19051d3aa923d07e4b854d2ef99e37c71aa4`。
+产品源码快照：日期 `2026-08-15`；等价 commit `null`；算法 `product-source-sha256-v1`；选择器 `apps-workspace-default-include-v1`；文件数 `53`；fingerprint `c4592dc568ae2de6d93b9852cd3308dd8d3f10ca00eef00f483dd6d7ee30d837`。
 
 ## L0–L6
 
@@ -29,14 +29,11 @@
 | test-ci-only | L1 | medium | unit_inventory, exact_provenance | no |
 | qa-control-plane | L4 | high | unit_inventory, contract_replay, exact_provenance | yes |
 | server-data-runtime | L2 | high | unit_inventory, service_integration, exact_provenance | yes |
-| feishu | L3 | high | contract_replay, scope_guard, exact_provenance | yes |
-| llm | L3 | high | contract_replay, redaction, exact_provenance | yes |
+| cindy-plugin | L3 | high | contract_replay, scope_guard, exact_provenance | yes |
 | web | L4 | high | unit_inventory, browser_e2e, exact_provenance | yes |
-| desktop | L5 | high | unit_inventory, lifecycle, windows_installer_smoke, exact_provenance | yes |
-| release | L5 | high | artifact_hash, windows_installer_smoke, exact_provenance | yes |
 | unknown | L6 | high | path_review, exact_provenance | yes |
 
-Path category precedence：docs → release → Feishu/LLM integration → test/CI → web → desktop → server/data/runtime → unknown。空 diff、绝对路径、父目录逃逸和无法识别路径不属于 docs-only。
+Path category precedence：docs → QA control → Cindy plugin → test/CI → web → server/data/runtime → unknown。空 diff、绝对路径、父目录逃逸和无法识别路径不属于 docs-only。
 
 ## Skip 与 provenance 合同
 
@@ -92,6 +89,7 @@ Path category precedence：docs → release → Feishu/LLM integration → test/
 | VER-ISSUE38-DATA04-L4-20260818 | Issue #38 DATA-04 连续 schema v7：不可变来源修订、精确 replay reference、canonical decision-scope binding、CAS/stale fence、隐私生命周期与强制服务层回放授权 | L4 | L4 | 实际运行证据已取得 | synthetic_local_sqlite_service_browser | 108d8eb4031a3ac3d4381516a4ea0205895ac350 | local-20260817T234313Z-18e3b200 | 未取得 |
 | VER-ISSUE111-QA02-L4-20260818 | 完全本地 exact verification 的 Git changed-path/plan/gate 重算、严格 schema、计数守恒与 crash-safe generation/lease/CAS evidence 发布；immutable candidate reader、identity-specific lease/reclaim paths 与 A-D publication fencing | L4 | L4 | 实际运行证据已取得 | local_exact_verification_infrastructure | adc56a0ab271228bb3f38d2d5f426f2df9d8d480 | local-20260818T083833Z-d2f27a74 | 未取得 |
 | VER-ISSUE41-FSH03-L4-20260818 | Issue #41 FSH-03 飞书 WebSocket durable inbox-before-ack、幂等去重、重启恢复和来源/主人范围 fencing | L4 | L4 | 实际运行证据已取得 | synthetic_local_sqlite_service_contract_browser_regression | dcf3d01ed6ba6fb2a876afc2f86171ab23a010ad | local-issue41-fsh03-20260818-02 | 未取得 |
+| VER-AILY-SDK-ISOLATED-20260827 | 独立 TooManyTasks OAuth/TokenStore/Aily SDK、SSE、持久窗口、Cindy 薄插件与 SQLite/CAS 入库合同 | L3 | L3 | 实际运行证据已取得 | synthetic_independent_service_thin_plugin_contract | b3f09335eaa1538e3fae987431def97125dbdd2c | local-aily-sdk-intake-20260827-04 | 未取得 |
 
 ## 证据详情
 
@@ -431,7 +429,7 @@ Path category precedence：docs → release → Feishu/LLM integration → test/
 - Evidence path：`release/latest.yml`
 - 限制 / 未验证：该记录绑定 exact product/build source f9e77aec 与精确包 hash，并包含合成 userData 的安装/启动/退出/卸载 Smoke；artifact 与本条记录首次进入仓库的已知 carrier ancestor 为 3dcd9d0779542a7f3b6beebe73048273a0eff68a，JSON record_commit 使用 pull_request_81_pending 以避免同一提交自引用；PR 最新 evidence head、merge-ref 和 run 只用于 freshness 并记录在 PR #81 body。它仍不证明完整 Windows L5、真实用户数据库升级、签名、发布渠道或真实 provider 行为。
 - Artifact：`release/Feishu-AI-PM-0.2.0-x64-Setup.exe`，101881096 bytes，SHA-256 `5D69C9DAD525B4CFDDB68CB64EC99C6109DB4E848D209B365C5D3D3B985A81AA`
-- 产物状态：x64；签名 NotSigned；仓库分发 Git LFS；GitHub Release not_published
+- 产物状态：x64；签名 NotSigned；仓库分发 Git LFS
 
 ### VER-ISSUE64-CONTRACT-L1-20260815
 
@@ -746,11 +744,27 @@ Path category precedence：docs → release → Feishu/LLM integration → test/
 - Evidence path：`apps/server/tests/feishu-durable-ack.test.ts`
 - 限制 / 未验证：本地证据证明回调等待 durable receipt、commit 前失败不确认、commit 后重复可重试、并发/乱序事实去重、孤儿来源重启恢复及 scope fail-closed；不证明真实飞书长连接 ACK 时序、租户权限、真实 provider/生产数据、Windows L5/L6。独立 Reviewer、普通合入和 post-merge exact evidence 仍待完成。
 
+### VER-AILY-SDK-ISOLATED-20260827
+
+- 能力：独立 TooManyTasks OAuth/TokenStore/Aily SDK、SSE、持久窗口、Cindy 薄插件与 SQLite/CAS 入库合同
+- 实现状态：`implemented_pending_commit`
+- 目标层级：`L3`；已取得层级：`L3`
+- 证据状态：`attained`（实际运行证据已取得）
+- 目标真实范围：否；真实环境证据：未取得；scope：`synthetic_local_oauth_tokenstore_aily_sdk_cindy_intake`
+- Evidence type：`synthetic_independent_service_thin_plugin_contract`
+- Source commit：`b3f09335eaa1538e3fae987431def97125dbdd2c`；记录 commit：`pull_request_aily_pending`
+- Provenance：mode=`local_run`；base=`not_applicable`；head=`b3f09335eaa1538e3fae987431def97125dbdd2c`；merge=`not_applicable`；parents=``；tree=`not_applicable`；run=`local-aily-sdk-intake-20260827-04`；job=`not_applicable`；environment=macOS Darwin 25.5.0 arm64; Node.js 26.4.0; npm 11.17.0; synthetic SDK/SQLite/Fastify fixtures; no real Feishu tenant, Aily provider, production data or external credentials
+- Skip classification：status=`present`；kinds=`capability, platform`；reason=本地合成测试和构建可以验证仓库合同，但当前环境没有真实 Aily/飞书租户、Cindy 宿主 errand 或 Windows L5 载体。
+- Run：`local-aily-sdk-intake-20260827-04`；时间：2026-08-27T16:05:21+08:00；环境：macOS Darwin 25.5.0 arm64; Node.js 26.4.0; npm 11.17.0; synthetic SDK/SQLite/Fastify fixtures; no real Feishu tenant, Aily provider, production data or external credentials
+- 命令或场景：npm run typecheck; npm run test:plugin (50/50); npm run test:server:current (42/42); npm run test:web:current (13/13); npm test (server 42, web 13); npm run build; npm run build:plugin; npm run docs:test (43/43); git diff --check. Tests cover encrypted local credentials, blank-by-default App/Agent identity, one-time OAuth state, refresh token renewal and temporary failure retention, official SDK user-token injection, bounded UTF-8/event SSE parsing, Aily/Cindy cursor fencing, empty-window advancement, server receipt authority including contradictory model status, source provenance, CAS and thin-plugin package allowlist.
+- 结果：`passed`；skips：真实 Aily/飞书租户 OAuth、用户 Token 权限覆盖、真实 Cindy 宿主 errand、生产数据、Windows 安装 Smoke L5 和真实 provider/tenant L6 未执行。
+- Evidence path：`apps/server/tests/aily.test.ts`
+- 限制 / 未验证：证据覆盖当前工作树的独立服务、加密 TokenStore、薄插件、SQLite 合同和本地构建；记录使用当前已提交基线 commit 并标记 pending commit，提交后需重新绑定 exact source/PR/CI provenance。Cindy 宿主仍没有稳定的 errand 工具白名单合同，TooManyTasks 也尚未提供独立常驻调度器或安装器。Aily 摘要仍是 limited 的派生证据，真实 Agent 技能、用户授权可见范围、飞书知识库覆盖、限流、refresh token 轮换、撤权和真实端到端聊天结果仍需在用户授权环境中单独验收。
+
 ## 使用规则
 
 - “目标层级”只表示计划达到哪里；只有“已取得层级”和“证据状态”才能说明已经得到什么证据。
 - `not_run` 明确表示未取得证据；`historical_documented_claim` 只是历史声明、未独立复验，二者都不能显示为真实环境证据已取得。
-- Artifact 的 hash 只证明该产物的完整性或身份；没有绑定该精确 hash 的实际 Windows 安装运行，不能显示为已取得 L5 Smoke。
-- Mock、契约、回放、浏览器 E2E、构建产物和旧包 Smoke 均不能写成 L6 真实连接验证。
-- 安装包必须以精确 hash 关联 Smoke；同名版本的其他 hash 不能互相替代。
+- Artifact 的 hash 只证明该产物的完整性或身份；不能替代插件、server 或 web 的实际运行证据。
+- Mock、契约、回放、浏览器 E2E 和构建产物均不能写成真实外部连接验证。
 - 历史测试数字保留在 CHANGELOG / QA；入口文档只引用验证 ID。

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Activity, Power, RefreshCw, Sparkles } from 'lucide-react';
+import { Activity, Bot, Link, Power, RefreshCw, Sparkles, Unplug } from 'lucide-react';
 import { api } from '../api';
 import { HealthStatusPanel } from '../components/HealthStatusPanel';
 import { normalizeHealth, type HealthSnapshot } from '../observability';
@@ -8,6 +8,19 @@ import type { HealthDto } from '../types';
 
 type RuntimeAutoScan = { enabled: boolean };
 type IntakeCursor = { window_end: string | null };
+type AilyStatus = {
+  appId: string;
+  agentId: string;
+  domain: 'feishu' | 'lark';
+  oauthRedirectUri: string;
+  oauthScopes: string[];
+  appSecretSaved: boolean;
+  connected: boolean;
+  refreshAvailable: boolean;
+  expiresAt: string | null;
+  grantedScopes: string[];
+  authStatus: 'connected' | 'expired' | 'not_connected' | 'not_configured';
+};
 
 function toDateTimeLocal(value: string | null) {
   if (!value) return '';
@@ -35,15 +48,45 @@ export default function SettingsPage() {
   const [runtimeExited, setRuntimeExited] = useState(false);
   const [seedState, setSeedState] = useState<'idle' | 'pending' | 'success' | 'error'>('idle');
   const [seedMessage, setSeedMessage] = useState('');
+  const [aily, setAily] = useState<AilyStatus | null>(null);
+  const [ailyForm, setAilyForm] = useState({
+    appId: '',
+    appSecret: '',
+    agentId: '',
+    domain: 'feishu' as 'feishu' | 'lark',
+    oauthRedirectUri: '',
+    oauthScopes: [] as string[],
+  });
+  const [ailyState, setAilyState] = useState<'idle' | 'pending' | 'error'>('idle');
+  const [ailyMessage, setAilyMessage] = useState('');
+
+  const applyAilyStatus = (status: AilyStatus) => {
+    setAily(status);
+    setAilyForm((current) => ({
+      appId: status.appId,
+      appSecret: current.appSecret,
+      agentId: status.agentId,
+      domain: status.domain,
+      oauthRedirectUri: status.oauthRedirectUri,
+      oauthScopes: status.oauthScopes,
+    }));
+  };
+
+  const loadAily = async () => {
+    const status = await api.get<AilyStatus>('/api/integrations/aily/status');
+    applyAilyStatus(status);
+    return status;
+  };
 
   const load = async () => {
     setHealth((current) => beginResource(current));
     setAutoScan((current) => beginResource(current));
     setCursor((current) => beginResource(current));
-    const [healthResult, autoScanResult, cursorResult] = await Promise.allSettled([
+    const [healthResult, autoScanResult, cursorResult, ailyResult] = await Promise.allSettled([
       api.get<HealthDto>('/api/health'),
       api.get<RuntimeAutoScan>('/api/runtime/auto-scan'),
       api.get<IntakeCursor>('/api/runtime/intake-cursor'),
+      api.get<AilyStatus>('/api/integrations/aily/status'),
     ]);
     if (healthResult.status === 'fulfilled') setHealth(successResource(normalizeHealth(healthResult.value)));
     else setHealth(failureResource(loadingResource<HealthSnapshot>(), healthResult.reason instanceof Error ? healthResult.reason.message : '健康状态读取失败。'));
@@ -55,9 +98,75 @@ export default function SettingsPage() {
     } else {
       setCursor(failureResource(loadingResource<IntakeCursor>(), cursorResult.reason instanceof Error ? cursorResult.reason.message : '入库游标读取失败。'));
     }
+    if (ailyResult.status === 'fulfilled') applyAilyStatus(ailyResult.value);
+    else setAilyMessage(ailyResult.reason instanceof Error ? ailyResult.reason.message : 'Aily 设置读取失败。');
   };
 
-  useEffect(() => { void load(); }, []);
+  useEffect(() => {
+    void load();
+    const receiveOAuth = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin || event.data?.type !== 'toomanytasks:aily-oauth') return;
+      void loadAily()
+        .then(() => setAilyMessage(event.data.ok ? 'Aily 已连接，用户 Token 将由 TooManyTasks 自动刷新。' : 'Aily 授权未完成。'))
+        .catch((error) => setAilyMessage(error instanceof Error ? error.message : 'Aily 状态刷新失败。'));
+    };
+    window.addEventListener('message', receiveOAuth);
+    return () => window.removeEventListener('message', receiveOAuth);
+  }, []);
+
+  const saveAilyConfig = async () => {
+    if (ailyState === 'pending') return;
+    setAilyState('pending');
+    setAilyMessage('正在保存 Aily 应用配置…');
+    try {
+      const updated = await api.put<AilyStatus>('/api/integrations/aily/config', {
+        appId: ailyForm.appId.trim(),
+        agentId: ailyForm.agentId.trim(),
+        domain: ailyForm.domain,
+        oauthRedirectUri: ailyForm.oauthRedirectUri.trim(),
+        oauthScopes: ailyForm.oauthScopes,
+        ...(ailyForm.appSecret.trim() ? { appSecret: ailyForm.appSecret.trim() } : {}),
+      });
+      setAilyForm((current) => ({ ...current, appSecret: '' }));
+      applyAilyStatus(updated);
+      setAilyState('idle');
+      setAilyMessage('Aily 应用配置已保存。');
+    } catch (error) {
+      setAilyState('error');
+      setAilyMessage(error instanceof Error ? error.message : 'Aily 应用配置保存失败。');
+    }
+  };
+
+  const connectAily = async () => {
+    if (ailyState === 'pending') return;
+    setAilyState('pending');
+    setAilyMessage('正在打开飞书用户授权页…');
+    try {
+      const result = await api.get<{ url: string }>('/api/integrations/aily/oauth/url');
+      const popup = window.open(result.url, 'toomanytasks-aily-oauth', 'popup,width=720,height=760');
+      if (!popup) throw new Error('浏览器拦截了授权窗口，请允许弹窗后重试。');
+      setAilyState('idle');
+      setAilyMessage('请在飞书授权窗口完成授权。');
+    } catch (error) {
+      setAilyState('error');
+      setAilyMessage(error instanceof Error ? error.message : 'Aily 授权页打开失败。');
+    }
+  };
+
+  const disconnectAily = async () => {
+    if (ailyState === 'pending') return;
+    setAilyState('pending');
+    setAilyMessage('正在清除本机 Aily 用户授权…');
+    try {
+      const result = await api.post<{ status: AilyStatus }>('/api/integrations/aily/disconnect', {});
+      applyAilyStatus(result.status);
+      setAilyState('idle');
+      setAilyMessage('Aily 用户授权已从本机凭证库清除。');
+    } catch (error) {
+      setAilyState('error');
+      setAilyMessage(error instanceof Error ? error.message : 'Aily 授权断开失败。');
+    }
+  };
 
   const changeAutoScan = async (enabled: boolean) => {
     const previous = autoScan.data;
@@ -148,8 +257,36 @@ export default function SettingsPage() {
 
       <HealthStatusPanel resource={health} onRetry={() => void load()} />
 
+      <section className="integration-section" aria-labelledby="aily-title">
+        <div className="integration-heading">
+          <span className="integration-icon"><Bot size={19} /></span>
+          <div>
+            <h2 id="aily-title">Aily 连接</h2>
+            <span>TooManyTasks 独立保存应用凭证和用户 OAuth Token，并通过官方 SDK 调用 Aily。</span>
+          </div>
+          <span className={`connection-state ${aily?.authStatus === 'connected' ? 'connected' : ''}`}>
+            {aily?.authStatus === 'connected' ? '已连接' : aily?.authStatus === 'expired' ? '需要重连' : aily?.authStatus === 'not_configured' ? '待配置' : '未连接'}
+          </span>
+        </div>
+        <div className="settings-fields">
+          <label><span>App ID</span><input value={ailyForm.appId} spellCheck={false} onChange={(event) => setAilyForm((current) => ({ ...current, appId: event.target.value }))} /></label>
+          <label><span>App Secret</span><input type="password" value={ailyForm.appSecret} placeholder={aily?.appSecretSaved ? '已安全保存；留空保持不变' : '输入飞书自建应用 App Secret'} onChange={(event) => setAilyForm((current) => ({ ...current, appSecret: event.target.value }))} /></label>
+          <label><span>Agent ID</span><input value={ailyForm.agentId} spellCheck={false} onChange={(event) => setAilyForm((current) => ({ ...current, agentId: event.target.value }))} /></label>
+          <label><span>飞书域</span><select value={ailyForm.domain} onChange={(event) => setAilyForm((current) => ({ ...current, domain: event.target.value as 'feishu' | 'lark' }))}><option value="feishu">飞书</option><option value="lark">Lark</option></select></label>
+          <label className="field-wide"><span>OAuth 回调地址</span><input value={ailyForm.oauthRedirectUri} spellCheck={false} onChange={(event) => setAilyForm((current) => ({ ...current, oauthRedirectUri: event.target.value }))} /></label>
+        </div>
+        <p className="integration-note">授权范围由 TooManyTasks 配置管理。访问 Token 和 refresh token 只进入本机加密凭证库，不会交给 Cindy 插件。</p>
+        {aily?.grantedScopes.length ? <p className="integration-note">已授权 {aily.grantedScopes.length} 项权限；Token 到期时间：{aily.expiresAt ? new Date(aily.expiresAt).toLocaleString('zh-CN') : '由飞书返回决定'}。</p> : null}
+        <div className="settings-actions">
+          <button className="secondary-button" type="button" disabled={ailyState === 'pending'} onClick={() => void saveAilyConfig()}><RefreshCw size={15} />保存应用配置</button>
+          <button className="primary-button" type="button" disabled={ailyState === 'pending' || !aily?.appSecretSaved} onClick={() => void connectAily()}><Link size={15} />{aily?.connected ? '重新连接 Aily' : '连接 Aily'}</button>
+          <button className="quiet-button" type="button" disabled={ailyState === 'pending' || !aily?.connected} onClick={() => void disconnectAily()}><Unplug size={15} />断开</button>
+        </div>
+        {ailyMessage && <p className="settings-feedback" role={ailyState === 'error' ? 'alert' : 'status'}>{ailyMessage}</p>}
+      </section>
+
       <section className="integration-section auto-scan-card" aria-labelledby="auto-scan-title">
-        <div className="integration-heading"><span className="integration-icon"><RefreshCw size={19} /></span><div><h2 id="auto-scan-title">定时扫描</h2><span>控制 Cindy 常驻线程的每 10 分钟自动入库。</span></div></div>
+        <div className="integration-heading"><span className="integration-icon"><RefreshCw size={19} /></span><div><h2 id="auto-scan-title">定时扫描</h2><span>控制 Cindy 薄插件每 10 分钟触发独立 TooManyTasks 扫描。</span></div></div>
         <label className="check-row connection-toggle"><input type="checkbox" aria-label="每 10 分钟自动扫描新任务" checked={Boolean(autoScan.data?.enabled)} disabled={!autoScan.data || autoScan.status === 'loading'} onChange={(event) => void changeAutoScan(event.target.checked)} /><span>每 10 分钟自动扫描新任务</span></label>
         <p className="integration-note">关闭后，定时触发不会跑扫描；手动「扫近10分钟」不受影响。</p>
         {autoScanMessage && <p className="settings-feedback" role="status">{autoScanMessage}</p>}

@@ -5,6 +5,8 @@ import { extname, relative, resolve, sep } from 'node:path';
 import cors from '@fastify/cors';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { z } from 'zod';
+import { AilyServiceError, type AilyService } from './aily.js';
+import { isLocalAilyRedirectUri } from './config.js';
 import type { CandidateState, RiskLevel, TaskStatus } from './domain.js';
 import { CandidateVersionConflictError, CandidateVersionRequiredError, CindyIntakeConflictError, CindyIntakeValidationError, type PmService } from './service.js';
 import { assertShanghaiCalendarPlanRange } from './shanghai-time.js';
@@ -67,10 +69,55 @@ type BuildAppOptions = {
   serveWeb?: boolean;
   webRoot?: string;
   cindyIntegrationToken?: string;
+  ailyService?: AilyService;
   runtimeShutdown?: () => Promise<void> | void;
   runtimeRestart?: () => Promise<void> | void;
   logger?: boolean;
 };
+
+function ailyErrorPayload(error: unknown) {
+  if (error instanceof AilyServiceError) {
+    return {
+      error: error.message,
+      error_code: error.code,
+    };
+  }
+  return {
+    error: 'Aily 集成操作失败，请稍后重试。',
+    error_code: 'AILY_INTEGRATION_FAILED',
+  };
+}
+
+function ailyErrorStatus(error: unknown) {
+  if (!(error instanceof AilyServiceError)) return 500;
+  if (error.code === 'AILY_OAUTH_STATE_INVALID') return 409;
+  if (error.code === 'AILY_AUTH_REQUIRED') return 401;
+  if (error.code === 'AILY_APP_NOT_CONFIGURED' || error.code === 'AILY_INVALID_AGENT') return 400;
+  return error.status && error.status >= 400 && error.status <= 499 ? error.status : 502;
+}
+
+function ailyCallbackHtml(ok: boolean, message: string) {
+  const title = ok ? 'Aily 已连接' : 'Aily 连接失败';
+  const safeMessage = message
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>${title}</title>
+  <style>body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:system-ui,-apple-system,sans-serif;background:#f4f7fb;color:#182235}.panel{width:min(420px,calc(100% - 32px));padding:24px;border:1px solid #dbe3ed;border-radius:8px;background:#fff;box-shadow:0 16px 40px rgba(24,34,53,.08)}h1{margin:0 0 10px;font-size:20px}p{margin:0;color:#5b687b;line-height:1.6}</style>
+</head>
+<body>
+  <main class="panel"><h1>${title}</h1><p>${safeMessage}</p></main>
+  <script>window.opener?.postMessage({type:"toomanytasks:aily-oauth",ok:${ok ? 'true' : 'false'}},window.location.origin);window.setTimeout(()=>window.close(),900);</script>
+</body>
+</html>`;
+}
 
 export function registerSeedIntakeRoute(app: FastifyInstance, service: PmService) {
   if (app.hasRoute({ method: 'POST', url: '/api/dev/seed-intake' })) return;
@@ -185,6 +232,90 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
       return reply.code(status).send({ error: error instanceof Error ? error.message : '入库窗口游标更新失败。' });
     }
   });
+  app.post('/api/runtime/intake-window', async (request, reply) => {
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: '入库窗口只接受本机请求。' });
+    return service.claimIntakeWindow();
+  });
+  app.get('/api/integrations/aily/status', async (request, reply) => {
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: 'Aily 状态接口只接受本机回环请求。' });
+    if (!options.ailyService) return reply.code(503).send({ error: 'Aily 集成尚未启用。' });
+    return options.ailyService.status();
+  });
+  app.put('/api/integrations/aily/config', async (request, reply) => {
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: 'Aily 配置接口只接受本机回环请求。' });
+    if (!options.ailyService) return reply.code(503).send({ error: 'Aily 集成尚未启用。' });
+    try {
+      const body = z.object({
+        appId: z.string().trim().min(1).max(200),
+        agentId: z.string().trim().min(1).max(160).regex(/^[A-Za-z0-9._:-]+$/u),
+        domain: z.enum(['feishu', 'lark']),
+        oauthRedirectUri: z.string().url().max(2048).refine(
+          isLocalAilyRedirectUri,
+          'OAuth 回调地址必须是本机 HTTP 回环地址，路径固定为 /oauth/aily/callback。',
+        ),
+        oauthScopes: z.array(z.string().trim().min(1).max(200)).min(1).max(48),
+        appSecret: z.string().max(8192).optional(),
+        clearAppSecret: z.boolean().optional(),
+      }).strict().parse(request.body);
+      return await options.ailyService.saveConfig(body);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return reply.code(400).send({ error: 'Aily 应用配置格式不正确。', details: error.issues });
+      }
+      return reply.code(ailyErrorStatus(error)).send(ailyErrorPayload(error));
+    }
+  });
+  app.get('/api/integrations/aily/oauth/url', async (request, reply) => {
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: 'Aily 授权接口只接受本机回环请求。' });
+    if (!options.ailyService) return reply.code(503).send({ error: 'Aily 集成尚未启用。' });
+    try {
+      return await options.ailyService.authorizationUrl();
+    } catch (error) {
+      return reply.code(ailyErrorStatus(error)).send(ailyErrorPayload(error));
+    }
+  });
+  app.get('/oauth/aily/callback', async (request, reply) => {
+    if (!isLoopbackRequest(request)) {
+      return reply.code(403).type('text/html; charset=utf-8')
+        .send(ailyCallbackHtml(false, '授权回调只接受本机浏览器请求。'));
+    }
+    if (!options.ailyService) {
+      return reply.code(503).type('text/html; charset=utf-8')
+        .send(ailyCallbackHtml(false, 'Aily 集成尚未启用。'));
+    }
+    const query = z.object({
+      code: z.string().max(8192).optional(),
+      state: z.string().max(8192).optional(),
+      error: z.string().max(200).optional(),
+    }).passthrough().safeParse(request.query);
+    if (!query.success || query.data.error) {
+      return reply.code(400).type('text/html; charset=utf-8')
+        .send(ailyCallbackHtml(false, '飞书未完成本次授权，请返回 TooManyTasks 重新连接。'));
+    }
+    try {
+      await options.ailyService.completeAuthorization(query.data.code ?? '', query.data.state ?? '');
+      return reply.type('text/html; charset=utf-8')
+        .send(ailyCallbackHtml(true, '授权已安全保存，可以返回 TooManyTasks。'));
+    } catch (error) {
+      return reply.code(ailyErrorStatus(error)).type('text/html; charset=utf-8')
+        .send(ailyCallbackHtml(false, error instanceof AilyServiceError
+          ? error.message
+          : 'Aily 授权保存失败，请返回 TooManyTasks 重试。'));
+    }
+  });
+  app.post('/api/integrations/aily/disconnect', async (request, reply) => {
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: 'Aily 断开接口只接受本机回环请求。' });
+    if (!options.ailyService) return reply.code(503).send({ error: 'Aily 集成尚未启用。' });
+    return options.ailyService.disconnect();
+  });
+  app.post('/api/integrations/cindy/scan', async (request, reply) => {
+    if (!options.ailyService) return reply.code(503).send({ error: 'Aily 集成尚未启用。' });
+    const body = z.object({
+      trigger: z.enum(['manual', 'schedule']).default('manual'),
+    }).strict().safeParse(request.body ?? {});
+    if (!body.success) return reply.code(400).send({ error: '扫描触发类型只能是 manual 或 schedule。' });
+    return options.ailyService.scan(service, body.data.trigger);
+  });
   registerSeedIntakeRoute(app, service);
   app.get('/api/dashboard', async () => dashboardDtoSchema.parse(service.dashboard()));
   app.get('/api/calendar', async () => service.calendar());
@@ -273,11 +404,15 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
         window_id: z.string().trim().min(1).max(200),
         window_start: isoTimestamp,
         window_end: isoTimestamp,
+        result_kind: z.enum(['intake', 'empty_window']),
         sources: z.array(z.object({
           source_key: z.string().trim().min(1).max(200),
+          source_kind: z.literal('aily_summary').optional(),
           occurred_at: isoTimestamp,
           conversation_key: z.string().trim().min(1).max(500).optional(),
           sender_role: z.string().trim().min(1).max(120).optional(),
+          agent_id: z.string().trim().min(1).max(160).optional(),
+          generated_at: isoTimestamp.optional(),
           text: z.string().min(1).max(20_000),
         }).strict()).max(500),
         proposals: z.array(z.object({
@@ -304,6 +439,15 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
         payload.current_version = error.currentVersion;
       }
       return reply.code(status).send(payload);
+    }
+  });
+  app.get('/api/integrations/cindy/intake/:windowId/status', async (request, reply) => {
+    try {
+      const params = z.object({ windowId: z.string().trim().min(1).max(200) }).parse(request.params);
+      return service.intakeResultStatus(params.windowId);
+    } catch (error) {
+      return reply.code(error instanceof z.ZodError || error instanceof CindyIntakeValidationError ? 400 : 409)
+        .send({ error: error instanceof Error ? error.message : '入库状态读取失败。' });
     }
   });
   app.get('/api/candidates', async (request) => {

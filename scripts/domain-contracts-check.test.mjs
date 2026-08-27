@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -46,9 +46,11 @@ function runWriteStructural(mutator) {
   // fixture env vars (and therefore exercises the actual --write branch).
   const tracked = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' }).split('\0').filter(Boolean);
   for (const relative of tracked) {
+    const source = join(root, relative);
+    if (!existsSync(source)) continue;
     const destination = join(dir, relative);
     mkdirSync(dirname(destination), { recursive: true });
-    copyFileSync(join(root, relative), destination);
+    copyFileSync(source, destination);
   }
   spawnSync('git', ['init', '-q'], { cwd: dir, encoding: 'utf8' });
   spawnSync('git', ['add', '-A'], { cwd: dir, encoding: 'utf8' });

@@ -4,8 +4,8 @@
   "product_snapshot": {
     "algorithm": "product-source-sha256-v1",
     "selector": "apps-workspace-default-include-v1",
-    "fingerprint": "596b57af001a973add63baca739f19051d3aa923d07e4b854d2ef99e37c71aa4",
-    "file_count": 87,
+    "fingerprint": "c4592dc568ae2de6d93b9852cd3308dd8d3f10ca00eef00f483dd6d7ee30d837",
+    "file_count": 53,
     "snapshot_as_of": "2026-08-15",
     "equivalent_commit": null
   },
@@ -1582,6 +1582,47 @@
       "artifact": null,
       "evidence_path": "apps/server/tests/feishu-durable-ack.test.ts",
       "limitations": "本地证据证明回调等待 durable receipt、commit 前失败不确认、commit 后重复可重试、并发/乱序事实去重、孤儿来源重启恢复及 scope fail-closed；不证明真实飞书长连接 ACK 时序、租户权限、真实 provider/生产数据、Windows L5/L6。独立 Reviewer、普通合入和 post-merge exact evidence 仍待完成。"
+    },
+    {
+      "id": "VER-AILY-SDK-ISOLATED-20260827",
+      "capability": "独立 TooManyTasks OAuth/TokenStore/Aily SDK、SSE、持久窗口、Cindy 薄插件与 SQLite/CAS 入库合同",
+      "implementation_state": "implemented_pending_commit",
+      "target_level": "L3",
+      "attained_level": "L3",
+      "evidence_status": "attained",
+      "evidence_type": "synthetic_independent_service_thin_plugin_contract",
+      "scope": "synthetic_local_oauth_tokenstore_aily_sdk_cindy_intake",
+      "source_commit": "b3f09335eaa1538e3fae987431def97125dbdd2c",
+      "record_commit": "pull_request_aily_pending",
+      "run_id": "local-aily-sdk-intake-20260827-04",
+      "run_at": "2026-08-27T16:05:21+08:00",
+      "environment": "macOS Darwin 25.5.0 arm64; Node.js 26.4.0; npm 11.17.0; synthetic SDK/SQLite/Fastify fixtures; no real Feishu tenant, Aily provider, production data or external credentials",
+      "command_or_scenario": "npm run typecheck; npm run test:plugin (50/50); npm run test:server:current (42/42); npm run test:web:current (13/13); npm test (server 42, web 13); npm run build; npm run build:plugin; npm run docs:test (43/43); git diff --check. Tests cover encrypted local credentials, blank-by-default App/Agent identity, one-time OAuth state, refresh token renewal and temporary failure retention, official SDK user-token injection, bounded UTF-8/event SSE parsing, Aily/Cindy cursor fencing, empty-window advancement, server receipt authority including contradictory model status, source provenance, CAS and thin-plugin package allowlist.",
+      "result": "passed",
+      "skips": "真实 Aily/飞书租户 OAuth、用户 Token 权限覆盖、真实 Cindy 宿主 errand、生产数据、Windows 安装 Smoke L5 和真实 provider/tenant L6 未执行。",
+      "skip_classification": {
+        "status": "present",
+        "kinds": ["capability", "platform"],
+        "reason": "本地合成测试和构建可以验证仓库合同，但当前环境没有真实 Aily/飞书租户、Cindy 宿主 errand 或 Windows L5 载体。"
+      },
+      "evidence_contract_version": 1,
+      "provenance": {
+        "mode": "local_run",
+        "base_commit": "not_applicable",
+        "head_commit": "b3f09335eaa1538e3fae987431def97125dbdd2c",
+        "merge_ref": "not_applicable",
+        "parents": [],
+        "tree": "not_applicable",
+        "run_id": "local-aily-sdk-intake-20260827-04",
+        "job_id": "not_applicable",
+        "environment": "macOS Darwin 25.5.0 arm64; Node.js 26.4.0; npm 11.17.0; synthetic SDK/SQLite/Fastify fixtures; no real Feishu tenant, Aily provider, production data or external credentials",
+        "command": "npm run typecheck; npm run test:plugin (50/50); npm run test:server:current (42/42); npm run test:web:current (13/13); npm test (server 42, web 13); npm run build; npm run build:plugin; npm run docs:test (43/43); git diff --check. Tests cover encrypted local credentials, blank-by-default App/Agent identity, one-time OAuth state, refresh token renewal and temporary failure retention, official SDK user-token injection, bounded UTF-8/event SSE parsing, Aily/Cindy cursor fencing, empty-window advancement, server receipt authority including contradictory model status, source provenance, CAS and thin-plugin package allowlist."
+      },
+      "target_real_scope": false,
+      "real_environment_attained": false,
+      "artifact": null,
+      "evidence_path": "apps/server/tests/aily.test.ts",
+      "limitations": "证据覆盖当前工作树的独立服务、加密 TokenStore、薄插件、SQLite 合同和本地构建；记录使用当前已提交基线 commit 并标记 pending commit，提交后需重新绑定 exact source/PR/CI provenance。Cindy 宿主仍没有稳定的 errand 工具白名单合同，TooManyTasks 也尚未提供独立常驻调度器或安装器。Aily 摘要仍是 limited 的派生证据，真实 Agent 技能、用户授权可见范围、飞书知识库覆盖、限流、refresh token 轮换、撤权和真实端到端聊天结果仍需在用户授权环境中单独验收。"
     }
   ]
 }

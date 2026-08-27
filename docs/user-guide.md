@@ -4,20 +4,20 @@
 
 ## 1. 打开当前入口和数据位置
 
-当前使用入口是 **Cindy 插件 + 本机后台 + 浏览器**：
+当前使用入口是 **独立 TooManyTasks + Cindy 薄插件 + 浏览器**：
 
-1. 在 Cindy 安装并开启插件 **TooManyTasks 入库**（`plugins/cindy-pm-intake`）。
-2. 在 Cindy 连接 **XD Feishu**。
-3. 对话里说「扫近10分钟」。插件会在本机拉起任务库后台，默认地址为 `http://127.0.0.1:4310`。
-4. 浏览器打开该地址，使用工作台、候选箱、任务详情和设置页。设置页可以重启后台，成功后当前页面继续可用；退出后台后页面会失去连接。
+1. 启动独立 TooManyTasks，默认地址为 `http://127.0.0.1:4310`。
+2. 在浏览器设置页保存 Aily 应用配置，点击「连接 Aily」完成飞书用户 OAuth。
+3. 在 Cindy 安装并开启插件 **TooManyTasks 入库**（`plugins/cindy-pm-intake`）。
+4. 对话里说「扫近10分钟」。插件调用本机扫描 API，独立 TooManyTasks 请求 Aily 总结窗口信息，再由 Cindy 完成入库判断。
 
-现行流程从 Cindy 插件开始；浏览器设置页只管理本机任务库运行选项，不提供旧飞书 OAuth 首配。飞书连接由 Cindy 的 XD Feishu 插件负责。
+现行流程从独立 TooManyTasks 开始；浏览器设置页管理 Aily OAuth 和本机任务库。扫描阶段不使用 Cindy 宿主 OAuth、XD Feishu、现有飞书 MCP 或 ChatD；Cindy 只负责触发扫描并结合 Aily 派生摘要和本地任务快照判断任务变化。
 
-数据保存在本机 SQLite。Cindy 退出后后台一起停；再次说「扫近10分钟」可以重新拉起。没有凭证时，可使用安全模拟模式与人工补录完成本机候选和任务管理验收。
+数据保存在本机 SQLite。TooManyTasks 独立运行，Cindy 退出不会关闭后台；服务未运行时插件会提示先启动 TooManyTasks。没有凭证时，可使用安全模拟模式与人工补录完成本机候选和任务管理验收。
 
 开发者需要本地改网页和接口时，在仓库根目录运行 `npm install` 和 `npm run dev`，打开 `http://localhost:5173`；生产式预览运行 `npm run build` 和 `npm start`，打开 `http://127.0.0.1:4310`。页面操作与下文相同。
 
-旧桌面安装与 OAuth 首配步骤仅作为历史记录保留，当前使用请按上面的 Cindy 插件与浏览器入口操作。
+旧桌面安装与 OAuth 首配步骤仅作为历史记录保留，当前使用请按上面的独立 TooManyTasks、浏览器和 Cindy 薄插件入口操作。
 
 ## 2. 无凭证时可以验证什么
 
@@ -141,9 +141,18 @@ SQLite 仍是唯一真源，文件夹是可重建投影；因此待确认提案�
 
 “清理并重建”只清理系统明确托管的 `task.json`、`brief.md`、`sources.md`、`artifacts.json` 和已登记的 `updates/` 文件，不递归删除整个任务目录，也不删除未知文件或用户自有附件。参考路径与任务记忆目录是两件事：解除引用只删除 SQLite 中的绑定和对应快照，真实工作目录仍然只读，不会被删除、移动或修改。
 
-## 3. 首次真实飞书连接（遗留桌面流程）
+## 3. 配置独立 Aily 扫描
 
-> 以下步骤仅保留旧版桌面端的历史记录；现行用户通过 Cindy 的 XD Feishu 插件连接飞书，浏览器设置页不再提供这些 OAuth 配置项。
+1. 打开 TooManyTasks 浏览器设置页，在「Aily 连接」中填写飞书自建应用 App ID、App Secret、Agent ID 和已登记的本机 OAuth 回调地址。
+2. 保存应用配置。页面不会回显 App Secret；更换应用身份或 App Secret 会清除旧用户授权。
+3. 点击「连接 Aily」，在飞书授权页批准用户权限。授权回调把 access token 与 refresh token 写入 TooManyTasks 本机 AES-256-GCM 凭证库；Token 接近过期时由服务端自动刷新。
+4. Cindy 插件设置页只保留本机地址、自动扫描和进度模式，不保存 Aily 凭证或本机集成令牌。
+
+自动扫描打开后，Cindy 薄插件每 10 分钟调用独立 TooManyTasks。服务端按持久窗口调用 Aily，返回摘要后才启动固定 `intake` errand；Cindy 读取 `get_pm_tasks` 的本地快照并调用 `submit_intake`。Aily 返回无新信息时由服务端提交空窗口并推进游标；Aily 或 Cindy 失败时保留旧游标。
+
+## 4. 首次真实飞书连接（遗留桌面流程）
+
+> 以下步骤仅保留旧版桌面端的历史记录；现行 TooManyTasks 用户使用上面的独立 Aily OAuth 配置。
 
 真实连接需要系统主人自己在程序内填写，不要把 App Secret、用户令牌或 LLM Key 发给协作者。
 

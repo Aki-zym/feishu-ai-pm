@@ -1,6 +1,6 @@
 # 当前状态
 
-> 当前运行入口（2026-08-25）：Cindy 插件 `plugins/cindy-pm-intake` 通过 `127.0.0.1:4310` 拉起 `apps/server`，浏览器使用 `apps/web` 任务台，SQLite 是任务、候选与运行状态真源。旧桌面壳、安装包和旧 Feishu/LLM 分类链只作为历史证据保留。
+> 当前运行入口（2026-08-27）：独立 `apps/server` 监听 `127.0.0.1:4310`，管理 Aily OAuth、TokenStore、官方 `@larksuiteoapi/node-sdk@1.73.0`、扫描窗口、SQLite 和 `apps/web` 任务台。Cindy `plugins/cindy-pm-intake` 是薄控制插件，只调用本机 API 并派 intake errand。旧桌面壳、安装包、XD Feishu、飞书 MCP 和旧 Feishu/LLM 分类链只作为历史证据保留。
 
 > 2026-08-18 FSH-03 candidate refresh：PR #108 / Issue #38 及其 docs follow-up 已形成 committed integration snapshot `a487598bcae3630f1c5906c8b384bc8811ee0e29`；当前 live integration tip 为 `635290379de2688187988692ecb619c9c109e100`，本候选已普通重绑该 live tip 并继续实现 FSH-03 durable inbox-before-ack。当前 product-source fingerprint 以本轮 docs 生成结果为准；v1-v7 descriptor/checksum 与行为保持连续。
 
@@ -18,7 +18,7 @@
 - Issue #33 / SEC-02 当前仍为 Draft PR #88 候选（验证 ID `VER-ISSUE33-SEC02-L3-20260816`）：只负责外部内容不可信边界、严格模型 schema、服务端 post-adapter guard、checkpoint/result/诊断安全 projection 与 synthetic malicious fixtures；不包含 #45 公共 DTO/UI。当前候选需基于正式 integration tip 普通 merge，exact head/merge-ref/parents/tree/run/job 以 PR #88 最新 body 为准。
 - PR #84 合入前的 exact integration base：`integration/m1-test-20260815` @ `ad75b68687356a4782779b34ec35c60db68e05ea`；旧 `e4c2b1335664429e354015b2131427dc277f0c7b` 与 `f7bdf11bf2578f130f2443c6f67d6d004b82b394` 仅作为历史候选 base，不能用于最终批准。
 - 上一轮候选产品源码快照为 `product-source-sha256-v1` / `6e2e398e6471fbbd7b08ba128a6bf518736139bd5ba6f4e895ae2367c2586dd9`，纳入 `84` 个文件；该历史 source 与当前合并候选投影分层记录。Issue #80 正式包的产品/构建 source 仍为 `f9e77aec70aaa846047f987672c9171e0790846a`。
-- 当前候选产品源码权威指纹为 `product-source-sha256-v1` / `0f78d1090fcea4452a145ea197f217ddd70506a58f6f4777636a022b26f81041`，纳入 `87` 个文件；除 DATA-04 v7 外，新增 FSH-03 durable WebSocket inbox-before-ack、来源去重身份 fencing 和 orphan recovery。本轮 exact evidence 必须以该 fingerprint 与 live integration tip 一致为前提。
+- 当前候选产品源码权威指纹以本轮 `docs:generate` 结果为准；本轮包含独立 TooManyTasks OAuth/TokenStore/Aily SDK、持久窗口和 Cindy 薄插件入库合同。本轮 exact evidence 必须以机器清单中的 fingerprint 与 live integration tip 一致为前提。
 - Issue #41 FSH-03 本候选新增 WebSocket durable-inbox gate：`im.message.receive_v1` 回调等待 `source_event` 事务提交并取得 `DurableEventReceipt` 后才返回；commit 前异常、无效回执或 scope 不匹配均 fail-closed。相同 `external_id` 的重复/并发投递只保留一条来源，但去重身份同时绑定 `owner_scope`、`metadata.sourceScope`、`source_type` 和 `conversation_id`；跨主人、跨入口或跨会话碰撞在任何行/metadata 变化前拒绝，兼容重复不会覆盖已提交的渠道 provenance。分类由 Runtime 幂等键承接；提交后分类窗口崩溃时，启动恢复只扫描明确标记 `sourceScope=bot_supplement`、`ownerScope=primary` 的 orphan source。验证 ID `VER-ISSUE41-FSH03-L4-20260818`；证据为 synthetic/local，真实飞书长连接、租户权限、生产数据、独立 Reviewer、普通合入和 post-merge evidence 尚未取得。
 
 Issue #39 FSH-01（验证 ID `VER-ISSUE39-FSH01-L3-20260816`）的 owner message、calendar、minutes runner 共享 canonical durable-scope parser/gate；calendar 需要 calendar:calendar:readonly，minutes 需要四项 minutes:* 读取/导出权限，缺失或 malformed durable scope 在 provider、游标、来源和候选副作用之前 fail-closed。证据仅限 synthetic/local，不代表真实租户 scope 缩权或 OAuth/provider 行为。
@@ -30,8 +30,11 @@ Issue #39 FSH-01（验证 ID `VER-ISSUE39-FSH01-L3-20260816`）的 owner message
 - Issue #45 / PROD-01 已由 PR #92 合入并 POST_MERGE_STABLE；默认候选、任务、线程、提案、主人信息和操作回执使用严格最小 DTO，不返回来源正文、稳定/外部 ID、provider/raw error 或未经核验自由文本。安全派生摘要仅对长度门槛的整段/近整段复制、NFKC/跨空白复现、结构化 Feishu/Docx token、URL/路径、UUID 和 secret-like token fail-closed；主人核验仍为显式、task-scoped、私有审计且 `external_action: none`，仅核验本地保存快照并返回带时间的 provider unknown/last-known 状态。验证 ID 为 `VER-ISSUE45-PROD01-SOURCE-PRIVACY-L4-20260816`；证据仅 synthetic/local L2-L4，不外推真实租户、provider、Windows L5 或 L6。
 - 产品阶段：`M1：本机任务库与 Cindy 插件入口维护`。
 - Issue #29 的 owner_decision 退休闭环验证 ID 为 `VER-ISSUE29-OWNER-RETIREMENT-L2-20260816`；证据仅限 synthetic SQLite/service L2，不代表真实 provider、飞书租户、生产数据或 Windows L5/L6。
-- 当前使用入口：Cindy 插件 + 本机后台 + 浏览器，默认地址为 `http://127.0.0.1:4310`。
-- 当前浏览器流程由 Cindy 插件启动本机后台，浏览器设置页只管理本机任务库运行选项，不提供旧飞书 OAuth 首配，也不经过 Electron 或 Windows EXE。
+- 当前使用入口：独立 TooManyTasks + 浏览器 + Cindy 薄插件，默认地址为 `http://127.0.0.1:4310`。
+- 当前阶段名称：`独立任务台与 Cindy 薄插件`；当前载体：`TooManyTasks 本机服务 + Cindy 薄插件 + SQLite`；当前 artifact 验证 ID：`VER-AILY-SDK-ISOLATED-20260827`。
+- TooManyTasks 扫描链：Cindy 定时器或手动命令 → 本机 `/api/integrations/cindy/scan` → 服务端窗口 Prompt 与官方 Aily SDK → Aily 派生摘要 → 固定 `sessionKey: "intake"` 的 Cindy errand → `get_pm_tasks` + `submit_intake` → SQLite 事务。Aily 空摘要由服务端推进空窗口；Aily 或 Cindy 失败不推进游标。
+- TooManyTasks 本轮本地合成验证：`VER-AILY-SDK-ISOLATED-20260827`，覆盖服务端 OAuth/TokenStore、SSE、窗口、插件 API 边界、脱敏、SQLite 合同和薄插件打包；真实 Aily/飞书租户、真实 Cindy 宿主和 Windows L5/L6 仍未验证。
+- 当前浏览器设置页管理 Aily 应用配置、用户 OAuth 和本机任务库运行选项；Cindy 插件不启动后台，也不保存任何 Aily 或集成凭证。
 - Windows Electron EXE 属于遗留载体，仅用于安装包证据和维护验证；React 网页界面继续由浏览器入口提供。
 - 产品版本：`0.2.0`。
 - server Vitest 门禁固定使用 single-thread threads pool、`--no-file-parallelism` 与单 worker；默认 5 秒 test timeout 仍保留，不通过提高 timeout 掩盖迁移或 worker 收尾问题。JSON 报告只有在子进程真实 zero exit、无失败测试且至少有一项通过时才算通过。
@@ -44,7 +47,7 @@ Issue #37 DATA-03（验证 ID `VER-DATA03-CANDIDATE-CAS-L2-20260816`）当前候
 
 Issue #34 PRIV-001（验证 ID `VER-ISSUE34-PRIVACY-L2-20260817`）在 DATA-03 schema v4 之后保留 dedicated v5 descriptor/checksum 原样不变，并新增连续 v6；v6 持久化跨进程 lifecycle claim/fencing、owner/capability/intent binding、版本 CAS、heartbeat/expiry/recovery 状态和 backup cleanup intent。活跃 claimed/compensating claim 默认阻止所有冲突的 start/update/retention/backup 状态推进；过期 claim 只能以完整 identity/token/version/timestamp CAS 原子 reclaim，双 reclaim 只有一个成功，畸形/未知时间戳和时钟回拨 fail-closed。隐私删除先完成 owner/capability/intent/token/CAS/expiry/replay/status/expected-version 的无副作用原子校验，再停止采集或撤权；provider 前再次 heartbeat/token/status/version fence，finalize、补偿或 rollback 失败写入 durable recovery 状态，不吞掉错误、不留下静默缺口。硬删除严格按 taskMemoryRoot 路径 grammar、root containment 与 symlink/reparse fail-closed 枚举 task.json/brief.md/sources.md/updates 等正文和派生投影；受管备份目录缺失按 count=0，存在时 unknown SQLite、wal/shm、临时文件、目录或不成对 sidecar 一律拒绝。成功只保留非内容 proof/hash/count/time，真实 Feishu OAuth/provider、平台备份残留、Windows 文件锁和 L5/L6 仍未验证；PR #98 的 exact head/merge-ref/tree/parents/run/job 以推送后的 Draft PR body 与 terminal CI 为准。
 
-commit 只提供精确产品快照的导航线索，可能因后续 squash/merge 改变；机器每次都以确定性的产品源码指纹比对被审工作树，并与 [文档清单](docs-manifest.json) 和 [验证事实源](verification-matrix.json) 交叉检查。产品源码或运行配置变化时，三处必须一起更新，否则 CI 失败。当前候选产品投影 fingerprint 为 `596b57af001a973add63baca739f19051d3aa923d07e4b854d2ef99e37c71aa4`；当前纳入 `87` 个文件；本轮暂不绑定等价参照 commit。当前 exact base/head/merge-ref/parents/tree/run/job 只以本轮 Draft PR provenance 为准，不把历史 PR 的 CI 当作当前候选授权。
+commit 只提供精确产品快照的导航线索，可能因后续 squash/merge 改变；机器每次都以确定性的产品源码指纹比对被审工作树，并与 [文档清单](docs-manifest.json) 和 [验证事实源](verification-matrix.json) 交叉检查。产品源码或运行配置变化时，三处必须一起更新，否则 CI 失败。当前候选产品投影算法为 `product-source-sha256-v1`，选择器为 `apps-workspace-default-include-v1`，fingerprint 为 `c4592dc568ae2de6d93b9852cd3308dd8d3f10ca00eef00f483dd6d7ee30d837`，纳入 `53` 个文件，快照日期为 `2026-08-15`；本轮暂不绑定等价参照 commit。当前 exact base/head/merge-ref/parents/tree/run/job 只以本轮 Draft PR provenance 为准，不把历史 PR 的 CI 当作当前候选授权。
 Issue #42 RUN-01 已合入 integration；Runtime 支持可复用 provider checkpoint、SQLite 工具审计原子落库、AbortSignal、有界续租和 exact lease fence，失效或迟到回调不能写入完成状态、checkpoint 或业务结果。RUN-01 的 `external.send` claim/幂等恢复仅作为历史审计兼容和未来独立发送 Issue 的保留结构，M1 当前 policy 永久固定为 `forbidden`：即使 `approved=true` 或存在幂等键，也不创建外部 claim、不调用 provider、不执行 callback。当前 v1/v2 schema identity 与 DATA-02 v2 合同保持不变，RUN-01 使用连续 v3 migration；正式验证 ID、commit、环境与限制以已合入 PR #87 的历史 provenance 为准，不代表真实 provider、飞书租户或 Windows L5。
 
 Issue #85 PROD-07 的规则合同与合成夹具验证 ID 为 `VER-ISSUE85-PROD07-L0-20260816`；本候选在该合同之上保留 exact typed meeting evidence hard gate、全字段 strict raw grammar、source/revision/lease/CAS/transaction safeguards 和 CalendarPage 320px 行为，新增运行证据只以本次 local exact evidence 为准，不证明真实飞书租户、provider、OAuth、生产数据或 Windows L5/L6。
@@ -67,20 +70,25 @@ M1 与首轮试点固定为 draft-only；当前没有发送执行路径，只生
 ## 当前主链
 
 ```text
-主人 OAuth 可见且由主人启用的信息源 / 机器人补充入口 / 人工补录
-  → 原始来源先耐久保存
-  → LLM 分阶段判断消息动作与具体需求
+插件定时器或手动扫描
+  → Cindy Worker 调用独立 TooManyTasks 本机 API
+  → apps/server 使用官方 Aily SDK
+  → Aily 按时间窗口检索飞书并生成派生摘要
+  → 固定 `sessionKey: "intake"` 的 Cindy errand
+  → Cindy 读取本地 `get_pm_tasks` 快照并调用 `submit_intake`
   → 候选、需求线程或待确认记录
   → 系统主人接受为私人任务
   → 高置信内部维护，歧义和弱证据等待主人确认
   → SQLite 真账本与可重建任务记忆投影
 ```
 
+人工补录与任务台操作仍直接进入本机服务；它们不改变扫描阶段的 Aily 独立授权边界。
+
 详细行为和安全门见 [实施说明](implementation_brief.md)、[架构边界](architecture.md)、[安全与隐私](security_and_privacy.md) 与 [飞书接入说明](feishu-integration.md)。
 
 ## 事实源摘要
 
-- 飞书原文是外部来源事实；本地只在已授权范围内保存受控来源记录。
+- 当前扫描保存的是 Aily 返回的派生摘要，带窗口、Agent 和生成时间标记，不能冒充逐条飞书原文；历史直接来源记录仍按原有合同保留。
 - 当前 M1 实现使用本地 SQLite 保存来源、任务和审计；`describe`、文档上下文和任务记忆文件均是派生或可重建内容。
 - 真实工作目录只通过 `reference path` 只读关联；系统不修改真实工作文件，也不依据文件活动自动完成任务。
 - M1、主人单机试用和首个受控单用户试点继续使用 SQLite；只有多人、多设备或远程服务需求出现时才触发 PostgreSQL 评审。迁移与恢复合同见 [ADR 0008](adr/0008-versioned-sqlite-migrations.md)，开放项见 [待决定事项](open_decisions.md) 与 [Issue #66](https://github.com/Aki-zym/feishu-ai-pm/issues/66)。
@@ -89,7 +97,7 @@ M1 与首轮试点固定为 draft-only；当前没有发送执行路径，只生
 
 ## Windows 遗留安装包
 
-本节只记录 Windows Electron/EXE 遗留载体的安装包和验证事实；当前使用从上面的 Cindy 插件与浏览器入口开始。
+本节只记录 Windows Electron/EXE 遗留载体的安装包和验证事实；当前使用从上面的独立 TooManyTasks、浏览器和 Cindy 薄插件入口开始。
 
 - 文件：`release/Feishu-AI-PM-0.2.0-x64-Setup.exe`。
 - 产品/构建 source commit：`f9e77aec70aaa846047f987672c9171e0790846a`；artifact/record carrier ancestor：`3dcd9d0779542a7f3b6beebe73048273a0eff68a`。
@@ -139,7 +147,7 @@ M1 与首轮试点固定为 draft-only；当前没有发送执行路径，只生
 
 ## 开放问题
 
-- 目标租户权限、P2P/群历史范围、日历、妙记、Docx/Wiki、限流、撤权和密集对话仍需 L6 验收。
+- Aily Agent 的已发布技能、用户 Token 权限、消息/日历/文档/知识库覆盖、限流和撤权行为仍需在独立 TooManyTasks + Cindy 薄插件真实端到端验收；本地合成测试不能替代该验收。
 - 已安装 EXE 对真实供应商错误的诊断读取与导出脱敏仍需 L6 验收；合成夹具不能替代。
 - 数据保留、隐私硬删除、用户导出、完整灾备产品和多设备仍未闭环；当前受管迁移备份只解决本机 schema 升级恢复。
 - M1 继续 SQLite 已确定；PostgreSQL 只在多人、多设备或远程服务触发后另行评审。对外动作的 draft-only 范围已经固定，开发者不得自行放宽。

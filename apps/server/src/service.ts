@@ -682,11 +682,15 @@ export type CindyIntakeInput = {
   window_id: string;
   window_start: string;
   window_end: string;
+  result_kind?: 'intake' | 'empty_window';
   sources: Array<{
     source_key: string;
+    source_kind?: 'aily_summary';
     occurred_at: string;
     conversation_key?: string;
     sender_role?: string;
+    agent_id?: string;
+    generated_at?: string;
     text: string;
   }>;
   proposals: Array<{
@@ -703,6 +707,7 @@ export type CindyIntakeInput = {
 
 export type CindyIntakeResult = {
   window_id: string;
+  result_kind: 'intake' | 'empty_window';
   duplicate: boolean;
   source_event_ids: string[];
   proposals: Array<{
@@ -713,6 +718,17 @@ export type CindyIntakeResult = {
     version?: number;
     reason?: string;
   }>;
+};
+
+type StoredCindyIntakeResult = CindyIntakeResult & {
+  _input_hash: string;
+};
+
+type CindyIntakeWindow = {
+  window_id: string;
+  window_start: string;
+  window_end: string;
+  reused: boolean;
 };
 
 type AutomationMode = 'auto' | 'suggest';
@@ -2533,6 +2549,57 @@ export class PmService {
     return { window_end: windowEnd };
   }
 
+  claimIntakeWindow(): CindyIntakeWindow {
+    return this.database.transaction(() => {
+      const cursorEnd = this.intakeWindowCursor().window_end;
+      const cursorMs = cursorEnd ? Date.parse(cursorEnd) : Number.NaN;
+      const pendingRow = this.database.raw.prepare(
+        "SELECT value_json FROM app_setting WHERE key = 'intake_pending_window'",
+      ).get() as { value_json: string } | undefined;
+      const pending = parseMetadata(pendingRow?.value_json);
+      const pendingStart = typeof pending.window_start === 'string' && Number.isFinite(Date.parse(pending.window_start))
+        ? new Date(pending.window_start).toISOString()
+        : null;
+      const pendingEnd = typeof pending.window_end === 'string' && Number.isFinite(Date.parse(pending.window_end))
+        ? new Date(pending.window_end).toISOString()
+        : null;
+      const pendingId = typeof pending.window_id === 'string' && pending.window_id.trim()
+        ? pending.window_id.trim()
+        : null;
+      if (pendingId && pendingStart && pendingEnd
+        && (!Number.isFinite(cursorMs) || Date.parse(pendingEnd) > cursorMs)) {
+        return {
+          window_id: pendingId,
+          window_start: pendingStart,
+          window_end: pendingEnd,
+          reused: true,
+        };
+      }
+
+      const endMs = Date.now();
+      const maxLookbackStartMs = endMs - 4 * 60 * 60 * 1000;
+      const startMs = Number.isFinite(cursorMs)
+        ? Math.max(Math.min(cursorMs, endMs), maxLookbackStartMs)
+        : endMs - 10 * 60 * 1000;
+      const window = {
+        window_id: `intake-${startMs}-${endMs}`,
+        window_start: new Date(startMs).toISOString(),
+        window_end: new Date(endMs).toISOString(),
+        reused: false,
+      } satisfies CindyIntakeWindow;
+      const timestamp = nowIso();
+      this.database.raw.prepare(
+        `INSERT INTO app_setting (key, value_json, updated_at) VALUES ('intake_pending_window', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+      ).run(JSON.stringify({
+        window_id: window.window_id,
+        window_start: window.window_start,
+        window_end: window.window_end,
+      }), timestamp);
+      return window;
+    });
+  }
+
   updateIntakeWindowCursor(windowEnd: string) {
     const next = new Date(windowEnd);
     if (!Number.isFinite(next.getTime())) throw new CindyIntakeValidationError('window_end 不是有效时间。');
@@ -2551,6 +2618,7 @@ export class PmService {
       `INSERT INTO app_setting (key, value_json, updated_at) VALUES ('intake_window_end', ?, ?)
        ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
     ).run(JSON.stringify({ window_end: windowEnd }), updatedAt);
+    this.database.raw.prepare("DELETE FROM app_setting WHERE key = 'intake_pending_window'").run();
   }
 
   private advanceIntakeWindowCursorUnsafe(windowEnd: string, updatedAt: string) {
@@ -2564,6 +2632,22 @@ export class PmService {
     const currentTime = typeof currentValue === 'string' ? Date.parse(currentValue) : Number.NaN;
     if (Number.isFinite(currentTime) && currentTime >= next.getTime()) return;
     this.writeIntakeWindowCursorUnsafe(nextIso, updatedAt);
+  }
+
+  intakeResultStatus(windowId: string) {
+    const normalizedWindowId = windowId.trim();
+    if (!normalizedWindowId) throw new CindyIntakeValidationError('window_id 不能为空。');
+    const row = this.database.raw.prepare(
+      `SELECT cursor FROM sync_cursor
+       WHERE integration = 'cindy_intake' AND scope_key = ?`,
+    ).get(normalizedWindowId) as { cursor: string | null } | undefined;
+    const stored = parseJsonValue<StoredCindyIntakeResult | null>(row?.cursor ?? null, null);
+    return {
+      window_id: normalizedWindowId,
+      completed: Boolean(stored && stored.window_id === normalizedWindowId && stored._input_hash),
+      result_kind: stored?.result_kind ?? null,
+      proposal_count: Array.isArray(stored?.proposals) ? stored.proposals.length : 0,
+    };
   }
 
   updateAutomationPolicy(mode: AutomationMode) {
@@ -3252,6 +3336,57 @@ export class PmService {
       'SELECT DISTINCT demand_unit_id FROM source_demand_unit_source WHERE source_event_id = ? ORDER BY demand_unit_id',
     ).all(sourceEventId) as Array<{ demand_unit_id: string }>;
     return rows.length === 1 ? rows[0]!.demand_unit_id : null;
+  }
+
+  private taskDemandUnitIds(taskId: string) {
+    const rows = this.database.raw.prepare(
+      `SELECT DISTINCT demand_unit_id
+         FROM task_source_link
+        WHERE task_id = ? AND demand_unit_id IS NOT NULL
+       UNION
+       SELECT DISTINCT candidate_request.demand_unit_id
+         FROM candidate_request
+        WHERE candidate_request.accepted_task_id = ?
+          AND candidate_request.demand_unit_id IS NOT NULL
+       UNION
+       SELECT DISTINCT requirement_thread_unit.demand_unit_id
+         FROM task
+         JOIN requirement_thread_unit
+           ON requirement_thread_unit.thread_id = task.thread_id
+        WHERE task.id = ?
+          AND requirement_thread_unit.demand_unit_id IS NOT NULL
+        ORDER BY demand_unit_id`,
+    ).all(taskId, taskId, taskId) as Array<{ demand_unit_id: string }>;
+    return rows.map((row) => row.demand_unit_id);
+  }
+
+  private ensureCindyTaskDemandUnit(task: TaskRecord, sourceEventId: string, timestamp: string) {
+    const demandUnitIds = this.taskDemandUnitIds(task.id);
+    if (demandUnitIds.length > 1) {
+      throw new CindyIntakeConflictError('任务关联多个需求单元，Cindy update_task 无法安全判断来源归属。', task.version);
+    }
+    if (demandUnitIds.length === 1) {
+      this.ensureDemandUnitSourceEdge(demandUnitIds[0]!, sourceEventId, timestamp);
+      return demandUnitIds[0]!;
+    }
+
+    const demandUnitId = id('unit');
+    this.database.raw.prepare(
+      `INSERT INTO source_demand_unit
+        (id, anchor_source_event_id, unit_key, unit_kind, state, classification_revision, ai_decision_id,
+         analysis_json, reason, created_at, updated_at)
+       VALUES (?, ?, ?, 'demand', 'ready', 'cindy-intake', NULL, ?, ?, ?, ?)`,
+    ).run(
+      demandUnitId,
+      sourceEventId,
+      `cindy-task:${task.id}`,
+      JSON.stringify({ origin: 'cindy_update', taskId: task.id }),
+      'Cindy 后续来源为历史任务建立兼容需求单元。',
+      timestamp,
+      timestamp,
+    );
+    this.ensureDemandUnitSourceEdge(demandUnitId, sourceEventId, timestamp);
+    return demandUnitId;
   }
 
   private ensureDemandUnitSourceEdge(demandUnitId: string, sourceEventId: string, timestamp: string) {
@@ -4006,6 +4141,7 @@ export class PmService {
       source_event.owner_mentioned,
       source_event.completeness AS source_completeness,
       source_event.discovery_reason,
+      source_event.metadata_json AS source_metadata_json,
       source_event.source_url,
       source_event.content AS source_content,
       ai_decision_log.reason AS ai_reason,
@@ -4223,6 +4359,9 @@ export class PmService {
       created_at: row.created_at,
       updated_at: row.updated_at,
       source_type: row.source_type,
+      ...(parseMetadata(String(row.source_metadata_json ?? '')).sourceKind === 'aily_summary'
+        ? { source_kind: 'aily_summary' }
+        : {}),
       owner_mentioned: row.owner_mentioned,
       source_completeness: row.source_completeness,
       discovery_reason: '来源已保存，可由系统主人主动核验。',
@@ -5343,7 +5482,7 @@ export class PmService {
 
   listCindyTasks() {
     const rows = this.database.raw.prepare(
-      `SELECT id, title, describe, status, next_step, waiting_reason, version, updated_at
+      `SELECT id, title, describe, status, next_step, waiting_reason, version, auto_update_paused, updated_at
          FROM task
         WHERE record_state = 'active'
           AND deleted_at IS NULL
@@ -5357,6 +5496,7 @@ export class PmService {
       next_step: string;
       waiting_reason: string | null;
       version: number;
+      auto_update_paused: number | boolean;
       updated_at: string;
     }>;
     return rows.map((row) => ({
@@ -5367,6 +5507,7 @@ export class PmService {
       next_step: row.next_step,
       waiting_reason: row.waiting_reason,
       version: row.version,
+      auto_update_paused: Boolean(row.auto_update_paused),
       updated_at: row.updated_at,
     }));
   }
@@ -5578,6 +5719,7 @@ export class PmService {
   }
 
   processCindyIntake(input: CindyIntakeInput): CindyIntakeResult {
+    const resultKind = input.result_kind ?? 'intake';
     const sourceKeys = input.sources.map((source) => source.source_key);
     if (new Set(sourceKeys).size !== sourceKeys.length) {
       throw new CindyIntakeValidationError('sources.source_key 不能重复。');
@@ -5589,9 +5731,39 @@ export class PmService {
     if (Date.parse(input.window_start) > Date.parse(input.window_end)) {
       throw new CindyIntakeValidationError('window_start 不能晚于 window_end。');
     }
+    if (!['intake', 'empty_window'].includes(resultKind)) {
+      throw new CindyIntakeValidationError('result_kind 不受支持。');
+    }
+    if (resultKind === 'empty_window' && (input.sources.length !== 0 || input.proposals.length !== 0)) {
+      throw new CindyIntakeValidationError('empty_window 必须同时提交空 sources 和空 proposals。');
+    }
+    if (resultKind === 'intake' && input.sources.length === 0) {
+      throw new CindyIntakeValidationError('普通 intake 窗口必须至少提交一条来源；空窗口请使用 result_kind=empty_window。');
+    }
+    const normalizedInput = { ...input, result_kind: resultKind };
+    const inputHash = createHash('sha256').update(stableJson(normalizedInput)).digest('hex');
+    const ailySources = input.sources.filter((source) => source.source_kind === 'aily_summary');
+    if (ailySources.length > 1) {
+      throw new CindyIntakeValidationError('每个入库窗口最多只能提交一条 aily_summary 来源。');
+    }
     for (const source of input.sources) {
       if (!source.source_key.trim() || !source.text.trim() || !Number.isFinite(Date.parse(source.occurred_at))) {
         throw new CindyIntakeValidationError('source_key、text 和 occurred_at 必须有效。');
+      }
+      if (source.source_kind && source.source_kind !== 'aily_summary') {
+        throw new CindyIntakeValidationError('source_kind 不受支持。');
+      }
+      if (source.source_kind === 'aily_summary') {
+        if (source.source_key !== `aily-summary:${input.window_id}`) {
+          throw new CindyIntakeValidationError('aily_summary 的 source_key 必须由窗口 ID 稳定生成。');
+        }
+        if (!source.conversation_key?.trim() || !source.conversation_key.startsWith('aily:')) {
+          throw new CindyIntakeValidationError('aily_summary 必须包含受控的 Aily conversation_key。');
+        }
+        if (!source.agent_id?.trim() || !/^[A-Za-z0-9._:-]{1,160}$/u.test(source.agent_id.trim())
+          || !source.generated_at || !Number.isFinite(Date.parse(source.generated_at))) {
+          throw new CindyIntakeValidationError('aily_summary 必须包含受控 agent_id 和有效 generated_at。');
+        }
       }
     }
     for (const proposal of input.proposals) {
@@ -5623,9 +5795,13 @@ export class PmService {
           `SELECT cursor FROM sync_cursor WHERE integration = 'cindy_intake' AND scope_key = ?`,
         ).get(input.window_id) as { cursor: string | null } | undefined;
         if (!existing?.cursor) throw new CindyIntakeConflictError('Cindy 窗口已存在但结果尚未完成。');
-        const stored = parseJsonValue<CindyIntakeResult | null>(existing.cursor, null);
+        const stored = parseJsonValue<StoredCindyIntakeResult | null>(existing.cursor, null);
         if (!stored || stored.window_id !== input.window_id) throw new CindyIntakeConflictError('Cindy 窗口幂等记录无效。');
-        return { ...stored, duplicate: true };
+        if (!stored._input_hash || stored._input_hash !== inputHash) {
+          throw new CindyIntakeConflictError('同一入库窗口的提交内容发生变化，已拒绝静默复用旧结果。');
+        }
+        const { _input_hash: _ignoredInputHash, ...publicResult } = stored;
+        return { ...publicResult, duplicate: true };
       }
 
       const sourceRows = new Map<string, SourceEventRow>();
@@ -5641,8 +5817,10 @@ export class PmService {
           content: source.text,
           occurredAt: source.occurred_at,
           ownerMentioned: false,
-          completeness: 'complete',
-          discoveryReason: 'Cindy 对话窗口入库。',
+          completeness: source.source_kind === 'aily_summary' ? 'limited' : 'complete',
+          discoveryReason: source.source_kind === 'aily_summary'
+            ? 'Aily 按时间窗口生成的派生摘要，不能冒充逐条飞书原文。'
+            : 'Cindy 对话窗口入库。',
           metadata: {
             ownerScope: DATA04_OWNER_SCOPE,
             sourceScope: 'cindy',
@@ -5651,10 +5829,18 @@ export class PmService {
             cindyConversationKey: source.conversation_key?.trim() ?? null,
             windowStart: input.window_start,
             windowEnd: input.window_end,
+            sourceKind: source.source_kind ?? 'manual',
+            derivedEvidence: source.source_kind === 'aily_summary',
+            ...(source.source_kind === 'aily_summary' ? {
+              ailyAgentId: source.agent_id?.trim(),
+              ailyGeneratedAt: source.generated_at,
+              ailySummaryWindowStart: input.window_start,
+              ailySummaryWindowEnd: input.window_end,
+            } : {}),
           },
         });
         sourceRows.set(source.source_key, persisted.row);
-        if (source.conversation_key?.trim()) {
+        if (source.source_kind !== 'aily_summary' && source.conversation_key?.trim()) {
           const previous = conversationCursors.get(source.conversation_key.trim());
           if (!previous || Date.parse(source.occurred_at) > Date.parse(previous)) {
             conversationCursors.set(source.conversation_key.trim(), source.occurred_at);
@@ -5700,6 +5886,8 @@ export class PmService {
             continue;
           }
           const draft = createManualCandidate(anchor.content, anchor.sender_name, anchor.occurred_at);
+          const anchorMetadata = parseMetadata(anchor.metadata_json);
+          const candidateConfidence = anchorMetadata.sourceKind === 'aily_summary' ? 0.75 : 1;
           const candidateId = id('cand');
           const demandUnitId = id('unit');
           const title = proposal.title ?? draft.title;
@@ -5730,7 +5918,7 @@ export class PmService {
             `INSERT INTO candidate_request
               (id, source_event_id, demand_unit_id, title, proposer_name, background, validation_question, describe,
                analysis_json, confidence, state, snoozed_until, accepted_task_id, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', NULL, NULL, ?, ?)`,
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)`,
           ).run(
             candidateId,
             anchor.id,
@@ -5741,6 +5929,7 @@ export class PmService {
             draft.validationQuestion,
             describe,
             analysisJson,
+            candidateConfidence,
             timestamp,
             timestamp,
           );
@@ -5755,8 +5944,16 @@ export class PmService {
           if (task.record_state !== 'active' || task.deleted_at || task.status === 'archived') {
             throw new CindyIntakeConflictError('update_task 对应的任务当前不可更新。', task.version);
           }
+          if (task.auto_update_paused) {
+            throw new CindyIntakeConflictError('任务已暂停 AI 自动维护，Cindy update_task 已拒绝。', task.version);
+          }
           if (task.version !== proposal.expected_version) {
             throw new CindyIntakeConflictError('任务已被其他操作更新，请刷新后重试。', task.version);
+          }
+          const demandUnitId = this.ensureCindyTaskDemandUnit(task, anchor.id, timestamp);
+          for (const source of proposalSources) {
+            if (source.id !== anchor.id) this.ensureDemandUnitSourceEdge(demandUnitId, source.id, timestamp);
+            this.linkTaskSource(task.id, source.id, 'cindy_update', timestamp, demandUnitId);
           }
           const patch: TaskPatch = {
             title: proposal.title,
@@ -5787,12 +5984,13 @@ export class PmService {
             `INSERT INTO task_event
               (id, task_id, event_type, actor_type, visibility, summary, source_event_id, demand_unit_id,
                before_json, after_json, occurred_at, recorded_at, version)
-             VALUES (?, ?, 'task_cindy_intake_update', 'cindy', 'private', ?, ?, NULL, ?, ?, ?, ?, ?)`,
+             VALUES (?, ?, 'task_cindy_intake_update', 'cindy', 'private', ?, ?, ?, ?, ?, ?, ?, ?)`,
           ).run(
             id('evt'),
             task.id,
             proposal.reason?.trim() || 'Cindy 提案更新了任务字段。',
             anchor.id,
+            demandUnitId,
             JSON.stringify(taskAuditSnapshot(task)),
             JSON.stringify(afterSnapshot),
             anchor.occurred_at,
@@ -5829,15 +6027,17 @@ export class PmService {
 
       const storedResult: CindyIntakeResult = {
         window_id: input.window_id,
+        result_kind: resultKind,
         duplicate: false,
         source_event_ids: [...sourceRows.values()].map((source) => source.id),
         proposals: proposalResults,
       };
+      const storedPayload: StoredCindyIntakeResult = { ...storedResult, _input_hash: inputHash };
       this.database.raw.prepare(
         `UPDATE sync_cursor
             SET cursor = ?, last_success_at = ?, updated_at = ?
           WHERE integration = 'cindy_intake' AND scope_key = ?`,
-      ).run(JSON.stringify(storedResult), timestamp, timestamp, input.window_id);
+      ).run(JSON.stringify(storedPayload), timestamp, timestamp, input.window_id);
       this.advanceIntakeWindowCursorUnsafe(input.window_end, timestamp);
       for (const [conversationKey, occurredAt] of conversationCursors) {
         this.database.advanceCindyConversationCursor(conversationKey, occurredAt, timestamp);
@@ -6211,6 +6411,7 @@ export class PmService {
     const sourceDtos: MinimalSourceDto[] = (sourceRows as Array<Record<string, unknown>>).map((row) => minimalSourceDtoSchema.parse({
       source_scope: sourceScope(taskId, String(row.id)),
       source_type: row.source_type,
+      ...(parseMetadata(String(row.metadata_json ?? '')).sourceKind === 'aily_summary' ? { source_kind: 'aily_summary' } : {}),
       completeness: row.completeness,
       occurred_at: row.occurred_at,
       summary_available: Boolean(row.demand_unit_title || row.demand_unit_describe),

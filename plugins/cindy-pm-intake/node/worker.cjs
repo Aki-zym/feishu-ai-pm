@@ -3,67 +3,6 @@ const os = require('node:os');
 const path = require('node:path');
 const readline = require('node:readline');
 
-const { join } = path;
-let pmServerHandle = null;
-
-function pmRuntime() {
-  try {
-    const runtime = require('./pm-runtime.cjs');
-    if (!runtime || typeof runtime.startPmServer !== 'function') {
-      throw new Error('模块未导出 startPmServer(options)');
-    }
-    return runtime;
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`本机任务库运行时不可用：请提供 node/pm-runtime.cjs 并导出 startPmServer(options)；${detail}`);
-  }
-}
-
-async function ensurePm(request) {
-  const token = request.cindy && request.cindy.secrets && request.cindy.secrets.pm_token;
-  if (!token) throw new Error('本机任务库令牌尚未配置');
-
-  const sqlitePath = join(os.homedir(), 'Library/Application Support/ai-pm-intake', 'ai-pm.sqlite');
-  fs.mkdirSync(path.dirname(sqlitePath), { recursive: true });
-  const webRoot = join(__dirname, '..', 'web-dist');
-  const server = await pmRuntime().startPmServer({
-    port: 4310,
-    host: '127.0.0.1',
-    sqlitePath,
-    token,
-    webRoot,
-  });
-  if (!server || typeof server.stop !== 'function') {
-    throw new Error('本机任务库启动结果缺少 stop()');
-  }
-  if (server.foreign) {
-    throw new Error('本机任务库 127.0.0.1:4310 已被其他进程占用，Cindy 令牌未验证通过；插件未接管该服务，请停止占用进程后重试。');
-  }
-  pmServerHandle = server;
-  return server;
-}
-
-async function stopPm() {
-  if (!pmServerHandle) return { stopped: false, reason: '本机任务库尚未由当前 worker 拉起' };
-  const server = pmServerHandle;
-  const result = await server.stop();
-  pmServerHandle = null;
-  return result === undefined ? { stopped: true } : result;
-}
-
-async function restartPm(request) {
-  if (!pmServerHandle) return ensurePm(request);
-  if (typeof pmServerHandle.restart !== 'function') {
-    throw new Error('本机任务库运行时结果缺少 restart()');
-  }
-  const restarted = await pmServerHandle.restart();
-  if (!restarted || typeof restarted.stop !== 'function' || typeof restarted.restart !== 'function') {
-    throw new Error('本机任务库重启结果缺少 stop()/restart()');
-  }
-  pmServerHandle = restarted;
-  return restarted;
-}
-
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
@@ -88,6 +27,33 @@ function isAllowedPath(value) {
   return typeof value === 'string'
     && !value.includes('..')
     && (/^\/api\/runtime\/[A-Za-z0-9._/-]+$/.test(value) || /^\/api\/integrations\/cindy\/[A-Za-z0-9._/-]+$/.test(value));
+}
+
+function tooManyTasksConfigRoot() {
+  if (process.env.TOOMANYTASKS_CONFIG_ROOT && process.env.TOOMANYTASKS_CONFIG_ROOT.trim()) {
+    return path.resolve(process.env.TOOMANYTASKS_CONFIG_ROOT.trim());
+  }
+  if (process.env.CONFIG_ROOT && process.env.CONFIG_ROOT.trim()) {
+    return path.resolve(process.env.CONFIG_ROOT.trim());
+  }
+  if (process.platform === 'darwin') {
+    return path.join(os.homedir(), 'Library', 'Application Support', 'ai-pm-intake');
+  }
+  if (process.platform === 'win32') {
+    return path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'ai-pm-intake');
+  }
+  return path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'ai-pm-intake');
+}
+
+function integrationToken() {
+  const tokenPath = path.join(tooManyTasksConfigRoot(), 'cindy-integration-token');
+  try {
+    const token = fs.readFileSync(tokenPath, 'utf8').trim();
+    if (token) return token;
+  } catch {
+    // 独立 TooManyTasks 首次启动时会创建这枚令牌。
+  }
+  throw new Error('TooManyTasks 尚未完成首次启动，请先启动独立 TooManyTasks。');
 }
 
 function cindyUserDataDirs() {
@@ -233,23 +199,27 @@ async function requestPm(request) {
   const baseUrl = String(params.baseUrl || 'http://127.0.0.1:4310').replace(/\/+$/, '');
   const requestPath = String(params.path || '');
   const method = String(params.method || 'GET').toUpperCase();
-  const token = request.cindy && request.cindy.secrets && request.cindy.secrets.pm_token;
-  if (!token) throw new Error('本机任务库令牌尚未配置');
   if (!isLoopbackUrl(baseUrl)) throw new Error('本机任务库地址必须是本机 HTTP 回环地址');
   if (!isAllowedPath(requestPath)) throw new Error('只允许调用 Cindy 专用本机任务库接口');
   if (!['GET', 'POST', 'PUT'].includes(method)) throw new Error('只允许 GET、POST 或 PUT');
+  const token = integrationToken();
 
-  const response = await fetch(baseUrl + requestPath, {
-    method,
-    redirect: 'error',
-    headers: {
-      authorization: `Bearer ${token}`,
-      accept: 'application/json',
-      ...(method === 'POST' || method === 'PUT' ? { 'content-type': 'application/json' } : {}),
-    },
-    ...(method === 'POST' || method === 'PUT' ? { body: JSON.stringify(params.body ?? {}) } : {}),
-    signal: AbortSignal.timeout(25000),
-  });
+  let response;
+  try {
+    response = await fetch(baseUrl + requestPath, {
+      method,
+      redirect: 'error',
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: 'application/json',
+        ...(method === 'POST' || method === 'PUT' ? { 'content-type': 'application/json' } : {}),
+      },
+      ...(method === 'POST' || method === 'PUT' ? { body: JSON.stringify(params.body ?? {}) } : {}),
+      signal: AbortSignal.timeout(requestPath === '/api/integrations/cindy/scan' ? 330000 : 25000),
+    });
+  } catch {
+    throw new Error('TooManyTasks 未运行，请先启动独立 TooManyTasks。');
+  }
   const responseText = await response.text();
   let body = null;
   try {
@@ -270,21 +240,6 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       send({ jsonrpc: '2.0', id: request.id, result });
       return;
     }
-    if (request.method === 'pm/ensure') {
-      const result = await ensurePm(request);
-      send({ jsonrpc: '2.0', id: request.id, result });
-      return;
-    }
-    if (request.method === 'pm/stop') {
-      const result = await stopPm();
-      send({ jsonrpc: '2.0', id: request.id, result });
-      return;
-    }
-    if (request.method === 'pm/restart') {
-      const result = await restartPm(request);
-      send({ jsonrpc: '2.0', id: request.id, result });
-      return;
-    }
     if (request.method !== 'pm/request') {
       send({ jsonrpc: '2.0', id: request.id, error: { code: -32601, message: 'Method not found' } });
       return;
@@ -295,7 +250,11 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
     send({
       jsonrpc: '2.0',
       id: request && request.id,
-      error: { code: -32000, message: error instanceof Error ? error.message : String(error) },
+      error: {
+        code: -32000,
+        message: error instanceof Error ? error.message : String(error),
+        ...(error && typeof error.code === 'string' ? { data: { error_code: error.code } } : {}),
+      },
     });
   }
 });

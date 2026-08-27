@@ -6,7 +6,7 @@ PRIV-001 v6 的 active claim 会阻止冲突主人状态推进；lease 过期只
 
 ## 当前使用入口
 
-当前用户流程：Cindy 插件连接 XD Feishu → 启动本机后台 → 浏览器访问 `http://127.0.0.1:4310`。浏览器设置页只管理本机任务库运行选项；当前使用不包含 Electron、Windows EXE 或旧飞书 OAuth 设置页。本文后续涉及桌面、安装包和 OAuth 的内容属于遗留安全合同与历史验证，供审计和维护参考。
+当前用户流程：独立 TooManyTasks 启动 `127.0.0.1:4310` → 浏览器设置页保存 Aily 应用配置并完成用户 OAuth → 服务端通过官方 Aily SDK 按窗口检索并总结飞书 → Cindy 薄插件只触发扫描，并结合摘要和本地任务快照提交判断。OAuth 回调只允许本机 HTTP 回环地址和固定 `/oauth/aily/callback` 路径。当前流程不使用 Cindy 宿主 OAuth、XD Feishu、现有飞书 MCP 或 ChatD；旧桌面、安装包和旧飞书分类链属于遗留安全合同与历史验证。
 
 ## 测试证据边界
 
@@ -17,6 +17,13 @@ CI 只消费完整 changed-path diff，并按 [测试选层与证据门禁](test
 - Issue #66 的隐私、发布和真实试点边界以 [DEC-01 决策登记](decision-register.md) 为准：停止采集/撤权→可选导出→二次确认硬删除；仅保留不含内容的删除证明和必要审计。没有四态、脱敏 identity 完整诊断和真实环境安全验收，不得扩大真实账号试点；Mock/L2/L4 不得冒充 L5/L6。
 
 - 真实 App Secret、用户令牌和模型密钥只放在安全配置系统或本地 `.env`，不能进入 Git。
+- TooManyTasks 使用本机 `master.key` 或显式 `TOKEN_ENCRYPTION_KEY` 对 Aily App Secret、access token、refresh token、scope 和过期时间进行 AES-256-GCM 加密；配置目录权限为 `0700`，密钥、密文和 Cindy 集成令牌文件权限为 `0600`。这些值不进入 Cindy 插件、Cindy Prompt、SQLite、普通日志或完整错误文本。
+- Aily App ID 和 Agent ID 由当前安装显式配置；源码与示例配置不带开发测试应用或 Agent 的默认标识，避免新安装误连到开发时的授权主体。
+- Cindy 集成令牌由独立 TooManyTasks 首次启动自动生成。插件 Worker 从同一平台私有配置目录读取，只向本机回环地址发送 Bearer；用户无需复制或手填。
+- 自定义私有配置目录统一使用 `TOOMANYTASKS_CONFIG_ROOT`，确保服务端生成令牌的位置与 Cindy Worker 读取位置一致；旧 `CONFIG_ROOT` 仅作为兼容回退。
+- Aily 返回文本只保存为 `source_kind=aily_summary` 的派生来源，带窗口起止时间、Agent 标识和生成时间；它不能冒充逐条飞书原文。Aily 失败、超时、权限失败或 Cindy 入库失败均不推进窗口游标。
+- Token 刷新遇到临时网络或上游失败时保留 access/refresh token，等待后续重试；只有明确的鉴权失效或撤权结果才清除本机 Aily 用户授权。
+- Cindy errand 的最终文本属于人读输出。窗口完成状态只以服务端 SQLite 入库回执为准，模型自报 JSON 不能替代或否决该回执。
 - M1 与首轮试点固定 draft-only；任何对外动作仍需系统主人明确触发。`main` 与 `integration` 只通过 Pull Request 合入，安全改动必须独立复核并由项目负责人最终批准。
 - OUT-01 的 approval/outbox 只保存本地草稿和审计元数据：payload、provider/raw 内容不进入公开 DTO；任务删除、候选撤销或任务无效化与草稿终止在同一 SQLite 事务内完成，失败整体回滚，重复调用安全无副作用。`ready/sent` 仅是旧 schema 兼容值，M1 不注册发送 mutation、consumer 或 provider adapter；真实发送必须另开 Issue 并重新完成主人确认、隐私和真实环境安全验收。
 - 开发模拟消息路由不得注册到正式服务端或 Electron App，也不得写入正式数据目录；只有自动测试创建 App 时可以显式开启。人工补录必须使用受控的正式纠错接口，不能依赖开发路由。

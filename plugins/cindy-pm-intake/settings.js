@@ -33,11 +33,16 @@ async function restartPm() {
   const baseUrl = configuredBaseUrl();
   if (!isLoopbackUrl(baseUrl)) throw new Error('本机任务库地址必须是本机 HTTP 回环地址');
   const restarted = await host.node.request({
-    method: 'pm/restart',
-    params: { baseUrl, scheduleExit: false },
+    method: 'pm/request',
+    params: {
+      baseUrl,
+      method: 'POST',
+      path: '/api/runtime/restart',
+      body: {},
+    },
     timeoutMs: 30000,
   });
-  if (!restarted || restarted.ok !== true) throw new Error(restarted?.message || '本机任务库重启失败');
+  if (!restarted || restarted.ok !== true) throw new Error(restarted?.message || '独立 TooManyTasks 重启失败');
 }
 
 async function requestAutoScanState() {
@@ -85,17 +90,21 @@ function progressModeValue() {
   return document.querySelector?.('input[name="progressMode"]:checked')?.value === 'automatic' ? 'automatic' : 'manual';
 }
 
-Promise.all([
-  fetch('/kv').then((response) => response.json()),
-  fetch('/secrets').then((response) => response.json()),
-]).then(([config, secrets]) => {
+async function putJson(url, body, message) {
+  const response = await fetch(url, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+  if (!response || response.ok !== true) throw new Error(message);
+  return response;
+}
+
+fetch('/kv').then((response) => response.json()).then((config) => {
   byId('pmBaseUrl').value = isLoopbackUrl(config.pmBaseUrl) ? config.pmBaseUrl : DEFAULT_PM_BASE_URL;
   byId('progressEnabled').checked = config.progressEnabled !== false;
   const progressMode = config.progressMode === 'automatic' ? 'automatic' : 'manual';
   const progressRadio = document.querySelector?.(`input[name="progressMode"][value="${progressMode}"]`);
   if (progressRadio) progressRadio.checked = true;
-  const saved = Array.isArray(secrets) && secrets.some((item) => item.key === 'pm_token' && item.saved);
-  byId('token').placeholder = saved ? '已保存；留空保持不变' : '请输入本机服务令牌';
   void requestAutoScanState().then((state) => {
     byId('autoScan').checked = state?.enabled === true;
   }).catch(() => undefined);
@@ -104,37 +113,32 @@ Promise.all([
 byId('save').onclick = async () => {
   const status = byId('status');
   status.textContent = '保存中…';
-  const pmBaseUrl = configuredBaseUrl();
-  if (!isLoopbackUrl(pmBaseUrl)) {
-    status.textContent = '本机任务库地址必须是本机 HTTP 回环地址';
-    return;
-  }
-  await fetch('/kv', {
-    method: 'PUT',
-    body: JSON.stringify({
+  try {
+    const pmBaseUrl = configuredBaseUrl();
+    if (!isLoopbackUrl(pmBaseUrl)) {
+      status.textContent = '本机任务库地址必须是本机 HTTP 回环地址';
+      return;
+    }
+    await putJson('/kv', {
       pmBaseUrl,
       progressEnabled: byId('progressEnabled').checked,
       progressMode: progressModeValue(),
-    }),
-  });
-  const token = byId('token').value;
-  if (token) {
-    await fetch('/secrets/pm_token', { method: 'PUT', body: JSON.stringify({ value: token }) });
-    byId('token').value = '';
-    byId('token').placeholder = '已保存；留空保持不变';
+    }, '配置保存失败');
+    new BroadcastChannel('cindy-pm-intake').postMessage({ type: 'settings-changed' });
+    status.textContent = '已保存';
+  } catch (error) {
+    status.textContent = error instanceof Error ? error.message : '配置保存失败';
   }
-  new BroadcastChannel('cindy-pm-intake').postMessage({ type: 'settings-changed' });
-  status.textContent = '已保存';
 };
 
 byId('restart').onclick = async () => {
   const status = byId('status');
-  status.textContent = '重启本机任务库中…';
+  status.textContent = '重启独立 TooManyTasks 中…';
   try {
     await restartPm();
-    status.textContent = '本机任务库已重启';
+    status.textContent = '独立 TooManyTasks 已收到重启请求';
   } catch (error) {
-    status.textContent = error instanceof Error ? error.message : '本机任务库重启失败';
+    status.textContent = error instanceof Error ? error.message : '独立 TooManyTasks 重启失败';
   }
 };
 

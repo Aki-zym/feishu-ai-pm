@@ -11,6 +11,7 @@ export const sourceScopeSchema = z.string().regex(/^src_scope_[a-f0-9]{32}$/u);
 export const minimalSourceDtoSchema = z.object({
   source_scope: sourceScopeSchema,
   source_type: z.enum(['bot_dm', 'owner_dm', 'group', 'calendar', 'meeting', 'manual']),
+  source_kind: z.literal('aily_summary').optional(),
   completeness: z.enum(['complete', 'partial', 'limited']),
   occurred_at: z.string().datetime(),
   summary_available: z.boolean(),
@@ -139,6 +140,7 @@ export const minimalCandidateDtoSchema = z.object({
   context_state: z.string().max(40),
   context_reason: z.string().nullable(),
   recovered_at: z.string().nullable(),
+  source_kind: z.literal('aily_summary').optional(),
   analysis: minimalCandidateAnalysisSchema,
   thread_association: minimalCandidateAssociationSchema.nullable(),
   merge_group: minimalCandidateMergeSchema.nullable(),
