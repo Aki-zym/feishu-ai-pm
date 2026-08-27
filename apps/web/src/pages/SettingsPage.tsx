@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Activity, Bot, Link, Power, RefreshCw, Sparkles, Unplug } from 'lucide-react';
-import { api } from '../api';
+import { ApiRequestError, api } from '../api';
 import { HealthStatusPanel } from '../components/HealthStatusPanel';
 import { normalizeHealth, type HealthSnapshot } from '../observability';
 import { beginResource, failureResource, loadingResource, successResource, type ResourceState } from '../resource-state';
@@ -242,6 +242,23 @@ export default function SettingsPage() {
       setSeedState('success');
       setSeedMessage('模拟需求已加入候选收件箱。');
     } catch (error) {
+      // Older/local backends may not expose the test-only seed endpoint. Fall
+      // back to the existing manual-intake route so the developer probe still
+      // exercises the candidate inbox without creating a task or sending out.
+      if (error instanceof ApiRequestError && error.status === 404) {
+        try {
+          await api.post('/api/corrections', {
+            correctionType: 'missed_request',
+            manualContent: '浏览器测试用的模拟需求：请核对候选收件箱是否能接收新内容。',
+            manualSenderName: '浏览器测试需求方',
+          });
+          setSeedState('success');
+          setSeedMessage('模拟需求已加入候选收件箱。');
+          return;
+        } catch (fallbackError) {
+          error = fallbackError;
+        }
+      }
       setSeedState('error');
       setSeedMessage(error instanceof Error ? error.message : '模拟需求添加失败。');
     }
@@ -301,7 +318,7 @@ export default function SettingsPage() {
 
       <section className="integration-section" aria-labelledby="seed-title">
         <div className="integration-heading"><span className="integration-icon"><Sparkles size={19} /></span><div><h2 id="seed-title">开发者测试入口</h2><span>只接受本机回环请求，写入一条 pending 候选，不创建正式任务。</span></div></div>
-        <button className="secondary-button" type="button" disabled={seedState === 'pending'} onClick={() => void seedCandidate()}>{seedState === 'pending' ? '生成中…' : '生成测试用模拟需求'}</button>
+        <button className="secondary-button" type="button" aria-label="模拟一条需求（浏览器测试）" disabled={seedState === 'pending'} onClick={() => void seedCandidate()}>{seedState === 'pending' ? '生成中…' : '生成测试用模拟需求'}</button>
         {seedMessage && <p className="settings-feedback" role={seedState === 'error' ? 'alert' : 'status'}>{seedMessage}</p>}
       </section>
 
