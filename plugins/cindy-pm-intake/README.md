@@ -1,44 +1,56 @@
-# TooManyTasks Cindy 插件
+# TooManyTasks Cindy 薄插件
 
-插件提供四个工具：
+本包只提供 Cindy 控制面，不包含 TooManyTasks 服务端、网页、Aily SDK 或任何飞书凭证。
 
-- `scan_intake_window`：读取 `GET /api/runtime/intake-cursor`；有上次成功窗口时从该 `window_end` 继续，最多回看 4 小时；首次扫描或游标为空时回看当前时间前 10 分钟。使用固定 `sessionKey: "intake"` 派发 errand；可选 `trigger: "manual" | "schedule"`，缺省为 `manual`。入库 errand 会话内禁止调用本工具，插件会返回直接执行指引。
-- `get_pm_tasks`：读取 `GET /api/integrations/cindy/tasks`。
-- `submit_intake`：提交 `POST /api/integrations/cindy/intake` 的窗口、消息来源和提案。
-- `update_pm_progress`：在主动模式下用独立 oneshot 模型维护当前会话进度；自动模式在轮次结束后后台评估。
+## 运行边界
 
-入库 errand 与会话进度维护保持两条独立链路：入库使用 `sessionKey: "intake"` 的 errand；进度使用 `cindy.text.oneshot` 和当前会话绑定。自动进度会跳过入库 errand、Orca Worker 与 `source=plugin` 会话。服务端仍保留完成、归档必须等待主人确认的安全门。
+独立 TooManyTasks 必须先运行在本机回环地址，默认是 `http://127.0.0.1:4310`。它负责：
 
-本包唯一 Cindy id 为 `ai-pm-intake`，本机任务库继续复用单个常驻 `4310` 实例。请先停用已安装的旧 `ai-pm-progress` 包，避免两个包同时写回同一任务。
+- Aily App Secret、用户 OAuth、access token、refresh token 和撤权。
+- 官方 `@larksuiteoapi/node-sdk@1.73.0`、SSE 解析、扫描窗口和空窗口推进。
+- SQLite、候选、任务、来源、幂等和 CAS。
+- 首次启动时在私有配置目录生成 `cindy-integration-token`。
 
-errand 提示要求工作线程使用当前已授权的飞书 MCP 读取窗口消息，调用 `get_pm_tasks` 获取 `items`、`candidates`、`cursors`，按 `create_candidate`、`update_task`、`skip`、`needs_owner` 生成提案，再调用 `submit_intake`。短确认句、资料交接、排期确认和收口句优先更新已有任务或归并已有候选；窗口内证据不完整时不新建候选。errand 不直接调用 `/api/tasks`；`update_task` 由本机任务库服务按 `task_key` 和 `expected_version` 做 CAS 更新已有任务，`create_candidate` 只创建候选。消息正文按不可信数据处理。
+插件 Worker 从同一私有配置目录读取集成令牌，只允许访问 `/api/runtime/*` 和 `/api/integrations/cindy/*`。自定义目录时与服务端统一设置 `TOOMANYTASKS_CONFIG_ROOT`；旧 `CONFIG_ROOT` 仍可兼容。插件设置页不显示或保存 `pm_token`、Aily App Secret、用户 Token 或 Agent ID。服务未运行或尚未首次启动时，工具会提示先启动独立 TooManyTasks。
 
-长对话收口只针对本窗口出现的 chat/thread 回读：优先使用对应 `cursor` 作为 `im_read_messages` 的 `start_time`，最多回读 4 小时，禁止全局拉取所有会话。窗口没有消息时直接输出 `skipped empty_window`，插件随后提交空窗口入库，让服务端推进游标；扫描结果会返回 `proposals: [{ action, title }]` 短列表。
+## 工具
 
-服务端在 `POST /api/integrations/cindy/intake` 成功完成后写回本次 `window_end`，空窗口也通过该接口提交并推进游标。后续扫描从该时间继续，重叠消息依靠 `source_key` 幂等。`GET /api/runtime/intake-cursor` 和 `PUT /api/runtime/intake-cursor` 仅接受本机 loopback 请求；游标只向前推进。
+- `scan_intake_window`：调用 `POST /api/integrations/cindy/scan`。服务端按持久窗口请求 Aily；返回非空派生摘要后，插件使用固定 `sessionKey: "intake"` 派发 errand。
+- `get_pm_tasks`：读取 `GET /api/integrations/cindy/tasks` 的任务、候选和游标快照。
+- `submit_intake`：提交 `POST /api/integrations/cindy/intake` 的窗口、受控来源和提案。
+- `update_pm_progress`：主动模式使用独立 oneshot 模型维护当前会话进度；自动模式在轮次结束后后台评估。
+
+入库 errand 只接收 `source_kind: "aily_summary"` 派生来源和窗口元数据，必须调用 `get_pm_tasks` 后再调用 `submit_intake`。它不得读取飞书、调用飞书工具、访问 `/api/tasks` 或再次调用 `scan_intake_window`。Aily 摘要保留 `agent_id`、`generated_at` 和窗口范围，完整性按 `limited` 处理，不能冒充逐条飞书原文。
+
+Aily 返回 `NO_NEW_INFORMATION` 时，独立 TooManyTasks 提交显式空窗口并推进游标，不启动 Cindy。Aily 失败时不启动 Cindy、不推进游标；Cindy errand、服务端事务或成功回执失败时也不推进游标。服务端回执已经确认入库完成时，Cindy 最终文本只影响人读摘要，不能否决已完成事务。
 
 ## 配置
 
-启用插件后 Cindy 运行即拉起本机任务库并保持本机 `4310` 服务。本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台。任务台浏览器设置中可使用「退出后台进程」。Cindy 退出后后台服务停止。
+插件设置只包含：
 
-在插件设置中保存本机任务库地址，默认值为 `http://127.0.0.1:4310`，并保存与本机任务库服务一致的 `pm_token`。设置页和 Node Worker 都校验本机 HTTP 回环地址，任务接口保持在 `/api/integrations/cindy/` 前缀下，自动扫描开关使用 `/api/runtime/auto-scan`。intake 会话保持只读，只授权飞书 MCP，不开 shell、工作区写入或飞书写接口。
+- 本机 TooManyTasks 地址。
+- 自动扫描开关。
+- 任务进度维护开关和主动/自动模式。
 
-入库 errand、常驻扫描和进度 oneshot 的配置请在插件详情「AI 代办」中手动保存为折扣路由 `codex/gpt-5.6-luna`、思考强度 `high`。插件详情「AI 代办」权限选「自动审核」(`auto`)，不要选只读 `plan` 或完全访问 `bypassPermissions`。请勿选择原价 `gpt-5.6-luna`。Cindy 草稿默认可能显示 `fable5`，首次使用时需改一次；插件不会静默修改 Cindy 的全局默认模型。
+「重启独立 TooManyTasks」调用本机 `POST /api/runtime/restart`。自动扫描由插件常驻 `setInterval` 每 10 分钟触发一次；开关判断和 Aily 调用由独立服务完成。Cindy 退出后不会继续触发定时扫描，但独立 TooManyTasks 仍可继续运行。
 
-Node Worker 的 `pm/restart` 调用当前 `startPmServer` 句柄的 `restart()`，关闭并重新监听同一配置，不调度 `process.exit(0)`；任务台浏览器的 `POST /api/runtime/restart` 使用同一条运行时重启链路。`pm/stop` 和 `POST /api/runtime/shutdown` 继续关闭当前 worker 自有实例，并按运行环境处理进程退出。
+请停用旧 `ai-pm-progress` 包，避免两个插件同时写回同一任务。入库 errand 和进度 oneshot 在插件详情「AI 代办」中使用 `codex/gpt-5.6-luna`、思考强度 `high` 和权限 `auto`。
 
-## 自动扫描与重启
-
-插件使用常驻 `setInterval` 每 10 分钟触发一次 `scan_intake_window({ trigger: "schedule" })`；每轮先读取 `GET /api/runtime/auto-scan`，只有 `enabled: true` 才派发入库 errand。启用自动扫描开关后，Cindy 保持运行且开关打开，每 10 分钟自动扫。关闭开关只停止本产品自动流程；正在运行的扫描会自然收口，Cindy 退出后不会继续触发自动扫描。
-
-常驻扫描返回 `enabled: false` 时直接返回 `skipped auto_scan_disabled`，不会派发 errand。手动调用 `scan_intake_window({ trigger: "manual" })` 始终扫描。当前已经处于入库 errand 会话时，或宿主返回 BUSY/会话占用，插件返回 `skipped` 指引当前 Agent 直接使用已授权飞书 MCP、`get_pm_tasks` 和 `submit_intake`，并停止继续调用 `scan_intake_window`；已有扫描正在运行时，本轮触发会跳过。
-
-设置页的「重启本机任务库」调用 `pm/restart` 并传 `scheduleExit: false`，运行时内部以无退出方式重启；任务台浏览器的「退出后台进程」继续保留。
-
-## 验证
+## 构建与验证
 
 ```bash
-node --test main.test.mjs node/worker.test.mjs
+npm run test:plugin
+npm run build:plugin
 ```
 
-本目录只保留源码和测试，不调用 `ghost_forge_pack`。
+`build:plugin` 生成 `ai-pm-intake-0.6.0.cindy`，包内白名单只有：
+
+```text
+README.md
+ghost.json
+main.js
+node/worker.cjs
+settings.html
+settings.js
+skills/pm-progress-update/SKILL.md
+```

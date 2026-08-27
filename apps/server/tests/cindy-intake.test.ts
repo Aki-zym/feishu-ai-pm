@@ -65,7 +65,7 @@ describe('Cindy 对话入库接口', () => {
     });
     expect(response.statusCode).toBe(200);
     expect(response.json().items).toEqual([
-      expect.objectContaining({ id: 'task-cindy-intake-1', status: 'planned', version: 1 }),
+      expect.objectContaining({ id: 'task-cindy-intake-1', status: 'planned', version: 1, auto_update_paused: false }),
     ]);
     expect(response.json().items.some((item: { id: string }) => item.id === 'task-cindy-intake-archived')).toBe(false);
   });
@@ -160,6 +160,7 @@ describe('Cindy 对话入库接口', () => {
         window_id: 'window-20260824-snapshot',
         window_start: '2026-08-24T00:00:00.000Z',
         window_end: '2026-08-24T00:10:00.000Z',
+        result_kind: 'intake',
         sources: [
           source,
           source2,
@@ -211,6 +212,7 @@ describe('Cindy 对话入库接口', () => {
       window_id: 'window-20260824-1',
       window_start: '2026-08-24T00:00:00.000Z',
       window_end: '2026-08-24T00:05:00.000Z',
+      result_kind: 'intake' as const,
       sources: [source, source2],
       proposals: [{
         action: 'create_candidate' as const,
@@ -251,6 +253,7 @@ describe('Cindy 对话入库接口', () => {
         window_id: 'window-20260824-2',
         window_start: '2026-08-24T00:05:00.000Z',
         window_end: '2026-08-24T00:10:00.000Z',
+        result_kind: 'intake' as const,
       },
     });
     expect(crossWindow.statusCode).toBe(200);
@@ -271,6 +274,7 @@ describe('Cindy 对话入库接口', () => {
         window_id: 'window-20260824-skip',
         window_start: '2026-08-24T00:00:00.000Z',
         window_end: '2026-08-24T00:05:00.000Z',
+        result_kind: 'intake',
         sources: [source],
         proposals: [{ action: 'skip', source_keys: ['s1'], reason: '仅供上下文参考。' }],
       },
@@ -279,6 +283,120 @@ describe('Cindy 对话入库接口', () => {
     expect((database.raw.prepare('SELECT COUNT(*) AS count FROM task').get() as { count: number }).count).toBe(0);
     expect((database.raw.prepare('SELECT COUNT(*) AS count FROM candidate_request').get() as { count: number }).count).toBe(0);
     expect((database.raw.prepare('SELECT COUNT(*) AS count FROM correction_event').get() as { count: number }).count).toBe(1);
+  });
+
+  it('aily_summary 来源保存为派生证据，并按窗口键稳定幂等', async () => {
+    const { app, database } = await makeApp();
+    const payload = {
+      window_id: 'window-20260826-aily',
+      window_start: '2026-08-26T00:00:00.000Z',
+      window_end: '2026-08-26T00:10:00.000Z',
+      result_kind: 'intake' as const,
+      sources: [{
+        source_key: 'aily-summary:window-20260826-aily',
+        source_kind: 'aily_summary' as const,
+        occurred_at: '2026-08-26T00:10:00.000Z',
+        conversation_key: 'aily:agent_4kx9t1gjymdxf0w',
+        sender_role: 'Aily 摘要（派生来源）',
+        agent_id: 'agent_4kx9t1gjymdxf0w',
+        generated_at: '2026-08-26T00:10:01.000Z',
+        text: 'Aily 总结：需要补充活动留存数据。',
+      }],
+      proposals: [{
+        action: 'create_candidate' as const,
+        source_keys: ['aily-summary:window-20260826-aily'],
+        title: '活动留存数据补充',
+        describe: '根据 Aily 派生摘要整理的待确认候选。',
+      }],
+    };
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/intake',
+      headers: { authorization: `Bearer ${token}` },
+      payload,
+    });
+    expect(response.statusCode).toBe(200);
+    const sourceRow = database.raw.prepare(
+      'SELECT source_type, content, discovery_reason, metadata_json FROM source_event',
+    ).get() as { source_type: string; content: string; discovery_reason: string; metadata_json: string };
+    expect(sourceRow.source_type).toBe('manual');
+    expect(sourceRow.content).toBe(payload.sources[0]!.text);
+    expect(sourceRow.discovery_reason).toMatch(/派生摘要/);
+    expect(JSON.parse(sourceRow.metadata_json)).toMatchObject({
+      sourceKind: 'aily_summary',
+      derivedEvidence: true,
+      ailyAgentId: 'agent_4kx9t1gjymdxf0w',
+      ailyGeneratedAt: '2026-08-26T00:10:01.000Z',
+      ailySummaryWindowStart: payload.window_start,
+      ailySummaryWindowEnd: payload.window_end,
+    });
+    expect(database.raw.prepare('SELECT completeness FROM source_event').get()).toEqual({ completeness: 'limited' });
+    expect(database.raw.prepare('SELECT confidence FROM candidate_request').get()).toEqual({ confidence: 0.75 });
+    const duplicate = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/intake',
+      headers: { authorization: `Bearer ${token}` },
+      payload,
+    });
+    expect(duplicate.statusCode).toBe(200);
+    expect(duplicate.json()).toMatchObject({ duplicate: true, window_id: payload.window_id });
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(1);
+  });
+
+  it('aily_summary source_key 不稳定或窗口内重复时拒绝写入', async () => {
+    const { app, database } = await makeApp();
+    const base = {
+        window_id: 'window-20260826-aily-invalid',
+        window_start: '2026-08-26T00:00:00.000Z',
+        window_end: '2026-08-26T00:10:00.000Z',
+        result_kind: 'intake',
+      proposals: [],
+    };
+    const invalidKey = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/intake',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        ...base,
+        sources: [{
+          source_key: 'aily-summary:other-window',
+          source_kind: 'aily_summary',
+          occurred_at: base.window_end,
+          agent_id: 'agent_1',
+          generated_at: base.window_end,
+          text: '摘要。',
+        }],
+      },
+    });
+    expect(invalidKey.statusCode).toBe(400);
+    const duplicateSources = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/intake',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        ...base,
+        sources: [
+          {
+            source_key: 'aily-summary:window-20260826-aily-invalid',
+            source_kind: 'aily_summary',
+            occurred_at: base.window_end,
+            agent_id: 'agent_1',
+            generated_at: base.window_end,
+            text: '摘要一。',
+          },
+          {
+            source_key: 'aily-summary:window-20260826-aily-invalid-2',
+            source_kind: 'aily_summary',
+            occurred_at: base.window_end,
+            agent_id: 'agent_1',
+            generated_at: base.window_end,
+            text: '摘要二。',
+          },
+        ],
+      },
+    });
+    expect(duplicateSources.statusCode).toBe(400);
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(0);
   });
 
   it('成功提交空窗口时也推进 intake_window_end', async () => {
@@ -291,6 +409,7 @@ describe('Cindy 对话入库接口', () => {
         window_id: 'window-20260824-empty',
         window_start: '2026-08-24T00:00:00.000Z',
         window_end: '2026-08-24T00:10:00.000Z',
+        result_kind: 'empty_window',
         sources: [],
         proposals: [],
       },
@@ -298,6 +417,100 @@ describe('Cindy 对话入库接口', () => {
     expect(response.statusCode).toBe(200);
     expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'intake_window_end'").get())
       .toEqual({ value_json: '{"window_end":"2026-08-24T00:10:00.000Z"}' });
+  });
+
+  it('同一窗口的提交内容变化返回冲突，不静默复用旧结果', async () => {
+    const { app, database } = await makeApp();
+    const payload = {
+      window_id: 'window-20260824-fingerprint',
+      window_start: '2026-08-24T00:00:00.000Z',
+      window_end: '2026-08-24T00:05:00.000Z',
+      result_kind: 'intake' as const,
+      sources: [source],
+      proposals: [{ action: 'skip' as const, source_keys: ['s1'], reason: '第一次判断。' }],
+    };
+    const first = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/intake',
+      headers: { authorization: `Bearer ${token}` },
+      payload,
+    });
+    expect(first.statusCode).toBe(200);
+    const changed = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/intake',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        ...payload,
+        proposals: [{ action: 'skip' as const, source_keys: ['s1'], reason: '第二次判断。' }],
+      },
+    });
+    expect(changed.statusCode).toBe(409);
+    expect(changed.json().error).toMatch(/内容发生变化/);
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(1);
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM correction_event').get() as { count: number }).count).toBe(1);
+  });
+
+  it('失败前后认领同一个持久窗口，成功入库后清除 pending window', async () => {
+    const { app, database } = await makeApp();
+    const first = await app.inject({
+      method: 'POST',
+      url: '/api/runtime/intake-window',
+      remoteAddress: '127.0.0.1',
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().reused).toBe(false);
+    const second = await app.inject({
+      method: 'POST',
+      url: '/api/runtime/intake-window',
+      remoteAddress: '127.0.0.1',
+    });
+    expect(second.statusCode).toBe(200);
+    expect(second.json()).toEqual({ ...first.json(), reused: true });
+    const { reused: _reused, ...window } = first.json();
+    const statusBefore = await app.inject({
+      method: 'GET',
+      url: `/api/integrations/cindy/intake/${encodeURIComponent(window.window_id)}/status`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(statusBefore.statusCode).toBe(200);
+    expect(statusBefore.json()).toMatchObject({ completed: false, window_id: window.window_id });
+    const completed = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/intake',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        ...window,
+        result_kind: 'empty_window',
+        sources: [],
+        proposals: [],
+      },
+    });
+    expect(completed.statusCode).toBe(200);
+    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'intake_pending_window'").get()).toBeUndefined();
+    const statusAfter = await app.inject({
+      method: 'GET',
+      url: `/api/integrations/cindy/intake/${encodeURIComponent(window.window_id)}/status`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(statusAfter.json()).toMatchObject({ completed: true, result_kind: 'empty_window' });
+  });
+
+  it('入库状态查询要求 Cindy Bearer 授权', async () => {
+    const { app } = await makeApp();
+    const windowId = 'window-20260824-status-auth';
+    const withoutAuth = await app.inject({
+      method: 'GET',
+      url: `/api/integrations/cindy/intake/${encodeURIComponent(windowId)}/status`,
+    });
+    expect(withoutAuth.statusCode).toBe(401);
+    const withAuth = await app.inject({
+      method: 'GET',
+      url: `/api/integrations/cindy/intake/${encodeURIComponent(windowId)}/status`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(withAuth.statusCode).toBe(200);
+    expect(withAuth.json()).toMatchObject({ window_id: windowId, completed: false });
   });
 
   it('update_task 使用 expected_version CAS，冲突时不写入来源或任务', async () => {
@@ -311,6 +524,7 @@ describe('Cindy 对话入库接口', () => {
         window_id: 'window-20260824-conflict',
         window_start: '2026-08-24T00:00:00.000Z',
         window_end: '2026-08-24T00:05:00.000Z',
+        result_kind: 'intake',
         sources: [source],
         proposals: [{
           action: 'update_task',
@@ -328,17 +542,50 @@ describe('Cindy 对话入库接口', () => {
     expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(0);
   });
 
+  it('暂停 AI 自动维护的任务拒绝 update_task，且任务和来源保持不变', async () => {
+    const { app, database } = await makeApp();
+    makeTask(database);
+    database.raw.prepare('UPDATE task SET auto_update_paused = 1 WHERE id = ?').run('task-cindy-intake-1');
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/intake',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        window_id: 'window-20260824-paused',
+        window_start: '2026-08-24T00:00:00.000Z',
+        window_end: '2026-08-24T00:05:00.000Z',
+        result_kind: 'intake',
+        sources: [source],
+        proposals: [{
+          action: 'update_task',
+          source_keys: ['s1'],
+          task_key: 'task-cindy-intake-1',
+          expected_version: 1,
+          next_step: '暂停任务不应被自动改写',
+        }],
+      },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error_code: 'CONFLICT', current_version: 1 });
+    expect(response.json().error).toMatch(/暂停 AI 自动维护/);
+    expect(database.raw.prepare('SELECT title, version, next_step, auto_update_paused FROM task WHERE id = ?').get('task-cindy-intake-1'))
+      .toEqual({ title: '活动留存分析', version: 1, next_step: '补充分区口径', auto_update_paused: 1 });
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(0);
+    expect((database.raw.prepare('SELECT COUNT(*) AS count FROM task_source_link').get() as { count: number }).count).toBe(0);
+  });
+
   it('成功 update_task 使用 CAS 更新版本，并在窗口重放时保持幂等', async () => {
     const { app, database } = await makeApp();
     makeTask(database);
     const payload = {
-      window_id: 'window-20260824-update',
-      window_start: '2026-08-24T00:00:00.000Z',
-      window_end: '2026-08-24T00:05:00.000Z',
-      sources: [source],
+        window_id: 'window-20260824-update',
+        window_start: '2026-08-24T00:00:00.000Z',
+        window_end: '2026-08-24T00:05:00.000Z',
+        result_kind: 'intake',
+      sources: [source, source2],
       proposals: [{
         action: 'update_task' as const,
-        source_keys: ['s1'],
+        source_keys: ['s1', 's2'],
         task_key: 'task-cindy-intake-1',
         expected_version: 1,
         next_step: '改用最新分区口径',
@@ -354,6 +601,31 @@ describe('Cindy 对话入库接口', () => {
     expect(response.json().proposals[0]).toMatchObject({ action: 'update_task', version: 2 });
     expect((database.raw.prepare('SELECT version, next_step FROM task WHERE id = ?').get('task-cindy-intake-1') as { version: number; next_step: string }))
       .toEqual({ version: 2, next_step: '改用最新分区口径' });
+    const link = database.raw.prepare(
+      `SELECT source_event_id, demand_unit_id, relation_type
+         FROM task_source_link
+        WHERE task_id = ?
+        ORDER BY source_event_id`,
+    ).all('task-cindy-intake-1') as Array<{
+      source_event_id: string;
+      demand_unit_id: string;
+      relation_type: string;
+    }>;
+    expect(link).toHaveLength(2);
+    expect(link.every((item) => item.demand_unit_id && item.relation_type === 'cindy_update')).toBe(true);
+    const event = database.raw.prepare(
+      `SELECT source_event_id, demand_unit_id
+         FROM task_event
+        WHERE task_id = ? AND event_type = 'task_cindy_intake_update'`,
+    ).get('task-cindy-intake-1') as { source_event_id: string; demand_unit_id: string };
+    expect(link.map((item) => item.source_event_id)).toContain(event.source_event_id);
+    expect(event.demand_unit_id).toBe(link[0]!.demand_unit_id);
+    expect(database.raw.prepare(
+      `SELECT 1 AS present
+         FROM source_demand_unit_source
+        WHERE demand_unit_id = ? AND source_event_id IN (?, ?)
+        GROUP BY demand_unit_id`,
+    ).get(link[0]!.demand_unit_id, link[0]!.source_event_id, link[1]!.source_event_id)).toEqual({ present: 1 });
 
     const duplicate = await app.inject({
       method: 'POST',

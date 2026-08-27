@@ -2,7 +2,13 @@
 
 ## 当前实现
 
-服务端使用 `@larksuiteoapi/node-sdk` 的真实适配层。没有填写凭证或没有打开“允许真实飞书连接”时，程序不会发起飞书网络请求，继续使用本地规则/Mock。
+TooManyTasks 当前的飞书扫描路径由独立 `apps/server` 使用官方 `@larksuiteoapi/node-sdk@1.73.0` 调用 Aily OpenAPI。浏览器设置页保存 Aily 应用配置并发起飞书用户 OAuth；App Secret、access token 和 refresh token 进入本机 AES-256-GCM 凭证库，服务端在 Token 接近过期时自动刷新。Cindy 插件不接收这些凭证，只读取自动生成的本机集成令牌并调用 `/api/integrations/cindy/scan`。
+
+Aily Prompt 只包含 `window_start`、`window_end`、Asia/Shanghai 时区和检索要求。服务端通过 `POST /open-apis/aily/v1/agents/{agent_id}/chats` 发起流式对话，逐事件解析 `start`、`message_delta` 和 `done`；只有 `Completed` 终态算成功。返回文本保存为最多一条 `source_kind=aily_summary` 的派生来源，来源键稳定为 `aily-summary:<window_id>`，同时保存窗口覆盖时间、Agent 标识和生成时间。该来源只代表 Aily 的摘要线索，不能冒充逐条飞书原文。
+
+扫描规则固定为：先由本机服务持久化认领窗口，再由 Aily 成功返回有内容后启动 Cindy intake errand；Aily 返回 `NO_NEW_INFORMATION` 时以 `result_kind=empty_window` 提交空窗口并推进游标；Aily 调用失败、Token 失效、权限失败、超时、Cindy errand 失败或没有服务端成功回执时保持旧游标。服务端执行窗口指纹幂等、来源关系和 `update_task.expected_version` CAS。
+
+以下旧的 OAuth、个人信息流、机器人事件和直接 Feishu adapter 章节属于历史实现/能力边界记录，不是 TooManyTasks 当前扫描链。
 
 已接入的只读能力：
 

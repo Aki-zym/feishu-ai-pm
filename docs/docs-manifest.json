@@ -21,10 +21,10 @@
     "pr86_current_base": "integration/m1-test-20260815",
     "pr86_current_base_commit": "ebe682aeae067bbf08a6f38ea39de17adceb9ac0",
     "stage_id": "M1",
-    "stage_name": "Cindy 插件与浏览器任务台",
-    "carrier": "Cindy 插件 + 127.0.0.1:4310 + SQLite",
+    "stage_name": "独立任务台与 Cindy 薄插件",
+    "carrier": "TooManyTasks 本机服务 + Cindy 薄插件 + SQLite",
     "product_version": "0.2.0",
-    "current_artifact_verification_id": null
+    "current_artifact_verification_id": "VER-AILY-SDK-ISOLATED-20260827"
   },
   "historical_milestones": [
     {
@@ -45,8 +45,8 @@
   "product_snapshot": {
     "algorithm": "product-source-sha256-v1",
     "selector": "apps-workspace-default-include-v1",
-    "fingerprint": "596b57af001a973add63baca739f19051d3aa923d07e4b854d2ef99e37c71aa4",
-    "file_count": 87,
+    "fingerprint": "c4592dc568ae2de6d93b9852cd3308dd8d3f10ca00eef00f483dd6d7ee30d837",
+    "file_count": 53,
     "snapshot_as_of": "2026-08-15",
     "equivalent_commit": null,
     "commit_semantics": "optional_product_snapshot_equivalent_reference; fingerprint_is_authoritative_across_squash_or_merge; test_only_package_scripts_are_excluded"

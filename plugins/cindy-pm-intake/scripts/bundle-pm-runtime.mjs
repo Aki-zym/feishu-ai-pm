@@ -1,44 +1,58 @@
-import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, rm } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { resolve } from 'node:path';
-import { build } from 'esbuild';
+import { dirname, resolve } from 'node:path';
 
 const execFileAsync = promisify(execFile);
 const root = resolve(import.meta.dirname, '../../..');
-const webSource = resolve(root, 'apps', 'web', 'dist');
-const webTarget = resolve(root, 'plugins', 'cindy-pm-intake', 'web-dist');
-const runtimeEntry = resolve(root, 'plugins', 'cindy-pm-intake', 'node', 'pm-runtime.entry.mjs');
-const runtimeOutput = resolve(root, 'plugins', 'cindy-pm-intake', 'node', 'pm-runtime.cjs');
-const statusSource = resolve(root, 'plugins', 'cindy-pm-intake', 'node', 'macos-status', 'main.swift');
-const statusOutput = resolve(root, 'plugins', 'cindy-pm-intake', 'node', 'macos-status', 'TooManyTasksStatus');
+const pluginRoot = resolve(root, 'plugins', 'cindy-pm-intake');
+const ghost = JSON.parse(await readFile(resolve(pluginRoot, 'ghost.json'), 'utf8'));
+const packagePath = resolve(pluginRoot, `${ghost.id}-${ghost.version}.cindy`);
+const stagingRoot = resolve(pluginRoot, '.package-tmp');
+const files = [
+  'README.md',
+  'ghost.json',
+  'main.js',
+  'node/worker.cjs',
+  'settings.html',
+  'settings.js',
+  'skills/pm-progress-update/SKILL.md',
+];
+const forbidden = [
+  'node/aily.cjs',
+  'node/aily-sdk.cjs',
+  'node/pm-runtime.cjs',
+  'node/macos-status/TooManyTasksStatus',
+  'web-dist',
+];
 
-await execFileAsync('npm', ['run', 'build', '-w', '@ai-pm/web'], { cwd: root, stdio: 'inherit' });
-await rm(webTarget, { recursive: true, force: true });
-await mkdir(webTarget, { recursive: true });
-await cp(webSource, webTarget, { recursive: true, force: true });
-
-await build({
-  entryPoints: [runtimeEntry],
-  outfile: runtimeOutput,
-  bundle: true,
-  platform: 'node',
-  format: 'cjs',
-  target: 'node24',
-  external: ['node:*'],
-  define: { 'process.env.CINDY_RUNTIME_BUNDLE': 'true' },
-  minifySyntax: true,
-  logLevel: 'info',
-});
-const bundledRuntime = await readFile(runtimeOutput, 'utf8');
-await writeFile(runtimeOutput, bundledRuntime.replace(/[ \t]+$/gmu, ''));
-
-if (process.platform === 'darwin') {
-  await execFileAsync('swiftc', ['-O', statusSource, '-o', statusOutput], { cwd: root, stdio: 'inherit' });
-  console.log(`macOS 菜单栏运行时已生成：${statusOutput}`);
-} else {
-  console.log(`当前平台为 ${process.platform}，跳过 macOS 菜单栏运行时编译。`);
+for (const relativePath of forbidden) {
+  try {
+    await readFile(resolve(pluginRoot, relativePath));
+    throw new Error(`薄插件目录仍包含已废弃产物：${relativePath}`);
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'EISDIR') {
+      throw new Error(`薄插件目录仍包含已废弃目录：${relativePath}`);
+    }
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') continue;
+    throw error;
+  }
 }
 
-console.log(`本机任务库运行时已生成：${runtimeOutput}`);
-console.log(`本机任务库网页资源已复制：${webTarget}`);
+await rm(stagingRoot, { recursive: true, force: true });
+await mkdir(stagingRoot, { recursive: true });
+for (const relativePath of files) {
+  const target = resolve(stagingRoot, relativePath);
+  await mkdir(dirname(target), { recursive: true });
+  await cp(resolve(pluginRoot, relativePath), target);
+}
+await rm(packagePath, { force: true });
+await execFileAsync('zip', ['-q', '-r', packagePath, '.'], { cwd: stagingRoot });
+await rm(stagingRoot, { recursive: true, force: true });
+
+const { stdout } = await execFileAsync('unzip', ['-Z1', packagePath], { cwd: root });
+const packagedFiles = stdout.trim().split(/\r?\n/u).filter((value) => value && !value.endsWith('/')).sort();
+if (JSON.stringify(packagedFiles) !== JSON.stringify([...files].sort())) {
+  throw new Error(`插件包内容不符合薄插件白名单：${packagedFiles.join(', ')}`);
+}
+console.log(`TooManyTasks Cindy 薄插件已生成：${packagePath}`);

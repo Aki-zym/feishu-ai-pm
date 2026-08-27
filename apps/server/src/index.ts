@@ -1,8 +1,10 @@
 import { buildApp } from './app.js';
 import { fileURLToPath } from 'node:url';
+import { AilyService } from './aily.js';
 import { loadConfig } from './config.js';
 import { AppDatabase } from './database.js';
 import { createCindyAdapters } from './integrations.js';
+import { LocalCredentialStore } from './local-credential-store.js';
 import { PmService } from './service.js';
 
 const config = loadConfig();
@@ -14,6 +16,10 @@ if (config.database.provider !== 'sqlite') {
 const database = new AppDatabase(config.database.sqlitePath);
 const adapters = createCindyAdapters(config);
 const service = new PmService(database, adapters, config);
+const credentials = new LocalCredentialStore(config);
+await credentials.load();
+const cindyIntegrationToken = await credentials.ensureIntegrationToken(config.cindyIntegrationToken);
+const ailyService = new AilyService(credentials);
 const webRoot = fileURLToPath(new URL('../../web/dist/', import.meta.url));
 let app: Awaited<ReturnType<typeof buildApp>>;
 let shutdownInProgress: Promise<void> | null = null;
@@ -35,7 +41,8 @@ const shutdownAndExit = async () => {
 const buildRuntimeApp = () => buildApp(service, {
   webOrigin: config.webOrigin,
   webRoot,
-  cindyIntegrationToken: config.cindyIntegrationToken,
+  cindyIntegrationToken,
+  ailyService,
   runtimeShutdown: shutdownAndExit,
   runtimeRestart: restart,
 });

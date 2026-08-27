@@ -1,13 +1,16 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import test from 'node:test';
 
 const workerPath = path.resolve(import.meta.dirname, 'worker.cjs');
+const tokenRoot = mkdtempSync(path.join(os.tmpdir(), 'toomanytasks-token-'));
+writeFileSync(path.join(tokenRoot, 'cindy-integration-token'), 'test-token\n', { mode: 0o600 });
+process.on('exit', () => rmSync(tokenRoot, { recursive: true, force: true }));
 
 function createCindyFixture({ source = 'desktop', orcaRole = null, sessionId = 'session-a' } = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'cindy-pm-worker-'));
@@ -27,7 +30,12 @@ function createCindyFixture({ source = 'desktop', orcaRole = null, sessionId = '
 function callWorkerWithDataDir(request, userDataDir) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [workerPath], {
-      env: { ...process.env, NODE_ENV: 'test', CINDY_PM_TEST_USER_DATA_DIR: userDataDir },
+      env: {
+        ...process.env,
+        NODE_ENV: 'test',
+        CINDY_PM_TEST_USER_DATA_DIR: userDataDir,
+        TOOMANYTASKS_CONFIG_ROOT: tokenRoot,
+      },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -43,7 +51,7 @@ function callWorkerWithDataDir(request, userDataDir) {
     });
     child.stderr.on('data', (chunk) => { stderr += chunk; });
     child.on('error', reject);
-    child.on('exit', (code) => { if (!stdout && code !== 0) reject(new Error(stderr || `worker exited ${code}`)); });
+    child.on('exit', (code) => { if (!stdout) reject(new Error(stderr || `worker exited ${code}`)); });
     child.stdin.end(`${JSON.stringify(request)}\n`);
   });
 }
@@ -59,9 +67,12 @@ function close(server) {
   return new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
 }
 
-function callWorker(request) {
+function callWorker(request, extraEnv = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [workerPath], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [workerPath], {
+      env: { ...process.env, TOOMANYTASKS_CONFIG_ROOT: tokenRoot, ...extraEnv },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8');
@@ -82,6 +93,56 @@ function callWorker(request) {
     child.on('exit', (code) => {
       if (!stdout && code !== 0) reject(new Error(stderr || `worker exited ${code}`));
     });
+    child.stdin.end(`${JSON.stringify(request)}\n`);
+  });
+}
+
+function callWorkerWithAilySdk(request, { status = 'Completed', text = 'Aily 摘要结果。', throwError = null } = {}) {
+  return new Promise((resolve, reject) => {
+    const bootstrap = `
+      const Module = require('node:module');
+      const workerPath = ${JSON.stringify(workerPath)};
+      const originalLoad = Module._load;
+      Module._load = function load(requestName, parent, isMain) {
+        if (parent && parent.filename === workerPath && requestName === './aily-sdk.cjs') {
+          return {
+            sdk: {
+              AppType: { SelfBuild: 'self-build' },
+              Domain: { Feishu: 'feishu' },
+              withUserAccessToken(token) { return { token }; },
+              Client: class {
+                async request() {
+                  ${throwError ? `const error = new Error(${JSON.stringify(throwError.message)}); error.status = ${Number(throwError.status || 403)}; throw error;` : `
+                  return (async function* stream() {
+                    yield Buffer.from('event: start\\ndata: {"agent_chat_id":"chat-12345678","session_id":"session-1"}\\n\\n');
+                    yield Buffer.from('event: message_delta\\ndata: ' + JSON.stringify({ delta: { type: 'content', text: ${JSON.stringify(text)} } }) + '\\n\\n');
+                    yield Buffer.from('event: done\\ndata: ' + JSON.stringify({ status: ${JSON.stringify(status)}, finish_reason: 'stop' }));
+                  })();
+                  `}
+                }
+              },
+            },
+          };
+        }
+        return originalLoad.call(this, requestName, parent, isMain);
+      };
+      require(workerPath);
+    `;
+    const child = spawn(process.execPath, ['-e', bootstrap], { stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+      const newline = stdout.indexOf('\n');
+      if (newline < 0) return;
+      child.kill();
+      try { resolve(JSON.parse(stdout.slice(0, newline))); } catch (error) { reject(error); }
+    });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('exit', (code) => { if (!stdout) reject(new Error(stderr || `worker exited ${code}`)); });
     child.stdin.end(`${JSON.stringify(request)}\n`);
   });
 }
@@ -171,58 +232,11 @@ function callWorkerLines(requests, { foreign = false } = {}) {
   });
 }
 
-test('pm/stop invokes the current server stop handle and a later pm/ensure starts again', async () => {
-  const results = await callWorkerLines([
-    {
-      jsonrpc: '2.0',
-      id: 10,
-      method: 'pm/ensure',
-      cindy: { secrets: { pm_token: 'test-token' } },
-    },
-    { jsonrpc: '2.0', id: 11, method: 'pm/stop' },
-    {
-      jsonrpc: '2.0',
-      id: 12,
-      method: 'pm/ensure',
-      cindy: { secrets: { pm_token: 'test-token' } },
-    },
-    { jsonrpc: '2.0', id: 13, method: 'pm/stop' },
-  ]);
-  assert.equal(results[0].result.startCount, 1);
-  assert.deepEqual(results[1].result, { stopped: true, stopCount: 1 });
-  assert.equal(results[2].result.startCount, 2);
-  assert.deepEqual(results[3].result, { stopped: true, stopCount: 2 });
-});
-
-test('pm/restart uses the runtime restart handle and keeps the worker process alive', async () => {
-  const results = await callWorkerLines([
-    {
-      jsonrpc: '2.0',
-      id: 20,
-      method: 'pm/ensure',
-      cindy: { secrets: { pm_token: 'test-token' } },
-    },
-    { jsonrpc: '2.0', id: 21, method: 'pm/restart' },
-    { jsonrpc: '2.0', id: 22, method: 'pm/stop' },
-  ]);
-  assert.equal(results[0].result.startCount, 1);
-  assert.equal(results[1].result.startCount, 2);
-  assert.equal(results[1].result.restartCount, 1);
-  assert.deepEqual(results[2].result, { stopped: true, stopCount: 2 });
-});
-
-test('pm/ensure rejects a port held by a service with a mismatched token', async () => {
-  const results = await callWorkerLines([
-    {
-      jsonrpc: '2.0',
-      id: 23,
-      method: 'pm/ensure',
-      cindy: { secrets: { pm_token: 'cindy-token' } },
-    },
-  ], { foreign: true });
-  assert.equal(results[0].error.code, -32000);
-  assert.match(results[0].error.message, /令牌未验证通过/);
-  assert.match(results[0].error.message, /未接管该服务/);
+test('legacy embedded runtime and Aily RPC methods are unavailable', async () => {
+  for (const method of ['pm/ensure', 'pm/stop', 'pm/restart', 'aily/summarize']) {
+    const result = await callWorker({ jsonrpc: '2.0', id: method, method });
+    assert.equal(result.error.code, -32601);
+  }
 });
 
 test('GET tasks uses the bearer token and Cindy-only loopback path', async () => {
@@ -247,6 +261,31 @@ test('GET tasks uses the bearer token and Cindy-only loopback path', async () =>
       url: '/api/integrations/cindy/tasks',
       authorization: 'Bearer test-token',
     }]);
+  } finally {
+    await close(server);
+  }
+});
+
+test('legacy CONFIG_ROOT still resolves the same integration token when TOOMANYTASKS_CONFIG_ROOT is empty', async () => {
+  const requests = [];
+  const server = createServer((request, response) => {
+    requests.push(request.headers.authorization);
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({ items: [] }));
+  });
+  const port = await listen(server);
+  try {
+    const result = await callWorker({
+      jsonrpc: '2.0',
+      id: 7,
+      method: 'pm/request',
+      params: { baseUrl: `http://127.0.0.1:${port}`, method: 'GET', path: '/api/integrations/cindy/tasks' },
+    }, {
+      TOOMANYTASKS_CONFIG_ROOT: '',
+      CONFIG_ROOT: tokenRoot,
+    });
+    assert.deepEqual(result.result, { items: [] });
+    assert.deepEqual(requests, ['Bearer test-token']);
   } finally {
     await close(server);
   }

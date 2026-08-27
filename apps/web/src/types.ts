@@ -129,6 +129,7 @@ export type Candidate = {
   created_at: string;
   updated_at: string;
   source_type?: string;
+  source_kind?: 'aily_summary';
   owner_mentioned?: number;
   source_completeness?: 'complete' | 'partial' | 'limited';
   discovery_reason?: string;
@@ -253,6 +254,7 @@ export type CalendarTaskItem = Pick<Task, 'id' | 'title' | 'status' | 'next_step
 export type SourceEvent = {
   source_scope: string;
   source_type: string;
+  source_kind?: 'aily_summary';
   completeness: string;
   occurred_at: string;
   summary_available: boolean;

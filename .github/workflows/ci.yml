@@ -16,6 +16,8 @@ jobs:
           node-version: "24"
           cache: npm
       - run: npm ci
+      - name: Build Cindy thin plugin
+        run: npm run build:plugin
       - name: Typecheck
         run: npm run typecheck
       - name: Plugin tests

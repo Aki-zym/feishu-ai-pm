@@ -11,6 +11,8 @@
 - [0006：分阶段小 Schema 承载连续对话语义判断](0006-staged-semantic-classification.md)
 - [0007：M1 单用户试点继续使用 SQLite，并以领域合同约束 draft-only](0007-m1-sqlite-draft-only-and-contracts.md)
 - [0008：当前 SQLite 使用版本化迁移与可恢复升级](0008-versioned-sqlite-migrations.md)
+- [0009：Aily 派生摘要驱动的任务入库合同](0009-aily-derived-intake-contracts.md)
+- [0010：独立 TooManyTasks 拥有 OAuth 与 Aily 运行时](0010-independent-toomanytasks-owns-aily-runtime.md)
 
 其中两个历史 `0002-*.md` 文件分别使用 `ADR-0002-owner-information-first` 与 `ADR-0002-electron`，文件名和旧标题不再作为新编号依据。
 

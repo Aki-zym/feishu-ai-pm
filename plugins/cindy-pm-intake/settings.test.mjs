@@ -7,10 +7,9 @@ import vm from 'node:vm';
 const settingsSource = readFileSync(path.resolve(import.meta.dirname, 'settings.js'), 'utf8');
 const settingsHtml = readFileSync(path.resolve(import.meta.dirname, 'settings.html'), 'utf8');
 
-async function loadSettings({ autoScanEnabled = false } = {}) {
+async function loadSettings({ autoScanEnabled = false, failedPutUrl = null } = {}) {
   const elements = new Map([
     ['pmBaseUrl', { value: '', placeholder: '' }],
-    ['token', { value: '', placeholder: '' }],
     ['save', { onclick: null }],
     ['restart', { onclick: null }],
     ['autoScan', { checked: false, onchange: null }],
@@ -27,7 +26,7 @@ async function loadSettings({ autoScanEnabled = false } = {}) {
       calls.push({ url, options });
       if (url === '/kv' && !options.method) return { json: async () => ({ pmBaseUrl: 'http://127.0.0.1:4310' }) };
       if (url === '/secrets' && !options.method) return { json: async () => [] };
-      return { json: async () => ({}) };
+      return { ok: url !== failedPutUrl, json: async () => ({}) };
     },
     cindy: {
       node: {
@@ -60,17 +59,33 @@ test('settings accepts loopback pmBaseUrl and writes configuration', async () =>
   const save = calls.find((call) => call.url === '/kv' && call.options.method === 'PUT');
   assert.ok(save);
   assert.equal(JSON.parse(save.options.body).pmBaseUrl, 'http://[::1]:4310');
+  assert.equal('ailyAgentId' in JSON.parse(save.options.body), false);
   assert.equal(elements.get('status').textContent, '已保存');
 });
 
-test('settings restarts the local task library through pm/restart without the stop exit path', async () => {
+test('settings never reads or writes plugin secrets for Aily or the integration token', async () => {
+  const { elements, calls } = await loadSettings();
+  await elements.get('save').onclick();
+  assert.equal(calls.some((call) => String(call.url).startsWith('/secrets')), false);
+  assert.doesNotMatch(settingsHtml, /id="ailyAppSecret"|id="ailyUserAccessToken"|id="token"/);
+});
+
+test('settings reports a failed PUT instead of showing a false success', async () => {
+  const { elements, calls } = await loadSettings({ failedPutUrl: '/kv' });
+  await elements.get('save').onclick();
+  assert.equal(elements.get('status').textContent, '配置保存失败');
+  assert.equal(calls.some((call) => call.url === 'broadcast'), false);
+});
+
+test('settings restarts the independent task service through its loopback runtime API', async () => {
   const { elements, nodeCalls } = await loadSettings();
   await elements.get('restart').onclick();
-  const restart = nodeCalls.find((request) => request.method === 'pm/restart');
+  const restart = nodeCalls.find((request) => request.method === 'pm/request'
+    && request.params.path === '/api/runtime/restart');
   assert.ok(restart);
   assert.equal(restart.params.baseUrl, 'http://127.0.0.1:4310');
-  assert.equal(restart.params.scheduleExit, false);
-  assert.equal(elements.get('status').textContent, '本机任务库已重启');
+  assert.equal(restart.params.method, 'POST');
+  assert.equal(elements.get('status').textContent, '独立 TooManyTasks 已收到重启请求');
 });
 
 test('settings enables the resident 10-minute scan loop without opening an automation panel', async () => {
@@ -107,7 +122,9 @@ test('settings explains the resident scan loop and required discounted Luna rout
   assert.match(settingsHtml, /不会静默修改 Cindy 的全局默认模型/);
   assert.match(settingsHtml, /Cindy 保持运行且开关打开，每 10 分钟自动扫/);
   assert.doesNotMatch(settingsHtml, /打开自动化面板/);
-  assert.match(settingsHtml, /本机后台运行时菜单栏会显示 TooManyTasks，点击打开任务台/);
+  assert.match(settingsHtml, /请先独立启动 TooManyTasks/);
+  assert.match(settingsHtml, /自行管理 Aily OAuth、Token、官方 SDK/);
+  assert.match(settingsHtml, /不保存 Aily App Secret、访问 Token 或任务库令牌/);
 });
 
 test('settings exposes active and automatic progress modes', async () => {
