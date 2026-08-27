@@ -55,6 +55,17 @@ export function runtimePaths(env = process.env) {
   };
 }
 
+export function serverEnvironment(paths, env = process.env) {
+  return {
+    ...env,
+    TOOMANYTASKS_CONFIG_ROOT: paths.configRoot,
+    NODE_ENV: 'production',
+    PORT: String(new URL(paths.baseUrl).port || DEFAULT_PORT),
+    AILY_OAUTH_REDIRECT_URI: env.AILY_OAUTH_REDIRECT_URI?.trim()
+      || `http://127.0.0.1:${new URL(paths.baseUrl).port || DEFAULT_PORT}/oauth/aily/callback`,
+  };
+}
+
 function isPidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -160,13 +171,7 @@ export async function startServer({ paths = runtimePaths(), waitMs = 30_000 } = 
   const logFd = openSync(paths.logFile, 'a', 0o600);
   const child = spawn(process.execPath, [resolve(root, 'apps/server/dist/index.js')], {
     cwd: root,
-    env: {
-      ...process.env,
-      NODE_ENV: 'production',
-      PORT: String(new URL(paths.baseUrl).port || DEFAULT_PORT),
-      AILY_OAUTH_REDIRECT_URI: process.env.AILY_OAUTH_REDIRECT_URI?.trim()
-        || `http://127.0.0.1:${new URL(paths.baseUrl).port || DEFAULT_PORT}/oauth/aily/callback`,
-    },
+    env: serverEnvironment(paths),
     detached: true,
     stdio: ['ignore', logFd, logFd],
   });
