@@ -33,7 +33,7 @@ evidence: [VER-AILY-SDK-ISOLATED-20260827]
 ## 限制
 
 - Aily 扫描可以在 Cindy 退出时继续运行；Cindy intake 判断仍依赖插件常驻。插件关闭期间的摘要会在本机 inbox 积压，重新启动后按顺序处理。
-- 自定义配置目录时，TooManyTasks 与 Cindy Worker 统一读取 `TOOMANYTASKS_CONFIG_ROOT`；服务端继续兼容旧 `CONFIG_ROOT`，Worker 也保留同名回退。两个进程必须看到同一路径。
+- 默认安装路径由 TooManyTasks 与 Cindy Worker 自动统一；自定义配置目录时，两个进程都必须显式看到同一个 `TOOMANYTASKS_CONFIG_ROOT`，服务端和 Worker 均兼容旧 `CONFIG_ROOT` 回退。
 - 本地合成测试不证明真实飞书租户的 OAuth、refresh token 轮换、Aily Agent 可见范围、限流或撤权结果。
 - Cindy 宿主当前没有稳定的 errand 工具白名单合同，插件仍依靠提示合同、API 白名单和服务端认证收紧能力。
 

@@ -13,7 +13,7 @@
 - SQLite、候选、任务、来源、幂等和 CAS。
 - 首次启动时在私有配置目录生成 `cindy-integration-token`。
 
-插件 Worker 从同一私有配置目录读取集成令牌，只允许访问 `/api/runtime/*` 和 `/api/integrations/cindy/*`。自定义目录时与服务端统一设置 `TOOMANYTASKS_CONFIG_ROOT`；旧 `CONFIG_ROOT` 仍可兼容。插件设置页不显示或保存 `pm_token`、Aily App Secret、用户 Token 或 Agent ID。服务未运行或尚未首次启动时，工具会提示先启动独立 TooManyTasks。
+插件 Worker 从同一私有配置目录读取集成令牌，只允许访问 `/api/runtime/*` 和 `/api/integrations/cindy/*`。默认安装路径由服务端和 Cindy Worker 自动一致；使用自定义目录时，服务进程与 Cindy 宿主进程都必须设置同一个 `TOOMANYTASKS_CONFIG_ROOT`（旧 `CONFIG_ROOT` 仍可兼容），宿主不会替插件自动继承服务进程环境变量。插件设置页不显示或保存 `pm_token`、Aily App Secret、用户 Token 或 Agent ID。服务未运行或尚未首次启动时，工具会提示先启动独立 TooManyTasks。
 
 ## 工具
 

@@ -87,6 +87,7 @@ function waitUntilReady(target, child) {
 
 async function startServer(target) {
   const taskMemoryRoot = join(runRoot, target.name, 'task-memory');
+  const configRoot = join(runRoot, target.name, 'config');
   const child = spawn(process.execPath, [tsxCli, serverEntry], {
     cwd: repoRoot,
     env: {
@@ -96,6 +97,8 @@ async function startServer(target) {
       DATABASE_URL: ':memory:',
       DATABASE_PROVIDER: 'sqlite',
       POSTGRES_URL: '',
+      TOOMANYTASKS_CONFIG_ROOT: configRoot,
+      CONFIG_ROOT: configRoot,
       TASK_MEMORY_ROOT: taskMemoryRoot,
       FEISHU_EXTERNAL_ENABLED: 'false',
       FEISHU_SCAN_ENABLED: 'false',

@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { AILY_SCAN_INTERVAL_MS, AilyScanScheduler, AilyService, AilyServiceError, ailyTestExports } from '../src/aily.js';
+import { AILY_APPLICATION_SCOPES, AILY_SCAN_INTERVAL_MS, AilyScanScheduler, AilyService, AilyServiceError, ailyTestExports } from '../src/aily.js';
 import { loadConfig } from '../src/config.js';
 import { AppDatabase } from '../src/database.js';
 import { createCindyAdapters } from '../src/integrations.js';
@@ -113,6 +113,106 @@ describe('独立 Aily 服务', () => {
     expect(JSON.stringify(service.status())).not.toContain('oauth-');
     await expect(service.completeAuthorization('authorization-code', state))
       .rejects.toMatchObject({ code: 'AILY_OAUTH_STATE_INVALID' });
+  });
+
+  it('应用准备使用 tenant_access_token 配置、发布并申请当前版本权限，返回脱敏状态', async () => {
+    const { service } = await makeService();
+    const calls: Array<{ name: string; input: unknown; options: unknown }> = [];
+    const mockedClient = {
+      auth: {
+        tenantAccessToken: {
+          internal: async (input: unknown) => {
+            calls.push({ name: 'tenantAccessToken.internal', input, options: undefined });
+            return { code: 0, tenant_access_token: 'private-tenant-token' };
+          },
+        },
+      },
+      application: {
+        v7: {
+          applicationConfig: {
+            patch: async (input: unknown, options: unknown) => {
+              calls.push({ name: 'applicationConfig.patch', input, options });
+              return { code: 0, data: {} };
+            },
+          },
+          applicationPublish: {
+            create: async (input: unknown, options: unknown) => {
+              calls.push({ name: 'applicationPublish.create', input, options });
+              return { code: 0, data: { version_id: 'version-1' } };
+            },
+          },
+        },
+        v6: {
+          scope: {
+            apply: async (input: unknown, options: unknown) => {
+              calls.push({ name: 'scope.apply', input, options });
+              return { code: 0, data: {} };
+            },
+            list: async (input: unknown, options: unknown) => {
+              calls.push({ name: 'scope.list', input, options });
+              return {
+                code: 0,
+                data: {
+                  scopes: AILY_APPLICATION_SCOPES.map(({ scope_name }) => ({ scope_name, grant_status: 1 })),
+                },
+              };
+            },
+          },
+        },
+      },
+    };
+    Object.assign(service, { client: () => mockedClient });
+
+    const result = await service.prepareApplication();
+    expect(result).toMatchObject({
+      status: 'ready',
+      configuredScopeCount: AILY_APPLICATION_SCOPES.length,
+      grantedScopeCount: AILY_APPLICATION_SCOPES.length,
+      pendingScopeCount: 0,
+      publishSubmitted: true,
+      adminApprovalRequested: true,
+    });
+    expect(JSON.stringify(result)).not.toContain('private-tenant-token');
+    expect(calls.map(({ name }) => name)).toEqual([
+      'tenantAccessToken.internal',
+      'applicationConfig.patch',
+      'applicationPublish.create',
+      'scope.apply',
+      'scope.list',
+    ]);
+    const configCall = calls.find(({ name }) => name === 'applicationConfig.patch');
+    expect(JSON.stringify(configCall?.input)).toContain('search:message');
+    expect(JSON.stringify(configCall?.input)).toContain('oauth/aily/callback');
+    expect(JSON.stringify(configCall?.input)).not.toContain('offline_access');
+  });
+
+  it('应用版本或权限仍在审核时立即返回可重试的审批中状态', async () => {
+    const { service } = await makeService();
+    const mockedClient = {
+      auth: { tenantAccessToken: { internal: async () => ({ code: 0, tenant_access_token: 'private-tenant-token' }) } },
+      application: {
+        v7: {
+          applicationConfig: { patch: async () => ({ code: 0, data: {} }) },
+          applicationPublish: { create: async () => ({ code: 0, data: { version_id: 'version-1' } }) },
+        },
+        v6: {
+          scope: {
+            apply: async () => ({ code: 0, data: {} }),
+            list: async () => ({
+              code: 0,
+              data: { scopes: AILY_APPLICATION_SCOPES.map(({ scope_name }) => ({ scope_name, grant_status: 0 })) },
+            }),
+          },
+        },
+      },
+    };
+    Object.assign(service, { client: () => mockedClient });
+
+    await expect(service.prepareApplication()).resolves.toMatchObject({
+      status: 'awaiting_admin_approval',
+      grantedScopeCount: 0,
+      pendingScopeCount: AILY_APPLICATION_SCOPES.length,
+    });
   });
 
   it('过期 Token 自动 refresh，SDK 请求使用刷新后的用户 Token，非空摘要进入 ready inbox 并推进扫描游标', async () => {

@@ -242,6 +242,10 @@ export async function configureAilyFromStdin(paths = runtimePaths()) {
   return { status: 'configured', appConfigured: true, agentConfigured: true };
 }
 
+export async function prepareAilyApplication(paths = runtimePaths()) {
+  return fetchJson(paths, 'POST', '/api/integrations/aily/application/prepare', {}, 30_000);
+}
+
 export async function getOAuthUrl(paths = runtimePaths()) {
   const result = await fetchJson(paths, 'GET', '/api/integrations/aily/oauth/url');
   if (!result?.url || typeof result.url !== 'string') throw new Error('TooManyTasks 没有返回 OAuth 地址。');
@@ -304,7 +308,7 @@ export async function main(command = process.argv[2] || 'install') {
       settingsUrl: `${paths.baseUrl}/settings`,
       oauthRedirectUri: `http://127.0.0.1:${new URL(paths.baseUrl).port || DEFAULT_PORT}/oauth/aily/callback`,
       pluginPackage: paths.pluginPackage,
-      next: ['用浏览器在当前用户自己的飞书后台创建并发布自建应用和 Aily Agent。', '调用 configure-aily 将凭证安全写入本机，再调用 oauth-url 和 wait-oauth。', '通过 Cindy 宿主安装插件包后调用 enable-scan。'],
+      next: ['仅用浏览器创建用户自己的自建应用和 Aily Agent，并读取首次 App ID、App Secret、Agent ID。', '调用 configure-aily 和 prepare-aily-app，由 CLI 配置、发布并申请应用权限，再调用 oauth-url 和 wait-oauth。', '通过 Cindy 宿主安装插件包后调用 enable-scan。'],
     }, null, 2));
     return;
   }
@@ -334,6 +338,10 @@ export async function main(command = process.argv[2] || 'install') {
   }
   if (command === 'configure-aily') {
     console.log(JSON.stringify(await configureAilyFromStdin(paths), null, 2));
+    return;
+  }
+  if (command === 'prepare-aily-app') {
+    console.log(JSON.stringify(await prepareAilyApplication(paths), null, 2));
     return;
   }
   if (command === 'oauth-url') {
