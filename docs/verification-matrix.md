@@ -3,7 +3,7 @@
 # 验证矩阵
 
 机器事实源：[`docs/verification-matrix.json`](verification-matrix.json)。当前产品状态见 [当前状态](current-state.md)。
-产品源码快照：日期 `2026-08-15`；等价 commit `null`；算法 `product-source-sha256-v1`；选择器 `apps-workspace-default-include-v1`；文件数 `53`；fingerprint `f8c043917bf3a0d83a941c97bc6da2fc79f22b2a26eb12b51b9d23688f54f8bf`。
+产品源码快照：日期 `2026-08-15`；等价 commit `null`；算法 `product-source-sha256-v1`；选择器 `apps-workspace-default-include-v1`；文件数 `53`；fingerprint `20d905583d11ae5ca220bee5f2e1ffbf61349947859c9e8989f12ca4d34c0ed0`。
 
 ## L0–L6
 

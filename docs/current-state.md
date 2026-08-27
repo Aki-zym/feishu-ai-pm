@@ -38,7 +38,7 @@
 
 
 
-commit 只提供精确产品快照的导航线索，可能因后续 squash/merge 改变；机器每次都以确定性的产品源码指纹比对被审工作树，并与 [文档清单](docs-manifest.json) 和 [验证事实源](verification-matrix.json) 交叉检查。产品源码或运行配置变化时，三处必须一起更新，否则 CI 失败。当前候选产品投影算法为 `product-source-sha256-v1`，选择器为 `apps-workspace-default-include-v1`，fingerprint 为 `f8c043917bf3a0d83a941c97bc6da2fc79f22b2a26eb12b51b9d23688f54f8bf`，纳入 `53` 个文件，快照日期为 `2026-08-15`；本轮暂不绑定等价参照 commit。当前 exact base/head/merge-ref/parents/tree/run/job 只以本轮 Draft PR provenance 为准，不把历史 PR 的 CI 当作当前候选授权。
+commit 只提供精确产品快照的导航线索，可能因后续 squash/merge 改变；机器每次都以确定性的产品源码指纹比对被审工作树，并与 [文档清单](docs-manifest.json) 和 [验证事实源](verification-matrix.json) 交叉检查。产品源码或运行配置变化时，三处必须一起更新，否则 CI 失败。当前候选产品投影算法为 `product-source-sha256-v1`，选择器为 `apps-workspace-default-include-v1`，fingerprint 为 `20d905583d11ae5ca220bee5f2e1ffbf61349947859c9e8989f12ca4d34c0ed0`，纳入 `53` 个文件，快照日期为 `2026-08-15`；本轮暂不绑定等价参照 commit。当前 exact base/head/merge-ref/parents/tree/run/job 只以本轮 Draft PR provenance 为准，不把历史 PR 的 CI 当作当前候选授权。
 Issue #42 RUN-01 已合入 integration；Runtime 支持可复用 provider checkpoint、SQLite 工具审计原子落库、AbortSignal、有界续租和 exact lease fence，失效或迟到回调不能写入完成状态、checkpoint 或业务结果。RUN-01 的 `external.send` claim/幂等恢复仅作为历史审计兼容和未来独立发送 Issue 的保留结构，M1 当前 policy 永久固定为 `forbidden`：即使 `approved=true` 或存在幂等键，也不创建外部 claim、不调用 provider、不执行 callback。当前 v1/v2 schema identity 与 DATA-02 v2 合同保持不变，RUN-01 使用连续 v3 migration；正式验证 ID、commit、环境与限制以已合入 PR #87 的历史 provenance 为准，不代表真实 provider、飞书租户或 Windows L5。
 
 
