@@ -1,8 +1,8 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { AilyService, AilyServiceError, ailyTestExports } from '../src/aily.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { AILY_SCAN_INTERVAL_MS, AilyScanScheduler, AilyService, AilyServiceError, ailyTestExports } from '../src/aily.js';
 import { loadConfig } from '../src/config.js';
 import { AppDatabase } from '../src/database.js';
 import { createCindyAdapters } from '../src/integrations.js';
@@ -26,6 +26,7 @@ describe('独立 Aily 服务', () => {
   const databases: AppDatabase[] = [];
 
   afterEach(async () => {
+    vi.useRealTimers();
     for (const database of databases.splice(0)) database.close();
     for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
   });
@@ -114,7 +115,7 @@ describe('独立 Aily 服务', () => {
       .rejects.toMatchObject({ code: 'AILY_OAUTH_STATE_INVALID' });
   });
 
-  it('过期 Token 自动 refresh，SDK 请求使用刷新后的用户 Token，非空摘要不推进游标', async () => {
+  it('过期 Token 自动 refresh，SDK 请求使用刷新后的用户 Token，非空摘要进入 ready inbox 并推进扫描游标', async () => {
     const { service, credentials, pm } = await makeService();
     await credentials.setMany({
       [ailySecretKeys.accessToken]: 'expired-access',
@@ -144,17 +145,22 @@ describe('独立 Aily 服务', () => {
     expect(result).toMatchObject({
       status: 'summary_ready',
       aily_summary_generated: true,
+      inbox: { status: 'ready', summary_ready: true },
+    });
+    expect(sdkUserToken).toBe('fresh-access');
+    if (!('window_end' in result)) throw new Error('Aily 扫描没有返回窗口。');
+    expect(pm.intakeWindowCursor().window_end).toBe(result.window_end);
+    expect(pm.claimNextAilySummaryInbox()).toMatchObject({
+      status: 'ready',
       source: {
         source_kind: 'aily_summary',
         agent_id: 'agent_test',
         text: '窗口内有一项需要跟进的任务。',
       },
     });
-    expect(sdkUserToken).toBe('fresh-access');
-    expect(pm.intakeWindowCursor()).toEqual({ window_end: null });
   });
 
-  it('空摘要提交显式空窗口并推进游标；上游失败保留待重试窗口', async () => {
+  it('空摘要写入 completed 审计记录并推进游标；上游失败保留待重试窗口', async () => {
     const empty = await makeService();
     await empty.credentials.setMany({
       [ailySecretKeys.accessToken]: 'valid-access',
@@ -165,8 +171,43 @@ describe('独立 Aily 服务', () => {
       client: () => ({ request: async () => chunks([sseText('NO_NEW_INFORMATION')]) }),
     });
     const emptyResult = await empty.service.scan(empty.pm, 'manual') as Record<string, unknown>;
-    expect(emptyResult).toMatchObject({ status: 'skipped', reason: 'aily_empty' });
+    expect(emptyResult).toMatchObject({
+      status: 'completed',
+      reason: 'aily_empty',
+      inbox: { status: 'completed', summary_ready: false },
+    });
     expect(empty.pm.intakeWindowCursor().window_end).toBe(emptyResult.window_end);
+    expect(empty.pm.claimNextAilySummaryInbox()).toEqual({ status: 'empty' });
+
+    expect(ailyTestExports.classifySummary('NO_NEW_INFORMATION')).toEqual({ kind: 'empty' });
+    expect(ailyTestExports.classifySummary('SEARCH_FAILED: MISSING_SEARCH_MESSAGE')).toEqual({
+      kind: 'failed_scope',
+      code: 'MISSING_SEARCH_MESSAGE',
+    });
+    expect(ailyTestExports.buildPrompt({
+      window_id: 'w',
+      window_start: '2026-08-26T16:00:00.000Z',
+      window_end: '2026-08-27T09:00:00.000Z',
+      reused: false,
+    })).toContain('禁止：列出全部会话后再逐个拉历史');
+
+    const scopeDump = await makeService();
+    await scopeDump.credentials.setMany({
+      [ailySecretKeys.accessToken]: 'valid-access',
+      [ailySecretKeys.refreshToken]: 'valid-refresh',
+      [ailySecretKeys.expiresAt]: '2099-01-01T00:00:00.000Z',
+    });
+    Object.assign(scopeDump.service, {
+      client: () => ({ request: async () => chunks([sseText('缺少 search:message 权限，无法检索。NO_NEW_INFORMATION')]) }),
+    });
+    const scopeResult = await scopeDump.service.scan(scopeDump.pm, 'manual') as Record<string, unknown>;
+    expect(scopeResult).toMatchObject({
+      status: 'failed',
+      aily_error_code: 'AILY_SCOPE_REQUIRED',
+      aily_scope_code: 'UNAUTHORIZED',
+    });
+    expect(scopeDump.pm.intakeWindowCursor()).toEqual({ window_end: null });
+    expect(scopeDump.pm.claimNextAilySummaryInbox()).toEqual({ status: 'empty' });
 
     const failed = await makeService();
     await failed.credentials.setMany({
@@ -252,5 +293,41 @@ describe('独立 Aily 服务', () => {
     });
     expect(await unauthorized.credentials.get(ailySecretKeys.accessToken)).toBeNull();
     expect(await unauthorized.credentials.get(ailySecretKeys.refreshToken)).toBeNull();
+  });
+
+  it('后台 scheduler 启动后等待 20 分钟再扫描，停止后不再触发', async () => {
+    vi.useFakeTimers();
+    const triggerScan = vi.fn(() => ({ status: 'accepted' }));
+    const stop = vi.fn(async () => undefined);
+    const scheduler = new AilyScanScheduler(
+      { triggerScan, stop } as unknown as AilyService,
+      {} as PmService,
+    );
+    scheduler.start();
+    expect(triggerScan).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(AILY_SCAN_INTERVAL_MS);
+    expect(triggerScan).toHaveBeenCalledTimes(1);
+    expect(triggerScan).toHaveBeenCalledWith(expect.anything(), 'schedule');
+    await scheduler.stop();
+    await vi.advanceTimersByTimeAsync(AILY_SCAN_INTERVAL_MS);
+    expect(triggerScan).toHaveBeenCalledTimes(1);
+    expect(stop).toHaveBeenCalledTimes(1);
+  });
+
+  it('异步手动扫描快速返回并拒绝重叠，stop 会中止当前扫描', async () => {
+    const { service, pm } = await makeService();
+    let release: (() => void) | undefined;
+    Object.assign(service, {
+      scan: (_pm: PmService, _trigger: string, signal: AbortSignal) => new Promise((resolve) => {
+        release = () => resolve({ status: 'done' });
+        signal.addEventListener('abort', () => resolve({ status: 'aborted' }), { once: true });
+      }),
+    });
+    expect(service.triggerScan(pm, 'manual')).toMatchObject({ status: 'accepted', job_id: expect.any(String) });
+    expect(service.triggerScan(pm, 'manual')).toMatchObject({ status: 'already_running' });
+    await service.stop();
+    expect(service.triggerScan(pm, 'manual')).toMatchObject({ status: 'accepted' });
+    release?.();
+    await service.stop();
   });
 });

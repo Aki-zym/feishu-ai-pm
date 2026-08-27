@@ -5,9 +5,9 @@ status: superseded-in-part
 date: 2026-08-09
 owner: 架构负责人
 scope: M0 技术栈与本地事实库
+evidence: []
 supersedes: []
 superseded_by: [ADR-0007]
-evidence: [VER-ISSUE64-CONTRACT-L1-20260815]
 ---
 
 # ADR 0001：首版采用 TypeScript 单仓库、React、Fastify 与本地 SQLite

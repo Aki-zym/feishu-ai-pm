@@ -36,7 +36,7 @@ const GENERATED_FILE = /\.(?:map|tsbuildinfo)$/i;
 const NON_PRODUCT_CONFIG_FILE = /^(?:eslint|jest|playwright|prettier|vitest|cypress)\.config\.|^tsconfig\.(?:spec|test|vitest)\.json$|^\.(?:eslint|prettier)/i;
 const FULL_SHA = /^[0-9a-f]{40}$/i;
 const INTEGRATION_BRANCH = 'integration/m1-test-20260815';
-export const INTEGRATION_DECLARATION_KINDS = new Set(['committed_base_snapshot', 'live_tip']);
+export const INTEGRATION_DECLARATION_KINDS = new Set(['committed_base_snapshot', 'live_tip', 'unbound']);
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 
@@ -316,6 +316,19 @@ export function integrationTipDeclarationErrors({ manifestTip, currentStateText,
   const declarations = parseDeclaredIntegrationDeclarations(currentStateText, branch);
   const parsedDeclaration = declarations[0] ?? null;
   const expectedKind = declarationKind ?? parsedDeclaration?.kind ?? null;
+  if (expectedKind === 'unbound') {
+    if (manifestTip !== null && manifestTip !== undefined && manifestTip !== '') {
+      errors.push('未绑定 integration tip 时 manifest current_state.committed_integration_base 必须为 null。');
+    }
+    if (declarations.length > 0) {
+      errors.push('未绑定 integration tip 时 docs/current-state 不得声明具体 integration commit。');
+    }
+    return {
+      errors,
+      parsedCurrentStateTip: null,
+      parsedDeclarationKind: null,
+    };
+  }
   if (!FULL_SHA.test(String(manifestTip ?? ''))) {
     errors.push('manifest current_state.committed_integration_base 必须是完整 40 位 commit SHA。');
   }

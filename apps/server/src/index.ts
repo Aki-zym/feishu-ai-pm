@@ -1,6 +1,6 @@
 import { buildApp } from './app.js';
 import { fileURLToPath } from 'node:url';
-import { AilyService } from './aily.js';
+import { AilyScanScheduler, AilyService } from './aily.js';
 import { loadConfig } from './config.js';
 import { AppDatabase } from './database.js';
 import { createCindyAdapters } from './integrations.js';
@@ -20,6 +20,7 @@ const credentials = new LocalCredentialStore(config);
 await credentials.load();
 const cindyIntegrationToken = await credentials.ensureIntegrationToken(config.cindyIntegrationToken);
 const ailyService = new AilyService(credentials);
+const ailyScheduler = new AilyScanScheduler(ailyService, service);
 const webRoot = fileURLToPath(new URL('../../web/dist/', import.meta.url));
 let app: Awaited<ReturnType<typeof buildApp>>;
 let shutdownInProgress: Promise<void> | null = null;
@@ -28,6 +29,7 @@ const listenOptions = { port: config.port, host: '127.0.0.1' } as const;
 const shutdown = async () => {
   if (shutdownInProgress) return shutdownInProgress;
   shutdownInProgress = (async () => {
+    await ailyScheduler.stop();
     await app.close();
     database.close();
   })();
@@ -50,9 +52,11 @@ const buildRuntimeApp = () => buildApp(service, {
 const restart = async () => {
   if (restartInProgress) return restartInProgress;
   restartInProgress = (async () => {
+    await ailyScheduler.stop();
     await app.close();
     app = await buildRuntimeApp();
     await app.listen(listenOptions);
+    ailyScheduler.start();
   })();
   try {
     await restartInProgress;
@@ -64,6 +68,7 @@ const restart = async () => {
 app = await buildRuntimeApp();
 
 await app.listen(listenOptions);
+ailyScheduler.start();
 
 process.on('SIGINT', () => { void shutdownAndExit(); });
 process.on('SIGTERM', () => { void shutdownAndExit(); });

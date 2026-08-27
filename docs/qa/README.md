@@ -35,7 +35,7 @@
 
 本轮只使用 `docs/product-rules/PROD-07-calendar-classification.json` 中的脱敏合成夹具和结构化合同 checker，不连接真实飞书、LLM 或生产数据，不修改 `apps/**` 分类实现。规则要求普通提醒、仅出席、全天/重复、节假日、生日和订阅日历保留 Calendar 事实；明确主人责任+动作+交付物/截止点才进入待确认候选；责任不明只进入主人确认提示；会议 action item 优先来自纪要/明确消息。
 
-量化目标：事实保留率 100%；事实型事件误报候选噪声率 0%；明确交付候选召回率 100%；责任不明批量候选数量 0；候选解释覆盖率 100%；重复系列候选倍增不超过 1。桌面与窄屏 route/解释一致只是后续实现验收目标，本 Issue 尚未实现或验证 UI 分类行为。该记录的 PROD-07 证据上限严格为 L0：整仓 CI/Playwright 只能说明回归未破坏，不能升级为规则已在 UI 或生产分类中运行；不代表生产行为已上线或真实日历租户已验收；证据 ID：`VER-ISSUE85-PROD07-L0-20260816`。
+量化目标：事实保留率 100%；事实型事件误报候选噪声率 0%；明确交付候选召回率 100%；责任不明批量候选数量 0；候选解释覆盖率 100%；重复系列候选倍增不超过 1。桌面与窄屏 route/解释一致只是后续实现验收目标，本 Issue 尚未实现或验证 UI 分类行为。该历史记录不再进入当前验证矩阵，当前产品状态以 [当前状态](../current-state.md) 和现行验证 ID 为准。
 ## 2026-08-16 Issue #37 DATA-03：候选版本 CAS 与刷新代际
 
 本轮仅使用当前 integration `integration/m1-test-20260815` @ `79f97d9505364fc5acbb9816fc77490e0b2e0211` 之上的合成 SQLite、Fastify inject、虚拟适配器与浏览器 Mock；不连接真实飞书、LLM、provider 或生产数据。DATA-03 行为提交为 `7cbb899017bcb5d577f3648442719ff4fa2d1efc`，其 5603404 基线仅作历史 source evidence；当前产品 fingerprint 为 `1b5fd6ae58701b699b2afa7dc6259ae54247289725011f91cc4ff83f6dc4e1a4`，纳入 `81` 个文件。
@@ -78,7 +78,7 @@
 | 失效闭环 | 删除任务、候选撤销/任务无效化在同一 SQLite transaction 内终止关联 approval/outbox；来源、task_event、correction_event 和其他审计保留；恢复不重开旧草稿 |
 | DTO/API | approval/outbox 只返回固定 allowlist 元数据、draft/rejected/obsolete 状态和 `externally_sent=false`，不返回 payload/provider/raw；没有 send mutation 或 consumer |
 | UI | 任务详情显示“对外草稿”“待主人审阅”“已拒绝”“已失效”，文案明确未发送，不提供发送按钮 |
-| 证据边界 | `VER-ISSUE55-DRAFT-ONLY-L4-20260816`；synthetic L4 only，不代表真实 provider、生产数据、Windows L5 或租户 L6 |
+| 证据边界 | 本历史记录不再进入当前验证矩阵；仅作背景材料，不代表真实 provider、生产数据、Windows L5 或租户 L6 |
 
 ## 2026-08-16 Issue #42 RUN-01：Runtime 恢复与关闭边界
 
@@ -391,7 +391,7 @@ Browser 插件在当前会话不可用，因此按前端调试规范使用仓库
 |---|---|
 | 新库路径 | `apps/desktop/src/database-path.test.ts`：1 passed；当前文件固定为 `data/ai-pm-v1.sqlite`，历史 `data/ai-pm.sqlite` 路径仅用于存在性提示 |
 | 精确产品/构建 source | `f9e77aec70aaa846047f987672c9171e0790846a`；这是正式安装包对应的产品实现来源，不是后续 PR 证据 head |
-| artifact/record carrier | 已知 carrier ancestor `3dcd9d0779542a7f3b6beebe73048273a0eff68a`；`VER-PACKAGE-020.record_commit` 使用 `pull_request_81_pending`，避免同一提交自引用 |
+| artifact/record carrier | 已知 carrier ancestor 属于历史证据；本历史记录不再进入当前验证矩阵 |
 | 产品投影 | selector `apps-workspace-default-include-v1`；`77` files；fingerprint `79c8f0bcc50df16ce0a515c5872027170f26c99c61776691c4b780f1038b83fe`；当前 DATA-02 merge `f080463cd43db63456b4408e18e7b0582666054f` 与该投影对应，正式包仍绑定历史 product/build source `f9e77aec70aaa846047f987672c9171e0790846a` |
 | PR evidence freshness | PR #81 最终 docs/evidence head、merge-ref、parents 与 run/job 只写入 PR body，不替代产品/构建 source |
 | 旧库保留 | 隔离 Smoke 创建 synthetic sentinel，启动后旧文件 SHA-256 不变，未读取/迁移/重命名/删除；新库建立并可重启，配置中的 synthetic appId 保留 |

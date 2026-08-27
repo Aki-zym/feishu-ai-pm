@@ -5,8 +5,8 @@ status: accepted
 date: 2026-08-15
 owner: 产品负责人 / 架构负责人
 scope: M1 单用户试点、Issue #64 领域合同
+evidence: []
 supersedes: [ADR-0001#正式试点 PostgreSQL 条款]
-evidence: [VER-ISSUE60-E2E-20260815, VER-ISSUE64-CONTRACT-L1-20260815]
 ---
 
 # ADR 0007：M1 单用户试点继续使用 SQLite，并以领域合同约束 draft-only

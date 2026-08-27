@@ -32,7 +32,7 @@ describe('Cindy 对话入库接口', () => {
     const service = new PmService(database, createCindyAdapters(config), config);
     const app = await buildApp(service, { serveWeb: false, cindyIntegrationToken: token });
     apps.push(app);
-    return { app, database };
+    return { app, database, service };
   }
 
   const source = {
@@ -127,7 +127,7 @@ describe('Cindy 对话入库接口', () => {
       payload: { window_end: '2026-08-24T00:10:00.000Z' },
     });
     expect(same.statusCode).toBe(409);
-    expect(same.json()).toMatchObject({ error: '入库窗口游标只允许向前推进。' });
+    expect(same.json()).toMatchObject({ error: 'Aily 扫描窗口游标只允许向前推进。' });
     const earlier = await app.inject({
       method: 'PUT',
       url: '/api/runtime/intake-cursor',
@@ -135,7 +135,7 @@ describe('Cindy 对话入库接口', () => {
       payload: { window_end: '2026-08-24T00:09:00.000Z' },
     });
     expect(earlier.statusCode).toBe(409);
-    expect(earlier.json()).toMatchObject({ error: '入库窗口游标只允许向前推进。' });
+    expect(earlier.json()).toMatchObject({ error: 'Aily 扫描窗口游标只允许向前推进。' });
 
     const remoteGet = await app.inject({ method: 'GET', url: '/api/runtime/intake-cursor', remoteAddress: '203.0.113.10' });
     expect(remoteGet.statusCode).toBe(403);
@@ -146,7 +146,7 @@ describe('Cindy 对话入库接口', () => {
       payload: { window_end: '2026-08-24T00:11:00.000Z' },
     });
     expect(remotePut.statusCode).toBe(403);
-    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'intake_window_end'").get())
+    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'aily_scan_window_end'").get())
       .toEqual({ value_json: '{"window_end":"2026-08-24T00:10:00.000Z"}' });
   });
 
@@ -177,8 +177,8 @@ describe('Cindy 对话入库接口', () => {
       },
     });
     expect(response.statusCode).toBe(200);
-    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'intake_window_end'").get())
-      .toEqual({ value_json: '{"window_end":"2026-08-24T00:10:00.000Z"}' });
+    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'aily_scan_window_end'").get())
+      .toBeUndefined();
 
     const snapshot = await app.inject({
       method: 'GET',
@@ -399,7 +399,7 @@ describe('Cindy 对话入库接口', () => {
     expect((database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get() as { count: number }).count).toBe(0);
   });
 
-  it('成功提交空窗口时也推进 intake_window_end', async () => {
+  it('直接提交空 intake 不推进独立 Aily 扫描游标', async () => {
     const { app, database } = await makeApp();
     const response = await app.inject({
       method: 'POST',
@@ -415,8 +415,8 @@ describe('Cindy 对话入库接口', () => {
       },
     });
     expect(response.statusCode).toBe(200);
-    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'intake_window_end'").get())
-      .toEqual({ value_json: '{"window_end":"2026-08-24T00:10:00.000Z"}' });
+    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'aily_scan_window_end'").get())
+      .toBeUndefined();
   });
 
   it('同一窗口的提交内容变化返回冲突，不静默复用旧结果', async () => {
@@ -451,8 +451,8 @@ describe('Cindy 对话入库接口', () => {
     expect((database.raw.prepare('SELECT COUNT(*) AS count FROM correction_event').get() as { count: number }).count).toBe(1);
   });
 
-  it('失败前后认领同一个持久窗口，成功入库后清除 pending window', async () => {
-    const { app, database } = await makeApp();
+  it('Aily 摘要持久化后推进独立游标并清除 pending window', async () => {
+    const { app, database, service } = await makeApp();
     const first = await app.inject({
       method: 'POST',
       url: '/api/runtime/intake-window',
@@ -467,33 +467,19 @@ describe('Cindy 对话入库接口', () => {
     });
     expect(second.statusCode).toBe(200);
     expect(second.json()).toEqual({ ...first.json(), reused: true });
-    const { reused: _reused, ...window } = first.json();
-    const statusBefore = await app.inject({
-      method: 'GET',
-      url: `/api/integrations/cindy/intake/${encodeURIComponent(window.window_id)}/status`,
-      headers: { authorization: `Bearer ${token}` },
+    const window = first.json();
+    service.persistAilySummaryWindow({
+      window,
+      agent_id: 'agent_test',
+      generated_at: window.window_end,
+      text: '',
+      empty: true,
     });
-    expect(statusBefore.statusCode).toBe(200);
-    expect(statusBefore.json()).toMatchObject({ completed: false, window_id: window.window_id });
-    const completed = await app.inject({
-      method: 'POST',
-      url: '/api/integrations/cindy/intake',
-      headers: { authorization: `Bearer ${token}` },
-      payload: {
-        ...window,
-        result_kind: 'empty_window',
-        sources: [],
-        proposals: [],
-      },
-    });
-    expect(completed.statusCode).toBe(200);
-    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'intake_pending_window'").get()).toBeUndefined();
-    const statusAfter = await app.inject({
-      method: 'GET',
-      url: `/api/integrations/cindy/intake/${encodeURIComponent(window.window_id)}/status`,
-      headers: { authorization: `Bearer ${token}` },
-    });
-    expect(statusAfter.json()).toMatchObject({ completed: true, result_kind: 'empty_window' });
+    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'aily_scan_pending_window'").get()).toBeUndefined();
+    expect(database.raw.prepare("SELECT value_json FROM app_setting WHERE key = 'aily_scan_window_end'").get())
+      .toEqual({ value_json: JSON.stringify({ window_end: window.window_end }) });
+    expect(database.raw.prepare('SELECT result_kind, status FROM aily_summary_inbox WHERE window_id = ?').get(window.window_id))
+      .toEqual({ result_kind: 'empty', status: 'completed' });
   });
 
   it('入库状态查询要求 Cindy Bearer 授权', async () => {
@@ -511,6 +497,206 @@ describe('Cindy 对话入库接口', () => {
     });
     expect(withAuth.statusCode).toBe(200);
     expect(withAuth.json()).toMatchObject({ window_id: windowId, completed: false });
+  });
+
+  it('Aily inbox 使用 Bearer 原子领取，submit_intake 成功后在同一事务标记 completed', async () => {
+    const { app, database, service } = await makeApp();
+    const window = {
+      window_id: 'intake-async-1',
+      window_start: '2026-08-27T08:00:00.000Z',
+      window_end: '2026-08-27T08:20:00.000Z',
+      reused: false,
+    };
+    service.persistAilySummaryWindow({
+      window,
+      agent_id: 'agent_test',
+      generated_at: '2026-08-27T08:20:01.000Z',
+      text: '窗口内新增一项需要确认的任务。',
+      empty: false,
+    });
+
+    expect((await app.inject({
+      method: 'GET',
+      url: '/api/integrations/cindy/summary-inbox/next',
+    })).statusCode).toBe(401);
+    const claimed = await app.inject({
+      method: 'GET',
+      url: '/api/integrations/cindy/summary-inbox/next',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(claimed.statusCode).toBe(200);
+    expect(claimed.json()).toMatchObject({
+      status: 'ready',
+      inbox_id: expect.stringMatching(/^aily-inbox:/u),
+      attempt: 1,
+      window: {
+        window_id: window.window_id,
+        window_start: window.window_start,
+        window_end: window.window_end,
+      },
+      source: {
+        source_key: `aily-summary:${window.window_id}`,
+        source_kind: 'aily_summary',
+        agent_id: 'agent_test',
+        text: '窗口内新增一项需要确认的任务。',
+      },
+    });
+
+    const body = claimed.json();
+    const completed = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/intake',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        ...body.window,
+        inbox_id: body.inbox_id,
+        claim_token: body.claim_token,
+        result_kind: 'intake',
+        sources: [body.source],
+        proposals: [{ action: 'skip', source_keys: [body.source.source_key], reason: '暂不入库。' }],
+      },
+    });
+    expect(completed.statusCode).toBe(200);
+    expect(database.raw.prepare('SELECT status, claim_token_hash, lease_until FROM aily_summary_inbox WHERE id = ?').get(body.inbox_id))
+      .toEqual({ status: 'completed', claim_token_hash: null, lease_until: null });
+    const stored = database.raw.prepare(
+      "SELECT cursor FROM sync_cursor WHERE integration = 'cindy_intake' AND scope_key = ?",
+    ).get(window.window_id) as { cursor: string };
+    expect(stored.cursor).not.toContain(body.claim_token);
+    const empty = await app.inject({
+      method: 'GET',
+      url: '/api/integrations/cindy/summary-inbox/next',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(empty.json()).toEqual({ status: 'empty' });
+  });
+
+  it('Aily inbox 失败进入退避，过期租约可重新领取且旧 token 失效', async () => {
+    const { app, database, service } = await makeApp();
+    service.persistAilySummaryWindow({
+      window: {
+        window_id: 'intake-async-retry',
+        window_start: '2026-08-27T08:20:00.000Z',
+        window_end: '2026-08-27T08:40:00.000Z',
+        reused: false,
+      },
+      agent_id: 'agent_test',
+      generated_at: '2026-08-27T08:40:01.000Z',
+      text: '需要重试的摘要。',
+      empty: false,
+    });
+    const first = (await app.inject({
+      method: 'GET',
+      url: '/api/integrations/cindy/summary-inbox/next',
+      headers: { authorization: `Bearer ${token}` },
+    })).json();
+    const retried = await app.inject({
+      method: 'POST',
+      url: `/api/integrations/cindy/summary-inbox/${encodeURIComponent(first.inbox_id)}/retry`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { claim_token: first.claim_token, error_code: 'CINDY_ERRAND_FAILED' },
+    });
+    expect(retried.statusCode).toBe(200);
+    expect(retried.json()).toMatchObject({ status: 'retry_waiting', attempts: 1 });
+    expect(database.raw.prepare('SELECT status, claim_token_hash, lease_until FROM aily_summary_inbox WHERE id = ?').get(first.inbox_id))
+      .toEqual({ status: 'retry_waiting', claim_token_hash: null, lease_until: null });
+
+    database.raw.prepare("UPDATE aily_summary_inbox SET status = 'claimed', available_at = ?, lease_until = ?, claim_token_hash = ? WHERE id = ?")
+      .run('2020-01-01T00:00:00.000Z', '2020-01-01T00:00:00.000Z', '0'.repeat(64), first.inbox_id);
+    const reclaimed = (await app.inject({
+      method: 'GET',
+      url: '/api/integrations/cindy/summary-inbox/next',
+      headers: { authorization: `Bearer ${token}` },
+    })).json();
+    expect(reclaimed).toMatchObject({ status: 'ready', inbox_id: first.inbox_id, attempt: 2 });
+    expect(reclaimed.claim_token).not.toBe(first.claim_token);
+    const stale = await app.inject({
+      method: 'POST',
+      url: `/api/integrations/cindy/summary-inbox/${encodeURIComponent(first.inbox_id)}/retry`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { claim_token: first.claim_token, error_code: 'CINDY_ERRAND_FAILED' },
+    });
+    expect(stale.statusCode).toBe(409);
+  });
+
+  it('Aily inbox 连续五次失败后进入 failed，完成和失败正文按 30 天清理', async () => {
+    const { database, service } = await makeApp();
+    service.persistAilySummaryWindow({
+      window: {
+        window_id: 'intake-async-exhausted',
+        window_start: '2026-08-27T09:00:00.000Z',
+        window_end: '2026-08-27T09:20:00.000Z',
+        reused: false,
+      },
+      agent_id: 'agent_test',
+      generated_at: '2026-08-27T09:20:01.000Z',
+      text: '将连续失败的摘要。',
+      empty: false,
+    });
+    let finalStatus = '';
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      database.raw.prepare("UPDATE aily_summary_inbox SET available_at = '2020-01-01T00:00:00.000Z' WHERE window_id = 'intake-async-exhausted'").run();
+      const claim = service.claimNextAilySummaryInbox();
+      if (claim.status !== 'ready') throw new Error('测试摘要未能领取。');
+      const retried = service.retryAilySummaryInbox(claim.inbox_id, claim.claim_token, 'CINDY_ERRAND_FAILED');
+      finalStatus = retried.status;
+    }
+    expect(finalStatus).toBe('failed');
+    expect(database.raw.prepare(
+      "SELECT status, attempts, claim_token_hash, lease_until FROM aily_summary_inbox WHERE window_id = 'intake-async-exhausted'",
+    ).get()).toEqual({ status: 'failed', attempts: 5, claim_token_hash: null, lease_until: null });
+
+    database.raw.prepare(
+      "UPDATE aily_summary_inbox SET completed_at = '2026-07-01T00:00:00.000Z', updated_at = '2026-07-01T00:00:00.000Z' WHERE window_id = 'intake-async-exhausted'",
+    ).run();
+    expect(service.cleanupAilySummaryInbox()).toEqual({ removed: 1, retentionDays: 30 });
+    expect(database.raw.prepare(
+      "SELECT COUNT(*) AS count FROM aily_summary_inbox WHERE window_id = 'intake-async-exhausted'",
+    ).get()).toEqual({ count: 0 });
+  });
+
+  it('inbox 绑定的 update_task CAS 失败时来源、任务和 completed 状态全部零推进', async () => {
+    const { app, database, service } = await makeApp();
+    makeTask(database);
+    service.persistAilySummaryWindow({
+      window: {
+        window_id: 'intake-async-cas',
+        window_start: '2026-08-27T09:20:00.000Z',
+        window_end: '2026-08-27T09:40:00.000Z',
+        reused: false,
+      },
+      agent_id: 'agent_test',
+      generated_at: '2026-08-27T09:40:01.000Z',
+      text: '活动留存分析已有新进展。',
+      empty: false,
+    });
+    const claim = service.claimNextAilySummaryInbox();
+    if (claim.status !== 'ready') throw new Error('测试摘要未能领取。');
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/cindy/intake',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        ...claim.window,
+        inbox_id: claim.inbox_id,
+        claim_token: claim.claim_token,
+        result_kind: 'intake',
+        sources: [claim.source],
+        proposals: [{
+          action: 'update_task',
+          source_keys: [claim.source.source_key],
+          task_key: 'task-cindy-intake-1',
+          expected_version: 2,
+          next_step: '错误版本不应写入。',
+        }],
+      },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(database.raw.prepare("SELECT version, next_step FROM task WHERE id = 'task-cindy-intake-1'").get())
+      .toEqual({ version: 1, next_step: '补充分区口径' });
+    expect(database.raw.prepare('SELECT COUNT(*) AS count FROM source_event').get()).toEqual({ count: 0 });
+    expect(database.raw.prepare('SELECT status FROM aily_summary_inbox WHERE id = ?').get(claim.inbox_id))
+      .toEqual({ status: 'claimed' });
   });
 
   it('update_task 使用 expected_version CAS，冲突时不写入来源或任务', async () => {

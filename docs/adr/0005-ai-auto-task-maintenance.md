@@ -5,8 +5,8 @@ status: accepted
 date: 2026-08-13
 owner: 产品负责人 / 后端负责人
 scope: 私人任务内部自动维护
+evidence: []
 supersedes: [ADR-0004#逐条事前审批]
-evidence: [VER-PR24-CHECK]
 ---
 
 # 0005：AI 自动维护私人任务，主人事后监督

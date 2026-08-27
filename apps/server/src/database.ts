@@ -17,7 +17,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { shanghaiDayWindow } from './shanghai-time.js';
 
-export const CURRENT_SCHEMA_VERSION = 8;
+export const CURRENT_SCHEMA_VERSION = 9;
 
 function registerData04SqlFunctions(database: DatabaseSync) {
   database.function('sha256', { deterministic: true }, (value: unknown) => createHash('sha256').update(String(value ?? '')).digest('hex'));
@@ -1769,7 +1769,7 @@ export type MigrationOperation =
 export interface MigrationDescriptor {
   version: number;
   name: string;
-  expectedPostSchemaIdentity: 'current-schema-v1' | 'current-schema-v2' | 'current-schema-v3' | 'current-schema-v4' | 'current-schema-v5' | 'current-schema-v6' | 'current-schema-v7' | 'current-schema-v8';
+  expectedPostSchemaIdentity: 'current-schema-v1' | 'current-schema-v2' | 'current-schema-v3' | 'current-schema-v4' | 'current-schema-v5' | 'current-schema-v6' | 'current-schema-v7' | 'current-schema-v8' | 'current-schema-v9';
   orderedOperations: readonly MigrationOperation[];
 }
 
@@ -3268,6 +3268,95 @@ export const PROVIDER_RETRY_COOLDOWN_MIGRATION_DESCRIPTOR = deepFreeze(Object.fr
 }) satisfies MigrationDescriptor);
 
 export const PROVIDER_RETRY_COOLDOWN_MIGRATION_CHECKSUM = migrationDescriptorChecksum(PROVIDER_RETRY_COOLDOWN_MIGRATION_DESCRIPTOR);
+
+/** TooManyTasks async Aily summaries are staged here before Cindy intake. */
+const AILY_SUMMARY_INBOX_MIGRATION_SQL = Object.freeze([
+  `CREATE TABLE aily_summary_inbox (
+    id TEXT PRIMARY KEY,
+    window_id TEXT NOT NULL UNIQUE,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    result_kind TEXT NOT NULL CHECK (result_kind IN ('summary','empty')),
+    agent_id TEXT NOT NULL,
+    summary_text TEXT NOT NULL CHECK (length(summary_text) <= 20000),
+    content_hash TEXT NOT NULL CHECK (length(content_hash) = 64),
+    generated_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ready','claimed','retry_waiting','completed','failed')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0 AND attempts <= 5),
+    available_at TEXT NOT NULL,
+    lease_until TEXT,
+    claim_token_hash TEXT CHECK (claim_token_hash IS NULL OR length(claim_token_hash) = 64),
+    last_error_code TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+      (result_kind = 'summary' AND length(summary_text) > 0)
+      OR (result_kind = 'empty' AND summary_text = '')
+    ),
+    CHECK (
+      (status = 'claimed' AND lease_until IS NOT NULL AND claim_token_hash IS NOT NULL)
+      OR (status <> 'claimed' AND lease_until IS NULL AND claim_token_hash IS NULL)
+    )
+  );`,
+  'CREATE INDEX idx_aily_summary_inbox_ready ON aily_summary_inbox(status, available_at, generated_at, id);',
+  'CREATE INDEX idx_aily_summary_inbox_retention ON aily_summary_inbox(status, completed_at, updated_at);',
+] as const);
+
+function ailySummaryInboxSchemaChecksum() {
+  const canonical = new DatabaseSync(':memory:');
+  try {
+    registerData04SqlFunctions(canonical);
+    executeMigrationOperations(canonical, { ...BASELINE_MIGRATION_DESCRIPTOR, checksum: BASELINE_MIGRATION_CHECKSUM }, {
+      databaseInstanceId: '00000000000000000000000000000000',
+      instanceCreatedAt: '2026-08-15T00:00:00.000Z',
+      appliedAt: '2026-08-15T00:00:00.000Z',
+      preexistingTables: [],
+    });
+    for (const statement of RELATION_CONSTRAINT_MIGRATION_SQL) {
+      if (!statement.startsWith('UPDATE ') && !statement.startsWith('INSERT ')) canonical.exec(statement);
+    }
+    for (const statement of RUNTIME_TOOL_IDEMPOTENCY_MIGRATION_SQL) canonical.exec(statement);
+    for (const statement of CANDIDATE_VERSION_MIGRATION_SQL) canonical.exec(statement);
+    for (const statement of PRIVACY_MIGRATION_SQL) {
+      if (!statement.startsWith('INSERT ')) canonical.exec(statement);
+    }
+    for (const statement of PRIVACY_FENCING_MIGRATION_SQL) canonical.exec(statement);
+    for (const statement of SOURCE_REVISION_MIGRATION_SQL) {
+      if (!statement.startsWith('INSERT ') && !statement.startsWith('UPDATE ')) canonical.exec(statement);
+    }
+    for (const statement of PROVIDER_RETRY_COOLDOWN_MIGRATION_SQL) canonical.exec(statement);
+    for (const statement of AILY_SUMMARY_INBOX_MIGRATION_SQL) canonical.exec(statement);
+    return schemaIdentityChecksum(captureSchemaIdentity(canonical));
+  } finally {
+    canonical.close();
+  }
+}
+
+export const AILY_SUMMARY_INBOX_SCHEMA_CHECKSUM = ailySummaryInboxSchemaChecksum();
+export const AILY_SUMMARY_INBOX_MIGRATION_DESCRIPTOR = deepFreeze(Object.freeze({
+  version: 9,
+  name: 'aily-summary-inbox',
+  expectedPostSchemaIdentity: 'current-schema-v9' as const,
+  orderedOperations: Object.freeze([
+    Object.freeze({ id: 'aily-summary-inbox' as const, kind: 'sql_batch' as const, statements: AILY_SUMMARY_INBOX_MIGRATION_SQL }),
+    Object.freeze({
+      id: 'verify-post-schema' as const,
+      kind: 'assert_database' as const,
+      expectedSchemaIdentityChecksum: AILY_SUMMARY_INBOX_SCHEMA_CHECKSUM,
+      checks: Object.freeze(['schema', 'foreign_keys', 'integrity'] as const),
+    }),
+    Object.freeze({
+      id: 'record-migration' as const,
+      kind: 'record_migration' as const,
+      ledgerTable: 'schema_migration' as const,
+      userVersion: 9,
+    }),
+  ]),
+}) satisfies MigrationDescriptor);
+
+export const AILY_SUMMARY_INBOX_MIGRATION_CHECKSUM = migrationDescriptorChecksum(AILY_SUMMARY_INBOX_MIGRATION_DESCRIPTOR);
+
 const MIGRATIONS = [
   {
     ...BASELINE_MIGRATION_DESCRIPTOR,
@@ -3301,13 +3390,17 @@ const MIGRATIONS = [
     ...PROVIDER_RETRY_COOLDOWN_MIGRATION_DESCRIPTOR,
     checksum: PROVIDER_RETRY_COOLDOWN_MIGRATION_CHECKSUM,
   },
+  {
+    ...AILY_SUMMARY_INBOX_MIGRATION_DESCRIPTOR,
+    checksum: AILY_SUMMARY_INBOX_MIGRATION_CHECKSUM,
+  },
 ] as const;
 
 function assertExecutableMigrationDescriptor(descriptor: MigrationDescriptor) {
   if (
     !Number.isInteger(descriptor.version)
     || descriptor.version < 1
-    || !['current-schema-v1', 'current-schema-v2', 'current-schema-v3', 'current-schema-v4', 'current-schema-v5', 'current-schema-v6', 'current-schema-v7', 'current-schema-v8'].includes(descriptor.expectedPostSchemaIdentity)
+    || !['current-schema-v1', 'current-schema-v2', 'current-schema-v3', 'current-schema-v4', 'current-schema-v5', 'current-schema-v6', 'current-schema-v7', 'current-schema-v8', 'current-schema-v9'].includes(descriptor.expectedPostSchemaIdentity)
     || descriptor.orderedOperations.length === 0
   ) {
     throw new DatabaseUpgradeError('migration', '数据库迁移描述符版本或负载无效；已拒绝推进版本。');
@@ -3511,7 +3604,7 @@ function openAppDatabase(path: string) {
 }
 
 /** Progress tables are additive plugin state. Keep them outside the numbered
- * core schema so opening an existing v8 database remains compatible with the
+ * core schema so opening an existing versioned database remains compatible with the
  * core migration identity and backup contract. */
 function ensureCindyProgressTables(database: DatabaseSync) {
   database.exec(`

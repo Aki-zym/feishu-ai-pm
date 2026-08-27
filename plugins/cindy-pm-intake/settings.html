@@ -10,7 +10,7 @@
     <label style="display:flex;gap:8px;align-items:center"><input id="progressEnabled" type="checkbox" checked>启用任务进度维护</label>
   </fieldset>
   <small>请先独立启动 TooManyTasks。它自行管理 Aily OAuth、Token、官方 SDK、扫描窗口和 SQLite，并自动生成 Cindy 集成令牌。插件只调用本机回环 API 和派发 intake errand，不保存 Aily App Secret、访问 Token 或任务库令牌。</small>
-  <small>自动扫描开关打开后，Cindy 保持运行且开关打开，每 10 分钟自动扫。关闭只停止本产品自动流程；正在运行的扫描会自然收口。Cindy 退出后不会继续触发自动扫描。</small>
-  <small>入库 errand、常驻扫描和任务进度 oneshot 请到插件详情的「AI 代办」中手动选择折扣路由 <code>codex/gpt-5.6-luna</code>，思考强度选择 <code>high</code>。插件详情「AI 代办」权限选「自动审核」(Auto-review / <code>auto</code>)，不要选只读 <code>plan</code> 或完全访问 <code>bypassPermissions</code>。请勿选择原价 <code>gpt-5.6-luna</code>。Cindy 草稿默认可能是 <code>fable5</code>，首次使用请改一次并保存。插件不会静默修改 Cindy 的全局默认模型。</small>
+  <small>自动扫描开关打开后，独立 TooManyTasks 每 20 分钟调用 Aily 并把摘要暂存到本机 SQLite。Cindy 插件每 5 分钟最多领取一条摘要；Cindy 退出期间仍会继续生成摘要，下次启动后按顺序处理。</small>
+  <small>入库 errand 和任务进度 oneshot 请到插件详情的「AI 代办」中手动选择折扣路由 <code>codex/gpt-5.6-luna</code>，思考强度选择 <code>high</code>。插件详情「AI 代办」权限选「自动审核」(Auto-review / <code>auto</code>)，不要选只读 <code>plan</code> 或完全访问 <code>bypassPermissions</code>。请勿选择原价 <code>gpt-5.6-luna</code>。Cindy 草稿默认可能是 <code>fable5</code>，首次使用请改一次并保存。插件不会静默修改 Cindy 的全局默认模型。</small>
   <script src="/settings.js"></script>
 </body>

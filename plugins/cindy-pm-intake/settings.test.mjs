@@ -88,7 +88,7 @@ test('settings restarts the independent task service through its loopback runtim
   assert.equal(elements.get('status').textContent, '独立 TooManyTasks 已收到重启请求');
 });
 
-test('settings enables the resident 10-minute scan loop without opening an automation panel', async () => {
+test('settings enables the independent 20-minute scan and five-minute Cindy inbox consumer', async () => {
   const { elements, nodeCalls } = await loadSettings();
   elements.get('autoScan').checked = true;
   await elements.get('autoScan').onchange();
@@ -96,7 +96,7 @@ test('settings enables the resident 10-minute scan loop without opening an autom
   assert.ok(update);
   assert.equal(update.params.path, '/api/runtime/auto-scan');
   assert.deepEqual(JSON.parse(JSON.stringify(update.params.body)), { enabled: true });
-  assert.match(elements.get('status').textContent, /Cindy 保持运行且开关打开，每 10 分钟自动扫/);
+  assert.match(elements.get('status').textContent, /TooManyTasks 每 20 分钟后台扫描，Cindy 每 5 分钟领取摘要/);
 });
 
 test('settings writes false when the auto-scan switch is disabled', async () => {
@@ -108,10 +108,10 @@ test('settings writes false when the auto-scan switch is disabled', async () => 
   const update = nodeCalls.find((request) => request.method === 'pm/request' && request.params.method === 'PUT');
   assert.ok(update);
   assert.deepEqual(JSON.parse(JSON.stringify(update.params.body)), { enabled: false });
-  assert.match(elements.get('status').textContent, /已关闭本产品自动扫描|当前正在运行的扫描会自然收口/);
+  assert.match(elements.get('status').textContent, /已关闭新摘要生成|已有摘要仍会由 Cindy 继续入库/);
 });
 
-test('settings explains the resident scan loop and required discounted Luna route', () => {
+test('settings explains the asynchronous scan inbox and required discounted Luna route', () => {
   assert.match(settingsHtml, /AI 代办/);
   assert.match(settingsHtml, /codex\/gpt-5\.6-luna/);
   assert.match(settingsHtml, /思考强度选择 <code>high<\/code>/);
@@ -120,7 +120,9 @@ test('settings explains the resident scan loop and required discounted Luna rout
   assert.match(settingsHtml, /Cindy 草稿默认可能是 <code>fable5<\/code>/);
   assert.match(settingsHtml, /改一次并保存/);
   assert.match(settingsHtml, /不会静默修改 Cindy 的全局默认模型/);
-  assert.match(settingsHtml, /Cindy 保持运行且开关打开，每 10 分钟自动扫/);
+  assert.match(settingsHtml, /TooManyTasks 每 20 分钟调用 Aily/);
+  assert.match(settingsHtml, /Cindy 插件每 5 分钟最多领取一条摘要/);
+  assert.match(settingsHtml, /Cindy 退出期间仍会继续生成摘要/);
   assert.doesNotMatch(settingsHtml, /打开自动化面板/);
   assert.match(settingsHtml, /请先独立启动 TooManyTasks/);
   assert.match(settingsHtml, /自行管理 Aily OAuth、Token、官方 SDK/);

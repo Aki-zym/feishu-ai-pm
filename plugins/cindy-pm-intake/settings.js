@@ -145,13 +145,13 @@ byId('restart').onclick = async () => {
 byId('autoScan').onchange = async () => {
   const status = byId('status');
   const enabled = byId('autoScan').checked;
-  status.textContent = enabled ? '正在启用常驻自动扫描…' : '正在关闭本产品自动扫描…';
+  status.textContent = enabled ? '正在启用 TooManyTasks 后台自动扫描…' : '正在关闭后台自动扫描…';
   try {
     await updateAutoScanState(enabled);
     if (enabled) {
-      status.textContent = '已启用：Cindy 保持运行且开关打开，每 10 分钟自动扫';
+      status.textContent = '已启用：TooManyTasks 每 20 分钟后台扫描，Cindy 每 5 分钟领取摘要';
     } else {
-      status.textContent = '已关闭本产品自动扫描；当前正在运行的扫描会自然收口';
+      status.textContent = '已关闭新摘要生成；已有摘要仍会由 Cindy 继续入库';
     }
   } catch (error) {
     status.textContent = error instanceof Error ? error.message : '自动扫描开关保存失败';

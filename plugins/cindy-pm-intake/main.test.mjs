@@ -19,7 +19,19 @@ function waitFor(predicate, timeoutMs = 1000) {
   });
 }
 
-function setup({ errandText = '{"status":"done","intake_submitted":true,"intake_window_id":"window-1","summary":"已提交。","proposals":[]}', errandResponse = null, errandError = null, errandGate = null, ailyText = '窗口内有一条任务摘要。', ailyResponse = null, ailyError = null, autoScanEnabled = false, intakeWindowEnd = null, intakeStatus = { completed: true, result_kind: 'intake', proposal_count: 0 }, progressMode = 'manual', progressEnabled = true, progressModelText = '{"decision":"no_update","reason":"无变化","evidence":[]}' } = {}) {
+function setup({
+  errandText = '{"status":"done","intake_submitted":true,"intake_window_id":"window-1","summary":"已提交。","proposals":[]}',
+  errandResponse = null,
+  errandError = null,
+  errandGate = null,
+  autoScanEnabled = false,
+  scanResponse = { status: 'accepted', job_id: 'aily-scan:test', summary: '已请求后台扫描。' },
+  inboxResponse = null,
+  intakeStatus = { completed: true, result_kind: 'intake', proposal_count: 0 },
+  progressMode = 'manual',
+  progressEnabled = true,
+  progressModelText = '{"decision":"no_update","reason":"无变化","evidence":[]}',
+} = {}) {
   let onHostMessage;
   const nodeCalls = [];
   const sent = [];
@@ -27,7 +39,30 @@ function setup({ errandText = '{"status":"done","intake_submitted":true,"intake_
   const secretCalls = [];
   const cursorWrites = [];
   const intakePosts = [];
+  const retryPosts = [];
   const intervals = [];
+  const defaultInbox = {
+    status: 'ready',
+    inbox_id: 'aily-inbox:test',
+    claim_token: 'claim-token-private',
+    lease_until: '2026-08-27T09:10:00.000Z',
+    attempt: 1,
+    window: {
+      window_id: 'intake-async-test',
+      window_start: '2026-08-27T08:40:00.000Z',
+      window_end: '2026-08-27T09:00:00.000Z',
+    },
+    source: {
+      source_key: 'aily-summary:intake-async-test',
+      source_kind: 'aily_summary',
+      occurred_at: '2026-08-27T09:00:00.000Z',
+      conversation_key: 'aily:agent_test',
+      sender_role: 'Aily 摘要（派生来源）',
+      agent_id: 'agent_test',
+      generated_at: '2026-08-27T09:00:01.000Z',
+      text: '窗口内有一条任务摘要。',
+    },
+  };
   const cindy = {
     onHostMessage(handler) { onHostMessage = handler; },
     node: {
@@ -63,88 +98,24 @@ function setup({ errandText = '{"status":"done","intake_submitted":true,"intake_
           };
         }
         if (request.params.path === '/api/integrations/cindy/scan') {
-          const endMs = Date.now();
-          const cursorMs = typeof intakeWindowEnd === 'string' ? Date.parse(intakeWindowEnd) : Number.NaN;
-          const startMs = Number.isFinite(cursorMs)
-            ? Math.max(Math.min(cursorMs, endMs), endMs - 4 * 60 * 60 * 1000)
-            : endMs - 10 * 60 * 1000;
-          const window = {
-            window_id: `intake-${startMs}-${endMs}`,
-            window_start: new Date(startMs).toISOString(),
-            window_end: new Date(endMs).toISOString(),
-            reused: false,
-          };
           if (request.params.body?.trigger === 'schedule' && autoScanEnabled === false) {
             return {
               ok: true,
               result: {
-                ...window,
-                status: 'skipped',
+                status: 'disabled',
                 reason: 'auto_scan_disabled',
                 summary: 'TooManyTasks 自动扫描已关闭。',
-                aily_status: 'not_started',
-                aily_summary_generated: false,
-                proposals: [],
               },
             };
           }
-          if (ailyError) {
-            return {
-              ok: true,
-              result: {
-                ...window,
-                status: 'failed',
-                reason: 'aily_failed',
-                summary: 'Aily 摘要失败，未启动 Cindy 入库判断，也未推进窗口游标。',
-                aily_status: 'failed',
-                aily_summary_generated: false,
-                aily_error_code: ailyError.code || 'AILY_FAILED',
-                proposals: [],
-              },
-            };
-          }
-          if (/^NO_NEW_INFORMATION[。.!！?？]*$/u.test(ailyText.trim())) {
-            return {
-              ok: true,
-              result: {
-                ...window,
-                status: 'skipped',
-                reason: 'aily_empty',
-                summary: 'Aily 在本次窗口没有发现新的任务相关信息，已推进窗口游标。',
-                aily_status: 'Completed',
-                aily_summary_generated: false,
-                intake_result: { window_id: window.window_id, result_kind: 'empty_window' },
-                proposals: [],
-              },
-            };
-          }
-          if (ailyResponse) return ailyResponse;
-          const generatedAt = new Date(endMs + 1).toISOString();
-          return {
-            ok: true,
-            result: {
-              ...window,
-              status: 'summary_ready',
-              reason: null,
-              summary: 'Aily 已生成窗口摘要。',
-              aily_status: 'Completed',
-              aily_summary_generated: true,
-              aily_agent_id: 'agent_4kx9t1gjymdxf0w',
-              aily_chat_id_suffix: '12345678',
-              aily_session_id_present: true,
-              source: {
-                source_key: `aily-summary:${window.window_id}`,
-                source_kind: 'aily_summary',
-                occurred_at: window.window_end,
-                conversation_key: 'aily:agent_4kx9t1gjymdxf0w',
-                sender_role: 'Aily 摘要（派生来源）',
-                agent_id: 'agent_4kx9t1gjymdxf0w',
-                generated_at: generatedAt,
-                text: ailyText,
-              },
-              proposals: [],
-            },
-          };
+          return { ok: true, result: scanResponse };
+        }
+        if (request.params.path === '/api/integrations/cindy/summary-inbox/next') {
+          return { ok: true, result: inboxResponse ?? defaultInbox };
+        }
+        if (request.params.path.match(/^\/api\/integrations\/cindy\/summary-inbox\/[^/]+\/retry$/u)) {
+          retryPosts.push(request.params.body);
+          return { ok: true, result: { status: 'retry_waiting', attempts: 1 } };
         }
         if (request.params.path.match(/^\/api\/integrations\/cindy\/intake\/[^/]+\/status$/u)) {
           return {
@@ -216,61 +187,37 @@ function setup({ errandText = '{"status":"done","intake_submitted":true,"intake_
     Number,
     Error,
   }), { filename: 'main.js' });
-  return { onHostMessage, nodeCalls, sent, errandCalls, secretCalls, cursorWrites, intakePosts, intervals };
+  return {
+    onHostMessage,
+    nodeCalls,
+    sent,
+    errandCalls,
+    secretCalls,
+    cursorWrites,
+    intakePosts,
+    retryPosts,
+    intervals,
+    defaultInbox,
+  };
 }
 
-test('scan_intake_window asks independent TooManyTasks for the Aily summary before the fixed intake errand', async () => {
-  const { onHostMessage, nodeCalls, errandCalls, sent, cursorWrites, intakePosts } = setup();
+test('scan_intake_window only asks independent TooManyTasks to start an asynchronous Aily scan', async () => {
+  const { onHostMessage, nodeCalls, errandCalls, sent } = setup();
   onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-scan', args: {} });
   await waitFor(() => sent.some((message) => message.callId === 'call-scan'));
-  assert.equal(errandCalls.length, 1);
-  assert.equal(errandCalls[0].sessionKey, 'intake');
-  assert.equal(errandCalls[0].mode, 'wait');
-  assert.equal(errandCalls[0].callId, 'call-scan');
+  assert.equal(errandCalls.length, 0);
   const scanCall = nodeCalls.find((call) => call.params?.path === '/api/integrations/cindy/scan');
   assert.ok(scanCall);
   assert.equal(scanCall.method, 'pm/request');
   assert.equal(scanCall.params.method, 'POST');
   assert.deepEqual(JSON.parse(JSON.stringify(scanCall.params.body)), { trigger: 'manual' });
-  assert.equal(scanCall.timeoutMs, 120000);
-  assert.match(errandCalls[0].task, /get_pm_tasks/);
-  assert.match(errandCalls[0].task, /items、candidates、cursors/);
-  assert.match(errandCalls[0].task, /submit_intake/);
-  assert.match(errandCalls[0].task, /Aily 摘要/);
-  assert.match(errandCalls[0].task, /source_kind/);
-  assert.match(errandCalls[0].task, /Aily Agent ID：agent_4kx9t1gjymdxf0w/);
-  assert.match(errandCalls[0].task, /摘要生成时间：/);
-  assert.match(errandCalls[0].task, /agent_id、generated_at/);
-  assert.match(errandCalls[0].task, /不得读取飞书/);
-  assert.doesNotMatch(errandCalls[0].task, /飞书 MCP/);
-  assert.match(errandCalls[0].task, /\/api\/tasks/);
-  assert.match(errandCalls[0].task, /CAS/);
-  assert.match(errandCalls[0].task, /create_candidate.*只创建候选/);
-  assert.doesNotMatch(errandCalls[0].task, /im_read_messages/);
-  assert.doesNotMatch(errandCalls[0].task, /读取消息整理为 sources/);
-  assert.match(errandCalls[0].task, /\[\{"action"/);
-  assert.equal('model' in errandCalls[0], false);
-  assert.equal('provider' in errandCalls[0], false);
-  assert.equal('effort' in errandCalls[0], false);
-  assert.equal('permissionMode' in errandCalls[0], false);
+  assert.equal(scanCall.timeoutMs, 30000);
   const result = sent.find((message) => message.callId === 'call-scan');
   assert.equal(result.ok, true);
-  assert.equal(result.result.job_id, 'job-1');
-  assert.equal(result.result.session_id, 'session-intake');
-  assert.equal(result.result.status, 'done');
-  assert.equal(result.result.aily_status, 'Completed');
-  assert.equal(result.result.aily_summary_generated, true);
-  assert.equal(result.result.cindy_result.intake_submitted, true);
-  assert.equal(result.result.cindy_result.server_receipt_verified, true);
-  assert.deepEqual(JSON.parse(JSON.stringify(result.result.proposals)), []);
-  const firstWindowDuration = Date.parse(result.result.window_end) - Date.parse(result.result.window_start);
-  assert.ok(firstWindowDuration >= 10 * 60 * 1000);
-  assert.ok(firstWindowDuration < 10 * 60 * 1000 + 2000);
+  assert.equal(result.result.status, 'accepted');
+  assert.equal(result.result.job_id, 'aily-scan:test');
   assert.equal(nodeCalls[0].params.path, '/api/integrations/cindy/scan');
   assert.equal(nodeCalls.some((call) => call.method === 'aily/summarize'), false);
-  assert.equal(nodeCalls.some((call) => call.params?.path === '/api/runtime/intake-cursor'), false);
-  assert.deepEqual(JSON.parse(JSON.stringify(cursorWrites)), []);
-  assert.deepEqual(JSON.parse(JSON.stringify(intakePosts)), []);
 });
 
 test('the non-empty errand source contract passes the real plugin validator only with all Aily metadata', async () => {
@@ -332,149 +279,98 @@ test('the non-empty errand source contract passes the real plugin validator only
   assert.equal(intakePosts[0].sources[0].generated_at, '2026-08-24T01:10:01.000Z');
 });
 
-test('scan_intake_window starts after the last successful intake window end', async () => {
-  const cursor = new Date(Date.now() - 30 * 60 * 1000).toISOString();
-  const { onHostMessage, errandCalls, sent } = setup({ intakeWindowEnd: cursor });
-  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-cursor', args: {} });
-  await waitFor(() => sent.some((message) => message.callId === 'call-cursor'));
-  assert.equal(errandCalls.length, 1);
-  assert.equal(errandCalls[0].context.window_start, cursor);
-  assert.equal(errandCalls[0].context.window_end, sent.find((message) => message.callId === 'call-cursor').result.window_end);
-});
-
-test('scan_intake_window caps an old intake cursor at four hours before now', async () => {
-  const cursor = new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString();
-  const { onHostMessage, errandCalls, sent } = setup({ intakeWindowEnd: cursor });
-  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-old-cursor', args: {} });
-  await waitFor(() => sent.some((message) => message.callId === 'call-old-cursor'));
-  const result = sent.find((message) => message.callId === 'call-old-cursor');
-  const startMs = Date.parse(errandCalls[0].context.window_start);
-  const endMs = Date.parse(result.result.window_end);
-  assert.ok(endMs - startMs >= 4 * 60 * 60 * 1000);
-  assert.ok(endMs - startMs < 4 * 60 * 60 * 1000 + 2000);
-});
-
-test('Aily returns no new information: submit an explicit empty window and advance', async () => {
-  const { onHostMessage, nodeCalls, errandCalls, intakePosts, sent } = setup({ ailyText: 'NO_NEW_INFORMATION' });
-  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-aily-empty', args: {} });
-  await waitFor(() => sent.some((message) => message.callId === 'call-aily-empty'));
-  const result = sent.find((message) => message.callId === 'call-aily-empty');
-  assert.equal(result.ok, true);
-  assert.equal(result.result.reason, 'aily_empty');
-  assert.equal(result.result.aily_status, 'Completed');
-  assert.equal(result.result.aily_summary_generated, false);
-  assert.equal(errandCalls.length, 0);
-  assert.equal(intakePosts.length, 0);
-  assert.equal(result.result.intake_result.result_kind, 'empty_window');
-  assert.equal(nodeCalls.some((call) => call.params?.path === '/api/integrations/cindy/scan'), true);
-});
-
-test('Chinese empty-summary equivalents are treated as real summaries and sent to the errand', async () => {
-  for (const [index, ailyText] of ['没有新信息', '窗口内没有新信息'].entries()) {
-    const { onHostMessage, errandCalls, intakePosts, sent } = setup({ ailyText });
-    const callId = `call-aily-chinese-${index}`;
-    onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId, args: {} });
-    await waitFor(() => sent.some((message) => message.callId === callId));
-    const result = sent.find((message) => message.callId === callId);
-    assert.equal(result.ok, true);
-    assert.equal(result.result.aily_summary_generated, true);
-    assert.equal(errandCalls.length, 1);
-    assert.equal(intakePosts.length, 0);
-  }
-});
-
-test('Aily failure returns a classified status without starting Cindy or moving the cursor', async () => {
-  const failure = new Error('Aily 用户访问 Token 已失效或无权限，请重新授权或更新 Aily Token。');
-  failure.code = 'AILY_AUTH_REQUIRED';
-  const { onHostMessage, nodeCalls, errandCalls, intakePosts, sent } = setup({ ailyError: failure });
-  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-aily-failed', args: {} });
-  await waitFor(() => sent.some((message) => message.callId === 'call-aily-failed'));
-  const result = sent.find((message) => message.callId === 'call-aily-failed');
-  assert.equal(result.ok, true);
-  assert.equal(result.result.status, 'failed');
-  assert.equal(result.result.reason, 'aily_failed');
-  assert.equal(result.result.aily_error_code, 'AILY_AUTH_REQUIRED');
-  assert.equal(errandCalls.length, 0);
-  assert.equal(intakePosts.length, 0);
-  assert.equal(nodeCalls.some((call) => call.params?.path === '/api/integrations/cindy/scan'), true);
-});
-
-test('schedule scan skips the errand when the product auto-scan switch is disabled', async () => {
-  const { onHostMessage, nodeCalls, errandCalls, sent } = setup({ autoScanEnabled: false });
-  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-schedule-off', args: { trigger: 'schedule' } });
-  await waitFor(() => sent.some((message) => message.callId === 'call-schedule-off'));
-  const result = sent.find((message) => message.callId === 'call-schedule-off');
-  assert.equal(errandCalls.length, 0);
-  assert.equal(nodeCalls.some((call) => call.params?.path === '/api/integrations/cindy/scan'), true);
-  assert.equal(result.ok, true);
-  assert.equal(result.result.status, 'skipped');
-  assert.equal(result.result.reason, 'auto_scan_disabled');
-  assert.deepEqual(JSON.parse(JSON.stringify(result.result.proposals)), []);
-});
-
-test('schedule scan runs when the product auto-scan switch is enabled', async () => {
-  const { onHostMessage, errandCalls, sent } = setup({ autoScanEnabled: true });
-  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-schedule-on', args: { trigger: 'schedule' } });
-  await waitFor(() => sent.some((message) => message.callId === 'call-schedule-on'));
-  assert.equal(errandCalls.length, 1);
-});
-
-test('schedule scan skips the round when the errand host reports BUSY', async () => {
-  const { onHostMessage, errandCalls, sent } = setup({
-    autoScanEnabled: true,
-    errandResponse: { ok: false, errorCode: 'BUSY', message: '已有 intake session occupied' },
-  });
-  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-schedule-busy', args: { trigger: 'schedule' } });
-  await waitFor(() => sent.some((message) => message.callId === 'call-schedule-busy'));
-  const result = sent.find((message) => message.callId === 'call-schedule-busy');
-  assert.equal(errandCalls.length, 1);
-  assert.equal(result.result.reason, 'intake_scan_busy');
-  assert.match(result.result.summary, /跳过/);
-});
-
-test('manual scan runs even when the product auto-scan switch is disabled', async () => {
-  const { onHostMessage, nodeCalls, errandCalls, sent } = setup({ autoScanEnabled: false });
-  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-manual-off', args: { trigger: 'manual' } });
-  await waitFor(() => sent.some((message) => message.callId === 'call-manual-off'));
-  assert.equal(errandCalls.length, 1);
-  assert.equal(nodeCalls.some((call) => call.params?.path === '/api/integrations/cindy/scan'), true);
-});
-
-test('resident scan loop skips a round when auto-scan is disabled', async () => {
-  const { intervals, nodeCalls, errandCalls } = setup({ autoScanEnabled: false });
-  const timer = intervals.find((item) => item.delay === 10 * 60 * 1000);
-  assert.ok(timer);
-  await timer.callback();
-  assert.equal(errandCalls.length, 0);
-  assert.equal(nodeCalls.some((call) => call.params?.path === '/api/integrations/cindy/scan'), true);
-});
-
-test('resident scan loop dispatches a schedule scan when auto-scan is enabled', async () => {
-  const { intervals, nodeCalls, errandCalls } = setup({ autoScanEnabled: true });
-  const timer = intervals.find((item) => item.delay === 10 * 60 * 1000);
+test('the resident plugin polls one Aily inbox item every five minutes and starts the fixed intake errand', async () => {
+  const { intervals, nodeCalls, errandCalls } = setup();
+  const timer = intervals.find((item) => item.delay === 5 * 60 * 1000);
   assert.ok(timer);
   await timer.callback();
   assert.equal(errandCalls.length, 1);
   assert.equal(errandCalls[0].sessionKey, 'intake');
-  assert.equal(nodeCalls.some((call) => call.params?.path === '/api/integrations/cindy/scan'), true);
+  assert.equal(errandCalls[0].mode, 'wait');
+  assert.match(errandCalls[0].task, /get_pm_tasks/);
+  assert.match(errandCalls[0].task, /submit_intake/);
+  assert.match(errandCalls[0].task, /Aily Agent ID：agent_test/);
+  assert.match(errandCalls[0].task, /不得读取飞书/);
+  assert.doesNotMatch(errandCalls[0].task, /claim-token-private/);
+  assert.equal(nodeCalls.filter((call) => call.params?.path === '/api/integrations/cindy/summary-inbox/next').length, 1);
+  assert.equal(nodeCalls.some((call) => call.params?.path === '/api/integrations/cindy/scan'), false);
 });
 
-test('resident scan loop skips a round while another intake scan is running', async () => {
+test('the five-minute inbox poll does nothing when TooManyTasks has no ready summary', async () => {
+  const { intervals, errandCalls } = setup({ inboxResponse: { status: 'empty' } });
+  const timer = intervals.find((item) => item.delay === 5 * 60 * 1000);
+  assert.ok(timer);
+  await timer.callback();
+  assert.equal(errandCalls.length, 0);
+});
+
+test('only one inbox errand runs at a time', async () => {
   let release;
   const errandGate = new Promise((resolve) => { release = resolve; });
-  const { intervals, errandCalls } = setup({ autoScanEnabled: true, errandGate });
-  const timer = intervals.find((item) => item.delay === 10 * 60 * 1000);
+  const { intervals, errandCalls, nodeCalls } = setup({ errandGate });
+  const timer = intervals.find((item) => item.delay === 5 * 60 * 1000);
   assert.ok(timer);
   const first = timer.callback();
   await waitFor(() => errandCalls.length === 1);
-  await timer.callback();
+  const second = timer.callback();
+  await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(errandCalls.length, 1);
+  assert.equal(nodeCalls.filter((call) => call.params?.path === '/api/integrations/cindy/summary-inbox/next').length, 1);
   release();
-  await first;
+  await Promise.all([first, second]);
 });
 
-test('scan_intake_window skips nested dispatch inside the intake errand session', async () => {
-  const { onHostMessage, nodeCalls, errandCalls, sent } = setup();
+test('submit_intake injects the active inbox claim without exposing it to the model prompt', async () => {
+  let release;
+  const errandGate = new Promise((resolve) => { release = resolve; });
+  const { intervals, onHostMessage, errandCalls, intakePosts, sent, defaultInbox } = setup({ errandGate });
+  const timer = intervals.find((item) => item.delay === 5 * 60 * 1000);
+  const polling = timer.callback();
+  await waitFor(() => errandCalls.length === 1);
+  onHostMessage({
+    type: 'tool-call',
+    tool: 'submit_intake',
+    callId: 'call-inbox-submit',
+    args: {
+      ...defaultInbox.window,
+      result_kind: 'intake',
+      sources: [defaultInbox.source],
+      proposals: [{ action: 'skip', source_keys: [defaultInbox.source.source_key], reason: '暂不入库。' }],
+    },
+  });
+  await waitFor(() => sent.some((message) => message.callId === 'call-inbox-submit'));
+  assert.equal(intakePosts.length, 1);
+  assert.equal(intakePosts[0].inbox_id, defaultInbox.inbox_id);
+  assert.equal(intakePosts[0].claim_token, defaultInbox.claim_token);
+  assert.doesNotMatch(errandCalls[0].task, new RegExp(defaultInbox.claim_token, 'u'));
+  release();
+  await polling;
+});
+
+test('errand failure returns the claim to TooManyTasks with a controlled error code', async () => {
+  const { intervals, retryPosts } = setup({
+    errandResponse: { ok: false, errorCode: 'BUSY', message: 'intake session occupied' },
+  });
+  const timer = intervals.find((item) => item.delay === 5 * 60 * 1000);
+  await timer.callback();
+  assert.equal(retryPosts.length, 1);
+  assert.equal(retryPosts[0].claim_token, 'claim-token-private');
+  assert.equal(retryPosts[0].error_code, 'CINDY_ERRAND_BUSY');
+});
+
+test('a model success message cannot replace the server intake receipt', async () => {
+  const { intervals, retryPosts } = setup({
+    intakeStatus: { completed: false, result_kind: null, proposal_count: 0 },
+    errandText: '{"status":"done","intake_submitted":true,"summary":"我已提交。","proposals":[]}',
+  });
+  const timer = intervals.find((item) => item.delay === 5 * 60 * 1000);
+  await timer.callback();
+  assert.equal(retryPosts.length, 1);
+  assert.equal(retryPosts[0].error_code, 'CINDY_INTAKE_NOT_CONFIRMED');
+});
+
+test('scan_intake_window skips recursive triggers inside the intake errand session', async () => {
+  const { onHostMessage, nodeCalls, sent } = setup();
   onHostMessage({
     type: 'tool-call',
     tool: 'scan_intake_window',
@@ -483,106 +379,9 @@ test('scan_intake_window skips nested dispatch inside the intake errand session'
   });
   await waitFor(() => sent.some((message) => message.callId === 'call-nested-intake'));
   const result = sent.find((message) => message.callId === 'call-nested-intake');
-  assert.equal(errandCalls.length, 0);
   assert.equal(nodeCalls.length, 0);
   assert.equal(result.ok, true);
   assert.equal(result.result.reason, 'already_in_intake_errand');
-  assert.doesNotMatch(result.result.next_action, /飞书 MCP/);
-  assert.match(result.result.next_action, /不要再次调用 scan_intake_window/);
-});
-
-test('scan_intake_window turns a BUSY errand response into direct intake instructions', async () => {
-  const { onHostMessage, nodeCalls, errandCalls, sent } = setup({
-    errandResponse: { ok: false, errorCode: 'BUSY', message: '已有 intake session occupied' },
-  });
-  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-busy', args: {} });
-  await waitFor(() => sent.some((message) => message.callId === 'call-busy'));
-  const result = sent.find((message) => message.callId === 'call-busy');
-  assert.equal(errandCalls.length, 1);
-  assert.equal(result.ok, true);
-  assert.equal(result.result.reason, 'intake_errand_busy');
-  assert.match(result.result.summary, /已占用/);
-  assert.doesNotMatch(result.result.next_action, /飞书 MCP/);
-  assert.match(result.result.next_action, /不要再次调用 scan_intake_window/);
-  assert.equal(nodeCalls[0].params.path, '/api/integrations/cindy/scan');
-});
-
-test('scan_intake_window turns a thrown session-occupied error into direct intake instructions', async () => {
-  const error = new Error('intake session occupied');
-  error.code = 'BUSY';
-  const { onHostMessage, errandCalls, sent } = setup({ errandError: error });
-  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-thrown-busy', args: {} });
-  await waitFor(() => sent.some((message) => message.callId === 'call-thrown-busy'));
-  const result = sent.find((message) => message.callId === 'call-thrown-busy');
-  assert.equal(errandCalls.length, 1);
-  assert.equal(result.ok, true);
-  assert.equal(result.result.reason, 'intake_errand_busy');
-  assert.doesNotMatch(result.result.next_action, /飞书 MCP/);
-});
-
-test('Cindy errand failure returns a structured result and keeps the window unadvanced', async () => {
-  const { onHostMessage, nodeCalls, errandCalls, intakePosts, sent } = setup({
-    errandResponse: { ok: false, errorCode: 'CINDY_FAILED', message: 'errand failed' },
-  });
-  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-cindy-failed', args: {} });
-  await waitFor(() => sent.some((message) => message.callId === 'call-cindy-failed'));
-  const result = sent.find((message) => message.callId === 'call-cindy-failed');
-  assert.equal(result.ok, true);
-  assert.equal(result.result.status, 'failed');
-  assert.equal(result.result.reason, 'cindy_failed');
-  assert.equal(result.result.aily_summary_generated, true);
-  assert.equal(result.result.cindy_result.reason, 'errand_failed');
-  assert.equal(result.result.cindy_result.error_code, 'CINDY_FAILED');
-  assert.equal(errandCalls.length, 1);
-  assert.equal(intakePosts.length, 0);
-  assert.equal(nodeCalls.some((call) => call.params?.path?.endsWith('/intake')), false);
-});
-
-test('Cindy text cannot stand in for a missing server intake receipt', async () => {
-  const { onHostMessage, nodeCalls, sent } = setup({
-    intakeStatus: { completed: false, result_kind: null, proposal_count: 0 },
-    errandText: '{"status":"done","intake_submitted":true,"intake_window_id":"window-1","summary":"我已提交。","proposals":[]}',
-  });
-  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-unconfirmed-receipt', args: {} });
-  await waitFor(() => sent.some((message) => message.callId === 'call-unconfirmed-receipt'));
-  const result = sent.find((message) => message.callId === 'call-unconfirmed-receipt');
-  assert.equal(result.ok, true);
-  assert.equal(result.result.status, 'failed');
-  assert.equal(result.result.reason, 'cindy_intake_not_confirmed');
-  assert.equal(result.result.cindy_result.server_receipt_verified, false);
-  assert.equal(nodeCalls.some((call) => call.params?.path?.endsWith('/intake')), false);
-});
-
-test('server intake receipt remains authoritative when Cindy final text is not valid JSON', async () => {
-  const { onHostMessage, sent } = setup({
-    intakeStatus: { completed: true, result_kind: 'intake', proposal_count: 2 },
-    errandText: '已完成提交，但最终回复没有按约定输出 JSON。',
-  });
-  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-authoritative-receipt', args: {} });
-  await waitFor(() => sent.some((message) => message.callId === 'call-authoritative-receipt'));
-  const result = sent.find((message) => message.callId === 'call-authoritative-receipt');
-  assert.equal(result.ok, true);
-  assert.notEqual(result.result.status, 'failed');
-  assert.equal(result.result.cindy_result.intake_submitted, true);
-  assert.equal(result.result.cindy_result.server_receipt_verified, true);
-  assert.equal(result.result.cindy_result.model_confirmation_present, false);
-  assert.equal(result.result.summary, '服务端已确认提交 2 条入库提案。');
-});
-
-test('server intake receipt overrides a contradictory failed status in Cindy final text', async () => {
-  const { onHostMessage, sent } = setup({
-    intakeStatus: { completed: true, result_kind: 'intake', proposal_count: 1 },
-    errandText: '{"status":"failed","reason":"errand_failed","summary":"模型误报失败。","proposals":[]}',
-  });
-  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-contradictory-model-status', args: {} });
-  await waitFor(() => sent.some((message) => message.callId === 'call-contradictory-model-status'));
-  const result = sent.find((message) => message.callId === 'call-contradictory-model-status');
-  assert.equal(result.ok, true);
-  assert.equal(result.result.status, 'done');
-  assert.equal(result.result.reason, null);
-  assert.equal(result.result.cindy_result.status, 'succeeded');
-  assert.equal(result.result.cindy_result.server_receipt_verified, true);
-  assert.equal(result.result.summary, '服务端已确认提交 1 条入库提案。');
 });
 
 test('get_pm_tasks exposes task items, pending candidates, and read cursors', async () => {
@@ -597,34 +396,8 @@ test('get_pm_tasks exposes task items, pending candidates, and read cursors', as
   assert.equal(result.result.cursors[0].conversation_key, 'conversation-1');
 });
 
-test('scan result returns a readable short proposal list with action and title', async () => {
-  const { onHostMessage, sent, cursorWrites } = setup({
-    errandText: '{"status":"done","intake_submitted":true,"intake_window_id":"window-1","summary":"已更新已有任务。","proposals":[{"action":"update_task","title":"活动留存分析"},{"action":"skip","title":"礼貌确认"}]}',
-  });
-  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-proposals', args: {} });
-  await waitFor(() => sent.some((message) => message.callId === 'call-proposals'));
-  const result = sent.find((message) => message.callId === 'call-proposals');
-  assert.deepEqual(JSON.parse(JSON.stringify(result.result.proposals)), [
-    { action: 'update_task', title: '活动留存分析' },
-    { action: 'skip', title: '礼貌确认' },
-  ]);
-  assert.equal(result.result.summary, '已更新正式任务：活动留存分析。');
-  assert.equal(result.result.model_summary, '已更新已有任务。');
-  assert.equal(cursorWrites.length, 0);
-});
-
-test('scan result uses human language for candidates, formal task updates, and empty windows', async () => {
-  const { onHostMessage, sent } = setup({
-    errandText: '{"status":"done","intake_submitted":true,"intake_window_id":"window-1","proposals":[{"action":"create_candidate","title":"新候选"},{"action":"update_task","title":"正式任务 A"},{"action":"update_task","title":"正式任务 B"}]}' ,
-  });
-  onHostMessage({ type: 'tool-call', tool: 'scan_intake_window', callId: 'call-readable', args: {} });
-  await waitFor(() => sent.some((message) => message.callId === 'call-readable'));
-  const result = sent.find((message) => message.callId === 'call-readable');
-  assert.equal(result.result.summary, '新建 1 张候选；已更新正式任务：正式任务 A、正式任务 B。');
-});
-
 test('ghost keeps resident errand support only', () => {
-  assert.equal(ghost.version, '0.6.0');
+  assert.equal(ghost.version, '0.7.0');
   assert.equal(ghost.id, 'ai-pm-intake');
   assert.equal(ghost.name, 'TooManyTasks');
   assert.match(ghost.description, /独立运行的 TooManyTasks/);
@@ -634,7 +407,7 @@ test('ghost keeps resident errand support only', () => {
   assert.equal(ghost.agent.errand, true);
   assert.equal('schedule' in ghost.agent, false);
   const scanTool = ghost.tools.find((tool) => tool.name === 'scan_intake_window');
-  assert.match(scanTool.description, /入库 errand 会话内禁止调用本工具/);
+  assert.match(scanTool.description, /后台 Aily 扫描/);
   assert.match(scanTool.description, /独立 TooManyTasks/);
   assert.deepEqual(scanTool.parameters.properties.trigger.enum, ['manual', 'schedule']);
   assert.equal(scanTool.parameters.properties.trigger.default, 'manual');

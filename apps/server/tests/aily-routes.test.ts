@@ -46,14 +46,11 @@ describe('Aily 与 Cindy 扫描路由', () => {
         return { ok: true, status };
       },
       disconnect: async () => ({ ok: true, status: { ...status, connected: false } }),
-      scan: async (_pm: PmService, trigger: 'manual' | 'schedule') => {
-        calls.push({ method: 'scan', input: trigger });
+      triggerScan: (_pm: PmService, trigger: 'manual' | 'schedule') => {
+        calls.push({ method: 'triggerScan', input: trigger });
         return {
-          status: 'skipped',
-          reason: 'aily_empty',
-          aily_status: 'Completed',
-          aily_summary_generated: false,
-          proposals: [],
+          status: 'accepted',
+          job_id: 'aily-scan:test',
         };
       },
     } as unknown as AilyService;
@@ -133,8 +130,8 @@ describe('Aily 与 Cindy 扫描路由', () => {
       payload: { trigger: 'schedule' },
     });
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({ reason: 'aily_empty' });
-    expect(calls).toContainEqual({ method: 'scan', input: 'schedule' });
+    expect(response.json()).toMatchObject({ status: 'accepted', job_id: 'aily-scan:test' });
+    expect(calls).toContainEqual({ method: 'triggerScan', input: 'schedule' });
   });
 
   it('OAuth callback 只回显脱敏结果并通知设置页刷新', async () => {

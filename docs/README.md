@@ -22,6 +22,7 @@ README、AGENTS 和本页不再复制当前测试数字、安装包 hash 或历�
 - `architecture.md`：系统组成、数据真源和自动化边界。
 - `domain-contracts.md`：Issue #64 统一术语、数据权威、状态机、CAS/恢复、错误目录和 ADR supersession。
 - `security_and_privacy.md`：令牌、聊天原文、隐私生命周期、硬删除证明和 GitHub 安全要求。
+- `first-install.md`：把 GitHub 地址交给 Agent 后的首次自动部署和用户操作说明。
 - `user-guide.md`：Cindy 插件、本机浏览器任务台、人工补录和验收步骤。
 - `diagnostics.md`：运行日志与诊断包字段、递归脱敏版本和禁止内容。
 - `../CHANGELOG.md`：用户可见历史；逐次验证数字另存 `qa/`。

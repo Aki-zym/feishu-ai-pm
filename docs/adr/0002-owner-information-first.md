@@ -5,8 +5,8 @@ status: accepted
 date: 2026-08-10
 owner: 产品负责人 / 飞书接入负责人
 scope: 飞书来源读取边界
+evidence: []
 supersedes: []
-evidence: [VER-PR24-CHECK]
 ---
 
 # ADR 0002：个人信息流优先，机器人降级为补充入口

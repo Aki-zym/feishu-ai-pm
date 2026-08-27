@@ -142,24 +142,26 @@ function validateManifest() {
   const tipDeclaration = integrationTipDeclarationErrors({ manifestTip: declaredTip, currentStateText, branch, declarationKind });
   for (const error of tipDeclaration.errors) addError(`integration tip declaration: ${error}`);
   const parsedTip = tipDeclaration.parsedCurrentStateTip;
-  try {
-    const live = resolveLiveIntegrationTip({ branch, declaredTip, declarationKind, baseArg: base, env: process.env, git: runGit, requireDeclaredMatch: true });
-    integrationFreshness = {
-      branch,
-      declared_tip: declaredTip,
-      declaration_kind: declarationKind,
-      live_tip: live.tip,
-      declared_match: live.declaredMatch,
-      second_parent: live.secondParent ?? null,
-      approved_pr_head: live.approvedPrHead ?? null,
-      merge_tree: live.mergeTree ?? null,
-      tree: live.tree ?? null,
-      event: process.env.GITHUB_EVENT_NAME ?? process.env.CI_EVENT_NAME ?? null,
-      ref: process.env.GITHUB_REF_NAME ?? process.env.CI_BRANCH ?? null,
-    };
-    if (base && live.tip !== String(base).toLowerCase()) addError(`integration provenance: base ${base} 解析为 ${live.tip}，声明不一致。`);
-  } catch (error) {
-    addError(`integration provenance: ${error.message}。`);
+  if (declarationKind !== 'unbound') {
+    try {
+      const live = resolveLiveIntegrationTip({ branch, declaredTip, declarationKind, baseArg: base, env: process.env, git: runGit, requireDeclaredMatch: true });
+      integrationFreshness = {
+        branch,
+        declared_tip: declaredTip,
+        declaration_kind: declarationKind,
+        live_tip: live.tip,
+        declared_match: live.declaredMatch,
+        second_parent: live.secondParent ?? null,
+        approved_pr_head: live.approvedPrHead ?? null,
+        merge_tree: live.mergeTree ?? null,
+        tree: live.tree ?? null,
+        event: process.env.GITHUB_EVENT_NAME ?? process.env.CI_EVENT_NAME ?? null,
+        ref: process.env.GITHUB_REF_NAME ?? process.env.CI_BRANCH ?? null,
+      };
+      if (base && live.tip !== String(base).toLowerCase()) addError(`integration provenance: base ${base} 解析为 ${live.tip}，声明不一致。`);
+    } catch (error) {
+      addError(`integration provenance: ${error.message}。`);
+    }
   }
   const milestones = manifest.historical_milestones;
   if (!Array.isArray(milestones) || milestones.length === 0) {
@@ -218,6 +220,7 @@ function validateManifest() {
   }
   const currentText = readText(manifest.canonical_current_state);
   for (const [key, value] of Object.entries(state)) {
+    if (value === null || value === undefined) continue;
     if (!value || !currentText.includes(String(value))) {
       addError(`${manifest.canonical_current_state}: 未同步 manifest.current_state.${key}。`);
     }
