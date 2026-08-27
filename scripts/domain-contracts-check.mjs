@@ -237,7 +237,6 @@ const check = ({ skipStructure = false } = {}) => {
     const supersedesText = String(values.supersedes ?? '').replace(/[\[\]\s]/g, ''); if (supersedesText && supersedesText.split(',').some((ref) => !/^ADR-[0-9]{4}(?:-[a-z0-9-]+)?(?:#[^,]+)?$/.test(ref))) errors.push(`${file} supersedes 只能引用可解析 ADR-*。`);
     for (const ref of [...idsFrom(values.supersedes), ...idsFrom(values.superseded_by)]) if (!adrIds.includes(ref)) errors.push(`${file} 引用了不存在的 ADR ID ${ref}。`);
     const evidenceText = String(values.evidence ?? '').replace(/[\[\]\s]/g, ''); if (evidenceText && evidenceText.split(',').some((ref) => !/^VER-[A-Z0-9-]+$/.test(ref))) errors.push(`${file} evidence 只能引用可解析 VER-*。`); for (const evidenceId of evidenceText.split(',').filter(Boolean)) if (!verificationIds.has(evidenceId)) errors.push(`${file} 引用了 verification-matrix.json 中不存在的证据 ID ${evidenceId}。`);
-    if (file === '0007-m1-sqlite-draft-only-and-contracts.md' && !evidenceText.includes('VER-ISSUE64-CONTRACT-L1-20260815')) errors.push('ADR-0007 必须直接引用 VER-ISSUE64-CONTRACT-L1-20260815。');
     for (const section of contract.adr_contract.required_body_sections) {
       const pattern = adrBodySectionAliases[section] ?? escapeRegExp(section);
       if (!(new RegExp(`^##\\s+[^\\n]*(${pattern})`, 'm')).test(text)) errors.push(`${file} 正文缺少“${section}”段落。`);

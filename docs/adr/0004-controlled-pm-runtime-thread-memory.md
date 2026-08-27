@@ -5,6 +5,7 @@ status: accepted
 date: 2026-08-12
 owner: 后端负责人
 scope: Runtime、线程和投影
+evidence: []
 supersedes: []
 superseded_by: [ADR-0005]
 ---

@@ -5,6 +5,7 @@ status: accepted
 date: 2026-08-15
 owner: 架构负责人 / 数据可靠性负责人
 scope: M1 SQLite schema 迁移、备份、恢复与降级门禁
+evidence: []
 supersedes: []
 ---
 

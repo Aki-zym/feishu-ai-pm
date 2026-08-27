@@ -5,6 +5,7 @@ status: deprecated
 date: 2026-08-09
 owner: 桌面负责人
 scope: Windows M1 载体
+evidence: []
 supersedes: []
 ---
 

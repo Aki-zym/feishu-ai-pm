@@ -5,6 +5,7 @@ status: accepted
 date: 2026-08-14
 owner: LLM/后端负责人
 scope: 连续对话分类与关联
+evidence: []
 supersedes: []
 ---
 

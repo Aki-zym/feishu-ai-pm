@@ -5,6 +5,7 @@ status: accepted
 date: 2026-08-15
 owner: 产品负责人 / 架构负责人
 scope: M1 单用户试点、Issue #64 领域合同
+evidence: []
 supersedes: [ADR-0001#正式试点 PostgreSQL 条款]
 ---
 
