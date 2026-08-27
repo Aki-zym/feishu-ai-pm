@@ -265,6 +265,15 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
       return reply.code(ailyErrorStatus(error)).send(ailyErrorPayload(error));
     }
   });
+  app.post('/api/integrations/aily/application/prepare', async (request, reply) => {
+    if (!isLoopbackRequest(request)) return reply.code(403).send({ error: 'Aily 应用配置接口只接受本机回环请求。' });
+    if (!options.ailyService) return reply.code(503).send({ error: 'Aily 集成尚未启用。' });
+    try {
+      return await options.ailyService.prepareApplication();
+    } catch (error) {
+      return reply.code(ailyErrorStatus(error)).send(ailyErrorPayload(error));
+    }
+  });
   app.get('/api/integrations/aily/oauth/url', async (request, reply) => {
     if (!isLoopbackRequest(request)) return reply.code(403).send({ error: 'Aily 授权接口只接受本机回环请求。' });
     if (!options.ailyService) return reply.code(503).send({ error: 'Aily 集成尚未启用。' });

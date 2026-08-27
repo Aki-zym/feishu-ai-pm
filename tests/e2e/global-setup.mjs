@@ -40,6 +40,18 @@ function exitValue(result) {
   return result.code ?? result.signal ?? 'unknown';
 }
 
+function npmInvocation() {
+  const localNpmCli = process.env.npm_execpath
+    || join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  if (existsSync(localNpmCli)) {
+    return { command: process.execPath, argsPrefix: [localNpmCli] };
+  }
+  return {
+    command: process.platform === 'win32' ? 'npm.cmd' : 'npm',
+    argsPrefix: [],
+  };
+}
+
 const lifecycleTransitions = {
   starting: new Set(['ready', 'failed', 'forcing']),
   ready: new Set(['shutdown-requested', 'failed', 'forcing']),
@@ -185,11 +197,10 @@ export async function launchE2eController({ build = true, captureOutput = false,
   const desktopPort = requestedPorts?.desktop ?? e2ePort('E2E_DESKTOP_PORT', 4410);
   if (mobilePort === desktopPort) throw new Error('E2E desktop and mobile ports must be different.');
   const ports = [mobilePort, desktopPort];
-  const npmCli = process.env.npm_execpath ?? join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
-  if (!existsSync(npmCli)) throw new Error('Unable to locate the npm CLI for E2E builds.');
   if (build) {
-    await runCommand(process.execPath, [npmCli, 'run', 'build', '-w', '@ai-pm/web']);
-    await runCommand(process.execPath, [npmCli, 'run', 'build', '-w', '@ai-pm/server']);
+    const npm = npmInvocation();
+    await runCommand(npm.command, [...npm.argsPrefix, 'run', 'build', '-w', '@ai-pm/web']);
+    await runCommand(npm.command, [...npm.argsPrefix, 'run', 'build', '-w', '@ai-pm/server']);
   }
 
   const runToken = randomUUID();

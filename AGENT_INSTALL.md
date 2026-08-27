@@ -14,7 +14,7 @@
 
 ## 用户首次只需知道
 
-Agent 会自动 clone、安装依赖、构建、启动本机服务，在用户自己的飞书后台创建应用和 Aily Agent，配置权限，保存凭证，打开授权页，安装 Cindy 插件，开启扫描并做一次真实检查。用户通常只需要在飞书要求时登录或点“允许/同意”，以及在 Cindy 要求时确认安装插件；用户不需要复制 App Secret、App ID、Agent ID 或 Token。
+Agent 会自动 clone、安装依赖、构建、启动本机服务，在用户自己的飞书后台创建应用和 Aily Agent，随后由 CLI 配置应用权限、回调地址、发布版本并提交管理员授权申请，再打开用户 OAuth 授权页，安装 Cindy 插件，开启扫描并做一次真实检查。用户通常只需要在飞书要求时登录或点“允许/同意”，以及在 Cindy 要求时确认安装插件；用户不需要复制 App Secret、App ID、Agent ID 或 Token。
 
 ## 强制执行流程
 
@@ -38,33 +38,15 @@ npm run agent:install
 
 使用 Agent 可用的浏览器控制能力打开飞书官方开放平台。若当前浏览器没有登录，提示用户在当前浏览器完成登录后继续。
 
+官方当前没有公开的“从零创建开发者后台自建应用”接口，因此这一步仍使用飞书官方后台。应用创建和首次凭证读取必须在浏览器完成；后续大部分权限、回调地址、发布和管理员授权申请交给 CLI。由于飞书要求调用应用配置 API 的应用身份权限先行开通，必须在权限管理中手动开启 `application:application:patch`，这是一项配置权限的前置条件。
+
 必须执行以下动作：
 
 1. 创建一个新的“企业自建应用”，名称使用当前用户可识别的唯一名称，例如 `TooManyTasks - <当前用户>`。
-2. 在权限管理中加入并发布当前版本需要的最小用户权限：
+2. 在权限管理中开启应用身份权限 `application:application:patch`。
+3. 打开应用凭证页面，读取当前用户自己新建应用的 App ID 和 App Secret。Agent 只在内存中暂存，不能在对话中回显。
 
-```text
-aily:agent_chat:write
-auth:user.id:read
-im:chat:read
-im:message:readonly
-im:message.group_msg:get_as_user
-im:message.p2p_msg:get_as_user
-search:message
-search:docs:read
-calendar:calendar.event:read
-offline_access
-```
-
-3. 如果飞书把高级权限交给企业管理员审批，暂停并请用户或管理员只完成审批；审批完成后继续发布版本。
-4. 在应用的 OAuth/重定向地址配置中登记：
-
-```text
-http://127.0.0.1:4310/oauth/aily/callback
-```
-
-5. 发布包含上述权限和回调地址的应用版本。
-6. 打开应用凭证页面，读取当前用户自己新建应用的 App ID 和 App Secret。Agent 只在内存中暂存，不能在对话中回显。
+除上述应用身份前置权限外，Agent 不得把后台权限表单点击当作必需步骤；其余应用权限、OAuth 回调地址和版本发布由第 5 步的 CLI 完成。
 
 如果页面出现已有应用，Agent 必须确认它是本次新建的用户自己的应用。发现共享应用、仓库示例应用或测试应用时停止并重新创建，不能顺手复用。
 
@@ -92,7 +74,26 @@ node scripts/agent-runtime.mjs configure-aily
 
 输入对象必须包含本次新建应用的 `appId`、`appSecret`、`agentId`、`domain`、本机 `oauthRedirectUri` 和上面的 `oauthScopes`。脚本只向用户报告配置已写入本机加密凭证库，不回显 Secret。
 
-### 6. 完成用户 OAuth
+### 6. CLI 配置并申请企业应用权限
+
+执行：
+
+```bash
+node scripts/agent-runtime.mjs prepare-aily-app
+```
+
+该命令使用官方 SDK 自动完成以下动作：
+
+1. 获取短期 `tenant_access_token`；
+2. 写入 Aily 所需用户权限；
+3. 写入 `http://127.0.0.1:4310/oauth/aily/callback` 和 refresh token 配置；
+4. 提交自建应用版本发布；
+5. 调用飞书“向管理员申请授权”接口；
+6. 查询当前租户的实际授权状态。
+
+命令只返回 scope 数量、待授权 scope 名称、发布状态和申请状态，不回显企业 Token、App Secret 或完整飞书响应。命令提交申请后立即查询一次授权状态；管理员自动审批时返回 `status=ready`，仍在审批中的权限返回 `status=awaiting_admin_approval`，Agent 应在平台动作完成后重试。高敏权限若被平台要求超级管理员处理，Agent 只能提示当前管理员完成平台动作。
+
+### 7. 完成用户 OAuth
 
 1. 执行 `node scripts/agent-runtime.mjs oauth-url` 获取一次性授权地址。
 2. 使用浏览器打开该地址。
@@ -102,7 +103,7 @@ node scripts/agent-runtime.mjs configure-aily
 
 Agent 不得要求用户把授权码、Token 或 Secret 复制到聊天中。
 
-### 7. 安装 Cindy 插件
+### 8. 安装 Cindy 插件
 
 先执行 `node scripts/agent-runtime.mjs verify`，然后使用 Cindy 宿主提供的插件安装能力安装：
 
@@ -119,7 +120,7 @@ Agent 必须等待宿主报告安装完成并确认 `ai-pm-intake` 已启用。�
 - 入库 errand 使用 `codex/gpt-5.6-luna`、思考强度 `high`、权限 `auto`。
 - 普通进度功能按用户默认保留主动模式；不得关闭 `update_pm_progress`。
 
-### 8. 开启扫描和首次验收
+### 9. 开启扫描和首次验收
 
 执行：
 

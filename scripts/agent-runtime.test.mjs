@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { DEFAULT_OAUTH_SCOPES, parseAilyConfig, readIntegrationToken, redactAilyStatus, runtimePaths } from './agent-runtime.mjs';
+import { DEFAULT_OAUTH_SCOPES, parseAilyConfig, readIntegrationToken, redactAilyStatus, runtimePaths, serverEnvironment } from './agent-runtime.mjs';
 
 test('Agent Aily 配置默认使用当前用户独立应用所需的 scope', () => {
   const config = parseAilyConfig({
@@ -61,6 +61,17 @@ test('Agent 运行目录默认落在本机配置目录，且自定义目录优�
   assert.equal(paths.configRoot, '/tmp/toomanytasks-agent-test');
   assert.equal(paths.baseUrl, 'http://127.0.0.1:4399');
   assert.match(paths.pidFile, /\.agent-runtime\/server\.pid$/u);
+});
+
+test('自定义配置目录会传给后台进程，避免令牌写到另一套安装', () => {
+  const paths = runtimePaths({
+    TOOMANYTASKS_CONFIG_ROOT: '/tmp/toomanytasks-agent-test',
+    PORT: '4399',
+  });
+  const environment = serverEnvironment(paths, { PATH: '/usr/bin', AILY_OAUTH_REDIRECT_URI: '' });
+  assert.equal(environment.TOOMANYTASKS_CONFIG_ROOT, '/tmp/toomanytasks-agent-test');
+  assert.equal(environment.PORT, '4399');
+  assert.equal(environment.AILY_OAUTH_REDIRECT_URI, 'http://127.0.0.1:4399/oauth/aily/callback');
 });
 
 test('Agent 的首次扫描使用 TooManyTasks 自动生成的本机集成令牌', async () => {

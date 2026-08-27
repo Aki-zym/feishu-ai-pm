@@ -39,6 +39,13 @@ export default function TaskDrawer() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
+  const [correctionOpen, setCorrectionOpen] = useState(false);
+  const [correctionType, setCorrectionType] = useState<'false_positive' | 'wrong_association' | 'wrong_fields' | 'describe_incomplete' | 'status_or_schedule_wrong'>('false_positive');
+  const [correctionValue, setCorrectionValue] = useState('');
+  const [correctionTargetTaskId, setCorrectionTargetTaskId] = useState('');
+  const [correctionSourceScope, setCorrectionSourceScope] = useState('');
+  const [correctionTasks, setCorrectionTasks] = useState<Array<{ id: string; title: string; version: number }>>([]);
+  const [correctionBusy, setCorrectionBusy] = useState(false);
 
   const sync = (detail: TaskDetail) => {
     setTask(detail);
@@ -53,13 +60,19 @@ export default function TaskDrawer() {
   };
 
   useEffect(() => {
+    let cancelled = false;
     setTask(null);
     setError('');
     setMessage('');
-    if (!taskId) return;
+    if (!taskId) return () => { cancelled = true; };
     void api.get<TaskDetail>('/api/tasks/' + encodeURIComponent(taskId))
-      .then(sync)
-      .catch((reason) => setError(reason instanceof Error ? reason.message : '任务详情读取失败。'));
+      .then((detail) => {
+        if (!cancelled) sync(detail);
+      })
+      .catch((reason) => {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : '任务详情读取失败。');
+      });
+    return () => { cancelled = true; };
   }, [taskId]);
 
   if (!taskId) return null;
@@ -129,15 +142,62 @@ export default function TaskDrawer() {
     }
   };
 
+  const openCorrection = async () => {
+    if (!task) return;
+    setCorrectionOpen(true);
+    setCorrectionType('false_positive');
+    setCorrectionValue('');
+    setCorrectionTargetTaskId('');
+    setCorrectionSourceScope(task.sources[0]?.source_scope ?? '');
+    try {
+      const result = await api.get<{ items: Array<{ id: string; title: string; version: number }> }>('/api/tasks');
+      setCorrectionTasks(result.items.filter((item) => item.id !== task.id));
+    } catch {
+      setCorrectionTasks([]);
+    }
+  };
+
+  const submitCorrection = async () => {
+    if (!task) return;
+    setCorrectionBusy(true);
+    setError('');
+    setMessage('');
+    try {
+      const body: Record<string, unknown> = {
+        correctionType,
+        taskId: task.id,
+        expectedTaskVersion: task.version,
+        idempotencyKey: `task-drawer:${task.id}:${Date.now()}`,
+      };
+      if (correctionType === 'wrong_association') {
+        body.targetTaskId = correctionTargetTaskId;
+        body.sourceScope = correctionSourceScope;
+      }
+      if (correctionType === 'wrong_fields' || correctionType === 'describe_incomplete' || correctionType === 'status_or_schedule_wrong') {
+        body.replacementValue = correctionValue.trim();
+      }
+      const result = await api.post<{ task?: TaskDetail | null }>('/api/corrections', body);
+      if (result.task) sync(result.task);
+      setCorrectionOpen(false);
+      setMessage('纠错已记录，只影响本机任务记录。');
+      announceTaskChange();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '纠错记录失败。');
+    } finally {
+      setCorrectionBusy(false);
+    }
+  };
+
   return (
     <div className="drawer-layer">
       <button className="drawer-backdrop" aria-label="关闭任务详情" onClick={close} />
       <aside className="task-drawer" aria-label="任务详情">
         <div className="drawer-header"><div><span className="drawer-kicker">任务详情</span><h2>{task?.title ?? '正在读取…'}</h2></div><button className="icon-button" aria-label="关闭" onClick={close}><X size={20} /></button></div>
+        <p className="drawer-safety-note">只生成、审阅、修改或废止，不发送</p>
         {error && <div className="error-banner">{error}</div>}
         {message && <div className="success-banner">{message}</div>}
         {task && <>
-          <section className="drawer-summary"><span>版本 v{task.version} · 最近更新 {formatFullDate(task.updated_at)}</span>{task.deleted_at && <strong>已在回收站</strong>}</section>
+          <section className="drawer-summary"><span>谁向我提出：{task.proposer_name}</span><span>版本 v{task.version} · 最近更新 {formatFullDate(task.updated_at)}</span>{task.deleted_at && <strong>已在回收站</strong>}</section>
           <section className="drawer-edit-panel" aria-label="编辑任务">
             <label className="correction-field"><span>标题</span><input value={title} onChange={(event) => setTitle(event.target.value)} /></label>
             <label className="correction-field"><span>Describe</span><textarea value={describe} onChange={(event) => setDescribe(event.target.value)} /></label>
@@ -146,6 +206,19 @@ export default function TaskDrawer() {
             <label className="correction-field"><span>等待原因</span><textarea value={waitingReason} onChange={(event) => setWaitingReason(event.target.value)} /></label>
             <div className="correction-grid"><label className="correction-field"><span><CalendarClock size={14} />计划开始</span><input type="datetime-local" value={plannedStart} onChange={(event) => setPlannedStart(event.target.value)} /></label><label className="correction-field"><span><CalendarClock size={14} />计划完成</span><input type="datetime-local" value={plannedDue} onChange={(event) => setPlannedDue(event.target.value)} /></label></div>
             <button className="primary-button" type="button" disabled={busy || Boolean(task.deleted_at)} onClick={() => void save()}><Save size={15} />保存任务</button>
+          </section>
+          <section className="task-correction-panel" aria-label="任务纠错">
+            <button className="secondary-button" type="button" disabled={busy || Boolean(task.deleted_at)} onClick={() => void openCorrection()}>纠错</button>
+            {correctionOpen && <div className="correction-box">
+              <div className="correction-private-note"><strong>这里只修正本机任务记录</strong><span>不会发送消息、拉群或执行外部业务动作。</span></div>
+              <label><span>哪里判断错了</span><select value={correctionType} onChange={(event) => setCorrectionType(event.target.value as typeof correctionType)}><option value="false_positive">这不是需求</option><option value="wrong_association">需求归属错了</option><option value="wrong_fields">提出人或字段错误</option><option value="describe_incomplete">Describe 不完整</option><option value="status_or_schedule_wrong">状态或排期有误</option></select></label>
+              {correctionType === 'wrong_association' && <>
+                <label><span>要移动的具体需求</span><select value={correctionTargetTaskId} onChange={(event) => setCorrectionTargetTaskId(event.target.value)}><option value="">请选择目标任务</option>{correctionTasks.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label>
+                <label><span>要移动的具体来源</span><select value={correctionSourceScope} onChange={(event) => setCorrectionSourceScope(event.target.value)}>{task.sources.map((source) => <option key={source.source_scope} value={source.source_scope}>{source.source_type} · {formatDate(source.occurred_at)}</option>)}</select></label>
+              </>}
+              {(correctionType === 'wrong_fields' || correctionType === 'describe_incomplete' || correctionType === 'status_or_schedule_wrong') && <label><span>正确内容</span><textarea value={correctionValue} onChange={(event) => setCorrectionValue(event.target.value)} /></label>}
+              <div className="correction-actions"><button className="secondary-button" type="button" disabled={correctionBusy || (correctionType === 'wrong_association' && (!correctionTargetTaskId || !correctionSourceScope)) || ((correctionType === 'wrong_fields' || correctionType === 'describe_incomplete' || correctionType === 'status_or_schedule_wrong') && !correctionValue.trim())} onClick={() => void submitCorrection()}>记录私人纠错</button><button className="quiet-button" type="button" disabled={correctionBusy} onClick={() => setCorrectionOpen(false)}>取消</button></div>
+            </div>}
           </section>
           <section className="continuity-section" aria-label="任务来源"><div className="section-heading-row"><strong>来源记录</strong><span>{task.sources.length} 条</span></div>{task.sources.length ? <ul className="task-source-list">{task.sources.map((source) => <li key={source.source_scope}><span>{source.source_kind === 'aily_summary' ? 'Aily 派生摘要' : source.source_type}</span><span>{formatDate(source.occurred_at)}</span><small>{source.completeness}</small></li>)}</ul> : <div className="empty-state compact-empty">暂无来源记录。</div>}</section>
           <div className="drawer-actions">{task.deleted_at ? <button className="secondary-button" disabled={busy} onClick={() => void restore()}><Undo2 size={15} />恢复任务</button> : <button className="danger-text-button" disabled={busy} onClick={() => void remove()}><Trash2 size={15} />移入回收站</button>}</div>

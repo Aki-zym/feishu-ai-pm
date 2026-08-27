@@ -41,6 +41,15 @@ describe('Aily 与 Cindy 扫描路由', () => {
         return status;
       },
       authorizationUrl: async () => ({ url: 'https://accounts.feishu.cn/example' }),
+      prepareApplication: async () => ({
+        status: 'ready',
+        configuredScopeCount: 10,
+        grantedScopeCount: 10,
+        pendingScopeCount: 0,
+        pendingScopes: [],
+        publishSubmitted: true,
+        adminApprovalRequested: true,
+      }),
       completeAuthorization: async (code: string, state: string) => {
         calls.push({ method: 'completeAuthorization', input: { code, state } });
         return { ok: true, status };
@@ -132,6 +141,31 @@ describe('Aily 与 Cindy 扫描路由', () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ status: 'accepted', job_id: 'aily-scan:test' });
     expect(calls).toContainEqual({ method: 'triggerScan', input: 'schedule' });
+  });
+
+  it('应用后台准备接口只接受 loopback，并返回脱敏权限状态', async () => {
+    const { app, calls } = await makeApp();
+    const remote = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/aily/application/prepare',
+      remoteAddress: '203.0.113.20',
+    });
+    expect(remote.statusCode).toBe(403);
+
+    const local = await app.inject({
+      method: 'POST',
+      url: '/api/integrations/aily/application/prepare',
+      remoteAddress: '127.0.0.1',
+    });
+    expect(local.statusCode).toBe(200);
+    expect(local.json()).toMatchObject({
+      status: 'ready',
+      configuredScopeCount: 10,
+      pendingScopeCount: 0,
+      publishSubmitted: true,
+    });
+    expect(JSON.stringify(local.json())).not.toContain('secret');
+    expect(calls).toHaveLength(0);
   });
 
   it('OAuth callback 只回显脱敏结果并通知设置页刷新', async () => {

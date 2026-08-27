@@ -20,7 +20,7 @@ CI 只消费完整 changed-path diff，并按 [测试选层与证据门禁](test
 - TooManyTasks 使用本机 `master.key` 或显式 `TOKEN_ENCRYPTION_KEY` 对 Aily App Secret、access token、refresh token、scope 和过期时间进行 AES-256-GCM 加密；配置目录权限为 `0700`，密钥、密文和 Cindy 集成令牌文件权限为 `0600`。这些值不进入 Cindy 插件、Cindy Prompt、SQLite、普通日志或完整错误文本。
 - Aily App ID 和 Agent ID 由当前安装显式配置；源码与示例配置不带开发测试应用或 Agent 的默认标识，避免新安装误连到开发时的授权主体。
 - Cindy 集成令牌由独立 TooManyTasks 首次启动自动生成。插件 Worker 从同一平台私有配置目录读取，只向本机回环地址发送 Bearer；用户无需复制或手填。
-- 自定义私有配置目录统一使用 `TOOMANYTASKS_CONFIG_ROOT`，确保服务端生成令牌的位置与 Cindy Worker 读取位置一致；旧 `CONFIG_ROOT` 仅作为兼容回退。
+- 默认安装路径由服务端与 Cindy Worker 自动一致；自定义私有配置目录时，服务进程与 Cindy 宿主进程都要显式设置同一个 `TOOMANYTASKS_CONFIG_ROOT`，旧 `CONFIG_ROOT` 仅作为兼容回退。
 - Aily 返回文本先进入 SQLite staging inbox，带窗口起止时间、Agent 标识、生成时间和内容 hash；Cindy 入库事务成功后才写成 `source_kind=aily_summary` 的派生来源。它不能冒充逐条飞书原文。Aily 失败、超时或权限失败不推进扫描游标；Cindy 入库失败只让该 inbox 记录重试，不回退已经成功生成的 Aily 窗口。
 - Token 刷新遇到临时网络或上游失败时保留 access/refresh token，等待后续重试；只有明确的鉴权失效或撤权结果才清除本机 Aily 用户授权。
 - Cindy errand 的最终文本属于人读输出。窗口完成状态只以服务端 SQLite 入库回执为准，模型自报 JSON 不能替代或否决该回执。

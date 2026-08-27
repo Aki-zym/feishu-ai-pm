@@ -9,7 +9,7 @@
 ## 当前实现快照
 
 - 原始审计快照日期：`2026-08-14`；该日期只表示 Issue #63 首次审计当时的文档快照，不能证明后续组合分支或 CI。
-- 组合重基线日期：`2026-08-15`；当前工作树未绑定 live integration tip，当前分支的 integration provenance 需在真实合入后重新绑定。历史冻结产品基线为 `c872c0f9534b1a8b7ad2fcde9551efcba503ad46`。
+- 组合重基线日期：`2026-08-15`；组合基线 `integration/m1-test-20260815` @ `635290379de2688187988692ecb619c9c109e100` 仅作历史快照。当前工作树未绑定 live integration tip，integration 声明类型为 `unbound`，当前分支的 integration provenance 需在真实合入后重新绑定。历史冻结产品基线为 `c872c0f9534b1a8b7ad2fcde9551efcba503ad46`。
 - PR #81 最新精确事件 base：同一分支在该 PR 中的事件 base 为 `integration/m1-test-20260815` @ `f7bdf11bf2578f130f2443c6f67d6d004b82b394`；它是本次 exact merge/event 证据的起点，不替代提交基线快照。
 - Issue #59 QA-01 已由 PR #90 纳入 integration，PR #107 补齐严格声明与 integration push 第一父提交例外；本修复继续使用上述 committed snapshot，并由 CI 额外绑定 GitHub 关联已合入 PR head、merge tree 与 live merge freshness，不把未来 merge SHA 追写回提交文档。
 - Issue #62 REL-01（验证 ID `VER-ISSUE62-REL01-GATE-20260816`）的 Windows L5 release-gate 基础设施已实现，但正式 owner-authorized 证书、signed artifact、GitHub Release 与 signed N-1/N upgrade/rollback 仍是外部阻塞；manifest 对 unsigned temporary smoke 保持 `authorization=false` / `pending`。
@@ -20,7 +20,7 @@
 
 - 产品路径选择器：`apps-workspace-default-include-v1`。
 - 产品/构建 source commit：`f9e77aec70aaa846047f987672c9171e0790846a`；它是正式安装包所对应的产品实现来源，不是本轮 PR 证据 head。
-- PR #81、PR #83、PR #84 与旧 PR #82 的最终 docs/evidence head、merge-ref、parents 与 run/job 只用于历史证据新鲜度，写在各自 PR body，不替代产品/构建 source；PR #86 / Issue #36 与 PR #87 / Issue #42 已合入/关闭，PR #87 的 exact head、merge-ref、parents 与 run/job 仅作为历史 provenance。
+- PR #81、PR #83、PR #84 与旧 PR #82 的最终 docs/evidence head、merge-ref、parents 与 run/job 只用于历史证据新鲜度，写在各自 PR body，不替代产品/构建 source；PR #86 / Issue #36 与 PR #87 / Issue #42 已合入/关闭，PR #87 的 exact head、merge-ref、parents 与 run/job 仅作为历史 provenance。PR #86 当前 base 为 `integration/m1-test-20260815` @ `ebe682aeae067bbf08a6f38ea39de17adceb9ac0`，仅作历史 provenance。
 - Issue #29 目标快照竞态修复行为/source 为 `60e10b1f1f9df0c9580772487e07b623e600a03e`；该提交是基于当前 integration tip 的普通 merge，包含 owner snapshot schema/CAS 兼容和退休目标 stale 结算修复。最终 exact head/merge-ref/tree/parents/run/job 以 PR #93 body 绑定；旧 head/CI 仅作 historical evidence。
 - Issue #45 / PROD-01 已由 PR #92 合入并 POST_MERGE_STABLE；默认候选、任务、线程、提案、主人信息和操作回执使用严格最小 DTO，不返回来源正文、稳定/外部 ID、provider/raw error 或未经核验自由文本。安全派生摘要仅对长度门槛的整段/近整段复制、NFKC/跨空白复现、结构化 Feishu/Docx token、URL/路径、UUID 和 secret-like token fail-closed；主人核验仍为显式、task-scoped、私有审计且 `external_action: none`，仅核验本地保存快照并返回带时间的 provider unknown/last-known 状态。验证 ID 为 `VER-ISSUE45-PROD01-SOURCE-PRIVACY-L4-20260816`；证据仅 synthetic/local L2-L4，不外推真实租户、provider、Windows L5 或 L6。
 - 产品阶段：`M1：本机任务库与 Cindy 插件入口维护`。
@@ -38,7 +38,7 @@
 
 
 
-commit 只提供精确产品快照的导航线索，可能因后续 squash/merge 改变；机器每次都以确定性的产品源码指纹比对被审工作树，并与 [文档清单](docs-manifest.json) 和 [验证事实源](verification-matrix.json) 交叉检查。产品源码或运行配置变化时，三处必须一起更新，否则 CI 失败。当前候选产品投影算法为 `product-source-sha256-v1`，选择器为 `apps-workspace-default-include-v1`，fingerprint 为 `86d5f1326b3f6b13e7091ed99d2d22f71b9513796f591602dca49acf9c7e0b45`，纳入 `53` 个文件，快照日期为 `2026-08-15`；本轮暂不绑定等价参照 commit。当前 exact base/head/merge-ref/parents/tree/run/job 只以本轮 Draft PR provenance 为准，不把历史 PR 的 CI 当作当前候选授权。
+commit 只提供精确产品快照的导航线索，可能因后续 squash/merge 改变；机器每次都以确定性的产品源码指纹比对被审工作树，并与 [文档清单](docs-manifest.json) 和 [验证事实源](verification-matrix.json) 交叉检查。产品源码或运行配置变化时，三处必须一起更新，否则 CI 失败。当前候选产品投影算法为 `product-source-sha256-v1`，选择器为 `apps-workspace-default-include-v1`，fingerprint 为 `f8c043917bf3a0d83a941c97bc6da2fc79f22b2a26eb12b51b9d23688f54f8bf`，纳入 `53` 个文件，快照日期为 `2026-08-15`；本轮暂不绑定等价参照 commit。当前 exact base/head/merge-ref/parents/tree/run/job 只以本轮 Draft PR provenance 为准，不把历史 PR 的 CI 当作当前候选授权。
 Issue #42 RUN-01 已合入 integration；Runtime 支持可复用 provider checkpoint、SQLite 工具审计原子落库、AbortSignal、有界续租和 exact lease fence，失效或迟到回调不能写入完成状态、checkpoint 或业务结果。RUN-01 的 `external.send` claim/幂等恢复仅作为历史审计兼容和未来独立发送 Issue 的保留结构，M1 当前 policy 永久固定为 `forbidden`：即使 `approved=true` 或存在幂等键，也不创建外部 claim、不调用 provider、不执行 callback。当前 v1/v2 schema identity 与 DATA-02 v2 合同保持不变，RUN-01 使用连续 v3 migration；正式验证 ID、commit、环境与限制以已合入 PR #87 的历史 provenance 为准，不代表真实 provider、飞书租户或 Windows L5。
 
 

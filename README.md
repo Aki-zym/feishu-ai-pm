@@ -1,12 +1,21 @@
 # TooManyTasks
 
+## 安装时你只需要做什么
+
+Agent 会自动唤起浏览器，为你创建专属的飞书企业自建应用和 Aily Agent。你只需要在提示时：
+
+1. 登录飞书或完成二次验证；
+2. 在新建应用的权限管理中开启一次 `application:application:patch` 应用身份权限；
+3. 在飞书授权页点击“允许”；
+4. 在 Cindy 中确认安装插件。
+
 事情来自飞书私聊、群聊、会议和正在干的活，背景和进度很容易散掉。TooManyTasks 把可能的需求收成候选卡片，你确认后进入个人任务台；后来的聊天和 Cindy 里干完的进展可以写回同一条任务。当前产品边界以 [当前状态](docs/current-state.md) 为准。
 
 聊天原文不进首页和任务卡。它不帮你跑数，也不改工作文件。对外发出去的东西只出草稿，由你点头。
 
 ## 现在怎么跑
 
-推荐把本仓库 GitHub 地址交给 Agent，并要求它执行 [Agent 安装合同](AGENT_INSTALL.md)。Agent 直接 clone 仓库，在当前用户自己的飞书租户中创建新的自建应用和新的 Aily Agent，完成本机环境准备、构建、启动、OAuth、Cindy 插件安装、自动扫描和首次验收。该流程不需要额外配置包；用户无需填写 App ID、App Secret、Agent ID 或 Token，也不配置开机自启。
+推荐把本仓库 GitHub 地址交给 Agent，并要求它执行 [Agent 安装合同](AGENT_INSTALL.md)。Agent 直接 clone 仓库，在当前用户自己的飞书租户中创建新的自建应用和新的 Aily Agent；应用创建后，CLI 自动完成权限配置、OAuth 回调地址、版本发布、管理员授权申请、OAuth、Cindy 插件安装、自动扫描和首次验收。该流程不需要额外配置包；用户无需填写 App ID、App Secret、Agent ID 或 Token，也不配置开机自启。
 
 手动开发路径仍是：启动独立 TooManyTasks，默认地址为 `http://127.0.0.1:4310`；在浏览器任务台完成 Aily OAuth；在 Cindy 安装 `plugins/cindy-pm-intake` 插件。完整的用户预期见 [第一次使用 TooManyTasks](docs/first-install.md)。
 

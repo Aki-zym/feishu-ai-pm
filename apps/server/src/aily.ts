@@ -14,6 +14,18 @@ const MAX_SSE_BYTES = 1_000_000;
 const MAX_SSE_EVENTS = 4_096;
 const MAX_SSE_BLOCK_LENGTH = 256_000;
 export const AILY_SCAN_INTERVAL_MS = 20 * 60 * 1000;
+export const AILY_APPLICATION_SCOPES = [
+  { scope_name: 'application:application:patch', token_type: 'tenant' as const },
+  'aily:agent_chat:write',
+  'auth:user.id:read',
+  'im:chat:read',
+  'im:message:readonly',
+  'im:message.group_msg:get_as_user',
+  'im:message.p2p_msg:get_as_user',
+  'search:message',
+  'search:docs:read',
+  'calendar:calendar.event:read',
+].map((scope_name) => typeof scope_name === 'string' ? { scope_name, token_type: 'user' as const } : scope_name);
 
 type AilyWindow = {
   window_id: string;
@@ -49,6 +61,7 @@ function safeStatus(error: unknown) {
   const value = error as {
     status?: unknown;
     statusCode?: unknown;
+    code?: unknown;
     response?: { status?: unknown };
   };
   const status = Number(value?.status ?? value?.statusCode ?? value?.response?.status);
@@ -84,6 +97,59 @@ function classifyAilyError(error: unknown) {
     return new AilyServiceError('AILY_UPSTREAM', `Aily 调用失败（HTTP ${status}），请稍后重试。`, status);
   }
   return new AilyServiceError('AILY_UPSTREAM', 'Aily 调用失败，请稍后重试。', status);
+}
+
+function assertApplicationApiSuccess(response: unknown, operation: string) {
+  const value = response as { code?: unknown; msg?: unknown };
+  const code = Number(value?.code ?? 0);
+  if (code !== 0) {
+    const message = cleanString(value?.msg, 300);
+    if (/审核中|审核|review|pending|发布中/iu.test(message)) {
+      throw new AilyServiceError(
+        'AILY_APP_SETUP_PENDING',
+        `飞书应用${operation}暂不可执行：当前版本正在审核中，请等待审核完成后重试。`,
+        409,
+      );
+    }
+    throw new AilyServiceError(
+      'AILY_APP_SETUP_FAILED',
+      `飞书应用${operation}失败，请检查应用状态和管理员授权。`,
+    );
+  }
+  return response as { code?: unknown; data?: Record<string, unknown> };
+}
+
+function classifyApplicationError(error: unknown) {
+  if (error instanceof AilyServiceError) return error;
+  const value = error as {
+    status?: unknown;
+    statusCode?: unknown;
+    code?: unknown;
+    response?: { status?: unknown; data?: { code?: unknown; msg?: unknown } };
+    message?: unknown;
+  };
+  const status = safeStatus(error);
+  const code = String(value?.response?.data?.code ?? value?.code ?? '');
+  const message = cleanString(value?.response?.data?.msg ?? value?.message, 500);
+  if (code === '99991672' || /application:application:patch/iu.test(message)) {
+    return new AilyServiceError(
+      'AILY_APP_PERMISSION_REQUIRED',
+      '飞书应用尚未开通 application:application:patch 身份权限，请先在开发者后台开启该权限后重试。',
+      400,
+    );
+  }
+  if (/审核中|审核|review|pending|发布中/iu.test(message)) {
+    return new AilyServiceError(
+      'AILY_APP_SETUP_PENDING',
+      '飞书应用当前版本正在审核中，请等待审核完成后重试。',
+      409,
+    );
+  }
+  return new AilyServiceError(
+    'AILY_APP_SETUP_FAILED',
+    status ? `飞书应用配置失败（HTTP ${status}），请检查应用状态和开发者权限。` : '飞书应用配置失败，请检查应用状态和开发者权限。',
+    status,
+  );
 }
 
 function parseSseBlock(block: string) {
@@ -387,6 +453,95 @@ export class AilyService {
   async disconnect() {
     await this.credentials.clearAilyAuthorization();
     return { ok: true, status: this.status() };
+  }
+
+  async prepareApplication() {
+    const config = this.credentials.current();
+    if (!config.appId || !config.appSecret) {
+      throw new AilyServiceError(
+        'AILY_APP_NOT_CONFIGURED',
+        '请先保存用户自己的飞书自建应用 App ID 和 App Secret。',
+      );
+    }
+    const client = this.client(config);
+    try {
+      const tenantTokenResponse = await client.auth.tenantAccessToken.internal({
+        data: {
+          app_id: config.appId,
+          app_secret: config.appSecret,
+        },
+      });
+      assertApplicationApiSuccess(tenantTokenResponse, '访问凭证获取');
+      const tenantAccessToken = String(
+        (tenantTokenResponse as { tenant_access_token?: unknown })?.tenant_access_token
+        ?? tenantTokenResponse?.data?.tenant_access_token
+        ?? '',
+      );
+      if (!tenantAccessToken) {
+        throw new AilyServiceError(
+          'AILY_APP_SETUP_FAILED',
+          '飞书没有返回企业应用访问凭证，请检查 App ID、App Secret 和应用状态。',
+        );
+      }
+      const tenantAuth = lark.withTenantToken(tenantAccessToken);
+      assertApplicationApiSuccess(
+        await client.application.v7.applicationConfig.patch({
+          path: { app_id: config.appId },
+          data: {
+            scope: {
+              add_scopes: AILY_APPLICATION_SCOPES,
+            },
+            security: {
+              add: {
+                redirect_urls: [config.oauthRedirectUri],
+              },
+              allow_refresh_token: true,
+            },
+          },
+        }, tenantAuth),
+        '配置',
+      );
+      const publish = assertApplicationApiSuccess(
+        await client.application.v7.applicationPublish.create({
+          path: { app_id: config.appId },
+          data: {
+            remark: 'TooManyTasks 自动配置 Aily 接入权限。',
+            changelog: '配置 Aily 用户授权、回环 OAuth 回调和任务摘要所需权限。',
+          },
+        }, tenantAuth),
+        '发布',
+      );
+      const apply = assertApplicationApiSuccess(
+        await client.application.v6.scope.apply({}, tenantAuth),
+        '管理员授权申请',
+      );
+      const configuredScopes = AILY_APPLICATION_SCOPES.map((scope) => scope.scope_name);
+      const scopeResponse = assertApplicationApiSuccess(
+        await client.application.v6.scope.list({}, tenantAuth),
+        '权限状态查询',
+      );
+      const scopes = Array.isArray(scopeResponse.data?.scopes)
+        ? scopeResponse.data.scopes as Array<{ scope_name?: unknown; grant_status?: unknown }>
+        : [];
+      const grantStatus = new Map(scopes.map((scope) => [
+        String(scope.scope_name ?? ''),
+        Number(scope.grant_status),
+      ]));
+      const grantedScopes = configuredScopes.filter((scope) => grantStatus.get(scope) === 1);
+      const pendingScopes = configuredScopes.filter((scope) => grantStatus.get(scope) !== 1);
+      return {
+        status: pendingScopes.length === 0 ? 'ready' as const : 'awaiting_admin_approval' as const,
+        configuredScopeCount: configuredScopes.length,
+        grantedScopeCount: grantedScopes.length,
+        pendingScopeCount: pendingScopes.length,
+        pendingScopes,
+        publishSubmitted: Number(publish.code ?? 0) === 0,
+        adminApprovalRequested: Number(apply.code ?? 0) === 0,
+      };
+    } catch (error) {
+      if (error instanceof AilyServiceError) throw error;
+      throw classifyApplicationError(error);
+    }
   }
 
   triggerScan(pm: PmService, trigger: 'manual' | 'schedule') {

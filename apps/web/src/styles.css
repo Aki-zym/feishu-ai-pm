@@ -672,6 +672,7 @@ a { color: inherit; text-decoration: none; }
 .drawer-header { min-height: 108px; padding: 24px 24px 18px; display: flex; flex: 0 0 auto; align-items: flex-start; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--border); }
 .drawer-kicker { display: block; margin-bottom: 8px; color: #7d899b; font-size: 10px; font-weight: 700; letter-spacing: .08em; }
 .drawer-header h2 { margin: 0; color: #1b2639; font-size: 20px; line-height: 1.4; letter-spacing: -.02em; }
+.drawer-safety-note { margin: 0; padding: 9px 24px; color: #4f6077; background: #f7faff; border-bottom: 1px solid var(--border); font-size: 11px; line-height: 1.5; }
 .detail-summary { padding: 20px 24px; flex: 0 0 auto; border-bottom: 1px solid var(--border); }
 .task-management-bar { margin-bottom: 18px; padding: 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; background: #f6f9fd; border: 1px solid #dbe5f2; border-radius: 9px; }
 .task-automation-state { min-width: 0; display: flex; align-items: flex-start; gap: 10px; }
