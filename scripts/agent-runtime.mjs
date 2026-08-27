@@ -100,6 +100,19 @@ async function fetchJson(paths, method, pathname, body, timeoutMs = 10_000, auth
   }
 }
 
+async function portResponds(paths, timeoutMs = 1_000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    await fetch(`${paths.baseUrl}/api/health`, { signal: controller.signal });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function readIntegrationToken(paths = runtimePaths()) {
   try {
     const token = (await readFile(join(paths.configRoot, 'cindy-integration-token'), 'utf8')).trim();
@@ -131,6 +144,15 @@ export async function startServer({ paths = runtimePaths(), waitMs = 30_000 } = 
     throw new Error('TooManyTasks 尚未构建，请先运行 npm run agent:install。');
   }
   const existingPid = await readPid(paths);
+  // A custom config root can coexist with another TooManyTasks installation.
+  // Probe the port before spawning so a health response from that other
+  // process cannot be mistaken for this child becoming ready.
+  if (await portResponds(paths)) {
+    if (existingPid && isPidAlive(existingPid)) {
+      return { status: 'already_running', pid: existingPid, health: await waitForHealth(paths, waitMs) };
+    }
+    throw new Error(`TooManyTasks 端口 ${new URL(paths.baseUrl).port} 已被其它进程占用，请先停止占用该端口的服务。`);
+  }
   if (existingPid && isPidAlive(existingPid)) {
     return { status: 'already_running', pid: existingPid, health: await waitForHealth(paths, waitMs) };
   }
@@ -154,6 +176,10 @@ export async function startServer({ paths = runtimePaths(), waitMs = 30_000 } = 
   child.unref();
   try {
     const health = await waitForHealth(paths, waitMs);
+    // The child may have failed to bind while an unrelated process answered
+    // the health probe. Require the PID we just launched to remain alive.
+    await new Promise((resolveReady) => setImmediate(resolveReady));
+    if (!isPidAlive(child.pid)) throw new Error('TooManyTasks 后台进程启动后立即退出，可能是端口冲突。');
     return { status: 'started', pid: child.pid, health };
   } catch (error) {
     try { process.kill(child.pid, 'SIGTERM'); } catch { /* process may have exited */ }
