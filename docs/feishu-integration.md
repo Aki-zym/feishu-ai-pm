@@ -1,12 +1,22 @@
 # 飞书接入说明
 
+## 当前 Aily OpenAPI 主链
+
+现行 TooManyTasks 使用独立飞书自建应用和用户 OAuth 调用 Aily OpenAPI。App Secret、access token、refresh token、scope 和 OAuth state 全部由独立 TooManyTasks 本机凭证库管理；Cindy 插件不持有这些凭证，也不代理飞书网络请求。
+
+首次部署推荐把 GitHub 地址交给 Agent，执行根目录 `AGENT_INSTALL.md`。Agent 直接 clone 仓库，并在当前用户自己的飞书租户中创建新的企业自建应用和新的 Aily Agent，读取本次创建的 App ID、App Secret 和 Agent ID，通过 stdin 写入本机配置，再完成 OAuth 和 Cindy 插件安装。该路径不依赖密封配置包或共享应用。用户无需手动填写凭证；登录、管理员审批、OAuth 允许和 Cindy 安装确认仍由平台在必要时要求。
+
+服务端每 20 分钟按持久窗口调用官方 `@larksuiteoapi/node-sdk@1.73.0`，通过 SSE 接收 `start`、`message_delta` 和 `done`，只有 `Completed` 终态成功。非空摘要先写入 SQLite `aily_summary_inbox`；Cindy 插件每 5 分钟领取一条并完成任务判断。手动 `scan_intake_window` 只请求后台开始扫描并快速返回。Aily Agent 的实际可见范围仍取决于已发布技能和用户授权，派生摘要不能代替逐条飞书原文或证明完整覆盖。
+
+下文的个人信息流、机器人、日历、妙记和旧桌面 OAuth 说明属于遗留能力合同，不参与当前 Aily 扫描链。
+
 ## 当前实现
 
 TooManyTasks 当前的飞书扫描路径由独立 `apps/server` 使用官方 `@larksuiteoapi/node-sdk@1.73.0` 调用 Aily OpenAPI。浏览器设置页保存 Aily 应用配置并发起飞书用户 OAuth；App Secret、access token 和 refresh token 进入本机 AES-256-GCM 凭证库，服务端在 Token 接近过期时自动刷新。Cindy 插件不接收这些凭证，只读取自动生成的本机集成令牌并调用 `/api/integrations/cindy/scan`。
 
-Aily Prompt 只包含 `window_start`、`window_end`、Asia/Shanghai 时区和检索要求。服务端通过 `POST /open-apis/aily/v1/agents/{agent_id}/chats` 发起流式对话，逐事件解析 `start`、`message_delta` 和 `done`；只有 `Completed` 终态算成功。返回文本保存为最多一条 `source_kind=aily_summary` 的派生来源，来源键稳定为 `aily-summary:<window_id>`，同时保存窗口覆盖时间、Agent 标识和生成时间。该来源只代表 Aily 的摘要线索，不能冒充逐条飞书原文。
+Aily Prompt 只包含 `window_start`、`window_end`、Asia/Shanghai 时区和检索要求。服务端通过 `POST /open-apis/aily/v1/agents/{agent_id}/chats` 发起流式对话，逐事件解析 `start`、`message_delta` 和 `done`；只有 `Completed` 终态算成功。非空返回文本先保存到 SQLite `aily_summary_inbox`，同时记录稳定窗口键、内容 hash、窗口覆盖时间、Agent 标识和生成时间。Cindy 成功调用 `submit_intake` 后，该摘要才以 `source_kind=aily_summary` 进入来源链。它只代表 Aily 的摘要线索，不能冒充逐条飞书原文。
 
-扫描规则固定为：先由本机服务持久化认领窗口，再由 Aily 成功返回有内容后启动 Cindy intake errand；Aily 返回 `NO_NEW_INFORMATION` 时以 `result_kind=empty_window` 提交空窗口并推进游标；Aily 调用失败、Token 失效、权限失败、超时、Cindy errand 失败或没有服务端成功回执时保持旧游标。服务端执行窗口指纹幂等、来源关系和 `update_task.expected_version` CAS。
+扫描规则固定为：本机服务持久化认领窗口，Aily 成功返回非空内容后把摘要与扫描游标推进放在同一事务中，随后由 Cindy 插件异步领取。Aily 返回 `NO_NEW_INFORMATION` 时写入 completed 空窗审计并推进扫描游标；Aily 调用失败、Token 失效、权限失败或超时时保持旧扫描游标。Cindy errand 失败只让对应 inbox 记录进入退避，不回退已经成功生成的 Aily 窗口。服务端执行窗口指纹幂等、来源关系和 `update_task.expected_version` CAS。
 
 以下旧的 OAuth、个人信息流、机器人事件和直接 Feishu adapter 章节属于历史实现/能力边界记录，不是 TooManyTasks 当前扫描链。
 
@@ -21,7 +31,6 @@ Aily Prompt 只包含 `window_start`、`window_end`、Asia/Shanghai 时区和检
 - 群聊 `@主人`：用户身份列出主人所在群，主人按群名选择后再读取该群近期历史，本地按 mentions 匹配主人；非 `@主人` 消息不会创建来源。该用户身份主链不要求机器人在群内。
 - 消息历史分页：每个人和群使用独立游标、重叠时间窗与 `source_event.external_id` 去重；一个目标失败不阻塞其他目标。未关注的个人不读取，重新启用不补未关注期间历史；新群仍默认不启用。
 - 业务响应守卫：所有应用身份和用户身份读取都在消费 `data/items` 前检查飞书业务 `code`。HTTP 200 但业务码非零或格式非法仍是失败，不能解释为空列表或成功页。
-- 统一 transport/business parser 只在真实 `Error` 或受控 `cause` 携带明确 allowlist（如 `ECONNRESET`、`ECONNREFUSED`、`ENOTFOUND`、`EAI_AGAIN`、`ETIMEDOUT`、`UND_ERR_CONNECT_TIMEOUT`、`AbortError` 或 `fetch failed`）时分类为 transient；普通响应对象的同名字符串 code 仍是非法 business。Calendar/Minutes 详情阶段的 transport 重试耗尽返回 `failure`，不降级为 partial，也不推进旧 cursor、watermark、checkpoint 或 `last_success_at`；permission/denied 仍按既有 partial 合同处理。该规则仅有 Mock/契约证据，索引为 `VER-ISSUE40-FSH02-L3-20260816`。
 - 主日历与日程：使用 `calendar.v4.calendar.primary`、`calendar.v4.calendarEvent.list` 和 `calendar.v4.calendarEvent.get`，需要用户 OAuth；当前代码已实现首次分页、后续 `sync_token` 增量、失败保留旧游标、受控游标重建、详情/参与者补取和来源版本去重，并把 `is_all_day`、系列键、日历类型、主人角色/响应和纪要/明确消息关联标记写入受控元数据。运行时按 PROD-07 将普通提醒、仅出席、全天/重复、节假日、生日和订阅日历保留为 Calendar 来源事实；只有明确主人责任、动作和交付物/截止点才进入待确认候选，责任不明只提示主人确认；会议 action item 必须有纪要或明确消息依据。该切片仅有合成 SQLite/虚拟适配器证据，真实字段、权限和租户行为仍需目标租户验收。
 - 会议纪要/妙记：使用用户 OAuth 的 `minutes.v1.minute.search`、`minute.get`、`minute.artifacts` 和限量 `minuteTranscript.get`；平时按创建时间重叠窗口分页扫描，每次运行会检查是否距上次全量对账已超过 24 小时，以 `minute_token` 幂等，并将详情、行动项和受限转写摘要的哈希作为来源版本。无权限、未完成或转写不可导出时保留受限来源，不把完整转写写入普通日志。
 - 消息内飞书文档背景：Docx 使用 `docx.v1.document.get` 与 `docx.v1.document.rawContent`；Wiki 先使用 `wiki.v2.space.getNode` 解析真实对象，再仅在目标是 Docx 时读取正文。Sheet、Base、旧版 Doc、File 和 Slides 当前只记录链接类型与受限状态，不读取正文。

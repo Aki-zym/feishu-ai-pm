@@ -6,7 +6,6 @@ date: 2026-08-15
 owner: 架构负责人 / 数据可靠性负责人
 scope: M1 SQLite schema 迁移、备份、恢复与降级门禁
 supersedes: []
-evidence: [VER-DATA01-SQLITE-MIGRATION-20260815]
 ---
 
 # ADR 0008：当前 SQLite 使用版本化迁移与可恢复升级

@@ -17,13 +17,14 @@ TooManyTasks 需要由独立服务端中的官方 Aily SDK 按时间窗口总结
 
 ## 决定
 
-1. 扫描链固定为 `Cindy 定时器或手动扫描 → TooManyTasks 本机 API → 服务端 Aily SDK → 固定 intake errand → get_pm_tasks → submit_intake → SQLite`。Aily Prompt 只接收窗口、时区和检索要求；Cindy 不读取飞书、不调用飞书工具，也不调用扫描工具。
+1. 扫描链固定为 `TooManyTasks 20 分钟调度或 Cindy 手动触发 → 服务端 Aily SDK → SQLite aily_summary_inbox → Cindy 5 分钟轮询 → 固定 intake errand → get_pm_tasks → submit_intake → SQLite`。Aily Prompt 只接收窗口、时区和检索要求；Cindy 不读取飞书、不调用飞书工具，也不调用扫描工具。
 2. `source_kind=aily_summary` 是受控来源类型。它保存 Aily 返回文本、窗口起止时间、Agent 标识和生成时间，并设置 `derivedEvidence=true`、`completeness=limited`。数据库现有 `source_type=manual` 仅作为兼容枚举值，调用方必须优先识别 `source_kind`。
 3. Cindy 可根据 Aily 摘要和本地任务快照提出 `create_candidate`、`update_task`、`skip` 或 `needs_owner`。`update_task` 保留 A 方案，必须携带任务 `task_key` 与快照中的 `expected_version`，并由服务端在同一事务内执行 CAS、来源关系和需求单元校验。
-4. 每个窗口最多生成一条 Aily 派生来源，键为 `aily-summary:<window_id>`。窗口由本地服务持久化；失败重试复用同一窗口边界和窗口键。相同窗口再次提交时，输入指纹一致才返回幂等结果，指纹变化返回冲突。
-5. 空窗口使用显式 `result_kind=empty_window` 合同，`sources` 与 `proposals` 必须为空；服务端记录窗口完成并推进游标。普通入库使用 `result_kind=intake`，必须有至少一条来源。
-6. 游标只在服务端成功完成入库事务或显式空窗口事务后推进。Aily 失败、权限失效、超时、errand 失败、服务端冲突或未取得服务端成功回执时，扫描结果保持失败且不由插件主动推进游标。服务端回执已经确认事务完成时，Cindy 最终文本缺少或损坏 JSON 不能把已完成窗口重新判成失败。
-7. Aily SSE 解析采用有限事件数、字节数、单事件缓存和摘要长度；收到 `done` 后停止消费并关闭流。只有 `Completed` 终态、合法 `start` 和合法 `done` 才算成功。
+4. 每个窗口最多生成一条 Aily inbox 记录和一条后续派生来源，来源键为 `aily-summary:<window_id>`。`window_id` 唯一；相同窗口正文 hash、Agent、窗口或结果类型变化时返回冲突。
+5. schema v9 的 `aily_summary_inbox` 固定 `ready / claimed / retry_waiting / completed / failed` 五态。领取租约为 10 分钟，失败按 1、2、5、10、20 分钟退避，最多五次。claim token 原值只存在于插件内存，SQLite 仅保存 SHA-256。
+6. Aily 摘要写入 inbox 与独立扫描游标推进在同一事务；Aily 失败、权限失效或超时不推进。空窗口直接写入 completed 审计记录。Cindy 的来源/候选/任务写入与 inbox completed 在另一事务；Cindy 失败不回滚摘要，也不阻塞后续扫描窗口。
+7. `submit_intake` 验证 inbox id、窗口、摘要 hash、Agent、生成时间、领取租约和 claim token。服务端回执已经确认事务完成时，Cindy 最终文本缺少或损坏 JSON 不能把已完成窗口重新判成失败。
+8. Aily SSE 解析采用有限事件数、字节数、单事件缓存和摘要长度；收到 `done` 后停止消费并关闭流。只有 `Completed` 终态、合法 `start` 和合法 `done` 才算成功。
 
 ## 原因
 

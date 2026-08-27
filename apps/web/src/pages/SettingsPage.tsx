@@ -175,7 +175,7 @@ export default function SettingsPage() {
     try {
       const updated = await api.put<RuntimeAutoScan>('/api/runtime/auto-scan', { enabled });
       setAutoScan(successResource(updated));
-      setAutoScanMessage(enabled ? '已开启每 10 分钟自动扫描新任务。' : '已关闭每 10 分钟自动扫描；手动扫描不受影响。');
+      setAutoScanMessage(enabled ? '已开启每 20 分钟自动扫描新任务。' : '已关闭每 20 分钟自动扫描；手动扫描不受影响。');
     } catch (error) {
       setAutoScan((current) => failureResource({ ...current, data: previous }, error instanceof Error ? error.message : '自动扫描设置保存失败。'));
       setAutoScanMessage(error instanceof Error ? error.message : '自动扫描设置保存失败。');
@@ -286,8 +286,8 @@ export default function SettingsPage() {
       </section>
 
       <section className="integration-section auto-scan-card" aria-labelledby="auto-scan-title">
-        <div className="integration-heading"><span className="integration-icon"><RefreshCw size={19} /></span><div><h2 id="auto-scan-title">定时扫描</h2><span>控制 Cindy 薄插件每 10 分钟触发独立 TooManyTasks 扫描。</span></div></div>
-        <label className="check-row connection-toggle"><input type="checkbox" aria-label="每 10 分钟自动扫描新任务" checked={Boolean(autoScan.data?.enabled)} disabled={!autoScan.data || autoScan.status === 'loading'} onChange={(event) => void changeAutoScan(event.target.checked)} /><span>每 10 分钟自动扫描新任务</span></label>
+        <div className="integration-heading"><span className="integration-icon"><RefreshCw size={19} /></span><div><h2 id="auto-scan-title">定时扫描</h2><span>控制独立 TooManyTasks 每 20 分钟调用一次 Aily。</span></div></div>
+        <label className="check-row connection-toggle"><input type="checkbox" aria-label="每 20 分钟自动扫描新任务" checked={Boolean(autoScan.data?.enabled)} disabled={!autoScan.data || autoScan.status === 'loading'} onChange={(event) => void changeAutoScan(event.target.checked)} /><span>每 20 分钟自动扫描新任务</span></label>
         <p className="integration-note">关闭后，定时触发不会跑扫描；手动「扫近10分钟」不受影响。</p>
         {autoScanMessage && <p className="settings-feedback" role="status">{autoScanMessage}</p>}
       </section>

@@ -20,6 +20,8 @@ jobs:
         run: npm run build:plugin
       - name: Typecheck
         run: npm run typecheck
+      - name: Agent installation workflow tests
+        run: npm run test:agent
       - name: Plugin tests
         run: npm run test:plugin
       - name: Web tests

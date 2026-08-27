@@ -314,7 +314,29 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
       trigger: z.enum(['manual', 'schedule']).default('manual'),
     }).strict().safeParse(request.body ?? {});
     if (!body.success) return reply.code(400).send({ error: '扫描触发类型只能是 manual 或 schedule。' });
-    return options.ailyService.scan(service, body.data.trigger);
+    return options.ailyService.triggerScan(service, body.data.trigger);
+  });
+  app.get('/api/integrations/cindy/summary-inbox/next', async (_request, reply) => {
+    try {
+      return service.claimNextAilySummaryInbox();
+    } catch (error) {
+      return reply.code(error instanceof CindyIntakeValidationError ? 400 : 409).send({
+        error: error instanceof Error ? error.message : 'Aily 摘要领取失败。',
+      });
+    }
+  });
+  app.post('/api/integrations/cindy/summary-inbox/:id/retry', async (request, reply) => {
+    try {
+      const params = z.object({ id: z.string().trim().min(1).max(200) }).parse(request.params);
+      const body = z.object({
+        claim_token: z.string().trim().min(1).max(200),
+        error_code: z.string().trim().regex(/^[A-Z0-9_:-]{1,80}$/u),
+      }).strict().parse(request.body);
+      return service.retryAilySummaryInbox(params.id, body.claim_token, body.error_code);
+    } catch (error) {
+      const status = error instanceof z.ZodError || error instanceof CindyIntakeValidationError ? 400 : 409;
+      return reply.code(status).send({ error: error instanceof Error ? error.message : 'Aily 摘要重试登记失败。' });
+    }
   });
   registerSeedIntakeRoute(app, service);
   app.get('/api/dashboard', async () => dashboardDtoSchema.parse(service.dashboard()));
@@ -405,6 +427,8 @@ export async function buildApp(service: PmService, input: string | BuildAppOptio
         window_start: isoTimestamp,
         window_end: isoTimestamp,
         result_kind: z.enum(['intake', 'empty_window']),
+        inbox_id: z.string().trim().min(1).max(200).optional(),
+        claim_token: z.string().trim().min(1).max(200).optional(),
         sources: z.array(z.object({
           source_key: z.string().trim().min(1).max(200),
           source_kind: z.literal('aily_summary').optional(),

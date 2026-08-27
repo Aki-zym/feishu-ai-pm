@@ -6,7 +6,6 @@ date: 2026-08-14
 owner: LLM/后端负责人
 scope: 连续对话分类与关联
 supersedes: []
-evidence: [VER-PR24-CHECK, VER-PR24-E2E]
 ---
 
 # ADR 0006：分阶段小 Schema 承载连续对话语义判断

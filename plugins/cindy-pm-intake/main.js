@@ -1,5 +1,4 @@
-const INTAKE_WINDOW_MS = 10 * 60 * 1000;
-const MAX_INTAKE_LOOKBACK_MS = 4 * 60 * 60 * 1000;
+const INBOX_POLL_INTERVAL_MS = 5 * 60 * 1000;
 const MAX_WINDOW_ID = 200;
 const MAX_SOURCE_TEXT = 20000;
 const MAX_PROPOSAL_TEXT = 2000;
@@ -7,8 +6,9 @@ const PROMPT_VERSION = 'cindy-aily-v1';
 const TASK_CANDIDATE_CHAR_BUDGET = 12000;
 const RECENT_TURN_TTL_MS = 10 * 60 * 1000;
 let settingsCache = null;
-let intakeScanInFlight = null;
-let autoScanLoopStarted = false;
+let inboxConsumptionInFlight = null;
+let inboxPollLoopStarted = false;
+let activeIntakeClaim = null;
 const pendingTurnsBySession = new Map();
 const recentAutomaticTurns = new Map();
 const automaticInputsInFlight = new Set();
@@ -38,7 +38,7 @@ async function pmRequest(method, path, body) {
       path,
       body: body === undefined ? null : body,
     },
-    timeoutMs: path === '/api/integrations/cindy/scan' ? 120000 : 30000,
+    timeoutMs: 30000,
   });
   if (!response || response.ok !== true) throw new Error(response?.message || '本机任务库调用失败');
   return response.result;
@@ -62,19 +62,6 @@ function cindyFailedResult(window, aily, error) {
       error_code: errorCode || 'CINDY_ERRAND_FAILED',
     },
     proposals: [],
-  };
-}
-
-function createWindow(cursorEnd = null, endMs = Date.now()) {
-  const cursorMs = typeof cursorEnd === 'string' ? Date.parse(cursorEnd) : Number.NaN;
-  const maxLookbackStartMs = endMs - MAX_INTAKE_LOOKBACK_MS;
-  const startMs = Number.isFinite(cursorMs)
-    ? Math.max(Math.min(cursorMs, endMs), maxLookbackStartMs)
-    : endMs - INTAKE_WINDOW_MS;
-  return {
-    window_id: `intake-${startMs}-${endMs}`.slice(0, MAX_WINDOW_ID),
-    window_start: new Date(startMs).toISOString(),
-    window_end: new Date(endMs).toISOString(),
   };
 }
 
@@ -129,16 +116,6 @@ function directIntakeInstruction(window, reason) {
       ? '入库 errand 当前已占用，已跳过嵌套派发。'
       : '当前已在入库 errand 会话中，已跳过嵌套派发。',
     next_action: '当前入库 errand 正在处理或占用中；不要再次调用 scan_intake_window，等待当前扫描收口，或退出后重试。',
-    proposals: [],
-  };
-}
-
-function intakeScanBusyResult(window) {
-  return {
-    ...window,
-    status: 'skipped',
-    reason: 'intake_scan_busy',
-    summary: '已有入库扫描正在运行，本轮自动扫描已跳过。',
     proposals: [],
   };
 }
@@ -764,129 +741,105 @@ async function scanIntakeWindow(args = {}, callId = null) {
   if (trigger !== 'manual' && trigger !== 'schedule') {
     throw new Error('scan_intake_window 的 trigger 只能是 manual 或 schedule');
   }
-  const fallbackWindow = createWindow();
-  if (isInsideIntakeErrand(args)) return directIntakeInstruction(fallbackWindow, 'already_in_intake_errand');
-  if (intakeScanInFlight) return intakeScanBusyResult(fallbackWindow);
-
-  const pending = (async () => {
-    let scan;
-    let awaitingAily = true;
-    const heartbeat = callId
-      ? setInterval(() => {
-          if (awaitingAily) void cindy.send({ type: 'tool-progress', callId });
-        }, 60 * 1000)
-      : null;
-    try {
-      scan = await pmRequest('POST', '/api/integrations/cindy/scan', { trigger });
-    } finally {
-      awaitingAily = false;
-      if (heartbeat) clearInterval(heartbeat);
-    }
-    if (!scan || scan.status !== 'summary_ready') return scan;
-    const window = {
-      window_id: safeText(scan.window_id, MAX_WINDOW_ID),
-      window_start: scan.window_start,
-      window_end: scan.window_end,
-      reused: scan.reused === true,
-    };
-    const source = scan.source;
-    if (!window.window_id || !source || source.source_kind !== 'aily_summary') {
-      throw new Error('TooManyTasks 返回的 Aily 扫描结果缺少受控窗口或派生来源。');
-    }
-    let result;
-    try {
-      result = await runErrand(window, source, callId);
-    } catch (error) {
-      if (isBusyErrandResult(error)) {
-        return trigger === 'schedule'
-          ? intakeScanBusyResult(window)
-          : directIntakeInstruction(window, 'intake_errand_busy');
-      }
-      return cindyFailedResult(window, scan, error);
-    }
-    if (!result || result.ok !== true) {
-      if (isBusyErrandResult(result)) {
-        return trigger === 'schedule'
-          ? intakeScanBusyResult(window)
-          : directIntakeInstruction(window, 'intake_errand_busy');
-      }
-      return cindyFailedResult(window, scan, result);
-    }
-    let receipt;
-    try {
-      receipt = await pmRequest('GET', `/api/integrations/cindy/intake/${encodeURIComponent(window.window_id)}/status`);
-    } catch (error) {
-      return cindyFailedResult(window, scan, error);
-    }
-    if (!receipt || receipt.completed !== true) {
-      return {
-        ...window,
-        status: 'failed',
-        reason: 'cindy_intake_not_confirmed',
-        summary: 'Cindy 未取得服务端入库成功回执，未确认本窗口已完成。',
-        aily_status: scan.aily_status,
-        aily_summary_generated: true,
-        aily_agent_id: scan.aily_agent_id,
-        aily_chat_id_suffix: scan.aily_chat_id_suffix,
-        aily_session_id_present: scan.aily_session_id_present,
-        cindy_result: {
-          status: 'failed',
-          reason: 'intake_not_confirmed',
-          server_receipt_verified: false,
-          job_id: result.jobId || null,
-          session_id: result.sessionId || null,
-        },
-        proposals: [],
-        errand_text: safeText(result.text, 64000),
-      };
-    }
-    const errand = parseErrandResult(result.text);
-    const proposals = errand?.proposals || [];
+  if (isInsideIntakeErrand(args)) {
     return {
-      ...window,
-      status: 'done',
-      reason: null,
-      summary: readableIntakeSummary('done', null, proposals, Number(receipt.proposal_count) || 0),
-      model_summary: errand?.summary || '',
-      aily_status: scan.aily_status,
-      aily_summary_generated: true,
-      aily_agent_id: scan.aily_agent_id,
-      aily_chat_id_suffix: scan.aily_chat_id_suffix,
-      aily_session_id_present: scan.aily_session_id_present,
-      cindy_result: {
-        status: 'succeeded',
-        intake_submitted: true,
-        intake_window_id: window.window_id,
-        server_receipt_verified: true,
-        model_confirmation_present: errand?.intakeSubmitted === true,
-        job_id: result.jobId || null,
-        session_id: result.sessionId || null,
-      },
-      proposals,
-      job_id: result.jobId || null,
-      session_id: result.sessionId || null,
-      errand_text: safeText(result.text, 64000),
+      status: 'skipped',
+      reason: 'already_in_intake_errand',
+      summary: '当前已在入库 errand 会话中，已跳过递归扫描触发。',
     };
-  })();
-  intakeScanInFlight = pending;
+  }
+  const result = await pmRequest('POST', '/api/integrations/cindy/scan', { trigger });
+  return result;
+}
+
+function intakeFailureCode(error) {
+  if (isBusyErrandResult(error)) return 'CINDY_ERRAND_BUSY';
+  return safeText(error?.code ?? error?.errorCode ?? error?.error_code, 80).toUpperCase()
+    .replace(/[^A-Z0-9_:-]/gu, '_') || 'CINDY_ERRAND_FAILED';
+}
+
+async function retryActiveIntakeClaim(claim, error) {
   try {
-    return await pending;
-  } finally {
-    if (intakeScanInFlight === pending) intakeScanInFlight = null;
+    return await pmRequest(
+      'POST',
+      `/api/integrations/cindy/summary-inbox/${encodeURIComponent(claim.inbox_id)}/retry`,
+      {
+        claim_token: claim.claim_token,
+        error_code: intakeFailureCode(error),
+      },
+    );
+  } catch (retryError) {
+    reportFailure('Aily 摘要重试登记失败', retryError);
+    return null;
   }
 }
 
-function runScheduledIntakeScan() {
-  return scanIntakeWindow({ trigger: 'schedule' }).catch((error) => {
-    reportFailure('自动扫描失败', error);
+async function consumeNextAilySummary() {
+  if (inboxConsumptionInFlight) return inboxConsumptionInFlight;
+  const pending = (async () => {
+    const claim = await pmRequest('GET', '/api/integrations/cindy/summary-inbox/next');
+    if (!claim || claim.status === 'empty') return claim;
+    if (claim.status !== 'ready') throw new Error(claim.error || 'TooManyTasks 返回了无效的 Aily inbox 状态。');
+    const window = claim.window;
+    const source = claim.source;
+    if (
+      !safeText(claim.inbox_id, 200)
+      || !safeText(claim.claim_token, 200)
+      || !window
+      || !safeText(window.window_id, MAX_WINDOW_ID)
+      || !source
+      || source.source_kind !== 'aily_summary'
+    ) {
+      throw new Error('TooManyTasks 返回的 Aily inbox 领取结果不完整。');
+    }
+    activeIntakeClaim = {
+      inbox_id: claim.inbox_id,
+      claim_token: claim.claim_token,
+      window_id: window.window_id,
+    };
+    try {
+      const result = await runErrand(window, source, null);
+      if (!result || result.ok !== true) throw result || new Error('Cindy intake errand 没有返回成功结果。');
+      const receipt = await pmRequest(
+        'GET',
+        `/api/integrations/cindy/intake/${encodeURIComponent(window.window_id)}/status`,
+      );
+      if (!receipt || receipt.completed !== true) {
+        throw Object.assign(new Error('Cindy 未取得服务端入库成功回执。'), {
+          code: 'CINDY_INTAKE_NOT_CONFIRMED',
+        });
+      }
+      return {
+        status: 'completed',
+        window_id: window.window_id,
+        proposal_count: Number(receipt.proposal_count) || 0,
+      };
+    } catch (error) {
+      await retryActiveIntakeClaim(activeIntakeClaim, error);
+      throw error;
+    } finally {
+      activeIntakeClaim = null;
+    }
+  })();
+  inboxConsumptionInFlight = pending;
+  try {
+    return await pending;
+  } finally {
+    if (inboxConsumptionInFlight === pending) inboxConsumptionInFlight = null;
+  }
+}
+
+function runScheduledInboxPoll() {
+  return consumeNextAilySummary().catch((error) => {
+    reportFailure('Aily 摘要自动入库失败', error);
     return null;
   });
 }
 
-function startAutomaticScanLoop() {
-  if (autoScanLoopStarted || typeof setInterval !== 'function') return;
-  autoScanLoopStarted = true;
-  setInterval(runScheduledIntakeScan, INTAKE_WINDOW_MS);
+function startInboxPollLoop() {
+  if (inboxPollLoopStarted || typeof setInterval !== 'function') return;
+  inboxPollLoopStarted = true;
+  setInterval(runScheduledInboxPoll, INBOX_POLL_INTERVAL_MS);
 }
 
 async function handleToolCall(msg) {
@@ -906,7 +859,10 @@ async function handleToolCall(msg) {
   }
   if (msg.tool === 'submit_intake') {
     const body = validateIntakeBody(msg.args || {});
-    const result = await pmRequest('POST', '/api/integrations/cindy/intake', body);
+    const claim = activeIntakeClaim;
+    const result = await pmRequest('POST', '/api/integrations/cindy/intake', claim && claim.window_id === body.window_id
+      ? { ...body, inbox_id: claim.inbox_id, claim_token: claim.claim_token }
+      : body);
     cindy.send({ type: 'tool-result', callId: msg.callId, ok: true, result });
     return;
   }
@@ -953,4 +909,4 @@ new BroadcastChannel('cindy-pm-intake').onmessage = (event) => {
   if (event.data && event.data.type === 'settings-changed') pendingTurnsBySession.clear();
 };
 
-startAutomaticScanLoop();
+startInboxPollLoop();

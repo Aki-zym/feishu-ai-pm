@@ -7,7 +7,6 @@ owner: 后端负责人
 scope: Runtime、线程和投影
 supersedes: []
 superseded_by: [ADR-0005]
-evidence: [VER-PR24-CHECK]
 ---
 
 # 0004：受控 PM Runtime、需求线程与任务记忆投影

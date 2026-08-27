@@ -13,12 +13,12 @@
 ## 入口
 
 1. 系统主人启动独立 TooManyTasks，在浏览器设置页保存 Aily App ID、App Secret 和 Agent ID，再通过飞书 OAuth 连接用户账号。
-2. 独立 TooManyTasks 加密保存 access token 与 refresh token。Cindy 插件手动或每 10 分钟调用本机扫描 API；服务端生成带 `window_start`、`window_end`、时区和检索要求的 Prompt，通过官方 SDK 请求 Aily。
-3. Aily 在自己的授权范围内检索飞书消息、日历、会议纪要、文档和知识库，并返回一段任务相关摘要；摘要保留为派生证据，不能冒充逐条飞书原文。
-4. Cindy 只接收 Aily 摘要和本地任务快照，通过 `get_pm_tasks` 判断新增、更新、跳过或待确认，再用 `submit_intake` 继续现有 SQLite 流程。
+2. 独立 TooManyTasks 加密保存 access token 与 refresh token，并由服务进程每 20 分钟生成带 `window_start`、`window_end`、时区和检索要求的 Prompt，通过官方 SDK 请求 Aily。手动扫描只负责立即排队，不同步等待结果。
+3. Aily 在自己的授权范围内检索飞书消息并返回一段任务相关摘要。摘要先写入 SQLite `aily_summary_inbox`，此时仍属于 staging 数据，不进入任务来源真账。
+4. Cindy 插件每 5 分钟最多领取一条摘要。固定 intake errand 只接收 Aily 摘要和本地任务快照，通过 `get_pm_tasks` 判断新增、更新、跳过或待确认，再用 `submit_intake` 继续现有 SQLite 流程。服务端成功回执会在同一事务中把 inbox 标记为 completed。
 5. 人工补录仍可使用现有任务台接口；当前扫描阶段不连接 Cindy 宿主 OAuth、XD Feishu、现有飞书 MCP 或 ChatD。
 
-Aily 能看到哪些飞书内容取决于 Aily Agent 的已发布技能和用户 Token 权限。Aily 调用失败、权限失效或 Cindy 入库失败时保留窗口游标；Aily 明确返回无新信息时提交空窗口并推进游标。
+Aily 能看到哪些飞书内容取决于 Aily Agent 的已发布技能和用户 Token 权限。Aily 调用失败或权限失效时保留扫描窗口；摘要成功写入 inbox 后推进独立 Aily 游标。Cindy 失败只影响该 inbox 的领取和重试状态，不阻塞后续 Aily 窗口。Aily 明确返回无新信息时写入 completed 空窗审计记录并推进扫描游标。
 
 ## 输出
 

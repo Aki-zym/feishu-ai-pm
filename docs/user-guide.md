@@ -4,12 +4,11 @@
 
 ## 1. 打开当前入口和数据位置
 
-当前使用入口是 **独立 TooManyTasks + Cindy 薄插件 + 浏览器**：
+当前推荐入口是把 GitHub 地址交给 Agent，并要求它执行根目录 [AGENT_INSTALL.md](../AGENT_INSTALL.md)。Agent 会在当前用户自己的飞书租户中创建新的企业自建应用和新的 Aily Agent，自动完成构建、启动、配置写入、OAuth、Cindy 插件安装、自动扫描和首次验收。用户不需要填写 App ID、App Secret、Agent ID 或 Token，也不配置开机自启。
 
-1. 启动独立 TooManyTasks，默认地址为 `http://127.0.0.1:4310`。
-2. 在浏览器设置页保存 Aily 应用配置，点击「连接 Aily」完成飞书用户 OAuth。
-3. 在 Cindy 安装并开启插件 **TooManyTasks 入库**（`plugins/cindy-pm-intake`）。
-4. 对话里说「扫近10分钟」。插件调用本机扫描 API，独立 TooManyTasks 请求 Aily 总结窗口信息，再由 Cindy 完成入库判断。
+平台仍可能要求用户登录飞书、点击 OAuth“允许”、处理企业管理员审批或确认 Cindy 插件安装。除此之外，Agent 不应把配置字段交回用户手工填写。
+
+手动开发入口仍是独立 TooManyTasks，默认地址为 `http://127.0.0.1:4310`。扫描流程为：插件调用本机扫描 API并立即返回；独立 TooManyTasks 在后台请求 Aily，总结完成后写入本机 inbox；Cindy 插件每 5 分钟领取一条摘要并完成入库判断。
 
 现行流程从独立 TooManyTasks 开始；浏览器设置页管理 Aily OAuth 和本机任务库。扫描阶段不使用 Cindy 宿主 OAuth、XD Feishu、现有飞书 MCP 或 ChatD；Cindy 只负责触发扫描并结合 Aily 派生摘要和本地任务快照判断任务变化。
 
@@ -46,7 +45,6 @@
 
 - 相同 `message_id` 重复进入不会重复建单；
 - 工作台标题与“今天推进”固定按上海自然日计算；显式计划区间覆盖今天的跨日任务也会显示，completed 不再算待推进，archived 默认隐藏。页面列表只展示前几项，但括号中的候选、今日计划和等待总数不受列表上限影响，“进行中”和“已逾期”也按各自状态/截止条件独立统计。底部会如实显示本地模拟模式或外部适配器已配置，后者只表示装配状态，不代表真实租户范围已经验收；
-- 工作台、候选、任务、排期、归档和设置页会明确区分读取中、成功但为空、读取失败、成功有数据和刷新后数据可能已过期。读取失败不会显示成“没有数据”或“0 项”；刷新失败会保留上次成功内容并标出过期提示，页面提供“重试”。同一资源的读取和保存/处理操作只接受最新一轮结果，迟到的旧结果不会覆盖刚完成的标记已读、主人刷新、来源同步、自动维护模式或关注范围保存。工作台提醒独立读取，因此主工作台失败时仍可看到提醒并安全处理。本轮 Issue #51 的可复核证据见 `VER-ISSUE51-UI-L4-20260816`；它只证明 Mock/合成浏览器 L4，不代表真实飞书、Electron/NSIS L5 或 provider L6。
 - 候选接受后才出现正式任务；
 - 候选可以在卡片底部点击“移入回收站”；未接受候选只影响自身，已接受候选会和对应正式任务一起进入回收站。切换“回收站”后可恢复，已接受候选和任务也会一起恢复；来源、通知审计和关联仍保留；
 - 保存计划后，全部任务和排期日历显示相同的开始/完成时间；日历固定按上海自然日归组，跨日任务出现在每个实际覆盖日，区间结束恰为 00:00 时不进入右侧日期，起止相等则作为单日点事件显示。单项计划最多覆盖 366 个上海自然日；任务编辑、主人消息确认排期、“状态或排期有误”纠错，以及撤销 AI 自动维护时恢复的计划会拒绝超限或反向区间。旧自动更新的 before/after 快照会使用同一严格 parser；数字、布尔值和看似日期但不是 ISO datetime 的字符串都会被拒绝，线程、候选或修订 ID 错配也只显示固定脱敏冲突。涉及候选修订的撤销还必须找到唯一 previous revision，并确认恢复前后内容与 candidate_request 一致，避免撤销后没有 current revision 或候选摘要分叉；候选的 pending/snoozed/ignored/accepted 业务状态不会由旧快照改写。失败时任务、提案、线程、候选、候选修订与时间线保持不变；合法历史额外字段会被忽略，不进入恢复后的任务或新审计。旧数据依次使用首个可解析的 `planned_start_at → planned_due_at → schedule_at`；部分坏字段会在 Calendar 专用响应中清成空值并使用有效 fallback，全坏、超限或反向任务会被逐项隐藏。页面只显示固定脱敏提示和隐藏数量，其他正常任务继续显示。completed 保留在原计划日，archived、已作废和回收站任务默认隐藏；清除安排后日历不再显示该任务；
@@ -143,12 +141,11 @@ SQLite 仍是唯一真源，文件夹是可重建投影；因此待确认提案�
 
 ## 3. 配置独立 Aily 扫描
 
-1. 打开 TooManyTasks 浏览器设置页，在「Aily 连接」中填写飞书自建应用 App ID、App Secret、Agent ID 和已登记的本机 OAuth 回调地址。
-2. 保存应用配置。页面不会回显 App Secret；更换应用身份或 App Secret 会清除旧用户授权。
-3. 点击「连接 Aily」，在飞书授权页批准用户权限。授权回调把 access token 与 refresh token 写入 TooManyTasks 本机 AES-256-GCM 凭证库；Token 接近过期时由服务端自动刷新。
-4. Cindy 插件设置页只保留本机地址、自动扫描和进度模式，不保存 Aily 凭证或本机集成令牌。
+推荐由 Agent 按 [AGENT_INSTALL.md](../AGENT_INSTALL.md) 在用户自己的飞书后台创建应用和 Aily Agent，再通过本机 `configure-aily` 命令写入配置。手动维护者才需要打开 TooManyTasks 浏览器设置页，在「Aily 连接」中填写飞书自建应用 App ID、App Secret、Agent ID 和已登记的本机 OAuth 回调地址。
 
-自动扫描打开后，Cindy 薄插件每 10 分钟调用独立 TooManyTasks。服务端按持久窗口调用 Aily，返回摘要后才启动固定 `intake` errand；Cindy 读取 `get_pm_tasks` 的本地快照并调用 `submit_intake`。Aily 返回无新信息时由服务端提交空窗口并推进游标；Aily 或 Cindy 失败时保留旧游标。
+应用配置保存后，点击「连接 Aily」并在飞书授权页批准用户权限。授权回调把 access token 与 refresh token 写入 TooManyTasks 本机 AES-256-GCM 凭证库；Token 接近过期时由服务端自动刷新。Cindy 插件设置页只保留本机地址、自动扫描和进度模式，不保存 Aily 凭证或本机集成令牌。
+
+自动扫描打开后，独立 TooManyTasks 每 20 分钟调用 Aily。非空摘要先写入 SQLite inbox，成功写入后推进独立扫描游标；Cindy 插件每 5 分钟最多领取一条 ready 摘要，再启动固定 `intake` errand。Cindy 读取 `get_pm_tasks` 的本地快照并调用 `submit_intake`，服务端提交成功后在同一事务中标记 inbox completed。Aily 返回无新信息时写入 completed 空窗审计记录并推进扫描游标。Aily 失败不推进扫描游标；Cindy 失败进入 1、2、5、10、20 分钟退避，五次失败后标记 failed。Cindy 退出期间 TooManyTasks 仍会继续生成摘要，下次启动后按顺序处理。
 
 ## 4. 首次真实飞书连接（遗留桌面流程）
 
@@ -299,6 +296,5 @@ API Key: DeepSeek 控制台生成的 Key
 
 ## 7. 尚未完成的真实验收清单
 
-当前 L6 状态只引用 `VER-OAUTH-OWNER-20260811`、`VER-LLM-CONNECTION-20260811`、`VER-FEISHU-TARGET-TENANT` 和 `VER-DIAGNOSTICS-REAL-EXE`。前两项只是缺少独立 run ID 的历史人读声明，本 Issue 未复验；后两项仍未运行。
 
 逐项开放问题见 [待决定事项](open_decisions.md)，能力、环境、commit、run、result、skips 和 evidence type 见 [验证矩阵](verification-matrix.md)。这些项目不能因为 Mock、契约、回放、浏览器 E2E 或安装包构建通过而写成“真实连接已验证”。

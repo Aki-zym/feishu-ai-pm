@@ -2,9 +2,9 @@
   "schemaVersion": 2,
   "id": "ai-pm-intake",
   "name": "TooManyTasks",
-  "description": "调用独立运行的 TooManyTasks，由其使用官方 Aily SDK 总结窗口内的飞书新信息，再由 Cindy 结合本地任务快照判断入库候选并维护当前会话的任务进度。",
-  "whenToUse": "需要触发独立 TooManyTasks 的 Aily 窗口扫描，或把当前 Cindy 会话的实际进展写回本机任务台时使用。",
-  "version": "0.6.0",
+  "description": "调用独立运行的 TooManyTasks 后台 Aily 扫描；插件每 5 分钟领取一条已生成摘要，由 Cindy 结合本地任务快照判断入库，并维护当前会话的任务进度。",
+  "whenToUse": "需要立即请求独立 TooManyTasks 开始后台 Aily 扫描，或把当前 Cindy 会话的实际进展写回本机任务台时使用。",
+  "version": "0.7.0",
   "entry": "main.js",
   "launch": "resident",
   "slots": ["tool", "agent", "node", "cindy", "session-context", "skill", "subscribe"],
@@ -78,7 +78,7 @@
     },
     {
       "name": "scan_intake_window",
-      "description": "调用独立 TooManyTasks 按窗口生成 Aily 飞书摘要，再派发固定 intake errand 结合派生摘要和本地任务快照提交入库提案；窗口、OAuth、Token、SDK 和 SQLite 均由独立 TooManyTasks 管理。入库 errand 会话内禁止调用本工具。",
+      "description": "立即请求独立 TooManyTasks 启动一轮后台 Aily 扫描并快速返回。摘要完成后，常驻插件会在 5 分钟轮询中领取摘要并派发固定 intake errand；入库 errand 会话内禁止递归调用本工具。",
       "parameters": {
         "type": "object",
         "properties": {

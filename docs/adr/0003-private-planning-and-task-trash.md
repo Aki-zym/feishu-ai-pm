@@ -6,7 +6,6 @@ date: 2026-08-10
 owner: 产品负责人
 scope: 私人任务台账
 supersedes: []
-evidence: [VER-ISSUE49-DASHBOARD-20260815]
 ---
 
 # ADR 0003：私人计划与任务回收站

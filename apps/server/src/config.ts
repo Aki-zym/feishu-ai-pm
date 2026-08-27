@@ -32,6 +32,7 @@ const schema = z.object({
     'im:message:readonly',
     'im:message.group_msg:get_as_user',
     'im:message.p2p_msg:get_as_user',
+    'search:message',
     'search:docs:read',
     'calendar:calendar.event:read',
     'offline_access',

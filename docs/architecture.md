@@ -8,19 +8,22 @@ M1 的产品与治理决策以 [DEC-01](decision-register.md) 为唯一登记入
 
 ## 当前用户入口
 
-现行使用从独立 TooManyTasks 开始：`apps/server` 监听 `127.0.0.1:4310`，管理 Aily 应用配置、用户 OAuth、TokenStore、官方 SDK、扫描窗口、SQLite 和浏览器任务台。Cindy 插件只从共享私有配置目录读取自动生成的本机集成令牌，触发扫描并派固定 intake errand；Cindy 只结合 Aily 派生摘要和本地任务快照做最终任务判断。当前用户流程不经过 Cindy 宿主 OAuth、XD Feishu、现有飞书 MCP、ChatD 或 Electron/Windows EXE；后文保留的旧 OAuth、桌面、安装包细节属于遗留实现与验证记录。
+现行使用从独立 TooManyTasks 开始：`apps/server` 监听 `127.0.0.1:4310`，管理 Aily 应用配置、用户 OAuth、TokenStore、官方 SDK、20 分钟扫描调度、SQLite inbox 和浏览器任务台。Cindy 插件只从共享私有配置目录读取自动生成的本机集成令牌，快速触发手动扫描，并每 5 分钟领取一条 ready 摘要派固定 intake errand；Cindy 只结合 Aily 派生摘要和本地任务快照做最终任务判断。当前用户流程不经过 Cindy 宿主 OAuth、XD Feishu、现有飞书 MCP、ChatD 或 Electron/Windows EXE；后文保留的旧 OAuth、桌面、安装包细节属于遗留实现与验证记录。
 
 PROD-07 进一步固定日历入口的语义：日历事件先作为来源事实/提醒保存；运行时仅当 `explicit_owner_responsibility + action + deliverable_or_deadline` 三项同时成立时才允许进入 `candidate_review`，否则走 `calendar_fact` 或责任不明的 `owner_confirmation`。过滤为非任务不删除来源；会议占位不单独推断 action item，纪要或明确消息必须重新提供可追溯依据。路由解释只保留固定代码、有限证据字段和来源引用，不暴露原始日历 payload、参会人目录或正文。
 
 ## 推荐主链
 
 ```text
-插件定时器或手动命令
-  → Cindy Worker 调用 TooManyTasks 本机扫描 API
+TooManyTasks 20 分钟调度或 Cindy 手动命令
+  → apps/server 建立持久扫描窗口
   → apps/server 官方 Aily SDK
   → Aily 按窗口检索飞书并生成派生摘要
+  → SQLite aily_summary_inbox（staging）
+  → Cindy 插件每 5 分钟领取一条摘要
+  → 固定 intake errand
   → Cindy 读取本地任务快照并提交入库提案
-  → SQLite 原始/派生来源耐久保存
+  → SQLite 原始/派生来源耐久保存并原子完成 inbox
   → 单条候选生成
   → 待确认候选归并与主人主体识别
   → 高置信自动归并 / 低置信主人确认
@@ -121,11 +124,14 @@ reminder
 reference_binding
 memory_projection
 app_setting
+aily_summary_inbox
 approval
 job / runtime_checkpoint / runtime_tool_call / outbox
 ```
 
 原始来源和正式任务状态保存在系统数据库中。飞书任务、多维表格或机器人卡片只能是提醒或投影视图，不能成为第二个可编辑真源。
+
+`aily_summary_inbox` 是 Aily 与 Cindy 之间的 staging 队列。schema v9 固定 `ready / claimed / retry_waiting / completed / failed` 五态、10 分钟领取租约、最多五次退避重试和窗口唯一键。Aily 摘要成功写入 inbox 与扫描游标推进处于同一事务；`submit_intake` 的来源/候选/任务写入与 inbox completed 处于另一事务。Cindy 失败不会回滚已经取得的 Aily 摘要，也不会阻塞后续扫描窗口。
 
 `source_context` 保存消息中识别到的飞书文档背景：受限正文片段、内容哈希、文档版本、读取状态、freshness、完整性和最近成功时间。它是来源的派生上下文，不是新的主信息源。`ai_decision_log` 保存 provider、model、prompt 版本、输入哈希、复合 revision、耗时与结构化结果元数据，不保存普通日志中不需要的完整原文。前端候选卡和任务详情只读取 `describe`、字段依据和审计元数据；聊天正文仍只在受控本地来源审计中保存，不作为页面摘要直接渲染。PROD-01 在 route/service 边界为候选、任务和主人响应建立严格 allowlist DTO；候选操作、任务列表/详情/工作台/日历/提醒、重新整理和纠错均由公开投影重新装配，不直接返回数据库行或内部审计快照。任务修改和自动维护回执仍重新读取完整严格 TaskDetail，不能以最小列表 DTO 替代页面所需关系集合；ISO 排期、状态和风险等结构化字段按自身 schema 校验，不进入自由文本清洗。默认来源只带 opaque `source_scope`、来源类型、完整性、发生时间和摘要可用性，不带正文、来源稳定 ID、外部 ID、文档 URL/ID、参考路径、纠错 before/after/note 或 Runtime/provider 原始错误。主人主动核验时，服务端重新校验 task↔source 关系、确认字段和作用域；当前只核验本地保存快照，返回有界脱敏片段、`local_snapshot_verified`/`local_snapshot_unavailable`、受控 `provider_status` 和快照捕获时间，并写私有审计；该流程不创建 outbox 或任何外部动作，也不声称实时 provider 权限或撤回状态。
 
@@ -226,7 +232,6 @@ Issue #39 的 OAuth 配置合同集中在 `integration-contracts.ts`、`feishu.t
 
 Issue #40 的 Feishu 错误分类和详情阻塞判断集中在 `feishu.ts`。只有真实 `Error` 或受控 `cause` 携带传输错误 allowlist 时才进入 transient 重试；普通响应对象即使带有 `ECONNRESET` 等非数字 code，也按非法业务响应 fail-closed 处理。Calendar 事件详情、Minutes 详情/AI artifacts/Transcript 的重试耗尽统一计入本轮 failure，不能降级成仅详情失败的 partial；permission/denied 等已授权业务结果仍可按原合同 partial。durable ingest 成功前不写入新的来源版本或同步状态，失败时保留旧 cursor、watermark、checkpoint 和 `last_success_at`。
 
-本规则的当前合成证据为 `VER-ISSUE40-FSH02-L3-20260816`，仅覆盖 Mock/契约与内存 SQLite；不代表 Windows 安装 L5 或真实飞书租户/provider L6。
 
 运行日志、连接健康与诊断导出共用版本化递归脱敏模块。`app_log` 和 `integration_health` 在写入 SQLite 前清理，日志/连接健康 API 与诊断导出在读取时再次清理，用于覆盖旧数据或旁路写入。当前 schema 版本为 `1`：字段白名单同时约束值类型，只有固定 schema key 输出受控规范名，其他动态 key 改用对象内唯一短编号，避免原 key 泄漏、别名覆盖和 prototype pollution；数组不继承父字段的 primitive 权限。数组、`Error`、URL 与 Proxy 通过受控 descriptor/intrinsic 分类，accessor、类型错配、未知结构和遍历异常只返回可 JSON 序列化的占位符。共享预算同时约束值节点与输出 key，普通对象 own-key 发现和原 key 扫描仍可能随输入规模增长；该能力只改变现有字段的安全表示，不扩大诊断采集范围。
 

@@ -683,6 +683,8 @@ export type CindyIntakeInput = {
   window_start: string;
   window_end: string;
   result_kind?: 'intake' | 'empty_window';
+  inbox_id?: string;
+  claim_token?: string;
   sources: Array<{
     source_key: string;
     source_kind?: 'aily_summary';
@@ -731,6 +733,29 @@ type CindyIntakeWindow = {
   reused: boolean;
 };
 
+type AilySummaryInboxStatus = 'ready' | 'claimed' | 'retry_waiting' | 'completed' | 'failed';
+
+type AilySummaryInboxRow = {
+  id: string;
+  window_id: string;
+  window_start: string;
+  window_end: string;
+  result_kind: 'summary' | 'empty';
+  agent_id: string;
+  summary_text: string;
+  content_hash: string;
+  generated_at: string;
+  status: AilySummaryInboxStatus;
+  attempts: number;
+  available_at: string;
+  lease_until: string | null;
+  claim_token_hash: string | null;
+  last_error_code: string | null;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 type AutomationMode = 'auto' | 'suggest';
 type ProposalApplyActor = 'owner' | 'ai';
 const AUTO_UPDATE_POLICY_VERSION = 'private_task_auto_v1';
@@ -747,6 +772,10 @@ const AUTO_TERMINAL_STATUS_CONFIDENCE = 0.97;
 const CONTINUOUS_MESSAGE_WINDOW_MS = 5 * 60 * 1000;
 const CONTINUOUS_DIALOGUE_WINDOW_MS = 30 * 60 * 1000;
 const EXPLICIT_MESSAGE_CONTEXT_WINDOW_MS = 72 * 60 * 60 * 1000;
+const AILY_SUMMARY_INBOX_LEASE_MS = 10 * 60 * 1000;
+const AILY_SUMMARY_INBOX_MAX_ATTEMPTS = 5;
+const AILY_SUMMARY_INBOX_RETRY_DELAYS_MS = [60_000, 2 * 60_000, 5 * 60_000, 10 * 60_000, 20 * 60_000] as const;
+const AILY_SUMMARY_INBOX_RETENTION_DAYS = 30;
 const terminalQuestionPattern = /[？?]|(?:是否|能否|可否|是不是|有没有)/iu;
 const explicitCompletionPatterns = [
   /^(?:(?:这项|这个|该项|本项)(?:需求|任务|分析|工作|事项))?(?:已经|已|现已|确认(?:已经|已)?)(?:明确)?(?:完成|做完|交付|结项)(?:了|啦|完毕)?$/iu,
@@ -942,7 +971,7 @@ const PRIVACY_PURGE_TABLES = [
   'source_context', 'source_demand_unit_source', 'candidate_request', 'requirement_thread',
   'source_demand_unit', 'privacy_export',
   'job', 'task', 'source_event', 'app_log', 'integration_health', 'sync_cursor',
-  'feishu_monitor_target', 'information_source_state', 'owner_profile', 'app_setting',
+  'aily_summary_inbox', 'feishu_monitor_target', 'information_source_state', 'owner_profile', 'app_setting',
 ] as const;
 const PRIVACY_PRESERVED_TABLES = new Set([
   'database_metadata', 'schema_migration', 'privacy_control', 'privacy_retention_policy',
@@ -2469,6 +2498,7 @@ export class PmService {
     this.retryCoordinator = retryCoordinator;
     this.runtime = new PmRuntime(database, { retryCoordinator });
     this.cleanupLogs(config.logging.retentionDays);
+    this.cleanupAilySummaryInbox();
   }
 
   /**
@@ -2539,10 +2569,17 @@ export class PmService {
   }
 
   intakeWindowCursor() {
+    return this.ailyScanWindowCursor();
+  }
+
+  ailyScanWindowCursor() {
     const row = this.database.raw.prepare(
+      "SELECT value_json FROM app_setting WHERE key = 'aily_scan_window_end'",
+    ).get() as { value_json: string } | undefined;
+    const legacyRow = row ? undefined : this.database.raw.prepare(
       "SELECT value_json FROM app_setting WHERE key = 'intake_window_end'",
     ).get() as { value_json: string } | undefined;
-    const value = parseMetadata(row?.value_json);
+    const value = parseMetadata(row?.value_json ?? legacyRow?.value_json);
     const windowEnd = typeof value.window_end === 'string' && Number.isFinite(Date.parse(value.window_end))
       ? new Date(value.window_end).toISOString()
       : null;
@@ -2550,13 +2587,20 @@ export class PmService {
   }
 
   claimIntakeWindow(): CindyIntakeWindow {
+    return this.claimAilyScanWindow();
+  }
+
+  claimAilyScanWindow(): CindyIntakeWindow {
     return this.database.transaction(() => {
-      const cursorEnd = this.intakeWindowCursor().window_end;
+      const cursorEnd = this.ailyScanWindowCursor().window_end;
       const cursorMs = cursorEnd ? Date.parse(cursorEnd) : Number.NaN;
       const pendingRow = this.database.raw.prepare(
+        "SELECT value_json FROM app_setting WHERE key = 'aily_scan_pending_window'",
+      ).get() as { value_json: string } | undefined;
+      const legacyPendingRow = pendingRow ? undefined : this.database.raw.prepare(
         "SELECT value_json FROM app_setting WHERE key = 'intake_pending_window'",
       ).get() as { value_json: string } | undefined;
-      const pending = parseMetadata(pendingRow?.value_json);
+      const pending = parseMetadata(pendingRow?.value_json ?? legacyPendingRow?.value_json);
       const pendingStart = typeof pending.window_start === 'string' && Number.isFinite(Date.parse(pending.window_start))
         ? new Date(pending.window_start).toISOString()
         : null;
@@ -2589,7 +2633,7 @@ export class PmService {
       } satisfies CindyIntakeWindow;
       const timestamp = nowIso();
       this.database.raw.prepare(
-        `INSERT INTO app_setting (key, value_json, updated_at) VALUES ('intake_pending_window', ?, ?)
+        `INSERT INTO app_setting (key, value_json, updated_at) VALUES ('aily_scan_pending_window', ?, ?)
          ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
       ).run(JSON.stringify({
         window_id: window.window_id,
@@ -2601,37 +2645,240 @@ export class PmService {
   }
 
   updateIntakeWindowCursor(windowEnd: string) {
+    return this.updateAilyScanWindowCursor(windowEnd);
+  }
+
+  updateAilyScanWindowCursor(windowEnd: string) {
     const next = new Date(windowEnd);
     if (!Number.isFinite(next.getTime())) throw new CindyIntakeValidationError('window_end 不是有效时间。');
     const nextIso = next.toISOString();
-    const current = this.intakeWindowCursor().window_end;
+    const current = this.ailyScanWindowCursor().window_end;
     if (current && Date.parse(nextIso) <= Date.parse(current)) {
-      throw new CindyIntakeConflictError('入库窗口游标只允许向前推进。');
+      throw new CindyIntakeConflictError('Aily 扫描窗口游标只允许向前推进。');
     }
     const timestamp = nowIso();
-    this.writeIntakeWindowCursorUnsafe(nextIso, timestamp);
+    this.writeAilyScanWindowCursorUnsafe(nextIso, timestamp);
     return { window_end: nextIso };
   }
 
-  private writeIntakeWindowCursorUnsafe(windowEnd: string, updatedAt: string) {
+  private writeAilyScanWindowCursorUnsafe(windowEnd: string, updatedAt: string) {
     this.database.raw.prepare(
-      `INSERT INTO app_setting (key, value_json, updated_at) VALUES ('intake_window_end', ?, ?)
+      `INSERT INTO app_setting (key, value_json, updated_at) VALUES ('aily_scan_window_end', ?, ?)
        ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
     ).run(JSON.stringify({ window_end: windowEnd }), updatedAt);
-    this.database.raw.prepare("DELETE FROM app_setting WHERE key = 'intake_pending_window'").run();
+    this.database.raw.prepare("DELETE FROM app_setting WHERE key IN ('aily_scan_pending_window', 'intake_pending_window')").run();
   }
 
-  private advanceIntakeWindowCursorUnsafe(windowEnd: string, updatedAt: string) {
+  private advanceAilyScanWindowCursorUnsafe(windowEnd: string, updatedAt: string) {
     const next = new Date(windowEnd);
     if (!Number.isFinite(next.getTime())) throw new CindyIntakeValidationError('window_end 不是有效时间。');
     const nextIso = next.toISOString();
     const row = this.database.raw.prepare(
+      "SELECT value_json FROM app_setting WHERE key = 'aily_scan_window_end'",
+    ).get() as { value_json: string } | undefined;
+    const legacyRow = row ? undefined : this.database.raw.prepare(
       "SELECT value_json FROM app_setting WHERE key = 'intake_window_end'",
     ).get() as { value_json: string } | undefined;
-    const currentValue = parseMetadata(row?.value_json).window_end;
+    const currentValue = parseMetadata(row?.value_json ?? legacyRow?.value_json).window_end;
     const currentTime = typeof currentValue === 'string' ? Date.parse(currentValue) : Number.NaN;
     if (Number.isFinite(currentTime) && currentTime >= next.getTime()) return;
-    this.writeIntakeWindowCursorUnsafe(nextIso, updatedAt);
+    this.writeAilyScanWindowCursorUnsafe(nextIso, updatedAt);
+  }
+
+  persistAilySummaryWindow(input: {
+    window: CindyIntakeWindow;
+    agent_id: string;
+    generated_at: string;
+    text: string;
+    empty: boolean;
+  }) {
+    if (!/^[A-Za-z0-9._:-]{1,160}$/u.test(input.agent_id)) {
+      throw new CindyIntakeValidationError('Aily Agent ID 格式不合法。');
+    }
+    if (!Number.isFinite(Date.parse(input.generated_at))) {
+      throw new CindyIntakeValidationError('Aily 摘要生成时间无效。');
+    }
+    const text = input.text.trim();
+    if ((!input.empty && !text) || text.length > 20_000) {
+      throw new CindyIntakeValidationError('Aily 摘要正文无效或超过长度上限。');
+    }
+    if (input.empty && text) {
+      throw new CindyIntakeValidationError('Aily 空窗口不能保存摘要正文。');
+    }
+    const contentHash = createHash('sha256').update(text).digest('hex');
+    const inboxId = `aily-inbox:${createHash('sha256').update(input.window.window_id).digest('hex')}`;
+    return this.database.transaction(() => {
+      const timestamp = nowIso();
+      const existing = this.database.raw.prepare(
+        'SELECT * FROM aily_summary_inbox WHERE window_id = ?',
+      ).get(input.window.window_id) as AilySummaryInboxRow | undefined;
+      if (existing) {
+        if (
+          existing.content_hash !== contentHash
+          || existing.agent_id !== input.agent_id
+          || existing.window_start !== input.window.window_start
+          || existing.window_end !== input.window.window_end
+          || existing.result_kind !== (input.empty ? 'empty' : 'summary')
+        ) {
+          throw new CindyIntakeConflictError('同一 Aily 扫描窗口的摘要内容发生变化，已拒绝覆盖旧结果。');
+        }
+        this.advanceAilyScanWindowCursorUnsafe(input.window.window_end, timestamp);
+        return {
+          inbox_id: existing.id,
+          window_id: existing.window_id,
+          status: existing.status,
+          duplicate: true,
+          summary_ready: existing.status === 'ready' || existing.status === 'claimed' || existing.status === 'retry_waiting',
+        };
+      }
+      const status: AilySummaryInboxStatus = input.empty ? 'completed' : 'ready';
+      this.database.raw.prepare(
+        `INSERT INTO aily_summary_inbox
+          (id, window_id, window_start, window_end, result_kind, agent_id, summary_text, content_hash,
+           generated_at, status, attempts, available_at, lease_until, claim_token_hash,
+           last_error_code, completed_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, NULL, NULL, ?, ?, ?)`,
+      ).run(
+        inboxId,
+        input.window.window_id,
+        input.window.window_start,
+        input.window.window_end,
+        input.empty ? 'empty' : 'summary',
+        input.agent_id,
+        text,
+        contentHash,
+        new Date(input.generated_at).toISOString(),
+        status,
+        timestamp,
+        input.empty ? timestamp : null,
+        timestamp,
+        timestamp,
+      );
+      this.advanceAilyScanWindowCursorUnsafe(input.window.window_end, timestamp);
+      return {
+        inbox_id: inboxId,
+        window_id: input.window.window_id,
+        status,
+        duplicate: false,
+        summary_ready: !input.empty,
+      };
+    });
+  }
+
+  claimNextAilySummaryInbox() {
+    return this.database.transaction(() => {
+      const timestamp = nowIso();
+      const nowMs = Date.parse(timestamp);
+      this.database.raw.prepare(
+        `UPDATE aily_summary_inbox
+            SET status = 'failed', lease_until = NULL, claim_token_hash = NULL,
+                last_error_code = COALESCE(last_error_code, 'CINDY_RETRY_EXHAUSTED'),
+                completed_at = COALESCE(completed_at, ?), updated_at = ?
+          WHERE status = 'claimed' AND lease_until <= ? AND attempts >= ?`,
+      ).run(timestamp, timestamp, timestamp, AILY_SUMMARY_INBOX_MAX_ATTEMPTS);
+      const row = this.database.raw.prepare(
+        `SELECT * FROM aily_summary_inbox
+          WHERE result_kind = 'summary'
+            AND attempts < ?
+            AND (
+              (status IN ('ready','retry_waiting') AND available_at <= ?)
+              OR (status = 'claimed' AND lease_until <= ?)
+            )
+          ORDER BY generated_at ASC, id ASC
+          LIMIT 1`,
+      ).get(AILY_SUMMARY_INBOX_MAX_ATTEMPTS, timestamp, timestamp) as AilySummaryInboxRow | undefined;
+      if (!row) return { status: 'empty' as const };
+      const claimToken = randomUUID();
+      const claimTokenHash = createHash('sha256').update(claimToken).digest('hex');
+      const leaseUntil = new Date(nowMs + AILY_SUMMARY_INBOX_LEASE_MS).toISOString();
+      const updated = this.database.raw.prepare(
+        `UPDATE aily_summary_inbox
+            SET status = 'claimed', attempts = attempts + 1, lease_until = ?, claim_token_hash = ?,
+                last_error_code = NULL, updated_at = ?
+          WHERE id = ? AND attempts = ? AND (
+            (status IN ('ready','retry_waiting') AND available_at <= ?)
+            OR (status = 'claimed' AND lease_until <= ?)
+          )`,
+      ).run(leaseUntil, claimTokenHash, timestamp, row.id, row.attempts, timestamp, timestamp);
+      if (updated.changes !== 1) throw new CindyIntakeConflictError('Aily 摘要已被其他消费者领取。');
+      return {
+        status: 'ready' as const,
+        inbox_id: row.id,
+        claim_token: claimToken,
+        lease_until: leaseUntil,
+        attempt: row.attempts + 1,
+        window: {
+          window_id: row.window_id,
+          window_start: row.window_start,
+          window_end: row.window_end,
+        },
+        source: {
+          source_key: `aily-summary:${row.window_id}`,
+          source_kind: 'aily_summary' as const,
+          occurred_at: row.window_end,
+          conversation_key: `aily:${row.agent_id}`,
+          sender_role: 'Aily 摘要（派生来源）',
+          agent_id: row.agent_id,
+          generated_at: row.generated_at,
+          text: row.summary_text,
+        },
+      };
+    });
+  }
+
+  retryAilySummaryInbox(inboxId: string, claimToken: string, errorCode: string) {
+    const normalizedId = inboxId.trim();
+    const normalizedToken = claimToken.trim();
+    const normalizedErrorCode = errorCode.trim().slice(0, 80);
+    if (!normalizedId || !normalizedToken || !/^[A-Z0-9_:-]{1,80}$/u.test(normalizedErrorCode)) {
+      throw new CindyIntakeValidationError('Aily inbox 重试参数无效。');
+    }
+    return this.database.transaction(() => {
+      const timestamp = nowIso();
+      const row = this.database.raw.prepare(
+        'SELECT * FROM aily_summary_inbox WHERE id = ?',
+      ).get(normalizedId) as AilySummaryInboxRow | undefined;
+      if (
+        !row
+        || row.status !== 'claimed'
+        || !row.claim_token_hash
+        || !row.lease_until
+        || Date.parse(row.lease_until) <= Date.parse(timestamp)
+      ) {
+        throw new CindyIntakeConflictError('Aily inbox 当前没有有效领取租约。');
+      }
+      const tokenHash = createHash('sha256').update(normalizedToken).digest('hex');
+      if (tokenHash !== row.claim_token_hash) {
+        throw new CindyIntakeConflictError('Aily inbox claim token 无效。');
+      }
+      const exhausted = row.attempts >= AILY_SUMMARY_INBOX_MAX_ATTEMPTS;
+      const delay = AILY_SUMMARY_INBOX_RETRY_DELAYS_MS[Math.max(0, Math.min(
+        row.attempts - 1,
+        AILY_SUMMARY_INBOX_RETRY_DELAYS_MS.length - 1,
+      ))]!;
+      const nextAvailableAt = new Date(Date.parse(timestamp) + delay).toISOString();
+      const status: AilySummaryInboxStatus = exhausted ? 'failed' : 'retry_waiting';
+      this.database.raw.prepare(
+        `UPDATE aily_summary_inbox
+            SET status = ?, available_at = ?, lease_until = NULL, claim_token_hash = NULL,
+                last_error_code = ?, completed_at = ?, updated_at = ?
+          WHERE id = ? AND status = 'claimed' AND claim_token_hash = ?`,
+      ).run(
+        status,
+        nextAvailableAt,
+        normalizedErrorCode,
+        exhausted ? timestamp : null,
+        timestamp,
+        normalizedId,
+        tokenHash,
+      );
+      return {
+        inbox_id: normalizedId,
+        status,
+        attempts: row.attempts,
+        retry_at: exhausted ? null : nextAvailableAt,
+      };
+    });
   }
 
   intakeResultStatus(windowId: string) {
@@ -5720,6 +5967,9 @@ export class PmService {
 
   processCindyIntake(input: CindyIntakeInput): CindyIntakeResult {
     const resultKind = input.result_kind ?? 'intake';
+    if (Boolean(input.inbox_id) !== Boolean(input.claim_token)) {
+      throw new CindyIntakeValidationError('inbox_id 和 claim_token 必须同时提供。');
+    }
     const sourceKeys = input.sources.map((source) => source.source_key);
     if (new Set(sourceKeys).size !== sourceKeys.length) {
       throw new CindyIntakeValidationError('sources.source_key 不能重复。');
@@ -5740,7 +5990,8 @@ export class PmService {
     if (resultKind === 'intake' && input.sources.length === 0) {
       throw new CindyIntakeValidationError('普通 intake 窗口必须至少提交一条来源；空窗口请使用 result_kind=empty_window。');
     }
-    const normalizedInput = { ...input, result_kind: resultKind };
+    const { claim_token: _claimToken, ...hashableInput } = input;
+    const normalizedInput = { ...hashableInput, result_kind: resultKind };
     const inputHash = createHash('sha256').update(stableJson(normalizedInput)).digest('hex');
     const ailySources = input.sources.filter((source) => source.source_kind === 'aily_summary');
     if (ailySources.length > 1) {
@@ -5800,8 +6051,42 @@ export class PmService {
         if (!stored._input_hash || stored._input_hash !== inputHash) {
           throw new CindyIntakeConflictError('同一入库窗口的提交内容发生变化，已拒绝静默复用旧结果。');
         }
+        if (input.inbox_id) {
+          const completedInbox = this.database.raw.prepare(
+            `SELECT id FROM aily_summary_inbox
+              WHERE id = ? AND window_id = ? AND status = 'completed'`,
+          ).get(input.inbox_id, input.window_id);
+          if (!completedInbox) throw new CindyIntakeConflictError('Aily inbox 与已完成入库结果不一致。');
+        }
         const { _input_hash: _ignoredInputHash, ...publicResult } = stored;
         return { ...publicResult, duplicate: true };
+      }
+
+      let claimedInbox: AilySummaryInboxRow | undefined;
+      if (input.inbox_id && input.claim_token) {
+        claimedInbox = this.database.raw.prepare(
+          'SELECT * FROM aily_summary_inbox WHERE id = ?',
+        ).get(input.inbox_id) as AilySummaryInboxRow | undefined;
+        const claimTokenHash = createHash('sha256').update(input.claim_token).digest('hex');
+        const ailySource = input.sources.find((source) => source.source_kind === 'aily_summary');
+        if (
+          !claimedInbox
+          || claimedInbox.status !== 'claimed'
+          || claimedInbox.claim_token_hash !== claimTokenHash
+          || !claimedInbox.lease_until
+          || Date.parse(claimedInbox.lease_until) <= Date.parse(timestamp)
+          || claimedInbox.result_kind !== 'summary'
+          || claimedInbox.window_id !== input.window_id
+          || claimedInbox.window_start !== input.window_start
+          || claimedInbox.window_end !== input.window_end
+          || !ailySource
+          || ailySource.source_key !== `aily-summary:${claimedInbox.window_id}`
+          || ailySource.agent_id !== claimedInbox.agent_id
+          || ailySource.generated_at !== claimedInbox.generated_at
+          || createHash('sha256').update(ailySource.text.trim()).digest('hex') !== claimedInbox.content_hash
+        ) {
+          throw new CindyIntakeConflictError('Aily inbox 领取租约或摘要内容与本次入库不一致。');
+        }
       }
 
       const sourceRows = new Map<string, SourceEventRow>();
@@ -6038,7 +6323,17 @@ export class PmService {
             SET cursor = ?, last_success_at = ?, updated_at = ?
           WHERE integration = 'cindy_intake' AND scope_key = ?`,
       ).run(JSON.stringify(storedPayload), timestamp, timestamp, input.window_id);
-      this.advanceIntakeWindowCursorUnsafe(input.window_end, timestamp);
+      if (claimedInbox) {
+        const completed = this.database.raw.prepare(
+          `UPDATE aily_summary_inbox
+              SET status = 'completed', lease_until = NULL, claim_token_hash = NULL,
+                  last_error_code = NULL, completed_at = ?, updated_at = ?
+            WHERE id = ? AND status = 'claimed' AND claim_token_hash = ?`,
+        ).run(timestamp, timestamp, claimedInbox.id, claimedInbox.claim_token_hash);
+        if (completed.changes !== 1) {
+          throw new CindyIntakeConflictError('Aily inbox 完成状态提交失败。');
+        }
+      }
       for (const [conversationKey, occurredAt] of conversationCursors) {
         this.database.advanceCindyConversationCursor(conversationKey, occurredAt, timestamp);
       }
@@ -8219,6 +8514,17 @@ export class PmService {
     });
     this.log('runtime', 'info', 'logs.cleanup', '已按保留期限清理脱敏日志。', { retentionDays: safeDays, ...result });
     return result;
+  }
+
+  cleanupAilySummaryInbox(retentionDays = AILY_SUMMARY_INBOX_RETENTION_DAYS) {
+    const safeDays = Math.min(Math.max(retentionDays, 1), 365);
+    const cutoff = new Date(Date.now() - safeDays * 24 * 60 * 60 * 1000).toISOString();
+    const removed = this.database.raw.prepare(
+      `DELETE FROM aily_summary_inbox
+        WHERE status IN ('completed','failed')
+          AND COALESCE(completed_at, updated_at) < ?`,
+    ).run(cutoff).changes;
+    return { removed, retentionDays: safeDays };
   }
 
   clearLogs(includeCorrections = false) {
