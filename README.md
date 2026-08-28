@@ -1,7 +1,8 @@
-# TooManyTasks
+  # TooManyTasks
 
 ## 安装时你只需要做什么
 
+工具运行需要Cindy，Aily智能体，飞书企业应用。
 Agent 会自动唤起浏览器，为你创建专属的飞书企业自建应用和 Aily Agent。你只需要在提示时：
 
 1. 登录飞书或完成二次验证；
